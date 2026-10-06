@@ -4,15 +4,24 @@
 
 ### Added
 - Add idle strategies with parameters:
-  - `IDLE=sleep:<period>`;
-  - `IDLE=backoff[:<spins>,<yields>,<min park>,<max park>]`, Agrona's
+  - `runtime.idle: sleep:<period>`;
+  - `runtime.idle: backoff[:<spins>,<yields>,<min park>,<max park>]`, Agrona's
     `BackoffIdleStrategy`, which spins, yields, then parks for doubling
     periods and starts over on any work;
-  - `TIMER_SLACK=<period>`, which sets the loop thread's Linux timer slack
-    so short parks wake on time.
+  - `runtime.timer_slack: <period>`, which sets the loop thread's Linux timer
+    slack so short parks wake on time.
 
   The lab's engines and dummy exchanges now back off instead of sleeping
   1 ms.
+- Configure a runtime process from one cold YAML file read at start-up
+  (`config::Cold<A>`): `ERGON_CONFIG`, else `/lab/cold/app.yaml`, else the
+  defaults, with `runtime:`, `persist:`, `bus:`, `log:`, `config_dir` and the
+  application's own `app:` section. `PROFILE` merges one of the file's
+  `profiles` over it. An unknown profile, key or value stops the start.
+- Read a process's identity in one place, `config::Identity::from_env`:
+  `NODE_NAME`, `POD_NAME`, `POD_IP`, `HOST_IP`, `REGION`, `PERSIST_APP`,
+  `SERVICE`, `EXCHANGE`, `ERGON_CONFIG` and `PROFILE`. It is the runtime's only
+  read of the environment, and a test fails on any other.
 - Gate releases on `just bench-runtime`. Both `just release` and
   `just release-verified` run it, then rerun each gated `ergon-runtime` bench
   with `-- --seed-regression`, which must make every gate fail.
@@ -22,6 +31,15 @@
   and borrowed frames for persistence, including unknown schemas and templates.
 
 ### Changed
+- Read the loop's and persist's settings from the cold file instead of
+  `IDLE`, `TIMER_SLACK`, `CPU`, `MLOCK`, `JOURNAL` and the `PERSIST_*`
+  variables, which the runtime no longer reads. Periods take `ns`, `us`, `ms`
+  or `s`. `Settings::from_env` returns a `Result`; `Settings::from_cold`,
+  `Invoker::from_cold` and `Runtime::from_cold` take a loaded identity and
+  file; `App::start` replaces `App::start_with`; `Idle::from_env`,
+  `source::host_name` and `app::Error::Idle` are gone. Until each lab app has
+  its cold ConfigMap, `lab::cold` lays `PERSIST_CONFIG`,
+  `PERSIST_SUBSCRIBER_TIMEOUT`, `IDLE` and `JOURNAL=on` over the file.
 - Keep the lab's ClickHouse password in the Kubernetes Secret `clickhouse`,
   which `just deploy` makes from `CLICKHOUSE_PASSWORD` in `.env`. ClickHouse,
   the ingesters, Grafana and Jupyter read it from there, and `just verify`
@@ -61,7 +79,7 @@
     exits with 143 once `Signals` is dropped.
 
   `Invoker::finish` runs once, and closes the outputs and persist's
-  publication. With `JOURNAL=on` it records `Signal` rows and a `Completed`
+  publication. With `runtime.journal` on it records `Signal` rows and a `Completed`
   row once the agent stopped and the outputs closed.
 - Replay a journal's `Signal` rows through `Agent::on_signal`, every row
   after a `ctx.stop()` as live dispatched it, and `Agent::stop` under the
