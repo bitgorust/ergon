@@ -13,6 +13,8 @@
 
   The lab's engines and dummy exchanges now back off instead of sleeping
   1 ms.
+- Add `just k9s`, which opens k9s on the lab's cluster, and have `just urls`
+  print the ClickHouse password with each UI's address.
 - Generate an opt-in cross-schema AnySchemaMessage dispatcher with typed errors
   and borrowed frames for persistence, including unknown schemas and templates.
 
