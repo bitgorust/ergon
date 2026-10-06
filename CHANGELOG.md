@@ -47,9 +47,22 @@
 - Record metrics only through `Metrics` handles. `tracing` events with a
   `counter`, `gauge` or `histogram` field are no longer recorded, and
   `LocalHistogram` is merged into `Histogram`.
-- Stop the runtime on SIGTERM through a pipe that housekeeping reads every
-  10 ms (`rt::sigterm`). `Invoker::finish` runs once and closes the outputs
-  and persist's publication.
+- Handle SIGINT and SIGTERM in the runtime (`rt::Signals`,
+  `Config::signals`):
+  - a startup guard exits with 128 + signo until the loop runs
+    (`rt::StartupGuard` alone for an app whose framework owns its signals);
+  - `Agent::on_signal` returns `OnSignal::Stop` or `OnSignal::Drain`;
+  - one deadline bounds shutdown (`Config::stop_timeout`, 3 s), and a
+    message's journal write stalled by back pressure gives way to a signal:
+    the journal ends there, that message and later ones are not dispatched,
+    and the loop stops after `on_signal` even on `OnSignal::Drain`, so the
+    journal stays an exact prefix;
+  - a second Ctrl-C always exits with 130; SIGTERM is never forced, and
+    exits with 143 once `Signals` is dropped.
+
+  `Invoker::finish` runs once, and closes the outputs and persist's
+  publication. With `JOURNAL=on` it records `Signal` rows and a `Completed`
+  row once the agent stopped and the outputs closed.
 - Resolve feed names through the application's `directory::Directory`
   (`rt::Config::directory`, `Ctx::set_directory`). The `streams.yaml`
   registry moved from `ergon-runtime` to the lab's `lab` crate, and the
