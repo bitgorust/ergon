@@ -85,6 +85,9 @@
   `try_decode`. They used the trusted tier, which panics on a frame shorter
   than its header or fixed block, and the ingester hands them archive bytes
   after reading only the schema id.
+- Decode an order in the lab's dummy exchange and simulated venue with the
+  generated `AnyMessage` decode. Both checked the schema id by hand and then
+  used the trusted decoder, so a 6- or 7-byte frame carrying that id panicked.
 - Look up a journalled message from a recording by the recording's session
   as well as its id, and compare frames only at the positions the journal
   names. A persistent subscription now journals the recording's session for
