@@ -111,6 +111,21 @@
   of the archive, so its pieces stay inside ClickHouse's deduplication window.
   Let a batch an older ingester left pending (`checkpoint.pending`) go in
   before upgrading, since it is cut the new way.
+- Insert each day of each piece of an ingester batch as one block of its
+  own, named by the piece and the day, with the settings that keep it one
+  block and deduplicated (`max_insert_block_size`, `insert_deduplicate`,
+  `async_insert`) sent with it. ClickHouse splits an insert by partition and
+  by a profile's lower `max_insert_block_size`, and does not promise to take
+  all of its blocks or none, so exactly-once no longer rests on it. A pending
+  batch file now starts with `v2`. One without it is finished cut by piece
+  alone, as the ingester that wrote it did.
+- Sync the ingester's pending batch and checkpoint files, and their
+  directory, to disk before an insert or an archive purge relies on them. A
+  host crash could leave either one empty or as it was before.
+- Have ClickHouse sync each part the ingester inserts to disk before it
+  answers (`fsync_after_insert` and `fsync_part_directory`, set on new tables
+  and added to existing ones). A crash of ClickHouse's host could lose parts
+  the ingester had already checkpointed and purged from the archive.
 - Insert a pending batch that names a recording at its start. A batch saved in
   a tick in which a new recording's replay had delivered nothing yet named it
   there, and after a crash the restart waited for that recording for good.
