@@ -38,7 +38,8 @@
   read of the environment, and a test fails on any other.
 - Gate releases on `just bench-runtime`. Both `just release` and
   `just release-verified` run it, then rerun each gated `ergon-runtime` bench
-  with `-- --seed-regression`, which must make every gate fail.
+  with `-- --seed-regression`, which must make every gate fail, and with
+  `--seed-regression=NAME`, where one failing gate must fail its bench.
 - Add `just k9s`, which opens k9s on the lab's cluster, and have `just urls`
   print the ClickHouse password with each UI's address.
 - Generate an opt-in cross-schema AnySchemaMessage dispatcher with typed errors
@@ -106,7 +107,8 @@
   signal-cut run with `SimConfig::journal_prefix` (loaded by
   `journal::clickhouse::load_prefix`): `Sim::run` returns
   `Outcome::Incomplete`, does not call `Agent::stop`, and drops and counts a
-  timer batch the journal ends inside. The sample's `backtest --source
+  timer batch the journal ends inside; `Outcome` is `#[must_use]`, so an
+  ignored `Incomplete` warns. The sample's `backtest --source
   journal-prefix` replays such a run, including one recorded before
   `Completed` existed, and reports it incomplete.
 - Re-read `tables.yaml` only when the config directory changes. The

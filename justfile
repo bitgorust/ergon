@@ -537,7 +537,8 @@ bench-cluster:
 # heap's tombstones drained, idle poll, fire, and order-timeout churn.
 # Then the per-message cost of an application loop over an IPC feed.
 # Both release recipes run it; scripts/tests/test-bench-runtime-gate.sh proves
-# each gate fails on a seeded regression.
+# each gate fails on a seeded regression, and that one failing gate fails its
+# bench.
 bench-runtime:
     #!/usr/bin/env bash
     set -euo pipefail
