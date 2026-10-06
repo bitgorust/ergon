@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- Record the log stream in the ingester's archive beside the persist stream:
+  stream 1004 (`persist::LOG_STREAM_ID`, documented with the other reserved
+  ids), read as the persist stream is, its rows going to the event table `log`
+  (`persist::LOG_TABLE`). `Settings.log_stream_id` names another stream.
 - Add idle strategies with parameters:
   - `runtime.idle: sleep:<period>`;
   - `runtime.idle: backoff[:<spins>,<yields>,<min park>,<max park>]`, Agrona's
@@ -31,6 +35,10 @@
   and borrowed frames for persistence, including unknown schemas and templates.
 
 ### Changed
+- Keep the journal's `input` rows and the `config` rows whatever
+  `tables.yaml` says (`ALWAYS_KEPT`): an entry gives only their `kind`
+  (default `dynamic`) and `database`. The ingester now creates `input` even
+  when `tables.yaml` leaves it out; it stays empty until an app journals.
 - Read the loop's and persist's settings from the cold file instead of
   `IDLE`, `TIMER_SLACK`, `CPU`, `MLOCK`, `JOURNAL` and the `PERSIST_*`
   variables, which the runtime no longer reads. Periods take `ns`, `us`, `ms`
