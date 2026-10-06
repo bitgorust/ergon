@@ -186,6 +186,10 @@
   before only one arm paid it.
 
 ### Fixed
+- Publish metrics without allocating on the loop, the first summary
+  included: registering a series now sizes every buffer a publish reuses.
+  The first histogram summary grew three of them, and with `mimalloc` the
+  5 s `alloc_sample_ns` histogram allocated on the loop shortly after start.
 - Refuse a short or corrupt `Source`, `Shape`, `MetricDef` or `TraceDef`
   message with `None` from its `decode`, which now uses the checked
   `try_decode`. They used the trusted tier, which panics on a frame shorter
