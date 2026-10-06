@@ -675,6 +675,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "signal-hook",
+ "syn 3.0.5",
  "tracing",
  "tracing-subscriber",
  "ureq",

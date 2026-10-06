@@ -137,6 +137,23 @@
   registry moved from `ergon-runtime` to the lab's `lab` crate, and the
   `ingester` binary from `ergon-runtime-server` to
   `samples/clickhouse/ingester`.
+- Keep Aeron out of the runtime's public API, which a test now checks:
+  - `Bus::publication` takes a `directory::Feed`, as `Ctx::publish_at`
+    does; `Bus::subscription(channel, stream)` is gone (use
+    `Bus::subscribe_live`);
+  - `Settings.channel` is gone from both crates, and so are
+    `persist::CHANNEL`, `logs::CHANNEL` and `bridge::BRIDGE_CHANNEL`. The
+    ingester records the persist and log streams by the same strings as
+    before;
+  - `ergon_runtime_server::RecordedFeed` takes a `feed: Feed` instead of
+    `stream_id` and a `spy` URI, and the ingester builds the spy at its
+    `Settings.host_ip` (`HOST_IP`). `lab::Streams::spy` is gone;
+  - `Error::Aeron` is `Error::Bus` in `ergon-runtime` and
+    `ergon-runtime-server`, displayed as `bus: …`.
+- Always set the media driver's directory on the client: `Settings.aeron_dir`
+  and the cold `bus.aeron_dir` are a `String`, default `/aeron/driver`, and
+  `AERON_DIR` is no longer read by the runtime. The ingester's
+  `Settings::from_env` reads `AERON_DIR` and `HOST_IP`.
 - Remove unused runtime API: `rt::Mode::Backtest` (`Mode::Replay` runs
   backtests), `Runtime::invoker` (use `Invoker::new`), `App::start`,
   `App::metrics` and `App.region`, `Ctx::is_sim` and `Ctx::sim_feeds`,
