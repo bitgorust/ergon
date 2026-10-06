@@ -125,7 +125,15 @@
   `Endpoint` (`Ipc`, `Udp(HostPort)`, or `Mdc { publisher, reliable, archive }`),
   for subscribing and publishing alike. The runtime builds every channel from
   it at this node's address, so a directory holds no Aeron URIs and no node
-  IP. `Bus::subscribe` and `Bus::subscribe_live` take a `Feed`. The `streams.yaml`
+  IP. `Bus::subscribe` and `Bus::subscribe_live` take a `Feed`.
+  `Ctx::subscribe_at(&feed)` and `Ctx::publish_at(&feed)` open a feed the
+  directory does not name, and replace `Ctx::subscribe_channel` and
+  `Ctx::publish_channel`; a simulation names such a feed
+  `<endpoint>/<stream id>` (`ipc/101`), the same for both. `rt::ArchiveConfig`
+  takes `control: Endpoint` (`Ipc` for this node's archive, `Udp` for a remote
+  one) and derives the response channel; its `response` field is gone, and
+  the backtest's `ARCHIVE_CONTROL` takes `<host>:<port>` and
+  `ARCHIVE_RESPONSE` is no longer read. The `streams.yaml`
   registry moved from `ergon-runtime` to the lab's `lab` crate, and the
   `ingester` binary from `ergon-runtime-server` to
   `samples/clickhouse/ingester`.
