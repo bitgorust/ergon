@@ -73,6 +73,16 @@
   timer batch the journal ends inside. The sample's `backtest --source
   journal-prefix` replays such a run, including one recorded before
   `Completed` existed, and reports it incomplete.
+- Re-read `tables.yaml` only when the config directory changes. The
+  runtime's 10 ms check of the signal sockets also polls an inotify watch
+  (a kqueue on macOS) of the directory, which sees the kubelet's `..data`
+  swap, and applies a change with `Persist::reload` at the tail of a cycle
+  that found no work. `Persist::poll` no longer `stat`s the file every second;
+  it still applies the switches again then, so an `until` passes by itself.
+  An application that drives `Persist` without the runtime calls
+  `Persist::reload` itself. If the
+  directory cannot be watched, one error is logged and live reload is off. On
+  macOS an in-place write of the file is not seen; replace the file instead.
 - Resolve feed names through the application's `directory::Directory`
   (`rt::Config::directory`, `Ctx::set_directory`). The `streams.yaml`
   registry moved from `ergon-runtime` to the lab's `lab` crate, and the
