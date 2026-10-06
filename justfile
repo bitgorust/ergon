@@ -198,6 +198,9 @@ release-check: test check-coverage check-generated-rustdoc
 #   just bench-cluster && just bench && just bench-historic   # quiet machine
 #   just release-verified                                     # same commit
 #
+# `bench-runtime` leaves no evidence file to check, so this recipe runs it
+# first, while the machine is still quiet, with its negative test.
+#
 # Re-run the benches if you commit anything afterwards; the manifest check will
 # reject stale evidence rather than let it through.
 # Release with benchmark gates already proven on a quiet machine
@@ -205,6 +208,9 @@ release-verified: _check-release-notes
     @echo "=== 0/8 confirm benchmark evidence exists for HEAD ==="
     bash scripts/package-bench-artifacts.sh /tmp/ergon-bench-evidence-precheck
     @rm -rf /tmp/ergon-bench-evidence-precheck
+    @echo "=== 0b/8 runtime benchmark gates + their negative test ==="
+    just bench-runtime
+    bash scripts/tests/test-bench-runtime-gate.sh
     just _release-pre
     just _release-post
 
@@ -219,10 +225,12 @@ release-verified: _check-release-notes
 release: _check-release-notes
     just clean
     just _release-pre
-    @echo "=== 5/8 benchmark gates (cluster + parity + historic) ==="
+    @echo "=== 5/8 benchmark gates (cluster + parity + historic + runtime) ==="
     just bench-cluster
     just bench
     just bench-historic
+    just bench-runtime
+    bash scripts/tests/test-bench-runtime-gate.sh
     just _release-post
 
 # Gates 1-4. Shared by `release` and `release-verified`.
@@ -528,12 +536,16 @@ bench-cluster:
 # slower in any scenario: schedule (ascending and mixed), cancel with the
 # heap's tombstones drained, idle poll, fire, and order-timeout churn.
 # Then the per-message cost of an application loop over an IPC feed.
+# Both release recipes run it; scripts/tests/test-bench-runtime-gate.sh proves
+# each gate fails on a seeded regression.
 bench-runtime:
     #!/usr/bin/env bash
     set -euo pipefail
     root="{{justfile_directory()}}"
-    lto_crit="$root/target/criterion"
-    no_lto_crit="$root/target/bench-no-lto/criterion"
+    # Not bench-cluster's Criterion trees: the release packages those as its
+    # cluster evidence.
+    lto_crit="$root/target/bench-runtime/lto/criterion"
+    no_lto_crit="$root/target/bench-runtime/no-lto/criterion"
     no_lto_target="$root/target/bench-no-lto"
     mkdir -p "$lto_crit" "$no_lto_crit"
     # The dispatch bench publishes through a local media driver.

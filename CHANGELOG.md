@@ -13,6 +13,9 @@
 
   The lab's engines and dummy exchanges now back off instead of sleeping
   1 ms.
+- Gate releases on `just bench-runtime`. Both `just release` and
+  `just release-verified` run it, then rerun each gated `ergon-runtime` bench
+  with `-- --seed-regression`, which must make every gate fail.
 - Add `just k9s`, which opens k9s on the lab's cluster, and have `just urls`
   print the ClickHouse password with each UI's address.
 - Generate an opt-in cross-schema AnySchemaMessage dispatcher with typed errors
