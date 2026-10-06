@@ -120,7 +120,12 @@
   directory cannot be watched, one error is logged and live reload is off. On
   macOS an in-place write of the file is not seen; replace the file instead.
 - Resolve feed names through the application's `directory::Directory`
-  (`rt::Config::directory`, `Ctx::set_directory`). The `streams.yaml`
+  (`rt::Config::directory`, `Ctx::set_directory`). Its one method,
+  `feed(service, kind)`, returns a typed `directory::Feed`: a stream id and an
+  `Endpoint` (`Ipc`, `Udp(HostPort)`, or `Mdc { publisher, reliable, archive }`),
+  for subscribing and publishing alike. The runtime builds every channel from
+  it at this node's address, so a directory holds no Aeron URIs and no node
+  IP. `Bus::subscribe` and `Bus::subscribe_live` take a `Feed`. The `streams.yaml`
   registry moved from `ergon-runtime` to the lab's `lab` crate, and the
   `ingester` binary from `ergon-runtime-server` to
   `samples/clickhouse/ingester`.
