@@ -63,6 +63,16 @@
   `Invoker::finish` runs once, and closes the outputs and persist's
   publication. With `JOURNAL=on` it records `Signal` rows and a `Completed`
   row once the agent stopped and the outputs closed.
+- Replay a journal's `Signal` rows through `Agent::on_signal`, every row
+  after a `ctx.stop()` as live dispatched it, and `Agent::stop` under the
+  `Stop` row's context. A replay, and `journal::clickhouse::load`, now reject
+  a journal that does not end `Stop`, `Completed`. Replay a crashed or
+  signal-cut run with `SimConfig::journal_prefix` (loaded by
+  `journal::clickhouse::load_prefix`): `Sim::run` returns
+  `Outcome::Incomplete`, does not call `Agent::stop`, and drops and counts a
+  timer batch the journal ends inside. The sample's `backtest --source
+  journal-prefix` replays such a run, including one recorded before
+  `Completed` existed, and reports it incomplete.
 - Resolve feed names through the application's `directory::Directory`
   (`rt::Config::directory`, `Ctx::set_directory`). The `streams.yaml`
   registry moved from `ergon-runtime` to the lab's `lab` crate, and the
