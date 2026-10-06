@@ -3,6 +3,16 @@
 ## [Unreleased]
 
 ### Added
+- Publish the loop's `log` lines as rows of the `log` table on the log stream
+  with `log.output: aeron` (`logs::Logger`, `logs::LoopLog`): no allocation
+  or system call per line once warm, never blocking. A line Aeron cannot take
+  is dropped and counted in `log_dropped{reason}`, and a `WARN` line says how
+  many once the stream takes lines again; a message over 16 KiB is cut. Other
+  threads' lines, and the loop's after shutdown, go to standard error.
+  `log.output: thread` publishes the same way, for a printer thread the
+  application starts. `stderr` stays the default. `Invoker::finish` closes
+  the stream with persist's; a loop the runtime does not own calls
+  `logs::close`. The runtime's `Settings.log_stream_id` names another stream.
 - Record the log stream in the ingester's archive beside the persist stream:
   stream 1004 (`persist::LOG_STREAM_ID`, documented with the other reserved
   ids), read as the persist stream is, its rows going to the event table `log`
