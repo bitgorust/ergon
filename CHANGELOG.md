@@ -80,6 +80,11 @@
   before only one arm paid it.
 
 ### Fixed
+- Refuse a short or corrupt `Source`, `Shape`, `MetricDef` or `TraceDef`
+  message with `None` from its `decode`, which now uses the checked
+  `try_decode`. They used the trusted tier, which panics on a frame shorter
+  than its header or fixed block, and the ingester hands them archive bytes
+  after reading only the schema id.
 - Look up a journalled message from a recording by the recording's session
   as well as its id, and compare frames only at the positions the journal
   names. A persistent subscription now journals the recording's session for
