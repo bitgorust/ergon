@@ -694,6 +694,7 @@ dependencies = [
  "mimalloc",
  "rusteron-archive",
  "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

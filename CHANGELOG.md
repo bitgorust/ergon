@@ -5,7 +5,8 @@
 ### Added
 - Compare a raw Aeron loop with the ergon runtime in `aeron-bench`:
   `--loop raw|runtime` on `ping` and `pong`, and `ping --gate`, which runs
-  both loops in turn, each against a `pong` of its own, and exits 1 when the
+  both loops in turn (`--rounds`, default 4, so each runs first equally
+  often), each against a `pong` of its own, and exits 1 when the
   runtime's median p50 or p99 round trip is above the raw loop's
   (`--seed-regression` proves it can fail). It takes `--size` above 32
   only, so pings and answers differ in length. `scripts/aeron-matrix.sh` runs
@@ -23,8 +24,10 @@
   and how many recordings it follows) through its archive, as an application
   does, and logs at the level `log.yaml` gives it.
 - Set log levels in the global config's `log.yaml` (`logs::Levels`): `level`
-  for every application and `apps` by name. The ingester reads it at start
-  and applies a change within a tick; the lab's `lab-config` carries it.
+  for every application and `apps` by name. Only the ingester reads it, at
+  start and within a tick of a change; a loop application follows
+  `log.output` (`RUST_LOG` for `stderr`, `info` for `aeron`). The lab's
+  `lab-config` carries it.
 - Wait for SIGINT or SIGTERM outside a loop: `Signals::wait(timeout)` arms
   the signals and consumes one with the loop's second-Ctrl-C latch, and
   `Signals::arm` is public. `source::stamp` writes a `Source` message's
@@ -32,13 +35,17 @@
 - Write the ingester's open histogram windows when it stops: call
   `Ingester::stop` before dropping it, as the lab's ingester now does on
   SIGTERM, so a rollout no longer loses up to 5 s of each histogram series.
-- `ergon_runtime_server::Settings.source`: an ingester given its identity
-  sends its `Source` message with a session on the persist stream every 5 s,
-  so its own `session` rows show it live.
+  `Ingester::is_pending` says when a batch `ClickHouse` refused is left for
+  the restart, which the lab's ingester logs at its stop.
+- Send an ingester's own session: set `ergon_runtime_server::Settings.source`,
+  and its `Source` message, with a session, goes on the persist stream every
+  5 s, so its own `session` rows show it live.
 - Say what an application is doing on its feeds: `Ctx::set_session(&value)`
   puts `value`, as JSON, in the `Source` message every output sends, at once
   and again every 5 s, beside a runtime-owned `source::Status` (`Starting`,
-  `Running`, `Draining`, `Stopping`, each sent at once) and when it was sent.
+  `Running`, `Draining`, `Stopping`, each sent at once) and when it was sent;
+  one an output did not take (back pressured, or no subscriber) goes ahead
+  of its next frame.
   Subscribers read it in-band with `source::Session::decode`, which does not
   allocate. A session whose message would not fit the smallest output's frame
   is refused, as is an output opened later whose frames are too small for it.
@@ -68,7 +75,9 @@
   Files are applied before `Agent::start`, and a refusal stops the start;
   while running, a refused text is logged, counted in `config_rejected{file}`
   and written as a `config` row, and the last applied one stays. A `v{N+1}`
-  file beside `v{N}` is refused the same way, once. The input journal holds a
+  file beside `v{N}` is refused the same way, once, its `config` row under
+  `v{N}`'s file (the one `config_rejected` counts) and the reason naming
+  `v{N+1}`. The input journal holds a
   `Config` row (kind 7: the hashes of the file's name and of the text)
   before each apply and another after one rolled back.
   `Ctx::feed` resolves a feed's address without opening it.
@@ -131,7 +140,8 @@
   (invoker mode) and publishes exclusively, as the runtime does, and both
   loops take the runtime's idle strategies. `--idle backoff` is now Agrona's
   10 spins, 5 yields and 1 µs–1 ms parks, not 100, 100 and 2 µs–1 ms, so
-  backoff results do not compare with older runs. Frames carry an 8-byte
+  backoff results do not compare with older runs, which `aeron-report.py`
+  labels `backoff(old)` and leaves out of its idle chart. Frames carry an 8-byte
   header, so `--size` is at least 24 bytes, and the JSON line's `idle` is the
   spec as given (`spin`, not `Spin`). `pong` answers each ping with its
   first 24 bytes rather than all of it: with pings and answers of one
@@ -149,7 +159,10 @@
   its once-a-second registry timer and `GapRule::parse` are gone.
   `backtest --source journal` reads both from the journal, needs no
   `streams.yaml` on disk and refuses `--streams`, so it no longer replays a
-  run journaled before this change.
+  run journaled before this change. A file, archive or ClickHouse backtest
+  takes the engine's rules from `--engine PATH`, by default `engine.v1.yaml`
+  beside the registry file (the fixture's for `file`); journal modes refuse
+  it.
 - Breaking: `journal::Journal` has a `configs` field, the texts its `Config`
   rows name; build one with `..Journal::default()`.
 - Breaking: every `Agent` declares `type Candidate`, what its
