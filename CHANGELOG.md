@@ -17,8 +17,8 @@
   `/lab/cold/app.yaml`) with `bus.aeron_dir`, `config_dir` and an `app:`
   section (`schemas`, `checkpoint`, `interval`, `clickhouse`, `stream_id`,
   `log_stream_id`). The ClickHouse password stays `CLICKHOUSE_PASSWORD`, from
-  the `clickhouse` Secret, and the variables its manifest sets still lay over
-  the file. SIGTERM or SIGINT now ends its wait between ticks at once, its
+  the `clickhouse` Secret, and `CLICKHOUSE_DATABASE` lays over `database`.
+  SIGTERM or SIGINT now ends its wait between ticks at once, its
   last inserts checkpointed; one during start-up exits at once, and a second
   SIGINT exits with 130. It reports its own `session` rows (status `Running`
   and how many recordings it follows) through its archive, as an application
@@ -179,9 +179,26 @@
   or `s`. `Settings::from_env` returns a `Result`; `Settings::from_cold`,
   `Invoker::from_cold` and `Runtime::from_cold` take a loaded identity and
   file; `App::start` replaces `App::start_with`; `Idle::from_env`,
-  `source::host_name` and `app::Error::Idle` are gone. Until each lab app has
-  its cold ConfigMap, `lab::cold` lays `PERSIST_CONFIG`,
-  `PERSIST_SUBSCRIBER_TIMEOUT`, `IDLE` and `JOURNAL=on` over the file.
+  `source::host_name` and `app::Error::Idle` are gone.
+- Give each lab application its own cold ConfigMap, `<app>-cold`
+  (`md.cold.yaml`, `engine.cold.yaml`, `exch-sim.cold.yaml`,
+  `ingester.cold.yaml` under `deploy/`), mounted at `/lab/cold/app.yaml` and
+  named by `ERGON_CONFIG`. Its name carries a hash of the file, so an edit
+  restarts that application and nothing else; `scripts/test-cold-config.sh`
+  (in `just test`) checks it. `lab::cold` and the ingester no longer read
+  `PERSIST_CONFIG`, `PERSIST_SUBSCRIBER_TIMEOUT`, `IDLE`, `JOURNAL`,
+  `PERSIST_SCHEMAS`, `PERSIST_CHECKPOINT`, `PERSIST_INTERVAL`,
+  `CLICKHOUSE_URL` or `CLICKHOUSE_USER`, and the manifests no longer set
+  them. md gets `REGION` from its overlay's `region` label; `just verify`
+  still names a feed handler `md-<exchange>`, and
+  `scripts/test-publisher-names.sh` (in `just test`) checks every publisher
+  name it builds is a Service.
+- Make `just spin` a kustomize overlay (`deploy/spin/`) applied server-side
+  like `just deploy`, instead of `kubectl patch`, which conflicted with
+  server-side apply's field ownership; `just deploy` undoes it. The engine
+  and the dummy exchange spin through their cold files' `spin` profile
+  (`PROFILE=spin`). The lab's workloads move to `deploy/lab/` and `lab-config`
+  to `config/kustomization.yaml`; `kustomization.yaml` lists both.
 - Keep the lab's ClickHouse password in the Kubernetes Secret `clickhouse`,
   which `just deploy` makes from `CLICKHOUSE_PASSWORD` in `.env`. ClickHouse,
   the ingesters, Grafana and Jupyter read it from there, and `just verify`
