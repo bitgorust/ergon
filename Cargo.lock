@@ -673,6 +673,7 @@ dependencies = [
  "proptest",
  "rusteron-archive",
  "serde",
+ "serde_json",
  "serde_yaml",
  "signal-hook",
  "syn 3.0.5",

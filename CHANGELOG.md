@@ -3,6 +3,24 @@
 ## [Unreleased]
 
 ### Added
+- Say what an application is doing on its feeds: `Ctx::set_session(&value)`
+  puts `value`, as JSON, in the `Source` message every output sends, at once
+  and again every 5 s, beside a runtime-owned `source::Status` (`Starting`,
+  `Running`, `Draining`, `Stopping`, each sent at once) and when it was sent.
+  Subscribers read it in-band with `source::Session::decode`, which does not
+  allocate. A session whose message would not fit the smallest output's frame
+  is refused, as is an output opened later whose frames are too small for it.
+  Persist's, the bridge's and a `Publication`'s copies stay identity only.
+  This is version 3 of the event schema: older readers take version 3
+  `Source` messages, and this one takes theirs.
+- Keep each recorded feed's sessions in the ingester's `session` table (`ts`,
+  `status`, `session`, `source`, and who sent it), always on like
+  `metrics`; `tables.yaml` may give its database. `session` is now a
+  reserved table name. A `Source` message whose
+  session changed is not a new origin: the saved dictionary grows only with
+  a new identity, and holds version 2 and 3 messages alike. The lab's Grafana
+  gains a `Sessions` dashboard (live sessions, config revisions) and an alert
+  on `config_rejected`.
 - Replay a run's config without its files: with the journal on, each
   watched text is recorded as a `config` row (`outcome: text`) ahead of the
   `Config` row naming it, under the journal's policy, and a text longer than
