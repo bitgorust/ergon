@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Added
+- Replay a run's config without its files: with the journal on, each
+  watched text is recorded as a `config` row (`outcome: text`) ahead of the
+  `Config` row naming it, under the journal's policy, and a text longer than
+  one row is refused. `journal::clickhouse::configs` reads them into the new
+  `Journal::configs`; a replay's `Ctx::watch` returns the startup text from
+  the journal and each revision applies the journal's text, reading no
+  file. The engine backtest loads them.
 - Watch an application's own config files live: `Ctx::watch(ConfigFile {
   name, version })` reads `<name>.v<N>.yaml` in `config_dir` during setup.
   Each text is checked by `Agent::check_config` (validate and resolve, with no
@@ -12,7 +19,8 @@
   while running, a refused text is logged, counted in `config_rejected{file}`
   and written as a `config` row, and the last applied one stays. A `v{N+1}`
   file beside `v{N}` is refused the same way, once. The input journal holds a
-  `Config` row (kind 7) before each apply and another after one rolled back.
+  `Config` row (kind 7: the hashes of the file's name and of the text)
+  before each apply and another after one rolled back.
   `Ctx::feed` resolves a feed's address without opening it.
 - Publish the loop's `log` lines as rows of the `log` table on the log stream
   with `log.output: aeron` (`logs::Logger`, `logs::LoopLog`): no allocation
@@ -61,6 +69,8 @@
   and borrowed frames for persistence, including unknown schemas and templates.
 
 ### Changed
+- Breaking: `journal::Journal` has a `configs` field, the texts its `Config`
+  rows name; build one with `..Journal::default()`.
 - Breaking: every `Agent` declares `type Candidate`, what its
   `check_config` makes of a config file; `type Candidate = ();` for one that
   watches none.
