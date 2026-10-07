@@ -119,6 +119,14 @@
   and borrowed frames for persistence, including unknown schemas and templates.
 
 ### Changed
+- `aeron-bench ping`'s JSON line adds `mean_ns`, to read beside `p50_ns`,
+  which the gate uses. `ping --gate` gives each run a driver of its own
+  when it starts one, as a killed `pong`'s client slowed the runs after
+  it. The raw loop now does
+  the runtime's work for each frame: it reads the runtime's clock for each
+  message it takes, claims and writes each frame in place rather than
+  copying it with `offer`, and sends the runtime's `Source` frames where
+  the runtime would.
 - `aeron-bench`'s raw loop runs its Aeron client's conductor in the loop
   (invoker mode) and publishes exclusively, as the runtime does, and both
   loops take the runtime's idle strategies. `--idle backoff` is now Agrona's
