@@ -683,6 +683,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ergon-runtime-log"
+version = "0.1.30"
+dependencies = [
+ "ergon-runtime",
+ "log",
+ "rusteron-archive",
+]
+
+[[package]]
 name = "ergon-runtime-server"
 version = "0.1.30"
 dependencies = [

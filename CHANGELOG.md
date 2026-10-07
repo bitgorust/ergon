@@ -3,6 +3,32 @@
 ## [Unreleased]
 
 ### Added
+- Print a pod's log lines with `ergon-runtime-log`, a new crate under the
+  server's rules. `Printer::spawn` subscribes untethered to the log stream
+  and writes each row of a source whose `Source.pod` is its own as one
+  logfmt line (`ts=… level=… target=… message=…`, quoted and escaped so a
+  line stays one line). `PrinterGuard` stops it: it prints until the pod's
+  stream ends and 100 ms pass with nothing to print, or 8 s pass, then
+  joins. A slow output costs only the printer's lines: they wait in a 1 MiB
+  buffer, and when it is full they are dropped and a `WARN` line says how
+  many. A printer that stops polling holds every application's log
+  publication on the node, so each drops its lines at the publisher
+  (`log_dropped{reason="back_pressure"}`) and the `log` table misses them,
+  for up to about 4 s (0.8 s measured) until the driver drops the printer.
+  A hung printer thread rejoins after 60 s; a sidecar stopped with SIGSTOP
+  has its client timed out after 10 s and exits with an error when
+  continued. The log publication now sets those untethered timeouts; Aeron's
+  defaults cost about 10 s of lines in every 20 s.
+- Add `log: { output: thread }`: lines go to the log stream as with `aeron`,
+  and the application prints them itself. The lab's `lab::runtime` starts the
+  printer for it and now returns it beside the runtime: keep it until the
+  loop has finished. `thread` was refused before.
+- Give the lab's engine and exch-sim pods a `logs` native sidecar (an init
+  container with `restartPolicy: Always`, 128 MiB) that prints the pod's
+  lines: `kubectl logs <pod> -c logs`. Their cold files now set
+  `log: { output: aeron }`. `just logs` follows every container
+  (`--all-containers`, up to 64 streams), and `just test` checks both renders
+  for the sidecar (`scripts/test-logs-sidecar.sh`).
 - Compare a raw Aeron loop with the ergon runtime in `aeron-bench`:
   `--loop raw|runtime` on `ping` and `pong`, and `ping --gate`, which runs
   both loops in turn (`--rounds`, default 4, so each runs first equally

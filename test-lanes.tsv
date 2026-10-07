@@ -25,11 +25,14 @@ runtime/tests/*.rs	pr	cd samples/clickhouse && just _test-aeron && cd ../.. && c
 runtime/benches/*.rs	benchmark	cargo bench -p ergon-runtime --all-features --no-run
 runtime-server/src/*.rs	pr	cd samples/clickhouse && just _test-clickhouse _test-aeron && cd ../.. && cargo test -p ergon-runtime-server --all-targets
 runtime-server/tests/*.rs	pr	cd samples/clickhouse && just _test-clickhouse _test-aeron && cd ../.. && cargo test -p ergon-runtime-server --all-targets
+runtime-log/src/*.rs	pr	cd samples/clickhouse && just _test-aeron && cd ../.. && cargo test -p ergon-runtime-log --all-targets
+runtime-log/tests/*.rs	pr	cd samples/clickhouse && just _test-aeron && cd ../.. && cargo test -p ergon-runtime-log --all-targets
 samples/clickhouse/engine/src/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/engine/tests/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/ingester/src/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/ingester/tests/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/lab/src/*.rs	samples	cd samples/clickhouse && just test
+samples/clickhouse/lab/tests/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/md/src/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/schema/src/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/aeron-bench/src/*.rs	samples	cd samples/clickhouse && just test

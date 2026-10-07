@@ -6,6 +6,7 @@ members = [
     "cluster-test-harness",
     "runtime",
     "runtime-server",
+    "runtime-log",
 ]
 # Excluded because they require nightly toolchain:
 #   sbe/fuzz         — cargo-fuzz (libfuzzer), needs `cargo +nightly fuzz run`
