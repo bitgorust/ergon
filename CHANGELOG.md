@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### Added
+- Watch an application's own config files live: `Ctx::watch(ConfigFile {
+  name, version })` reads `<name>.v<N>.yaml` in `config_dir` during setup.
+  Each text is checked by `Agent::check_config` (validate and resolve, with no
+  side effect) and adopted by `Agent::apply_config`; on `Err` the runtime
+  discards the feeds, outputs, timers, ids and directory the apply set up.
+  Files are applied before `Agent::start`, and a refusal stops the start;
+  while running, a refused text is logged, counted in `config_rejected{file}`
+  and written as a `config` row, and the last applied one stays. A `v{N+1}`
+  file beside `v{N}` is refused the same way, once. The input journal holds a
+  `Config` row (kind 7) before each apply and another after one rolled back.
+  `Ctx::feed` resolves a feed's address without opening it.
 - Publish the loop's `log` lines as rows of the `log` table on the log stream
   with `log.output: aeron` (`logs::Logger`, `logs::LoopLog`): no allocation
   or system call per line once warm, never blocking. A line Aeron cannot take
@@ -50,10 +61,13 @@
   and borrowed frames for persistence, including unknown schemas and templates.
 
 ### Changed
+- Breaking: every `Agent` declares `type Candidate`, what its
+  `check_config` makes of a config file; `type Candidate = ();` for one that
+  watches none.
 - Have the ingester keep the journal's `input` rows and the `config` rows
   whatever `tables.yaml` says (`ALWAYS_KEPT`): an entry gives only their
-  `kind` (default `dynamic`) and `database`. An application's `Persist` still
-  switches a `config` row it records like any event row. The ingester now creates `input` even
+  `kind` (default `dynamic`) and `database`. The runtime records its own
+  `config` rows whatever the switch says. The ingester now creates `input` even
   when `tables.yaml` leaves it out; it stays empty until an app journals.
 - Read the loop's and persist's settings from the cold file instead of
   `IDLE`, `TIMER_SLACK`, `CPU`, `MLOCK`, `JOURNAL` and the `PERSIST_*`
