@@ -9,8 +9,7 @@
   is dropped and counted in `log_dropped{reason}`, and a `WARN` line says how
   many once the stream takes lines again; a message over 16 KiB is cut. Other
   threads' lines, and the loop's after shutdown, go to standard error.
-  `log.output: thread` publishes the same way, for a printer thread the
-  application starts. `stderr` stays the default. `Invoker::finish` closes
+  `stderr` stays the default. `Invoker::finish` closes
   the stream with persist's; a loop the runtime does not own calls
   `logs::close`. The runtime's `Settings.log_stream_id` names another stream.
 - Record the log stream in the ingester's archive beside the persist stream:
@@ -31,24 +30,30 @@
   (`config::Cold<A>`): `ERGON_CONFIG`, else `/lab/cold/app.yaml`, else the
   defaults, with `runtime:`, `persist:`, `bus:`, `log:`, `config_dir` and the
   application's own `app:` section. `PROFILE` merges one of the file's
-  `profiles` over it. An unknown profile, key or value stops the start.
+  `profiles` over it. An unknown profile, key or value stops the start, in
+  any of the file's profiles whether chosen or not.
 - Read a process's identity in one place, `config::Identity::from_env`:
   `NODE_NAME`, `POD_NAME`, `POD_IP`, `HOST_IP`, `REGION`, `PERSIST_APP`,
   `SERVICE`, `EXCHANGE`, `ERGON_CONFIG` and `PROFILE`. It is the runtime's only
-  read of the environment, and a test fails on any other.
+  read of the environment, and a test fails on any other in its source;
+  `env_logger` still reads `RUST_LOG` for `log.output: stderr`.
 - Gate releases on `just bench-runtime`. Both `just release` and
   `just release-verified` run it, then rerun each gated `ergon-runtime` bench
-  with `-- --seed-regression`, which must make every gate fail, and with
-  `--seed-regression=NAME`, where one failing gate must fail its bench.
+  with `-- --seed-regression`, which must make every gate fail. The benches
+  with several gates (`timer`, `hotpath`) are also rerun with
+  `--seed-regression=NAME`, and that one failing gate must fail the run.
+  The `dispatch` bench fails within seconds, rather than hangs, when a feed
+  frame is dropped or a message is lost, which `--seed-loss` proves.
 - Add `just k9s`, which opens k9s on the lab's cluster, and have `just urls`
   print the ClickHouse password with each UI's address.
 - Generate an opt-in cross-schema AnySchemaMessage dispatcher with typed errors
   and borrowed frames for persistence, including unknown schemas and templates.
 
 ### Changed
-- Keep the journal's `input` rows and the `config` rows whatever
-  `tables.yaml` says (`ALWAYS_KEPT`): an entry gives only their `kind`
-  (default `dynamic`) and `database`. The ingester now creates `input` even
+- Have the ingester keep the journal's `input` rows and the `config` rows
+  whatever `tables.yaml` says (`ALWAYS_KEPT`): an entry gives only their
+  `kind` (default `dynamic`) and `database`. An application's `Persist` still
+  switches a `config` row it records like any event row. The ingester now creates `input` even
   when `tables.yaml` leaves it out; it stays empty until an app journals.
 - Read the loop's and persist's settings from the cold file instead of
   `IDLE`, `TIMER_SLACK`, `CPU`, `MLOCK`, `JOURNAL` and the `PERSIST_*`
@@ -95,11 +100,14 @@
     and the loop stops after `on_signal` even on `OnSignal::Drain`, so the
     journal stays an exact prefix;
   - a second Ctrl-C always exits with 130; SIGTERM is never forced, and
-    exits with 143 once `Signals` is dropped.
+    exits with 143 (128 + SIGTERM) once `Signals` is dropped. Install one
+    `Signals` per process: after the drop both signals exit, so a later
+    install never shuts down gracefully.
 
   `Invoker::finish` runs once, and closes the outputs and persist's
-  publication. With `runtime.journal` on it records `Signal` rows and a `Completed`
-  row once the agent stopped and the outputs closed.
+  publication. With `runtime.journal` on, the runtime records a `Signal` row
+  per signal, and `finish` records a `Completed` row after `Stop`, once the
+  agent stopped and the outputs closed.
 - Replay a journal's `Signal` rows through `Agent::on_signal`, every row
   after a `ctx.stop()` as live dispatched it, and `Agent::stop` under the
   `Stop` row's context. A replay, and `journal::clickhouse::load`, now reject
@@ -118,9 +126,10 @@
   that found no work. `Persist::poll` no longer `stat`s the file every second;
   it still applies the switches again then, so an `until` passes by itself.
   An application that drives `Persist` without the runtime calls
-  `Persist::reload` itself. If the
-  directory cannot be watched, one error is logged and live reload is off. On
-  macOS an in-place write of the file is not seen; replace the file instead.
+  `Persist::reload` itself. If the directory cannot be watched, or the
+  directory itself is later removed or renamed, one error is logged and live
+  reload is off. On macOS an in-place write of the file is not seen; replace
+  the file instead.
 - Resolve feed names through the application's `directory::Directory`
   (`rt::Config::directory`, `Ctx::set_directory`). Its one method,
   `feed(service, kind)`, returns a typed `directory::Feed`: a stream id and an
