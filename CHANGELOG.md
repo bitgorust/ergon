@@ -69,6 +69,18 @@
   and borrowed frames for persistence, including unknown schemas and templates.
 
 ### Changed
+- Breaking: have the lab engine watch `streams.yaml` and its own
+  `engine.v1.yaml` through `Ctx::watch` (`Engine::watched`), so the input
+  journal holds the registry it started with and each revision: a feed
+  handler added mid-run is subscribed in service order, and a replay
+  subscribes to it at the same point under the same feed ids, with the files
+  gone. Set each venue's `gap_rule` in `engine.v1.yaml`, which replaces the
+  `GAP_RULE_<VENUE>` variables; the engine refuses to start without the file.
+  `Engine::new` takes a fixed registry and `EngineConfig`; `Engine::watching`,
+  its once-a-second registry timer and `GapRule::parse` are gone.
+  `backtest --source journal` reads both from the journal, needs no
+  `streams.yaml` on disk and refuses `--streams`, so it no longer replays a
+  run journaled before this change.
 - Breaking: `journal::Journal` has a `configs` field, the texts its `Config`
   rows name; build one with `..Journal::default()`.
 - Breaking: every `Agent` declares `type Candidate`, what its
