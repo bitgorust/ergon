@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Added
+- Compare a raw Aeron loop with the ergon runtime in `aeron-bench`:
+  `--loop raw|runtime` on `ping` and `pong`, and `ping --gate`, which runs
+  both loops in turn, each against a `pong` of its own, and exits 1 when the
+  runtime's median p50 or p99 round trip is above the raw loop's
+  (`--seed-regression` proves it can fail). It takes `--size` above 32
+  only, so pings and answers differ in length. `scripts/aeron-matrix.sh` runs
+  each cell in both loops, except the invoker-driver and archive cells, which
+  the runtime loop cannot run, and `aeron-report.py` keeps the loops apart.
 - Configure the lab's ingester as the other applications are: identity from
   the environment, and a cold file (`ERGON_CONFIG`, else
   `/lab/cold/app.yaml`) with `bus.aeron_dir`, `config_dir` and an `app:`
@@ -111,6 +119,17 @@
   and borrowed frames for persistence, including unknown schemas and templates.
 
 ### Changed
+- `aeron-bench`'s raw loop runs its Aeron client's conductor in the loop
+  (invoker mode) and publishes exclusively, as the runtime does, and both
+  loops take the runtime's idle strategies. `--idle backoff` is now Agrona's
+  10 spins, 5 yields and 1 µs–1 ms parks, not 100, 100 and 2 µs–1 ms, so
+  backoff results do not compare with older runs. Frames carry an 8-byte
+  header, so `--size` is at least 24 bytes, and the JSON line's `idle` is the
+  spec as given (`spin`, not `Spin`). `pong` answers each ping with its
+  first 24 bytes rather than all of it: with pings and answers of one
+  length, the offset the streams' first frames left between them stayed
+  fixed and alone moved p99 about threefold on an M4, so results do not
+  compare with older runs either.
 - Breaking: have the lab engine watch `streams.yaml` and its own
   `engine.v1.yaml` through `Ctx::watch` (`Engine::watched`), so the input
   journal holds the registry it started with and each revision: a feed
