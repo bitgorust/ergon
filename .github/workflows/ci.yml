@@ -285,7 +285,7 @@ jobs:
   # engine) under their own clippy.toml (the client ban, runtime/clippy.toml's
   # entries, which ergon-runtime's client_ban_lint test keeps in step, and the
   # engine's determinism ban; the ingester and the Aeron tools have no ban),
-  # and the ingester's tests against the test ClickHouse. The lab is its own
+  # and the ingester's tests against the test ClickHouse and archive. The lab is its own
   # workspace, on its own toolchain (NautilusTrader needs 1.98.1).
   clickhouse-lab:
     needs: policy
@@ -318,14 +318,14 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Start the test ClickHouse
+      - name: Start the test ClickHouse and the archiving media driver
         run: |
           if ! command -v just >/dev/null; then
             curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to "$HOME/.local/bin"
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
             export PATH="$HOME/.local/bin:$PATH"
           fi
-          cd samples/clickhouse && just _test-clickhouse
+          cd samples/clickhouse && just _test-clickhouse _test-aeron
 
       - name: The ingester's tests
         run: cd samples/clickhouse && cargo test -p ingester -- --test-threads=2

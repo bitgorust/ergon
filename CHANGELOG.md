@@ -3,6 +3,30 @@
 ## [Unreleased]
 
 ### Added
+- Configure the lab's ingester as the other applications are: identity from
+  the environment, and a cold file (`ERGON_CONFIG`, else
+  `/lab/cold/app.yaml`) with `bus.aeron_dir`, `config_dir` and an `app:`
+  section (`schemas`, `checkpoint`, `interval`, `clickhouse`, `stream_id`,
+  `log_stream_id`). The ClickHouse password stays `CLICKHOUSE_PASSWORD`, from
+  the `clickhouse` Secret, and the variables its manifest sets still lay over
+  the file. SIGTERM or SIGINT now ends its wait between ticks at once, its
+  last inserts checkpointed; one during start-up exits at once, and a second
+  SIGINT exits with 130. It reports its own `session` rows (status `Running`
+  and how many recordings it follows) through its archive, as an application
+  does, and logs at the level `log.yaml` gives it.
+- Set log levels in the global config's `log.yaml` (`logs::Levels`): `level`
+  for every application and `apps` by name. The ingester reads it at start
+  and applies a change within a tick; the lab's `lab-config` carries it.
+- Wait for SIGINT or SIGTERM outside a loop: `Signals::wait(timeout)` arms
+  the signals and consumes one with the loop's second-Ctrl-C latch, and
+  `Signals::arm` is public. `source::stamp` writes a `Source` message's
+  `sent` time for a process that sends its own.
+- Write the ingester's open histogram windows when it stops: call
+  `Ingester::stop` before dropping it, as the lab's ingester now does on
+  SIGTERM, so a rollout no longer loses up to 5 s of each histogram series.
+- `ergon_runtime_server::Settings.source`: an ingester given its identity
+  sends its `Source` message with a session on the persist stream every 5 s,
+  so its own `session` rows show it live.
 - Say what an application is doing on its feeds: `Ctx::set_session(&value)`
   puts `value`, as JSON, in the `Source` message every output sends, at once
   and again every 5 s, beside a runtime-owned `source::Status` (`Starting`,
@@ -217,8 +241,9 @@
     `ergon-runtime-server`, displayed as `bus: …`.
 - Always set the media driver's directory on the client: `Settings.aeron_dir`
   and the cold `bus.aeron_dir` are a `String`, default `/aeron/driver`, and
-  `AERON_DIR` is no longer read by the runtime. The ingester's
-  `Settings::from_env` reads `AERON_DIR` and `HOST_IP`.
+  `AERON_DIR` is no longer read by the runtime or the ingester.
+- Remove `ergon_runtime_server::Settings::from_env`: build `Settings::new`
+  from the caller's config, as the ingester binary does from its cold file.
 - Remove unused runtime API: `rt::Mode::Backtest` (`Mode::Replay` runs
   backtests), `Runtime::invoker` (use `Invoker::new`), `App::start`,
   `App::metrics` and `App.region`, `Ctx::is_sim` and `Ctx::sim_feeds`,
