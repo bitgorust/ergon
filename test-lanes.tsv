@@ -27,6 +27,7 @@ runtime-server/src/*.rs	pr	cd samples/clickhouse && just _test-clickhouse _test-
 runtime-server/tests/*.rs	pr	cd samples/clickhouse && just _test-clickhouse _test-aeron && cd ../.. && cargo test -p ergon-runtime-server --all-targets
 samples/clickhouse/engine/src/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/engine/tests/*.rs	samples	cd samples/clickhouse && just test
+samples/clickhouse/ingester/src/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/ingester/tests/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/lab/src/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/md/src/*.rs	samples	cd samples/clickhouse && just test
