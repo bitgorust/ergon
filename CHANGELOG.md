@@ -29,6 +29,15 @@
   `log: { output: aeron }`. `just logs` follows every container
   (`--all-containers`, up to 64 streams), and `just test` checks both renders
   for the sidecar (`scripts/test-logs-sidecar.sh`).
+- Read every lab container's output in Grafana's Explore: the lab now runs
+  Loki (one process, 72 h on its pod's disk) beside Grafana, an Alloy on each
+  node that tails `/var/log/pods` and labels lines with `app`, `pod`,
+  `container` and `node`, and a provisioned **Loki** data source. Both have
+  CPU and memory limits. `just test` renders them and lints Grafana's
+  provisioning and dashboards, and runs Loki's and Alloy's own validators on
+  their configs (`scripts/test-loki.sh`); `just verify` checks that each app
+  pod and `logs` sidecar has lines there. A lab deployed before this
+  restarts Grafana once to load the data source.
 - Compare a raw Aeron loop with the ergon runtime in `aeron-bench`:
   `--loop raw|runtime` on `ping` and `pong`, and `ping --gate`, which runs
   both loops in turn (`--rounds`, default 4, so each runs first equally
