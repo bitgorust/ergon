@@ -169,6 +169,10 @@
   and borrowed frames for persistence, including unknown schemas and templates.
 
 ### Changed
+- ergo-sbe rejects a float or double `nullValue`, `minValue`, `maxValue` or
+  constant spelled `inf`, `infinity` or `nan` in any case other than
+  `Infinity` and `NaN` (with an optional sign), as sbe-tool does. A malformed
+  float constant now fails at parse time, not in the generated module.
 - `aeron-bench ping`'s JSON line adds `mean_ns`, to read beside `p50_ns`,
   which the gate uses. `ping --gate` gives each run a driver of its own
   when it starts one, as a killed `pong`'s client slowed the runs after
@@ -372,6 +376,17 @@
   before only one arm paid it.
 
 ### Fixed
+- Take an enum's null from its `encodingType` typedef's `nullValue` when the
+  enum declares none, as sbe-tool does: `NullVal`, the `From` conversions and
+  an optional enum field's `None` now write that value (254 for
+  `nullValue="254"`), where they wrote the primitive default.
+- Generate float and double constants written `Infinity`, `-Infinity`,
+  `+Infinity` or `NaN`; they produced code that did not compile. A negative
+  constant such as `-1.5` is no longer mistaken for an `Enum.value` reference.
+- Decode an optional float or double whose `nullValue` is not NaN (such as
+  `Infinity` or `-1.0`) as `None` when it holds that value, at message level,
+  in group entries and in composite members. Only a NaN null still matches
+  any NaN.
 - Remove the per-message allocations found on the lab apps' loops. The
   engine's order books are sorted vectors that keep their capacity: a book
   snapshot allocated every node of the old maps. It reserves 256 levels a

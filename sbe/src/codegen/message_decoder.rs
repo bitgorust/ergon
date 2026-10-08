@@ -23,7 +23,7 @@ use super::domain_cluster::generate_domain_objects;
 use super::group_decoder::generate_group_decoder;
 use super::runtime::{
     constant_value_expr, deprecated_attr_tokens, doc_attr_tokens, emit_field_consts,
-    schema_marker_ident, to_pascal_case, to_snake_case,
+    float_null_check, schema_marker_ident, to_pascal_case, to_snake_case,
 };
 use super::tail_stages::generate_decoder_consuming_stages;
 
@@ -750,9 +750,7 @@ pub(crate) fn generate_message_decoder(
                         let null_val = f.null_value.unwrap_or(0);
                         let null_check_expr =
                             if *prim == PrimitiveType::Float || *prim == PrimitiveType::Double {
-                                // Any IEEE NaN is null (matches sbe-tool is_nan()).
-                                let _ = null_val;
-                                "val.is_nan()".to_string()
+                                float_null_check(*prim, f.null_value)
                             } else {
                                 format!("val == {null_val}_u64 as {r_type}")
                             };

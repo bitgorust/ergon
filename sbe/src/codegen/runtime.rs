@@ -1018,6 +1018,33 @@ pub(crate) fn to_upper_snake_case(s: &str) -> String {
 }
 
 pub(crate) fn constant_value_expr(prim: PrimitiveType, val: &str) -> String {
+    // Before the valueRef check: `-1.5` splits on '.' like `Enum.variant`, and
+    // an enum can never be float-encoded, so a float constant is never a valueRef.
+    match prim {
+        PrimitiveType::Float => {
+            if let Some(v) = crate::xml::parse_sbe_float::<f32>(val) {
+                return float_literal(
+                    v.is_nan(),
+                    v.is_infinite(),
+                    v.is_sign_negative(),
+                    "f32",
+                    &format!("{v:?}"),
+                );
+            }
+        }
+        PrimitiveType::Double => {
+            if let Some(v) = crate::xml::parse_sbe_float::<f64>(val) {
+                return float_literal(
+                    v.is_nan(),
+                    v.is_infinite(),
+                    v.is_sign_negative(),
+                    "f64",
+                    &format!("{v:?}"),
+                );
+            }
+        }
+        _ => {}
+    }
     // Convert dotted valueRef like "TimeUnit.nanosecond" → "TimeUnit::Nanosecond".
     // Only if the prefix is non-numeric — float constants like "1.5" must not
     // be mistaken for enum references.
@@ -1040,15 +1067,35 @@ pub(crate) fn constant_value_expr(prim: PrimitiveType, val: &str) -> String {
     match prim {
         // parser validates single-char constants, generator trusts it; add a debug_assert! if parser ever skips validation
         PrimitiveType::Char => format!("b'{}'", val),
-        PrimitiveType::Float => {
-            format!("{}f32", val)
-        }
-        PrimitiveType::Double => {
-            format!("{}f64", val)
-        }
-        _ => {
-            format!("{}", val)
-        }
+        _ => val.to_string(),
+    }
+}
+
+/// A Rust expression for a parsed float: the named constants for NaN and the
+/// infinities (no literal spells them), otherwise the exact `Debug` digits.
+fn float_literal(nan: bool, infinite: bool, negative: bool, ty: &str, digits: &str) -> String {
+    let sign = if negative { "-" } else { "" };
+    if nan {
+        format!("{ty}::NAN")
+    } else if infinite {
+        format!("{sign}{ty}::INFINITY")
+    } else {
+        format!("{digits}_{ty}")
+    }
+}
+
+/// Null test for an optional float/double read into `val`. A NaN null matches
+/// any NaN (`is_nan()`), as sbe-tool does; any other null compares with `==`
+/// against the schema value, as sbe-tool does, so `-0.0` also matches `0.0`.
+pub(crate) fn float_null_check(prim: PrimitiveType, null_value: Option<u64>) -> String {
+    let is_nan = match (prim, null_value) {
+        (_, None) => true,
+        (PrimitiveType::Float, Some(bits)) => f32::from_bits(bits as u32).is_nan(),
+        (_, Some(bits)) => f64::from_bits(bits).is_nan(),
+    };
+    match null_value {
+        Some(bits) if !is_nan => format!("val == {}", field_const_value_expr(bits, prim)),
+        _ => "val.is_nan()".to_string(),
     }
 }
 
@@ -1706,15 +1753,17 @@ pub(crate) fn generate_set(src: &mut String, tokens: &[Token]) {
 /// unaligned UB. See README “Composite layout & little-endian”.
 /// Null-sentinel comparison for a `presence="optional"` composite member
 /// (e.g. a Decimal composite's `mantissa`). Mirrors the top-level optional
-/// primitive field check in `message_decoder.rs`: any IEEE NaN is null for
-/// float/double (matches sbe-tool's `is_nan()`), otherwise wire equality
-/// against the schema `nullValue` (default 0, matching top-level optionals).
+/// primitive field check in `message_decoder.rs`: [`float_null_check`] for
+/// float/double, otherwise wire equality against the schema `nullValue`
+/// (default 0, matching top-level optionals).
 fn composite_member_null_check(
     prim: PrimitiveType,
     null_value: Option<u64>,
 ) -> proc_macro2::TokenStream {
     if prim == PrimitiveType::Float || prim == PrimitiveType::Double {
-        quote::quote! { val.is_nan() }
+        let check: syn::Expr = syn::parse_str(&float_null_check(prim, null_value))
+            .expect("float null check is a valid expression");
+        quote::quote! { #check }
     } else {
         let null_val = null_value.unwrap_or(0);
         let null_lit = syn::LitInt::new(&format!("{null_val}_u64"), proc_macro2::Span::call_site());

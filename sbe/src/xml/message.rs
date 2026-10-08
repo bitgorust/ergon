@@ -309,6 +309,13 @@ pub(crate) fn parse_message_child(
                 if let Some(value_ref) = from_value_ref {
                     validate_constant_value_ref(node, value_ref, &type_name, registry)?;
                 }
+                if let Some(cv) = from_constant_value {
+                    super::registry::check_float_constant(
+                        type_encoding.and_then(|e| e.primitive_type),
+                        cv,
+                    )
+                    .map_err(|e| Fault::invalid(node, "constantValue", e))?;
+                }
                 from_value_ref.or(from_constant_value).map(str::to_string)
             } else {
                 None

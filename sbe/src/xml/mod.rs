@@ -45,6 +45,7 @@ pub use entry::{
     parse, parse_file, parse_file_with_shared, parse_with_shared, parse_with_xsd_validation,
 };
 pub use error::{IncludeCause, ParseError};
+pub(crate) use registry::parse_sbe_float;
 
 // Test-visible re-exports of parse internals (xml is already #[doc(hidden)]).
 #[cfg(test)]

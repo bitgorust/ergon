@@ -18,7 +18,8 @@ use super::conversion_helpers::{
 use super::field_type::field_type_ident;
 use super::generate_entry_consuming_stages;
 use super::runtime::{
-    constant_value_expr, doc_attr_tokens, emit_field_consts, to_pascal_case, to_snake_case,
+    constant_value_expr, doc_attr_tokens, emit_field_consts, float_null_check, to_pascal_case,
+    to_snake_case,
 };
 
 /// Pure flyweight observers — discarding the return is almost always a mistake.
@@ -1051,8 +1052,7 @@ pub(crate) fn generate_group_decoder(
                     let null_val = f.null_value.unwrap_or(0);
                     let null_check =
                         if *prim == PrimitiveType::Float || *prim == PrimitiveType::Double {
-                            let _ = null_val;
-                            "val.is_nan()".to_string()
+                            float_null_check(*prim, f.null_value)
                         } else {
                             format!("val == {}_u64 as {}", null_val, r_type)
                         };

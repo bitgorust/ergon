@@ -225,15 +225,15 @@ pub(crate) fn generate_owner_consuming_stages(
                 pub fn #into_ident(self) -> Result<(&'a [u8], #next_stage<'a>), sbe_rt::DecodeError> {
                     #absent_vardata
                     let offset = #se;
-                    if offset + #prefix_size_lit > self.buf.len() {
+                    if offset.checked_add(#prefix_size_lit).is_none_or(|end| end > self.buf.len()) {
                         return Err(sbe_rt::DecodeError::BufferTooShort {
                             field: #vd_name_lit,
                             needed: #prefix_size_lit,
                             available: self.buf.len().saturating_sub(offset),
                         });
                     }
-                    // SAFETY: bounds verified by the preceding check
-                    // (offset + prefix_size <= buf.len()).
+                    // SAFETY: bounds verified by the preceding overflow-checked
+                    // test (offset + prefix_size <= buf.len()).
                     let bytes: [u8; #prefix_size_lit] = unsafe {
                         core::ptr::read_unaligned(
                             self.buf.as_ptr().add(offset) as *const [u8; #prefix_size_lit],
@@ -266,7 +266,7 @@ pub(crate) fn generate_owner_consuming_stages(
                 pub fn #slice_ident(&self) -> Result<&'a [u8], sbe_rt::DecodeError> {
                     #slice_cached_tail
                     let offset = #se;
-                    if offset + #prefix_size_lit > self.buf.len() {
+                    if offset.checked_add(#prefix_size_lit).is_none_or(|end| end > self.buf.len()) {
                         return Err(sbe_rt::DecodeError::BufferTooShort {
                             field: #vd_name_lit,
                             needed: #prefix_size_lit,

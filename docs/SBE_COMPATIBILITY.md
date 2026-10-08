@@ -15,6 +15,18 @@ venue schema.”
 - Version-aware presence (`sinceVersion`) and optional null sentinels follow the
   schema.
 
+## Null values and float literals
+
+- An enum's null is its own `nullValue`, else its `encodingType` typedef's,
+  else the primitive default (sbe-tool's `EnumType` precedence).
+- An optional float or double is `None` when it holds the schema null: any NaN
+  for a NaN null, otherwise `==` the null value, as sbe-tool's Rust decoder
+  compares.
+- Float literals are a decimal number, `NaN` or `Infinity` with an optional
+  sign. Rust also parses `inf`, `infinity` and `nan` in any case; ergon rejects
+  those, as sbe-tool's Java parser does, so a schema one accepts the other
+  accepts. A NaN null, `-NaN` included, is the canonical quiet NaN Java writes.
+
 ## What is not claimed
 
 - Latency parity with sbe-tool on your schema (only gated benches are enforced).

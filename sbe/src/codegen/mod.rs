@@ -2511,4 +2511,57 @@ mod tests {
         assert!(lean.contains("struct PingEncoder"));
         Ok(())
     }
+
+    /// sbe-tool `RustUtilTest.generateRustLiteralsHappyPaths`, float cases, plus
+    /// NaN, a leading `+`, and values `-1.5` that look like `Enum.variant`.
+    #[test]
+    fn float_constant_literals() -> Result<(), Box<dyn std::error::Error>> {
+        use super::runtime::constant_value_expr;
+        use crate::ir::PrimitiveType::{Double, Float};
+        let cases = [
+            (Double, "Infinity", "f64::INFINITY"),
+            (Double, "+Infinity", "f64::INFINITY"),
+            (Double, "-Infinity", "-f64::INFINITY"),
+            (Float, "Infinity", "f32::INFINITY"),
+            (Float, "-Infinity", "-f32::INFINITY"),
+            (Float, "NaN", "f32::NAN"),
+            (Double, "NaN", "f64::NAN"),
+            (Float, "-1.5", "-1.5_f32"),
+            (Float, "-0.0", "-0.0_f32"),
+            (Double, "-1.5", "-1.5_f64"),
+            (Double, "-0.0", "-0.0_f64"),
+            (Float, "+2", "2.0_f32"),
+            (Double, "1e-7", "1e-7_f64"),
+        ];
+        for (prim, schema, rust) in cases {
+            assert_eq!(constant_value_expr(prim, schema), rust, "{prim:?} {schema}");
+            syn::parse_str::<syn::Expr>(rust)?;
+        }
+        Ok(())
+    }
+
+    /// A NaN null matches any NaN; any other null is compared with `==`.
+    #[test]
+    fn float_null_checks() -> Result<(), Box<dyn std::error::Error>> {
+        use super::runtime::float_null_check;
+        use crate::ir::PrimitiveType::{Double, Float};
+        let quiet = u64::from(f32::NAN.to_bits());
+        let payload = u64::from(0x7fc0_0001_u32);
+        assert_eq!(float_null_check(Float, None), "val.is_nan()");
+        assert_eq!(float_null_check(Float, Some(quiet)), "val.is_nan()");
+        assert_eq!(float_null_check(Float, Some(payload)), "val.is_nan()");
+        assert_eq!(
+            float_null_check(Double, Some(f64::NAN.to_bits())),
+            "val.is_nan()"
+        );
+        assert_eq!(
+            float_null_check(Float, Some(0x7f80_0000)),
+            "val == f32::from_bits(2139095040u32)"
+        );
+        assert_eq!(
+            float_null_check(Double, Some((-1.0_f64).to_bits())),
+            format!("val == f64::from_bits({})", (-1.0_f64).to_bits())
+        );
+        Ok(())
+    }
 }

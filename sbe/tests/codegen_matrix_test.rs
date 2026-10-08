@@ -72,6 +72,12 @@ const SHAPES: &[(&str, &str, &str)] = &[
     ("e_norm", "Model", "Option<Model>"),
     ("set_opt", "Opts", "Option<Opts>"),
     ("s_dep", "u32", "Option<u32>"),
+    // Non-NaN float nulls: the decoder compares against the schema null.
+    ("f_opt_inf", "Option<f32>", "Option<f32>"),
+    ("d_opt_neg", "Option<f64>", "Option<f64>"),
+    // The enum's null comes from its encodingType typedef.
+    ("e_td_null", "Side", "Option<Side>"),
+    ("c_float_null", "Bounds", "Option<Bounds>"),
 ];
 
 const VERSIONS: &[u16] = &[0, 1];

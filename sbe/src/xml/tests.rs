@@ -86,6 +86,96 @@ fn parse_set_choice_bit_out_of_range_is_error() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+/// sbe-tool `PrimitiveValueTest`: `NaN` and `Infinity` with any sign parse to
+/// their IEEE images at the declared width, finite values keep their sign bit,
+/// and spellings Java's parser rejects are rejected.
+#[test]
+fn float_null_min_max_literals_match_java() -> Result<(), Box<dyn std::error::Error>> {
+    let f = Some(PrimitiveType::Float);
+    let d = Some(PrimitiveType::Double);
+    let float = |s| try_parse_u64_val(s, f);
+    let double = |s| try_parse_u64_val(s, d);
+    assert_eq!(float("Infinity")?, Some(0x7f80_0000));
+    assert_eq!(float("+Infinity")?, Some(0x7f80_0000));
+    assert_eq!(float("-Infinity")?, Some(0xff80_0000));
+    assert_eq!(double("Infinity")?, Some(0x7ff0_0000_0000_0000));
+    assert_eq!(double("+Infinity")?, Some(0x7ff0_0000_0000_0000));
+    assert_eq!(double("-Infinity")?, Some(0xfff0_0000_0000_0000));
+    assert_eq!(float("NaN")?, Some(u64::from(f32::NAN.to_bits())));
+    assert_eq!(float("-NaN")?, Some(u64::from(f32::NAN.to_bits())));
+    assert_eq!(double("NaN")?, Some(f64::NAN.to_bits()));
+    assert_eq!(double("+NaN")?, Some(f64::NAN.to_bits()));
+    assert_eq!(double("-NaN")?, Some(f64::NAN.to_bits()));
+    assert_eq!(float("-0.0")?, Some(u64::from((-0.0_f32).to_bits())));
+    assert_eq!(double("-0.0")?, Some((-0.0_f64).to_bits()));
+    assert_eq!(float("-1.5")?, Some(u64::from((-1.5_f32).to_bits())));
+    assert_eq!(double("1e-7")?, Some(1e-7_f64.to_bits()));
+    for bad in [
+        "inf", "-inf", "infinity", "INFINITY", "nan", "NAN", "Inf", "-nan",
+    ] {
+        assert!(float(bad).is_err(), "float {bad} must be rejected");
+        assert!(double(bad).is_err(), "double {bad} must be rejected");
+    }
+    Ok(())
+}
+
+/// sbe-tool `SetTypeTest.shouldThrowExceptionWhenNegativeValueSpecified`.
+#[test]
+fn parse_set_negative_choice_bit_is_error() -> Result<(), Box<dyn std::error::Error>> {
+    let xml = r#"<?xml version="1.0"?>
+<messageSchema package="x" id="1" version="0" byteOrder="littleEndian">
+  <types>
+<set name="S" encodingType="uint8">
+  <choice name="Neg">-1</choice>
+</set>
+  </types>
+</messageSchema>"#;
+    assert!(parse(xml).is_err(), "set choice bit -1 must error");
+
+    Ok(())
+}
+
+/// Java `EnumType` precedence for the null: the enum's own `nullValue`, else
+/// the encodingType typedef's, else the primitive default.
+#[test]
+fn enum_null_value_precedence() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = |enum_null: &str, typedef_null: &str| {
+        format!(
+            r#"<?xml version="1.0"?>
+<messageSchema package="x" id="1" version="0" byteOrder="littleEndian">
+  <types>
+<composite name="messageHeader">
+  <type name="blockLength" primitiveType="uint16"/>
+  <type name="templateId" primitiveType="uint16"/>
+  <type name="schemaId" primitiveType="uint16"/>
+  <type name="version" primitiveType="uint16"/>
+</composite>
+<type name="Enc" primitiveType="uint8" presence="optional"{typedef_null}/>
+<enum name="E" encodingType="Enc"{enum_null}>
+  <validValue name="A">0</validValue>
+</enum>
+  </types>
+</messageSchema>"#
+        )
+    };
+    let enum_null = |xml: String| -> Result<Option<u64>, Box<dyn std::error::Error>> {
+        let ir = parse(&xml)?;
+        let token = ir
+            .tokens
+            .iter()
+            .find(|t| t.signal == Signal::BeginEnum)
+            .ok_or("no enum token")?;
+        Ok(token.encoding.null_value)
+    };
+    assert_eq!(
+        enum_null(schema(r#" nullValue="7""#, r#" nullValue="254""#))?,
+        Some(7)
+    );
+    assert_eq!(enum_null(schema("", r#" nullValue="254""#))?, Some(254));
+    assert_eq!(enum_null(schema("", ""))?, Some(255));
+    Ok(())
+}
+
 #[test]
 fn parse_set_duplicate_choice_bit_is_error() -> Result<(), Box<dyn std::error::Error>> {
     let xml = r#"<?xml version="1.0"?>
