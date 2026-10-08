@@ -3,6 +3,12 @@
 ## [Unreleased]
 
 ### Added
+- Document what the loop thread of each lab app allocates and which system
+  calls it makes, in the runtime README's "Allocations and system calls on
+  the loop thread". Steady-state tests of md, the engine and exch-sim count
+  every allocation on the loop over 5.5 s of traffic and fail on one; under
+  `strace` on Linux the same windows show only the 10 ms external check
+  (`ppoll`) and the 5 s allocator sample (`getrusage`), none per message.
 - Print a pod's log lines with `ergon-runtime-log`, a new crate under the
   server's rules. `Printer::spawn` subscribes untethered to the log stream
   and writes each row of a source whose `Source.pod` is its own as one
@@ -366,6 +372,14 @@
   before only one arm paid it.
 
 ### Fixed
+- Remove the per-message allocations found on the lab apps' loops. The
+  engine's order books are sorted vectors that keep their capacity: a book
+  snapshot allocated every node of the old maps. It reserves 256 levels a
+  side and 256 open orders. It compares an instrument spec, which md repeats
+  before every snapshot, before copying its asset name.
+  `Persist::record_row` keeps up to 32 fields on the stack, where it
+  collected them into a `Vec` for each row, such as md's one per Hyperliquid
+  public trade.
 - Publish metrics without allocating on the loop, the first summary
   included: registering a series now sizes every buffer a publish reuses.
   The first histogram summary grew three of them, and with `mimalloc` the
