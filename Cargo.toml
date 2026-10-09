@@ -67,3 +67,11 @@ codegen-units = 1
 [profile.release]
 lto = true
 codegen-units = 1
+
+# shortcut: builds against the local rusteron `improvements` checkout next to
+# this repo, whose additive APIs ship in 0.2.11; delete this table and require
+# 0.2.11 once it is on crates.io.
+[patch.crates-io]
+rusteron-client = { path = "../rusteron/rusteron-client" }
+rusteron-media-driver = { path = "../rusteron/rusteron-media-driver" }
+rusteron-archive = { path = "../rusteron/rusteron-archive" }
