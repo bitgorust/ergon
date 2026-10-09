@@ -546,7 +546,8 @@ bench-cluster:
 # replacements against what they replaced, and the per-message cost of an
 # application loop over an IPC feed against the same loop by hand. Each gate
 # prints `GATE <name> <k>/20 slower pass|fail` and fails when the runtime is
-# slower in 16 or more of 20 alternated pairs. A failing gate fails the run
+# slower in 16 or more of 20 ABBA pairs, each arm of each pair a fresh child
+# process of the bench. A failing gate fails the run
 # only with GATE_ENFORCE=1 (the x86 gate VM, `just azure gate`); anywhere
 # else, the release recipes included, the run is a smoke test that prints
 # `fail (smoke: not enforced)` and exits 0. scripts/tests/test-bench-runtime-gate.sh
