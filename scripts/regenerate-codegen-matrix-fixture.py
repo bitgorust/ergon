@@ -75,6 +75,13 @@ def fields(start_id, indent):
     for name, ty in (("kInfF", "InfF"), ("kNegInfD", "NegInfD"), ("kNanD", "NanD")):
         out.append(f'{indent}<field name="{name}" id="{fid}" type="{ty}" presence="constant"/>')
         fid += 1
+    # Field-level constant enums end the block: they take no wire space at
+    # any location, so their accessors must not read the wire.
+    out.append(f"{indent}<!-- constant enums: plain and bool -->")
+    for name, ref in (("kEnum", "Model.A"), ("kBool", "BooleanType.T")):
+        ty = ref.split(".")[0]
+        out.append(f'{indent}<field name="{name}" id="{fid}" type="{ty}" presence="constant" valueRef="{ref}"/>')
+        fid += 1
     return out, fid
 
 

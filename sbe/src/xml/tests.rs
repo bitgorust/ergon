@@ -773,6 +773,15 @@ fn parse_value_ref_rejects_what_sbe_tool_rejects() -> Result<(), Box<dyn std::er
             "validValue name not found",
         ),
         (r#"type="Flags" valueRef="Flags.A""#, "not an enum"),
+        (r#"type="Flags" constantValue="1""#, "set or composite"),
+        (
+            r#"type="messageHeader" constantValue="1""#,
+            "set or composite",
+        ),
+        (
+            r#"type="Colour" constantValue="1""#,
+            "valueRef for constant enum",
+        ),
         (
             r#"type="Colour" valueRef="Side.Buy""#,
             "does not match field type",
@@ -790,6 +799,34 @@ fn parse_value_ref_rejects_what_sbe_tool_rejects() -> Result<(), Box<dyn std::er
             message.contains(expected),
             "{field}: expected '{expected}' in '{message}'"
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn parse_rejects_constant_set_and_composite_in_group_entries()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Entry blockLength leaves constants out, so a wire read of one would
+    // land in the next entry or past the buffer.
+    for field in [
+        r#"type="Flags" presence="constant" constantValue="3""#,
+        r#"type="groupSizeEncoding" presence="constant" constantValue="1""#,
+    ] {
+        let xml = format!(
+            r#"<?xml version="1.0"?>
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="t" id="1" version="0" byteOrder="littleEndian">
+<types><composite name="messageHeader"><type name="blockLength" primitiveType="uint16"/><type name="templateId" primitiveType="uint16"/><type name="schemaId" primitiveType="uint16"/><type name="version" primitiveType="uint16"/></composite>
+<composite name="groupSizeEncoding"><type name="blockLength" primitiveType="uint16"/><type name="numInGroup" primitiveType="uint16"/></composite>
+<set name="Flags" encodingType="uint8"><choice name="A">0</choice><choice name="B">1</choice></set></types>
+<sbe:message name="M" id="1"><group name="g" id="2" dimensionType="groupSizeEncoding">
+<field name="x" id="3" type="uint8"/><field name="c" id="4" {field}/></group></sbe:message>
+</sbe:messageSchema>"#
+        );
+        let Err(err) = parse(&xml) else {
+            return Err(format!("expected {field} to be rejected").into());
+        };
+        let message = format!("{err}");
+        assert!(message.contains("set or composite"), "{field}: {message}");
     }
     Ok(())
 }

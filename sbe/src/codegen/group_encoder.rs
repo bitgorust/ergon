@@ -597,6 +597,10 @@ pub(crate) fn generate_group_encoder(
     }
 
     for f in &g.fields {
+        // A constant takes no wire space, so it has no setter.
+        if f.presence == Presence::Constant {
+            continue;
+        }
         let f_snake = to_snake_case(&f.name);
         let wire_name =
             field_has_conversion_free(f, conversions).then(|| format!("{f_snake}_wire"));
@@ -608,9 +612,7 @@ pub(crate) fn generate_group_encoder(
             FieldType::Primitive(prim, length) => {
                 let r_ty = syn::Ident::new(&rust_type(*prim), span);
                 let prim_size = prim.size();
-                if f.presence == Presence::Constant {
-                    continue;
-                } else if let Some(len) = length {
+                if let Some(len) = length {
                     let len_lit = syn::LitInt::new(&len.to_string(), span);
                     let sz = syn::LitInt::new(&prim_size.to_string(), span);
                     entry_methods.extend(quote::quote! {

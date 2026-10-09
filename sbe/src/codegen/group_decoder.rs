@@ -1237,7 +1237,24 @@ pub(crate) fn generate_group_decoder(
                 );
                 let since_lit =
                     syn::LitInt::new(&f.since_version.to_string(), proc_macro2::Span::call_site());
-                if f.since_version > 0 {
+                // A constant takes no wire space: return the schema value, as
+                // message level does, never a read past the entry block.
+                if f.presence == Presence::Constant {
+                    if let Some(ref val) = f.constant_value {
+                        let variant = val.rsplit('.').next().unwrap_or(val);
+                        let variant_ident = syn::Ident::new(
+                            &to_pascal_case(variant),
+                            proc_macro2::Span::call_site(),
+                        );
+                        entry_body.extend(quote::quote! {
+                            #mu
+                            #[inline]
+                            pub const fn #f_name_ident(&self) -> #target_ident {
+                                #target_ident::#variant_ident
+                            }
+                        });
+                    }
+                } else if f.since_version > 0 {
                     entry_body.extend(quote::quote! {
                         #mu
                         #[inline]
@@ -1304,7 +1321,11 @@ pub(crate) fn generate_group_decoder(
                     }
                 }
 
-                if crate::structured_ir::is_bool_enum(elements, enum_name) {
+                // A constant has no wire discriminant to reject, so no `try_*_bool`
+                // (message level emits none either).
+                if f.presence != Presence::Constant
+                    && crate::structured_ir::is_bool_enum(elements, enum_name)
+                {
                     // Group entries name every boolean accessor `try_*`, unlike
                     // message level where an `Option`-returning one drops the
                     // prefix. Consumers depend on these names, so the domain

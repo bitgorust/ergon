@@ -215,6 +215,34 @@ fn validate_constant_value_ref(
     }
 }
 
+/// A constant field takes no wire space, so its value must come from the
+/// schema. A set or composite has no constant form (sbe-tool gives one zero
+/// block space yet reads it from the wire), and a constant enum needs a
+/// `valueRef` (sbe-tool `Field.validate`).
+fn reject_unrepresentable_constant(
+    node: Node<'_, '_>,
+    type_name: &str,
+    value_ref: Option<&str>,
+    registry: &TypeRegistry,
+) -> Result<(), Fault> {
+    let kind = registry
+        .registry
+        .get(type_name)
+        .and_then(|tokens| tokens.first())
+        .map(|t| t.signal);
+    match kind {
+        Some(Signal::BeginSet | Signal::BeginComposite) => Err(Fault::invalid(
+            node,
+            "presence",
+            format!("constant is not supported on set or composite field type '{type_name}'"),
+        )),
+        Some(Signal::BeginEnum) if value_ref.is_none() => {
+            Err(Fault::missing(node, "valueRef for constant enum field"))
+        }
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn validate_message_member_order(node: Node<'_, '_>) -> Result<(), Fault> {
     let mut phase = 0u8;
     for child in element_children(node) {
@@ -290,6 +318,7 @@ pub(crate) fn parse_message_child(
                 value_ref_enum(node, value_ref, registry)?;
             }
             let constant_value = if presence == Presence::Constant {
+                reject_unrepresentable_constant(node, &type_name, value_ref, registry)?;
                 let from_value_ref = value_ref;
                 let from_constant_value = node.attribute("constantValue");
                 if from_value_ref.is_none() && from_constant_value.is_none() {

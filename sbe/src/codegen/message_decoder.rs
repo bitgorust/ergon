@@ -68,17 +68,7 @@ pub(crate) fn generate_message_decoder(
     // Prefer the resolved message block length (includes schema-declared
     // padding via `blockLength="…"`). Fall back to a tight field-span only if
     // resolve left it zero (should not happen for real messages).
-    // Constant fields have zero wire footprint; skip them so block_length stays
-    // 0 for constant-only messages (e.g. value_ref MsgTwo–MsgFive).
-    let computed_block_length = msg
-        .fields
-        .iter()
-        .filter(|f| f.presence != Presence::Constant)
-        .fold(0, |acc, f| {
-            let size = f.field_type.size();
-            acc.max(f.offset + size)
-        });
-    let block_length = msg.block_length.max(computed_block_length);
+    let block_length = msg.block_length.max(fixed_extent(&msg.fields));
 
     let header_pascal = to_pascal_case(header_type);
     let (header_bl, header_ti, header_si, header_vr, header_ti_constant, header_si_constant) = {

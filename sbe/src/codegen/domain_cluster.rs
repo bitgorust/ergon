@@ -322,7 +322,7 @@ pub(crate) fn dto_range_check_tokens(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_domain_recursive(
     struct_prefix: &str,
     decoder_name: &str,
@@ -1092,14 +1092,9 @@ pub(crate) fn generate_domain_recursive(
             }
         };
 
-        let entry_block_len = groups.iter().fold(
-            fields.iter().fold(0usize, |acc, f| {
-                let size = f.field_type.size();
-                acc.max(f.offset + size)
-            }),
-            |acc, g| acc.max(g.effective_block_length()),
-        );
-        let entry_bl_lit = syn::LitInt::new(&entry_block_len.to_string(), span);
+        // The caller passes the group's `effective_block_length()`, the stride
+        // the entry encoder writes; nested entries are counted below.
+        let entry_bl_lit = syn::LitInt::new(&message_block_length.to_string(), span);
         let mut len_stmts = quote::quote! {
             let mut len: usize = #entry_bl_lit;
         };

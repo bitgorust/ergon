@@ -7834,7 +7834,7 @@ impl CarPerformanceFiguresEntryDomain {
     /// (entry block + nested groups + entry var-data).
     #[inline]
     pub fn length_contribution(&self) -> Result<usize, sbe_rt::EncodeError> {
-        let mut len: usize = 6;
+        let mut len: usize = 1;
         len = len.checked_add(4).ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
         for entry in &self.acceleration {
             len = len

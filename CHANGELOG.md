@@ -169,10 +169,20 @@
   and borrowed frames for persistence, including unknown schemas and templates.
 
 ### Changed
+- Check ergo-sbe's wire bytes against sbe-tool 1.40.2, up from a pre-1.40.0
+  snapshot: the reference codecs and the benchmark comparators are
+  regenerated from it, and the parity suite adds its `issue1116`,
+  `issue1118` and `floating-point-infinity-schema` schemas plus five more of
+  its test schemas (an explicit message `blockLength`, lower-case set choices
+  and enum values, `sinceVersion` messages and constant group fields).
 - ergo-sbe rejects a float or double `nullValue`, `minValue`, `maxValue` or
   constant spelled `inf`, `infinity` or `nan` in any case other than
   `Infinity` and `NaN` (with an optional sign), as sbe-tool does. A malformed
   float constant now fails at parse time, not in the generated module.
+- ergo-sbe rejects `presence="constant"` on a set or composite field, and a
+  constant enum field given by `constantValue` rather than `valueRef`. A
+  constant takes no block space, so these read the wire past the block (or
+  failed to generate); sbe-tool rejects the enum form too.
 - `aeron-bench ping`'s JSON line adds `mean_ns`, to read beside `p50_ns`,
   which the gate uses. `ping --gate` gives each run a driver of its own
   when it starts one, as a killed `pong`'s client slowed the runs after
@@ -376,6 +386,18 @@
   before only one arm paid it.
 
 ### Fixed
+- Leave constant fields (declared on the field or on its type) out of a
+  group entry's `blockLength`. ergo-sbe counted a constant that ends an
+  entry, so each entry was wider than sbe-tool's; frames ergo-sbe encoded
+  for such schemas change width. Message blocks were already right.
+- Return a constant enum in a group entry from its `valueRef`, as message
+  level does. The entry accessor read the wire past the entry's block; its
+  entry setters and its `raw_` and `try_*_bool` accessors, which wrote or
+  read there, are removed.
+- Count a group entry's DTO `encoded_length()` from the stride the encoder
+  writes. It ignored a group's declared `blockLength` padding and took the
+  width of a nested group's entry when that was wider (the Car example's
+  `performanceFigures` entries by 5 bytes each).
 - Take an enum's null from its `encodingType` typedef's `nullValue` when the
   enum declares none, as sbe-tool does: `NullVal`, the `From` conversions and
   an optional enum field's `None` now write that value (254 for

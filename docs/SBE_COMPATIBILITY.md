@@ -26,11 +26,15 @@ venue schema.”
   sign. Rust also parses `inf`, `infinity` and `nan` in any case; ergon rejects
   those, as sbe-tool's Java parser does, so a schema one accepts the other
   accepts. A NaN null, `-NaN` included, is the canonical quiet NaN Java writes.
+- The parity suite checks these against sbe-tool 1.40.2's own Rust codecs for
+  its `issue1116` and `floating-point-infinity-schema` schemas.
 
 ## What is not claimed
 
 - Latency parity with sbe-tool on your schema (only gated benches are enforced).
 - Every optional SBE XML extension used by every market data venue.
+- Constant set or composite fields. ergon rejects them; sbe-tool accepts them
+  but gives them no block space and still reads them from the wire.
 - Self-describing total message length on the wire (SBE has none — use
   `decode_frame` with an external frame length when framing is external).
 

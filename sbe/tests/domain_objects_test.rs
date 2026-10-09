@@ -7,7 +7,10 @@
     unused
 )]
 mod common;
-use common::{Paths, compile_and_run, generate_domain as generate, generate_domain_with};
+use common::{
+    Paths, compile_and_run, compile_fails_with_diagnostics, generate_domain as generate,
+    generate_domain_with,
+};
 use ergo_sbe::DomainVarData;
 use std::path::PathBuf;
 
@@ -1513,6 +1516,177 @@ fn versioned_required_enum_none_writes_null_on_reused_buffer()
             Some(Status::NullVal),
             "versioned required None must write NullVal; without null_as_option the getter keeps the variant"
         );
+        "#,
+    );
+    Ok(())
+}
+
+fn fixture_schema(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/schemas")
+        .join(name)
+}
+
+/// The entry DTO's `length_contribution` must use the stride the entry
+/// encoder writes. Constant fields ending a top-level entry take no wire
+/// space (sbe-tool's entry blockLength for this schema is 2).
+#[test]
+fn dto_length_skips_constant_fields_in_group_entries() -> Result<(), Box<dyn std::error::Error>> {
+    let (_schema, src) = generate(
+        &fixture_schema("group-with-constant-fields.xml"),
+        "dto_const_galore",
+    );
+    compile_and_run(
+        "dto_const_galore",
+        &src,
+        r#"
+        let mut pad = [0u8; ConstantsGaloreEncoder::compute_length_with_header(3)];
+        for n in 0..=3u8 {
+            let dto = ConstantsGaloreDomain {
+                a: 7,
+                e: CompositeWithConst::new(9),
+                f: (0..n)
+                    .map(|i| ConstantsGaloreFEntryDomain { g: i, h: CompositeWithConst::new(i + 100) })
+                    .collect(),
+            };
+            let len = ConstantsGaloreEncoder::compute_length_with_header(usize::from(n));
+            assert_eq!(dto.encoded_length()? + ConstantsGaloreEncoder::HEADER_LENGTH, len);
+            let buf = &mut pad[..len];
+            assert_eq!(dto.encode(buf)?, len);
+            assert_eq!(u16::from_le_bytes([buf[10], buf[11]]), 2, "entry blockLength");
+            assert_eq!(ConstantsGaloreDomain::try_from_slice_with_header(buf, 0)?, dto);
+        }
+        "#,
+    );
+    Ok(())
+}
+
+/// Nested entries ending in constants are 2 bytes wide at both levels, and a
+/// nested entry wider than its parent (`wide`, 8) does not widen the parent.
+#[test]
+fn dto_length_skips_constant_fields_in_nested_group_entries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_schema, src) = generate(
+        &fixture_schema("nested-group-constant-fields.xml"),
+        "dto_const_nested",
+    );
+    compile_and_run(
+        "dto_const_nested",
+        &src,
+        r#"
+        let dto = OuterDomain {
+            a: 1,
+            rows: vec![
+                OuterRowsEntryDomain {
+                    p: 2,
+                    q: CompositeWithConst::new(3),
+                    cells: vec![OuterRowsEntryCellsEntryDomain { t: 4, u: CompositeWithConst::new(5) }; 2],
+                    wide: vec![OuterRowsEntryWideEntryDomain { m: 6 }],
+                },
+                OuterRowsEntryDomain { p: 7, q: CompositeWithConst::new(8), cells: vec![], wide: vec![] },
+            ],
+        };
+        let len = OuterEncodedLength::new()
+            .rows_ragged(2, |r| {
+                r.add()?.cells(|c| { c.uniform(2)?; Ok(()) })?.wide(|w| { w.uniform(1)?; Ok(()) })?;
+                r.add()?.cells(|c| { c.uniform(0)?; Ok(()) })?.wide(|w| { w.uniform(0)?; Ok(()) })?;
+                Ok(())
+            })?
+            .encoded_length_with_header();
+        // header, a, rows dim, row 0 (block, cells dim + 2 x 2, wide dim + 8),
+        // row 1 (block, two empty dims).
+        assert_eq!(len, 8 + 1 + 4 + (2 + 4 + 2 * 2 + 4 + 8) + (2 + 4 + 4));
+        assert_eq!(dto.encoded_length()? + OuterEncoder::HEADER_LENGTH, len);
+
+        let mut pad = [0u8; 64];
+        let buf = &mut pad[..len];
+        assert_eq!(dto.encode(buf)?, len);
+        let block_length = |at: usize| u16::from_le_bytes([buf[at], buf[at + 1]]);
+        assert_eq!((block_length(9), block_length(15), block_length(23)), (2, 2, 8));
+        assert_eq!(OuterDomain::try_from_slice_with_header(buf, 0)?, dto);
+
+        for row in OuterDecoder::try_from(&buf[..])?.rows()? {
+            let row = row?;
+            assert_eq!(row.k(), Model::A);
+            for cell in row.cells()? {
+                assert_eq!(cell.kk(), Model::B);
+            }
+        }
+        "#,
+    );
+    Ok(())
+}
+
+/// Constant enum fields in group and nested-group entries have no setter: one
+/// would write at its IR offset, past the entry block, into the next entry.
+#[test]
+fn constant_enum_fields_in_group_entries_have_no_setter() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_schema, src) = generate(
+        &fixture_schema("nested-group-constant-fields.xml"),
+        "const_entry_setter",
+    );
+    let encode = |row_extra: &str, cell_extra: &str| {
+        format!(
+            r#"
+            let run = || -> Result<(), Box<dyn std::error::Error>> {{
+            let mut pad = [0u8; 64];
+            let len = OuterEncoder::wrap_and_apply_header(&mut pad, 0)
+                .fixed(&OuterFixedFields {{ a: 1 }})
+                .rows(1, |rows| {{
+                    rows.add(|mut r| {{
+                        r.p(2){row_extra};
+                        Ok(r.cells(1, |cells| {{
+                                cells.add(|c| {{ c.t(4){cell_extra}; Ok(()) }})?;
+                                Ok(())
+                            }})?
+                            .wide(0, |_| Ok(()))?)
+                    }})?;
+                    Ok(())
+                }})?
+                .encoded_length_with_header();
+            assert!(len > 0);
+            Ok(())
+            }};
+            run().map_err(|e| e.to_string()).expect("encode");
+            "#
+        )
+    };
+    compile_and_run("const_entry_setter_ok", &src, &encode("", ""));
+    compile_fails_with_diagnostics(
+        "const_entry_setter_cf",
+        &src,
+        &encode(".k(Model::A)", ".kk(Model::B)"),
+        &["no method named `k`", "no method named `kk`"],
+    );
+    Ok(())
+}
+
+/// A group's declared blockLength (16) pads each entry past its fields (12);
+/// the entry DTO must count the padding the encoder writes.
+#[test]
+fn dto_length_keeps_declared_group_block_length() -> Result<(), Box<dyn std::error::Error>> {
+    let (_schema, src) = generate(
+        &fixture_schema("block-length-schema.xml"),
+        "dto_padded_group",
+    );
+    compile_and_run(
+        "dto_padded_group",
+        &src,
+        r#"
+        let mut pad = [0u8; Message3Encoder::compute_length_with_header(2)];
+        for n in 0..=2u32 {
+            let dto = Message3Domain {
+                header: MessageHeader([0u8; 8]),
+                group: (0..n).map(|i| Message3GroupEntryDomain { f1: i, f2: u64::from(i) }).collect(),
+            };
+            let len = Message3Encoder::compute_length_with_header(n as usize);
+            assert_eq!(len, 8 + 64 + 3 + n as usize * 16);
+            assert_eq!(dto.encoded_length()? + Message3Encoder::HEADER_LENGTH, len);
+            let buf = &mut pad[..len];
+            assert_eq!(dto.encode(buf)?, len);
+            assert_eq!(Message3Domain::try_from_slice_with_header(buf, 0)?, dto);
+        }
         "#,
     );
     Ok(())
