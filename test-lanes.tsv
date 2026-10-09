@@ -25,6 +25,7 @@ runtime/tests/*.rs	pr	cd samples/clickhouse && just _test-aeron && cd ../.. && c
 runtime/benches/*.rs	benchmark	cargo bench -p ergon-runtime --all-features --no-run
 runtime-server/src/*.rs	pr	cd samples/clickhouse && just _test-clickhouse _test-aeron && cd ../.. && cargo test -p ergon-runtime-server --all-targets
 runtime-server/tests/*.rs	pr	cd samples/clickhouse && just _test-clickhouse _test-aeron && cd ../.. && cargo test -p ergon-runtime-server --all-targets
+bridge/src/*.rs	pr	cargo test -p ergon-bridge --all-targets && cargo test -p ergon-bridge --doc
 runtime-log/src/*.rs	pr	cd samples/clickhouse && just _test-aeron && cd ../.. && cargo test -p ergon-runtime-log --all-targets
 runtime-log/tests/*.rs	pr	cd samples/clickhouse && just _test-aeron && cd ../.. && cargo test -p ergon-runtime-log --all-targets
 samples/clickhouse/engine/src/*.rs	samples	cd samples/clickhouse && just test

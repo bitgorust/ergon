@@ -31,6 +31,7 @@ deployments. Criteria for lifting that disclaimer:
 | [`cluster/`](cluster/) | `ergo-aeron-cluster` | Experimental Aeron Cluster client |
 | [`runtime/`](runtime/) | `ergon-runtime` | Client runtime for apps on the bus: one busy-spin thread each, low latency, no locks, atomics or channels |
 | [`runtime-server/`](runtime-server/) | `ergon-runtime-server` | Ingester from the Aeron Archive into ClickHouse: throughput first, threads allowed |
+| [`bridge/`](bridge/) | `ergon-bridge` | The `tracing` bridge: events and spans from any thread into the ingester's stream. The only crate that enables rusteron's `multi-threaded`; the engine never links it |
 | [`runtime-log/`](runtime-log/) | `ergon-runtime-log` | Prints a pod's log lines from the Aeron log stream as logfmt: the `logs` sidecar, or a local thread |
 | [`samples/`](samples/) | seven teaching crates, plus the ClickHouse lab | Unpublished integration playgrounds |
 
