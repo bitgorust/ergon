@@ -205,7 +205,11 @@ release-check: test check-coverage check-generated-rustdoc
 #   just release-verified                                     # same commit
 #
 # `bench-runtime` leaves no evidence file to check, so this recipe runs it
-# first, while the machine is still quiet, with its negative test.
+# first, while the machine is still quiet, with its negative test. Off the
+# gate VM (no GATE_ENFORCE=1) its timing gates are a smoke run: a failing
+# gate prints `fail (smoke: not enforced)` and does not stop the release.
+# The binding verdict is `just azure gate`'s; the negative test still proves
+# every gate can fail here.
 #
 # Re-run the benches if you commit anything afterwards; the manifest check will
 # reject stale evidence rather than let it through.
@@ -225,7 +229,7 @@ release-verified: _check-release-notes
 # calling this. The version is read from workspace Cargo.toml.
 #
 # Runs the benchmark gates inline, ~40 min in, on a machine hot from the test
-# suite. If the tightest maintained ratio fails there, re-measure on an idle
+# suite; `bench-runtime` is a smoke run there (see `release-verified`). If the tightest maintained ratio fails there, re-measure on an idle
 # machine before believing it, then use `just release-verified`.
 # Full release: test, bench, publish, tag, GitHub release, version bump
 release: _check-release-notes
@@ -543,41 +547,60 @@ bench-cluster:
 # application loop over an IPC feed against the same loop by hand. Each gate
 # prints `GATE <name> <k>/20 slower pass|fail` and fails when the runtime is
 # slower in 16 or more of 20 alternated pairs. A failing gate fails the run
-# only with GATE_ENFORCE=1 (the x86 gate VM, `just azure gate`); a Mac run is
-# a smoke test. Both release recipes run it; scripts/tests/test-bench-runtime-gate.sh
+# only with GATE_ENFORCE=1 (the x86 gate VM, `just azure gate`); anywhere
+# else, the release recipes included, the run is a smoke test that prints
+# `fail (smoke: not enforced)` and exits 0. scripts/tests/test-bench-runtime-gate.sh
 # proves each gate fails on a seeded regression, and that one failing gate
-# fails its bench.
+# fails its bench. It stops at the first bench that fails; the gate VM runs
+# each bench and profile itself (`_bench-runtime-one`), so all get a verdict.
+# Runtime sign-test gates, both LTO profiles (a smoke run off the gate VM)
 bench-runtime:
     #!/usr/bin/env bash
     set -euo pipefail
-    root="{{justfile_directory()}}"
-    # Not bench-cluster's Criterion trees: the release packages those as its
-    # cluster evidence.
-    lto_crit="$root/target/bench-runtime/lto/criterion"
-    no_lto_crit="$root/target/bench-runtime/no-lto/criterion"
-    no_lto_target="$root/target/bench-no-lto"
-    mkdir -p "$lto_crit" "$no_lto_crit"
     # The dispatch bench publishes through a local media driver.
     (cd samples/clickhouse && just _test-aeron)
     for bench in timer dispatch hotpath; do
-      CRITERION_HOME="$lto_crit" cargo bench -p ergon-runtime --bench "$bench"
-      CARGO_TARGET_DIR="$no_lto_target" \
-        CARGO_PROFILE_BENCH_LTO=false \
-        CARGO_PROFILE_BENCH_CODEGEN_UNITS=1 \
-        CRITERION_HOME="$no_lto_crit" \
-        cargo bench -p ergon-runtime --bench "$bench"
+      for profile in lto no-lto; do
+        just _bench-runtime-one "$bench" "$profile"
+      done
     done
     # One allocator-metrics sample, and dispatch with the feature compiled in.
     cargo bench -p ergon-runtime --features mimalloc --bench alloc_sample
     cargo bench -p ergon-runtime --features mimalloc --bench dispatch
 
+# One runtime bench in one profile: lto (the bench profile) or no-lto, each
+# with its own Criterion tree under target/bench-runtime/, not bench-cluster's,
+# which the release packages as its cluster evidence. Needs the test media
+# driver for dispatch and hotpath.
+[private]
+_bench-runtime-one bench profile:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="{{justfile_directory()}}"
+    crit="$root/target/bench-runtime/{{profile}}/criterion"
+    mkdir -p "$crit"
+    case "{{profile}}" in
+      lto) CRITERION_HOME="$crit" cargo bench -p ergon-runtime --bench "{{bench}}" ;;
+      no-lto)
+        CARGO_TARGET_DIR="$root/target/bench-no-lto" \
+          CARGO_PROFILE_BENCH_LTO=false \
+          CARGO_PROFILE_BENCH_CODEGEN_UNITS=1 \
+          CRITERION_HOME="$crit" \
+          cargo bench -p ergon-runtime --bench "{{bench}}" ;;
+      *) echo "profile: lto or no-lto, not {{profile}}" >&2; exit 2 ;;
+    esac
+
 # A/A calibration and seed power of the sign-test gates: R runs (default 20)
-# of every gate raw against raw, plain and seeded, into
+# of every gate raw against raw, plain and with a 5% seed, into
 # target/bench-runtime/<UTC date>/calibration.json. Smoke: GATE_PAIRS=6 R=3.
+# A/A calibration and seed power of the runtime gates
 bench-runtime-calibrate *args:
     bash scripts/bench-runtime-calibrate.sh {{args}}
 
 # The callgrind Ir gate: instructions per operation, runtime against raw, for
-# every gated comparison; Linux with valgrind only (ir.json beside the above).
+# every gated comparison, refusing a verdict when the counts are not linear;
+# dispatch and claim are report-only (IR_REPORT_ONLY). Linux with valgrind
+# only (ir.json beside the above).
+# The callgrind Ir gate of the runtime benches (Linux + valgrind)
 bench-runtime-ir *args:
     bash scripts/bench-runtime-ir.sh {{args}}
