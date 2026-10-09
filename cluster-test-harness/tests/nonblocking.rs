@@ -426,6 +426,38 @@ fn let_land() {
     thread::sleep(Duration::from_millis(500));
 }
 
+/// Member 1's endpoint, which nothing subscribes to until a test says so.
+const LATE_MEMBER: &str = "0=localhost:19231,1=localhost:19234";
+
+/// Bring up the member a dropped add pointed at, and check the closed session
+/// never adopts it.
+fn assert_pending_add_dropped(
+    cluster: &FakeCluster,
+    client: &mut AeronCluster,
+) -> Result<(), Box<dyn Error>> {
+    let _late_member = cluster.aeron.add_subscription(
+        c"aeron:udp?endpoint=localhost:19234",
+        101,
+        Handlers::NONE,
+        Handlers::NONE,
+        Duration::from_secs(5),
+    )?;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(1) {
+        client.poll_state_changes()?;
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        (
+            client.state(),
+            client.leadership_term_id(),
+            client.leader_member_id()
+        ),
+        (SessionState::Closed, 1, 0)
+    );
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn async_connect_adds_its_transport_without_waiting() -> Result<(), Box<dyn Error>> {
@@ -630,11 +662,8 @@ fn closed_while_a_new_leader_is_pending_ends_the_session() -> Result<(), Box<dyn
         &client_driver,
     )?;
     let new_egress = cluster.egress()?;
-    // Nothing subscribes at member 1's endpoint, so the add stays pending.
-    offer(
-        &new_egress,
-        &new_leader_event(2, 1, "0=localhost:19231,1=localhost:19234")?,
-    )?;
+    // Nothing subscribes at member 1's endpoint yet, so the add stays pending.
+    offer(&new_egress, &new_leader_event(2, 1, LATE_MEMBER)?)?;
     let mut egress = Egress::regular();
     egress.poll_until(&mut client, SessionState::AwaitingNewLeader)?;
 
@@ -647,7 +676,90 @@ fn closed_while_a_new_leader_is_pending_ends_the_session() -> Result<(), Box<dyn
         }
         thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(client.leadership_term_id(), 1);
+    assert_pending_add_dropped(&cluster, &mut client)
+}
+
+#[test]
+#[serial]
+fn close_while_a_new_leader_is_pending_drops_its_publication() -> Result<(), Box<dyn Error>> {
+    let client_driver = JavaDriver::launch("nonblocking-close-pending")?;
+    let cluster = FakeCluster::launch()?;
+    let (mut client, _old_egress) = cluster.connect(
+        builder(Duration::from_secs(10), Duration::from_secs(60))?,
+        &client_driver,
+    )?;
+    let new_egress = cluster.egress()?;
+    offer(&new_egress, &new_leader_event(2, 1, LATE_MEMBER)?)?;
+    Egress::regular().poll_until(&mut client, SessionState::AwaitingNewLeader)?;
+
+    client.close()?;
+    assert_pending_add_dropped(&cluster, &mut client)
+}
+
+#[test]
+#[serial]
+fn closed_beside_a_failing_new_leader_event_ends_the_session() -> Result<(), Box<dyn Error>> {
+    let client_driver = JavaDriver::launch("nonblocking-closed-failing")?;
+    let cluster = FakeCluster::launch()?;
+    let (mut client, _old_egress) = cluster.connect(
+        builder(Duration::from_secs(10), Duration::from_secs(60))?,
+        &client_driver,
+    )?;
+    let new_egress = cluster.egress()?;
+    // Member 2 is not in the endpoint list, so this event alone would fail.
+    offer(&new_egress, &new_leader_event(2, 2, ENDPOINTS)?)?;
+    offer(&new_egress, &session_event(EventCode::CLOSED, 1, "")?)?;
+    let_land();
+
+    Egress::regular().poll(&mut client)?;
+    assert_eq!(client.state(), SessionState::Closed);
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn a_new_leader_whose_image_closes_waits_for_the_next_one() -> Result<(), Box<dyn Error>> {
+    let message_timeout = Duration::from_secs(4);
+    let client_driver = JavaDriver::launch("nonblocking-leader-lost")?;
+    let cluster = FakeCluster::launch()?;
+    let (mut client, _old_egress) = cluster.connect(
+        builder(message_timeout, Duration::from_secs(20))?,
+        &client_driver,
+    )?;
+    let first = cluster.egress()?;
+    offer(&first, &new_leader_event(2, 1, LATE_MEMBER)?)?;
+    let mut egress = Egress::regular();
+    egress.poll_until(&mut client, SessionState::AwaitingNewLeader)?;
+    let event_at = Instant::now();
+
+    // Member 1 fails before its ingress connects: its egress image closes.
+    drop(first);
+    wait_until(
+        || {
+            let _ = egress.poll(&mut client);
+            !client.is_egress_connected()
+        },
+        "member 1's egress image to close",
+    )?;
+    assert!(
+        event_at.elapsed() < message_timeout,
+        "the image took {:?} to close, too long for this test",
+        event_at.elapsed()
+    );
+    // Past message_timeout the session still waits, now for a new leader.
+    while event_at.elapsed() < message_timeout + Duration::from_secs(1) {
+        egress.poll(&mut client)?;
+        assert_eq!(client.state(), SessionState::AwaitingNewLeader);
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let second = cluster.egress()?;
+    offer(&second, &new_leader_event(3, 0, ENDPOINTS)?)?;
+    egress.poll_until(&mut client, SessionState::Connected)?;
+    assert_eq!(
+        (client.leadership_term_id(), client.leader_member_id()),
+        (3, 0)
+    );
     Ok(())
 }
 
@@ -733,10 +845,11 @@ fn a_new_leader_that_never_connects_times_out() -> Result<(), Box<dyn Error>> {
 #[test]
 #[serial]
 fn a_failed_new_leader_add_is_reported_once() -> Result<(), Box<dyn Error>> {
+    let message_timeout = Duration::from_secs(3);
     let client_driver = JavaDriver::launch("nonblocking-failed-add")?;
     let cluster = FakeCluster::launch()?;
     let (mut client, _old_egress) = cluster.connect(
-        builder(Duration::from_secs(10), Duration::from_secs(60))?,
+        builder(message_timeout, Duration::from_secs(60))?,
         &client_driver,
     )?;
     let new_egress = cluster.egress()?;
@@ -750,20 +863,33 @@ fn a_failed_new_leader_add_is_reported_once() -> Result<(), Box<dyn Error>> {
     let mut egress = Egress::regular();
     let mut failures = 0;
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(2) {
+    // After the failure the session waits out message_timeout, as Java's
+    // AWAIT_NEW_LEADER_CONNECTION does, not new_leader_timeout.
+    let reason = loop {
         match egress.poll(&mut client) {
             Err(ClusterError::ReconnectFailed { .. }) => failures += 1,
+            Err(ClusterError::Disconnected { reason }) => break reason,
             Err(error) => return Err(error.into()),
-            Ok(_) => {}
+            Ok(_) => {
+                assert_eq!(client.state(), SessionState::AwaitingNewLeader);
+                assert_eq!(
+                    (client.leadership_term_id(), client.leader_member_id()),
+                    (1, 0)
+                );
+            }
+        }
+        if started.elapsed() > Duration::from_secs(20) {
+            return Err(format!("still {:?} after 20s", client.state()).into());
         }
         thread::sleep(Duration::from_millis(1));
-    }
+    };
     assert_eq!(failures, 1, "the failed add is reported exactly once");
-    assert_eq!(client.state(), SessionState::AwaitingNewLeader);
-    assert_eq!(
-        (client.leadership_term_id(), client.leader_member_id()),
-        (1, 0)
+    assert!(
+        started.elapsed() < message_timeout + Duration::from_secs(2),
+        "closed after {:?}",
+        started.elapsed()
     );
+    assert!(reason.contains("message_timeout"), "{reason}");
     Ok(())
 }
 

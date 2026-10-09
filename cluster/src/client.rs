@@ -121,7 +121,10 @@ struct NewLeader {
 /// The new leader's ingress publication while Aeron adds it and it connects.
 /// The session adopts the new term and leader only once it has connected.
 struct PendingIngress {
-    publication: AeronAsyncAddExclusivePublication,
+    /// `None` once the add has resolved or failed. A failed add leaves the
+    /// session waiting out `message_timeout`, as Java's
+    /// `AWAIT_NEW_LEADER_CONNECTION` does, unless another event comes.
+    add: Option<AeronAsyncAddExclusivePublication>,
     added: Option<AeronExclusivePublication>,
     leadership_term_id: i64,
     leader_member_id: i32,
@@ -925,7 +928,7 @@ impl AeronCluster {
             .async_add_exclusive_publication(&channel, self.ingress_stream_id)
             .map_err(|e| ClusterError::reconnect(format!("ingress to {endpoint}: {e}")))?;
         self.pending_ingress = Some(PendingIngress {
-            publication,
+            add: Some(publication),
             added: None,
             leadership_term_id,
             leader_member_id,
@@ -942,25 +945,32 @@ impl AeronCluster {
     /// non-blocking poll; a failed add is reported once and leaves the session
     /// to time out unless another `NewLeaderEvent` comes.
     fn poll_pending_ingress(&mut self) -> Result<(), ClusterError> {
-        let Some(mut pending) = self.pending_ingress.take() else {
+        let Some(pending) = self.pending_ingress.as_mut() else {
             return Ok(());
         };
-        if pending.added.is_none() {
-            pending.added = pending
-                .publication
-                .poll()
-                .map_err(|e| ClusterError::reconnect(format!("new leader ingress publication: {e}")))?;
+        if let Some(add) = &pending.add {
+            let polled = add.poll();
+            match polled {
+                Ok(None) => return Ok(()),
+                Ok(Some(publication)) => pending.added = Some(publication),
+                Err(e) => {
+                    pending.add = None;
+                    return Err(ClusterError::reconnect(format!("new leader ingress publication: {e}")));
+                }
+            }
+            pending.add = None;
         }
         let Some(ingress) = pending.added.take_if(|publication| publication.is_connected()) else {
-            self.pending_ingress = Some(pending);
             return Ok(());
         };
         let (max_message_length, max_payload_length) = publication_limits(&ingress)?;
+        let (leadership_term_id, leader_member_id) = (pending.leadership_term_id, pending.leader_member_id);
+        self.pending_ingress = None;
         self.ingress = ingress;
         self.max_message_length = max_message_length;
         self.max_payload_length = max_payload_length;
-        self.leadership_term_id = pending.leadership_term_id;
-        self.leader_member_id = pending.leader_member_id;
+        self.leadership_term_id = leadership_term_id;
+        self.leader_member_id = leader_member_id;
         if self.state == SessionState::AwaitingNewLeader {
             self.state = SessionState::Connected;
             self.awaiting_leader_since = None;
@@ -1081,6 +1091,12 @@ impl AeronCluster {
     pub fn poll_state_changes(&mut self) -> Result<(), ClusterError> {
         self.poll_pending_ingress()?;
         let connected = self.is_egress_connected();
+        // The new leader's egress image closed before its ingress connected:
+        // wait for another NewLeaderEvent from now (Java `onDisconnected`).
+        if self.pending_ingress.is_some() && !connected {
+            self.pending_ingress = None;
+            self.awaiting_leader_since = Some(Instant::now());
+        }
         // Once a NewLeaderEvent has come, the wait is for its publication,
         // bounded by message_timeout as Java bounds AWAIT_NEW_LEADER_CONNECTION.
         let awaiting = if self.pending_ingress.is_some() {

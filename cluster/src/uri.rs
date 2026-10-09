@@ -126,12 +126,15 @@ mod tests {
 
     #[test]
     fn ingress_channel_for_endpoint_keeps_the_settings() -> Result<(), Box<dyn std::error::Error>> {
-        let template = channel_cstr("aeron:udp?endpoint=a:1|term-length=1m|mtu=4096")?;
-        let c = ingress_channel_for_endpoint(Some(&template), "b:2")?;
-        let s = c.to_str()?;
-        let mut params: Vec<&str> = s.strip_prefix("aeron:udp?").ok_or(s)?.split('|').collect();
-        params.sort_unstable();
-        assert_eq!(params, ["endpoint=b:2", "mtu=4096", "term-length=1m"], "{s}");
+        // Unicast endpoints by name and by IPv4 and IPv6 literal.
+        for endpoint in ["a:1", "10.0.0.1:1", "[::1]:1"] {
+            let template = channel_cstr(&format!("aeron:udp?endpoint={endpoint}|term-length=1m|mtu=4096"))?;
+            let c = ingress_channel_for_endpoint(Some(&template), "b:2")?;
+            let s = c.to_str()?;
+            let mut params: Vec<&str> = s.strip_prefix("aeron:udp?").ok_or(s)?.split('|').collect();
+            params.sort_unstable();
+            assert_eq!(params, ["endpoint=b:2", "mtu=4096", "term-length=1m"], "{s}");
+        }
         Ok(())
     }
 
