@@ -87,6 +87,21 @@ fn connect(aeron_dir: &str) -> Result<ergo_aeron_cluster::AeronCluster, ergo_aer
 Drive `poll` / `step` yourself when you need to inspect connect steps or plug
 in a custom idle strategy.
 
+No poll waits on the media driver. `AsyncClusterConnect::poll` adds the egress
+subscription and ingress publication, and the publication a REDIRECT asks
+for, with Aeron's async add and picks them up on later polls. `poll_egress`
+handles a `NewLeaderEvent` the same way: the session stays `AwaitingNewLeader`
+until the new leader's publication exists. Only the first `poll`, which
+creates the Aeron client, can wait, and only while the media driver is not
+running yet.
+
+Check message sizes once, at start-up: `offer` takes payloads up to
+`ingress_max_message_length()` and `try_claim` up to
+`ingress_max_payload_length()` (when smaller), each less
+`AeronCluster::SESSION_HEADER_LENGTH`. A REDIRECT or a new leader keeps every
+setting of the ingress channel but the endpoint, so the limits hold across
+failover.
+
 ## Egress and errors
 
 Implement `EgressListener` and pass it through `EgressAdapter` to

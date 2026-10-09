@@ -17,7 +17,7 @@
 //! once to `CString` for the public API so callers pass `&CStr` to rusteron
 //! without a second `cformat!`.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 
 use rusteron_client::{AeronCError, AeronUriStringBuilder, cformat};
 
@@ -40,6 +40,23 @@ pub fn channel_cstr(uri: &str) -> Result<CString, ClusterError> {
         let builder: AeronUriStringBuilder = uri.parse().map_err(map_uri)?;
         builder.build(512).map_err(map_uri)?
     };
+    Ok(cformat!("{s}"))
+}
+
+/// The configured ingress channel pointed at another member's `endpoint`,
+/// keeping every other setting (Java `ChannelUri.put(ENDPOINT, …)`):
+/// `term-length` and `mtu` fix the publication's message limits, so dropping
+/// them would change [`crate::AeronCluster::ingress_max_message_length`] on a
+/// REDIRECT or failover. Without a configured UDP channel the result is
+/// `aeron:udp?endpoint={endpoint}`.
+pub(crate) fn ingress_channel_for_endpoint(template: Option<&CStr>, endpoint: &str) -> Result<CString, ClusterError> {
+    let Some(template) = template.filter(|t| t.to_bytes().starts_with(b"aeron:udp")) else {
+        return udp_endpoint_cstr(endpoint);
+    };
+    let builder = AeronUriStringBuilder::default();
+    builder.init_on_string(template).map_err(map_uri)?;
+    builder.endpoint(endpoint).map_err(map_uri)?;
+    let s = builder.build(512).map_err(map_uri)?;
     Ok(cformat!("{s}"))
 }
 
@@ -76,6 +93,28 @@ mod tests {
     fn full_uri_parse() -> Result<(), Box<dyn std::error::Error>> {
         let c = channel_cstr("aeron:udp?endpoint=127.0.0.1:9002")?;
         assert!(c.to_str()?.contains("endpoint=127.0.0.1:9002"));
+        Ok(())
+    }
+
+    #[test]
+    fn ingress_channel_for_endpoint_keeps_the_settings() -> Result<(), Box<dyn std::error::Error>> {
+        let template = channel_cstr("aeron:udp?endpoint=a:1|term-length=1m|mtu=4096")?;
+        let c = ingress_channel_for_endpoint(Some(&template), "b:2")?;
+        let s = c.to_str()?;
+        let mut params: Vec<&str> = s.strip_prefix("aeron:udp?").ok_or(s)?.split('|').collect();
+        params.sort_unstable();
+        assert_eq!(params, ["endpoint=b:2", "mtu=4096", "term-length=1m"], "{s}");
+        Ok(())
+    }
+
+    #[test]
+    fn ingress_channel_for_endpoint_without_a_udp_template_is_the_bare_endpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ipc = channel_cstr("aeron:ipc?term-length=1m")?;
+        for template in [None, Some(ipc.as_c_str())] {
+            let c = ingress_channel_for_endpoint(template, "b:2")?;
+            assert_eq!(c.to_str()?, udp_endpoint_cstr("b:2")?.to_str()?);
+        }
         Ok(())
     }
 }
