@@ -108,7 +108,8 @@ impl EgressImage {
     }
 }
 
-/// A NewLeaderEvent for this session, applied once the poll returns.
+/// A NewLeaderEvent for this session, applied once the poll returns. The last
+/// one in a poll wins, as Java applies each in order.
 struct NewLeader {
     leadership_term_id: i64,
     leader_member_id: i32,
@@ -117,10 +118,11 @@ struct NewLeader {
     image_session_id: Option<i32>,
 }
 
-/// The new leader's ingress publication while Aeron adds it. The session
-/// adopts the new term and leader only when the publication exists.
+/// The new leader's ingress publication while Aeron adds it and it connects.
+/// The session adopts the new term and leader only once it has connected.
 struct PendingIngress {
     publication: AeronAsyncAddExclusivePublication,
+    added: Option<AeronExclusivePublication>,
     leadership_term_id: i64,
     leader_member_id: i32,
 }
@@ -161,7 +163,7 @@ fn dispatch_regular<L: EgressListener>(ctx: &mut PollCtx<L>, data: &[u8], hdr: r
             leader_member_id,
             ingress_endpoints,
             cluster_session_id,
-        } if ctx.new_leader.is_none() && *cluster_session_id == ctx.expected_session_id => {
+        } if *cluster_session_id == ctx.expected_session_id => {
             *ctx.new_leader = Some(NewLeader {
                 leadership_term_id: *leadership_term_id,
                 leader_member_id: *leader_member_id,
@@ -209,7 +211,7 @@ fn dispatch_controlled<L: ControlledEgressListener>(
             leader_member_id,
             ingress_endpoints,
             cluster_session_id,
-        } if ctx.new_leader.is_none() && *cluster_session_id == ctx.expected_session_id => {
+        } if *cluster_session_id == ctx.expected_session_id => {
             *ctx.new_leader = Some(NewLeader {
                 leadership_term_id: *leadership_term_id,
                 leader_member_id: *leader_member_id,
@@ -281,6 +283,9 @@ pub struct AeronCluster {
     /// `newLeaderTimeout` from the builder (ms). Enforced by
     /// [`Self::poll_state_changes`].
     new_leader_timeout_ms: u64,
+    /// `messageTimeout` from the builder (ms): how long a new leader's
+    /// ingress publication may take to connect.
+    message_timeout_ms: u64,
     /// When the last keep-alive was sent (drives auto-scheduling).
     last_keep_alive: Instant,
     /// Interval between keep-alive sends (derived from message_timeout_ms).
@@ -355,6 +360,7 @@ impl AeronCluster {
             ingress_stream_id: builder.ingress_stream_id,
             ingress_channel: builder.ingress_channel_c_str().map(CStr::to_owned),
             new_leader_timeout_ms: builder.new_leader_timeout_ms,
+            message_timeout_ms: builder.message_timeout_ms,
             last_keep_alive: Instant::now(),
             keep_alive_interval_ms: connect_reoffer_interval_ms(builder.message_timeout_ms),
             max_message_length,
@@ -796,6 +802,7 @@ impl AeronCluster {
         // not block local cleanup or leave the session half-closed, so set the
         // state first and send best-effort.
         self.state = SessionState::PendingClose;
+        self.pending_ingress = None;
         let _ = self.ingress.offer_raw(&buf, Handlers::NONE);
         Ok(())
     }
@@ -808,8 +815,8 @@ impl AeronCluster {
     /// Handles `NewLeaderEvent` internally: binds the session to the egress
     /// image that delivered it and starts adding an ingress publication for
     /// the new leader without waiting; [`Self::poll_state_changes`] adopts the
-    /// new term and leader once that publication exists. Returns fragments
-    /// polled.
+    /// new term and leader once that publication has connected. Returns
+    /// fragments polled.
     pub fn poll_egress<L: EgressListener>(
         &mut self,
         adapter: &mut EgressAdapter<L>,
@@ -831,16 +838,7 @@ impl AeronCluster {
             .regular_assembler
             .poll(&self.egress, &mut ctx, dispatch_regular::<L>, limit)
             .map_err(|e| ClusterError::aeron("poll", e))?;
-        if let Some(event) = new_leader {
-            self.on_new_leader_event(event)?;
-        }
-        if let Some(e) = decode_err {
-            return Err(e);
-        }
-        if session_closed && self.state == SessionState::Connected {
-            self.state = SessionState::PendingClose;
-        }
-        self.poll_state_changes()?;
+        self.apply_polled(session_closed, new_leader, decode_err)?;
         Ok(n)
     }
 
@@ -869,25 +867,40 @@ impl AeronCluster {
             .controlled_assembler
             .poll(&self.egress, &mut ctx, dispatch_controlled::<L>, fragment_limit)
             .map_err(|e| ClusterError::aeron("controlled_poll", e))?;
+        self.apply_polled(session_closed, new_leader, decode_err)?;
+        Ok(n)
+    }
+
+    /// Apply what one egress poll saw. A CLOSED for this session ends it first,
+    /// whatever the state (Java sets `PENDING_CLOSE` unconditionally), so
+    /// neither an error below nor a NewLeaderEvent in the same poll can lose
+    /// or undo it.
+    fn apply_polled(
+        &mut self,
+        session_closed: bool,
+        new_leader: Option<NewLeader>,
+        decode_err: Option<ClusterError>,
+    ) -> Result<(), ClusterError> {
+        if session_closed && matches!(self.state, SessionState::Connected | SessionState::AwaitingNewLeader) {
+            self.state = SessionState::PendingClose;
+            self.pending_ingress = None;
+        }
         if let Some(event) = new_leader {
             self.on_new_leader_event(event)?;
         }
         if let Some(e) = decode_err {
             return Err(e);
         }
-        if session_closed && self.state == SessionState::Connected {
-            self.state = SessionState::PendingClose;
-        }
-        self.poll_state_changes()?;
-        Ok(n)
+        self.poll_state_changes()
     }
 
     /// Handle a `NewLeaderEvent` without blocking (Java `onNewLeader`, whose
     /// publication add waits; this one is polled). Every fallible step runs
     /// before any session field changes. The session stays
-    /// `AwaitingNewLeader`, with a fresh `new_leader_timeout`, until
-    /// [`Self::poll_pending_ingress`] swaps the publication in. A later event
-    /// replaces a pending add.
+    /// `AwaitingNewLeader`, with `message_timeout` from now, until
+    /// [`Self::poll_pending_ingress`] swaps the connected publication in. A
+    /// later event replaces a pending add. The fragment assemblers are kept:
+    /// they buffer per session id, so the old leader's leftovers are harmless.
     fn on_new_leader_event(&mut self, event: NewLeader) -> Result<(), ClusterError> {
         if !matches!(self.state, SessionState::Connected | SessionState::AwaitingNewLeader) {
             return Ok(());
@@ -911,38 +924,36 @@ impl AeronCluster {
             ._aeron
             .async_add_exclusive_publication(&channel, self.ingress_stream_id)
             .map_err(|e| ClusterError::reconnect(format!("ingress to {endpoint}: {e}")))?;
-        let regular_assembler = AeronFragmentClosureAssembler::new()
-            .map_err(|e| ClusterError::aeron("AeronFragmentClosureAssembler", e))?;
-        let controlled_assembler = AeronControlledFragmentClosureAssembler::new()
-            .map_err(|e| ClusterError::aeron("AeronControlledFragmentClosureAssembler", e))?;
         self.pending_ingress = Some(PendingIngress {
             publication,
+            added: None,
             leadership_term_id,
             leader_member_id,
         });
         self.egress_image = EgressImage::bind(&self.egress, image_session_id);
-        self.regular_assembler = regular_assembler;
-        self.controlled_assembler = controlled_assembler;
         self.state = SessionState::AwaitingNewLeader;
         self.awaiting_leader_since = Some(Instant::now());
         Ok(())
     }
 
-    /// Swap in the new leader's ingress publication once Aeron has added it,
-    /// adopting its term and leader and returning the session to `Connected`.
-    /// One non-blocking poll; a failed add is reported once and leaves the
-    /// session to `new_leader_timeout` unless another `NewLeaderEvent` comes.
+    /// Swap in the new leader's ingress publication once Aeron has added it
+    /// and it has connected (Java `AWAIT_NEW_LEADER_CONNECTION`), adopting its
+    /// term and leader and returning the session to `Connected`. One
+    /// non-blocking poll; a failed add is reported once and leaves the session
+    /// to time out unless another `NewLeaderEvent` comes.
     fn poll_pending_ingress(&mut self) -> Result<(), ClusterError> {
-        let Some(pending) = self.pending_ingress.take() else {
+        let Some(mut pending) = self.pending_ingress.take() else {
             return Ok(());
         };
-        let ingress = match pending.publication.poll() {
-            Ok(Some(publication)) => publication,
-            Ok(None) => {
-                self.pending_ingress = Some(pending);
-                return Ok(());
-            }
-            Err(e) => return Err(ClusterError::reconnect(format!("new leader ingress publication: {e}"))),
+        if pending.added.is_none() {
+            pending.added = pending
+                .publication
+                .poll()
+                .map_err(|e| ClusterError::reconnect(format!("new leader ingress publication: {e}")))?;
+        }
+        let Some(ingress) = pending.added.take_if(|publication| publication.is_connected()) else {
+            self.pending_ingress = Some(pending);
+            return Ok(());
         };
         let (max_message_length, max_payload_length) = publication_limits(&ingress)?;
         self.ingress = ingress;
@@ -1001,9 +1012,9 @@ impl AeronCluster {
     /// of the channel's term length). [`Self::offer`] takes payloads up to
     /// this minus [`Self::SESSION_HEADER_LENGTH`]; check the largest message
     /// against it at start-up rather than meet
-    /// [`ClusterError::PayloadTooLarge`] later. A new leader's publication is
-    /// built from the same ingress channel settings, so the limit holds across
-    /// failover.
+    /// [`ClusterError::PayloadTooLarge`] later. A REDIRECT or new leader
+    /// re-adds the configured ingress channel, changing only a unicast
+    /// endpoint, so the limit holds across failover.
     #[must_use = "discarding this value is almost always a mistake"]
     #[inline]
     pub fn ingress_max_message_length(&self) -> usize {
@@ -1063,18 +1074,31 @@ impl AeronCluster {
 
     /// Drive session-state transitions without polling fragments (Java
     /// `pollStateChanges`): adopting a new leader's ingress publication once
-    /// Aeron has added it, leader-loss detection, `newLeaderTimeout`
-    /// enforcement, and `PendingClose` → `Closed` finalisation. Never blocks.
+    /// it has connected, leader-loss detection, `new_leader_timeout` (and,
+    /// after a NewLeaderEvent, `message_timeout`) enforcement, and
+    /// `PendingClose` → `Closed` finalisation. Never blocks.
     /// Call this from your event loop alongside [`Self::poll_egress`].
     pub fn poll_state_changes(&mut self) -> Result<(), ClusterError> {
         self.poll_pending_ingress()?;
         let connected = self.is_egress_connected();
-        apply_state_transition(
-            &mut self.state,
-            &mut self.awaiting_leader_since,
-            self.new_leader_timeout_ms,
-            connected,
-        )
+        // Once a NewLeaderEvent has come, the wait is for its publication,
+        // bounded by message_timeout as Java bounds AWAIT_NEW_LEADER_CONNECTION.
+        let awaiting = if self.pending_ingress.is_some() {
+            Awaiting {
+                what: "connection to the new leader within message_timeout",
+                timeout_ms: self.message_timeout_ms,
+            }
+        } else {
+            Awaiting {
+                what: "NewLeaderEvent within new_leader_timeout",
+                timeout_ms: self.new_leader_timeout_ms,
+            }
+        };
+        let result = apply_state_transition(&mut self.state, &mut self.awaiting_leader_since, awaiting, connected);
+        if self.state == SessionState::Closed {
+            self.pending_ingress = None;
+        }
+        result
     }
 
     /// Begin a poll-driven async connect. Returns an
@@ -1161,12 +1185,19 @@ impl AeronCluster {
     }
 }
 
+/// What an `AwaitingNewLeader` session waits for, and for how long.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Awaiting {
+    what: &'static str,
+    timeout_ms: u64,
+}
+
 /// Pure state-machine transition logic, extracted for unit testing.
 /// Called by [`AeronCluster::poll_state_changes`].
 pub(crate) fn apply_state_transition(
     state: &mut SessionState,
     awaiting_leader_since: &mut Option<Instant>,
-    new_leader_timeout_ms: u64,
+    awaiting: Awaiting,
     egress_connected: bool,
 ) -> Result<(), ClusterError> {
     match *state {
@@ -1176,14 +1207,11 @@ pub(crate) fn apply_state_transition(
         }
         SessionState::AwaitingNewLeader => {
             if let Some(since) = *awaiting_leader_since
-                && since.elapsed() >= Duration::from_millis(new_leader_timeout_ms)
+                && since.elapsed() >= Duration::from_millis(awaiting.timeout_ms)
             {
                 *state = SessionState::Closed;
                 return Err(ClusterError::Disconnected {
-                    reason: format!(
-                        "no NewLeaderEvent within new_leader_timeout ({}ms)",
-                        new_leader_timeout_ms
-                    ),
+                    reason: format!("no {} ({}ms)", awaiting.what, awaiting.timeout_ms),
                 });
             }
         }
@@ -1524,6 +1552,7 @@ impl AsyncClusterConnect {
             ingress_stream_id: builder.ingress_stream_id,
             ingress_channel: builder.ingress_channel_c_str().map(CStr::to_owned),
             new_leader_timeout_ms: builder.new_leader_timeout_ms,
+            message_timeout_ms: builder.message_timeout_ms,
             last_keep_alive: Instant::now(),
             max_message_length,
             max_payload_length,
@@ -1631,6 +1660,11 @@ impl AsyncClusterConnect {
 mod tests {
     use super::*;
 
+    const AWAITING_LEADER: Awaiting = Awaiting {
+        what: "NewLeaderEvent within new_leader_timeout",
+        timeout_ms: 5_000,
+    };
+
     #[test]
     fn test_msg_header_total_is_32() -> Result<(), Box<dyn std::error::Error>> {
         // MessageHeader(8) + SessionMessageHeader body(24) = 32
@@ -1727,7 +1761,7 @@ mod tests {
         // T1: PendingClose → Closed via poll_state_changes → apply_state_transition.
         let mut state = SessionState::PendingClose;
         let mut awaiting = None;
-        apply_state_transition(&mut state, &mut awaiting, 5_000, true)?;
+        apply_state_transition(&mut state, &mut awaiting, AWAITING_LEADER, true)?;
         assert_eq!(state, SessionState::Closed);
         Ok(())
     }
@@ -1737,7 +1771,7 @@ mod tests {
         // T7: After deadline, AwaitingNewLeader → Closed + Disconnected error.
         let mut state = SessionState::AwaitingNewLeader;
         let mut awaiting = Some(Instant::now() - Duration::from_secs(6));
-        let result = apply_state_transition(&mut state, &mut awaiting, 5_000, false);
+        let result = apply_state_transition(&mut state, &mut awaiting, AWAITING_LEADER, false);
         match result {
             Err(ClusterError::Disconnected { .. }) => {}
             other => panic!("expected Disconnected, got {other:?}"),
@@ -1758,13 +1792,22 @@ mod tests {
             .ok_or("on_new_leader_event not found")?;
         let end = src[off..].find("\n    }\n").ok_or("end of on_new_leader_event")?;
         let body = &src[off..off + end];
-        let first_write = body.find("self.pending_ingress =").ok_or("pending_ingress write")?;
+        let first_write = [
+            "self.pending_ingress =",
+            "self.egress_image =",
+            "self.state =",
+            "self.awaiting_leader_since =",
+            "self.leadership_term_id =",
+            "self.leader_member_id =",
+        ]
+        .iter()
+        .filter_map(|write| body.find(write))
+        .min()
+        .ok_or("no session write")?;
         for step in [
             "parse_leader_endpoint(",
             "ingress_channel_for_endpoint(",
             "async_add_exclusive_publication(",
-            "AeronFragmentClosureAssembler::new()",
-            "AeronControlledFragmentClosureAssembler::new()",
         ] {
             let at = body.find(step).ok_or(step)?;
             assert!(at < first_write, "{step} must precede the first session write");
@@ -1809,7 +1852,7 @@ mod tests {
     fn test_new_leader_timeout_not_yet_elapsed_keeps_awaiting() -> Result<(), Box<dyn std::error::Error>> {
         let mut state = SessionState::AwaitingNewLeader;
         let mut awaiting = Some(Instant::now());
-        apply_state_transition(&mut state, &mut awaiting, 5_000, false)?;
+        apply_state_transition(&mut state, &mut awaiting, AWAITING_LEADER, false)?;
         assert_eq!(state, SessionState::AwaitingNewLeader);
         Ok(())
     }

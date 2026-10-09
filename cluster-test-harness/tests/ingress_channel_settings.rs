@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use ergo_aeron_cluster::egress::EgressAdapter;
 use ergo_aeron_cluster::{
-    AeronCluster, SessionBuilder, SessionState, default_idle, poll_connect_until_done,
+    AeronCluster, ClusterError, SessionBuilder, SessionState, default_idle, poll_connect_until_done,
 };
 use serial_test::serial;
 
@@ -25,7 +25,11 @@ const MAX_MESSAGE: usize = 1024 * 1024 / 8;
 /// A frame is capped at the MTU less its 32-byte data header.
 const MAX_PAYLOAD: usize = 4096 - 32;
 
-fn assert_limits(client: &AeronCluster, when: &str) {
+/// The limits are what the settings make them, and `try_claim` and `offer`
+/// enforce exactly those limits: a claim one byte over is refused locally,
+/// a claim at the limit is granted (and aborted), and an offer one byte over
+/// is refused before reaching Aeron.
+fn assert_limits(client: &mut AeronCluster, when: &str) -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
         (
             client.ingress_max_message_length(),
@@ -34,6 +38,29 @@ fn assert_limits(client: &AeronCluster, when: &str) {
         (MAX_MESSAGE, MAX_PAYLOAD),
         "ingress limits {when}"
     );
+    let header = AeronCluster::SESSION_HEADER_LENGTH;
+    assert!(
+        matches!(
+            client.try_claim(MAX_PAYLOAD - header + 1),
+            Err(ClusterError::PayloadTooLarge {
+                maximum: MAX_PAYLOAD,
+                ..
+            })
+        ),
+        "a claim over the frame limit {when}"
+    );
+    client.try_claim(MAX_PAYLOAD - header)?.abort()?;
+    assert!(
+        matches!(
+            client.offer(&vec![0u8; MAX_MESSAGE - header + 1]),
+            Err(ClusterError::PayloadTooLarge {
+                maximum: MAX_MESSAGE,
+                ..
+            })
+        ),
+        "an offer over the message limit {when}"
+    );
+    Ok(())
 }
 
 /// The ingress channel of `member` in a `TestCluster`, with [`SETTINGS`].
@@ -52,7 +79,7 @@ fn failover_keeps_the_ingress_channel_settings() -> Result<(), Box<dyn std::erro
         19210,
         &driver.dir,
     )?;
-    assert_limits(&client, "after connect");
+    assert_limits(&mut client, "after connect")?;
 
     let mut adapter = EgressAdapter::new(Capture::new());
     await_echo(
@@ -81,7 +108,7 @@ fn failover_keeps_the_ingress_channel_settings() -> Result<(), Box<dyn std::erro
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_ne!(client.leader_member_id(), initial_leader);
-    assert_limits(&client, "after failover");
+    assert_limits(&mut client, "after failover")?;
 
     await_echo(
         &mut client,
@@ -105,9 +132,9 @@ fn redirect_keeps_the_ingress_channel_settings() -> Result<(), Box<dyn std::erro
     let follower_channel = member_channel(cluster.base_port(), follower);
 
     // A follower answers SessionConnectRequest with REDIRECT to the leader.
-    let blocking = connect_own_driver(&follower_channel, 19212, &driver.dir)?;
+    let mut blocking = connect_own_driver(&follower_channel, 19212, &driver.dir)?;
     assert_eq!(blocking.leader_member_id(), leader);
-    assert_limits(&blocking, "after a blocking connect's REDIRECT");
+    assert_limits(&mut blocking, "after a blocking connect's REDIRECT")?;
     drop(blocking);
 
     let builder = SessionBuilder::default()
@@ -116,8 +143,8 @@ fn redirect_keeps_the_ingress_channel_settings() -> Result<(), Box<dyn std::erro
         .message_timeout(Duration::from_secs(10))?;
     let mut connecting = builder.connect_async(driver.dir.clone());
     poll_connect_until_done(&mut connecting, &mut default_idle())?;
-    let polled = connecting.finish()?;
+    let mut polled = connecting.finish()?;
     assert_eq!(polled.leader_member_id(), leader);
-    assert_limits(&polled, "after a poll-driven connect's REDIRECT");
+    assert_limits(&mut polled, "after a poll-driven connect's REDIRECT")?;
     Ok(())
 }

@@ -91,16 +91,16 @@ No poll waits on the media driver. `AsyncClusterConnect::poll` adds the egress
 subscription and ingress publication, and the publication a REDIRECT asks
 for, with Aeron's async add and picks them up on later polls. `poll_egress`
 handles a `NewLeaderEvent` the same way: the session stays `AwaitingNewLeader`
-until the new leader's publication exists. Only the first `poll`, which
-creates the Aeron client, can wait, and only while the media driver is not
-running yet.
+until the new leader's publication has connected, for up to the message
+timeout. Only the first `poll`, which creates the Aeron client, can wait, and
+only while the media driver is not running yet.
 
 Check message sizes once, at start-up: `offer` takes payloads up to
 `ingress_max_message_length()` and `try_claim` up to
 `ingress_max_payload_length()` (when smaller), each less
-`AeronCluster::SESSION_HEADER_LENGTH`. A REDIRECT or a new leader keeps every
-setting of the ingress channel but the endpoint, so the limits hold across
-failover.
+`AeronCluster::SESSION_HEADER_LENGTH`. A REDIRECT or a new leader re-adds the
+configured ingress channel, changing only a unicast endpoint (IPC and
+multicast channels stay as they are), so the limits hold across failover.
 
 ## Egress and errors
 
