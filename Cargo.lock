@@ -658,6 +658,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ergon-bridge"
+version = "0.1.30"
+dependencies = [
+ "ergon-runtime",
+ "log",
+ "rusteron-archive",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ergon-runtime"
 version = "0.1.30"
 dependencies = [
@@ -696,6 +707,7 @@ name = "ergon-runtime-server"
 version = "0.1.30"
 dependencies = [
  "ergo-sbe",
+ "ergon-bridge",
  "ergon-runtime",
  "hdrhistogram",
  "jiff",
