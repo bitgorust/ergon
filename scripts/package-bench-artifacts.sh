@@ -55,14 +55,15 @@ sys.exit(0 if d.get('commit') == sys.argv[2] else 1)
 }
 
 SBE_RUN_ID=""
-for candidate in $(ls -t "$SBE_RUNS" 2>/dev/null); do
+# Newest first, which a glob cannot sort by.
+while IFS= read -r candidate; do
     m_lto="$SBE_RUNS/$candidate/lto/criterion/run-manifest.json"
     m_nolto="$SBE_RUNS/$candidate/no-lto/criterion/run-manifest.json"
     if manifest_commit_matches "$m_lto" && manifest_commit_matches "$m_nolto"; then
         SBE_RUN_ID="$candidate"
         break
     fi
-done
+done < <(ls -t "$SBE_RUNS" 2>/dev/null)
 [ -n "$SBE_RUN_ID" ] || fail \
     "no SBE bench run with run-manifest commit matching HEAD ($COMMIT) — re-run 'just bench' on this commit"
 SBE_RUN_DIR="$SBE_RUNS/$SBE_RUN_ID"
