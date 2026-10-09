@@ -36,6 +36,7 @@ policy:
     bash scripts/tests/test-public-api.sh
     bash scripts/tests/test-packaged-cluster-features.sh
     bash scripts/tests/test-bench-historic.sh
+    bash scripts/tests/test-bench-runtime-calibrate.sh
     bash scripts/tests/test-stale-deny-ignores.sh
     bash scripts/tests/test-cluster-ergo-sbe-features.sh
     bash scripts/tests/test-bridge-isolation.sh
@@ -84,6 +85,7 @@ preflight:
     bash scripts/tests/test-instruction-probe-pairs.sh
     bash scripts/tests/test-packaged-cluster-features.sh
     bash scripts/tests/test-bench-historic.sh
+    bash scripts/tests/test-bench-runtime-calibrate.sh
     bash scripts/tests/test-stale-deny-ignores.sh
     bash scripts/tests/test-cluster-ergo-sbe-features.sh
     bash scripts/tests/test-bridge-isolation.sh
@@ -534,15 +536,17 @@ bench-cluster:
     echo "=== Gate (no-LTO) ==="
     ./scripts/check-bench-gate.sh "$no_lto_crit" 0 cluster --run-id "$run_id"
 
-# Deadline wheel against a pre-reserved lazy-delete heap held to the same
-# contract, both LTO profiles. The bench binary checks both fire the same
-# expiries, prints PERCENTILES, and exits non-zero when the wheel's p50 is
-# slower in any scenario: schedule (ascending and mixed), cancel with the
-# heap's tombstones drained, idle poll, fire, and order-timeout churn.
-# Then the per-message cost of an application loop over an IPC feed.
-# Both release recipes run it; scripts/tests/test-bench-runtime-gate.sh proves
-# each gate fails on a seeded regression, and that one failing gate fails its
-# bench.
+# The runtime benches' sign-test gates (ruling U1), both LTO profiles: the
+# deadline wheel against a pre-reserved lazy-delete heap (schedule ascending
+# and mixed, cancel, idle poll, fire, order-timeout churn), the hot-path
+# replacements against what they replaced, and the per-message cost of an
+# application loop over an IPC feed against the same loop by hand. Each gate
+# prints `GATE <name> <k>/20 slower pass|fail` and fails when the runtime is
+# slower in 16 or more of 20 alternated pairs. A failing gate fails the run
+# only with GATE_ENFORCE=1 (the x86 gate VM, `just azure gate`); a Mac run is
+# a smoke test. Both release recipes run it; scripts/tests/test-bench-runtime-gate.sh
+# proves each gate fails on a seeded regression, and that one failing gate
+# fails its bench.
 bench-runtime:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -566,3 +570,14 @@ bench-runtime:
     # One allocator-metrics sample, and dispatch with the feature compiled in.
     cargo bench -p ergon-runtime --features mimalloc --bench alloc_sample
     cargo bench -p ergon-runtime --features mimalloc --bench dispatch
+
+# A/A calibration and seed power of the sign-test gates: R runs (default 20)
+# of every gate raw against raw, plain and seeded, into
+# target/bench-runtime/<UTC date>/calibration.json. Smoke: GATE_PAIRS=6 R=3.
+bench-runtime-calibrate *args:
+    bash scripts/bench-runtime-calibrate.sh {{args}}
+
+# The callgrind Ir gate: instructions per operation, runtime against raw, for
+# every gated comparison; Linux with valgrind only (ir.json beside the above).
+bench-runtime-ir *args:
+    bash scripts/bench-runtime-ir.sh {{args}}
