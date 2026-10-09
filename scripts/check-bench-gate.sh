@@ -18,7 +18,7 @@
 set -euo pipefail
 
 CRITERION_DIR="${1:-target/criterion}"
-NOISE_TOLERANCE="${2:-0.005}"
+# Argument 2, the noise tolerance, is accepted and ignored (see above).
 SUITE="${3:-all}"
 if [ $# -ge 3 ]; then shift 3; else shift $#; fi
 

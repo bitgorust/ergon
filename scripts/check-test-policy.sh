@@ -231,6 +231,7 @@ while IFS= read -r file; do
     matches=0
     owners=
     while IFS=$'\t' read -r pattern lane command; do
+        # shellcheck disable=SC2053  # $pattern is a glob from the lane manifest
         if [[ "$file" == $pattern ]]; then
             matches=$((matches + 1))
             owners="${owners}${owners:+, }${lane}"
@@ -250,6 +251,7 @@ done <"$test_sources"
 while IFS=$'\t' read -r pattern lane command; do
     pattern_matches=0
     while IFS= read -r file; do
+        # shellcheck disable=SC2053  # $pattern is a glob from the lane manifest
         if [[ "$file" == $pattern ]]; then
             pattern_matches=$((pattern_matches + 1))
         fi
