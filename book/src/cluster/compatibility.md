@@ -29,8 +29,11 @@ The client handles these documented transitions:
 
 | Trigger | Expected behaviour |
 |---------|-------------------|
-| Leader loss (egress closed / publication CLOSED) | Session → `AwaitingNewLeader`, poll for `NewLeaderEvent` |
+| Leader loss (the session's egress image closes / publication CLOSED) | Session → `AwaitingNewLeader`, poll for `NewLeaderEvent` |
+| `NewLeaderEvent` (the last one in a poll) | Bind to the image that delivered it; add the leader's ingress publication without waiting; `Connected` once it connects, `Disconnected` if it has not within the message timeout |
+| `SessionEvent(CLOSED)` | Session → `PendingClose` → `Closed`, even while a new leader's publication is pending |
 | Redirect during connect | Follow `leader_endpoints` to new leader |
+| New ingress publication (redirect or new leader) | Keep every unicast ingress channel setting but the endpoint, and re-add IPC and multicast channels unchanged, so the message limits do not change |
 | Auth challenge | Pass to `CredentialsSupplier`, send `ChallengeResponse` |
 | Auth rejection | `ClusterError::AuthRejected` |
 | Timeout (connect / poll / new-leader) | `ClusterError::Timeout` / `ClusterError::Disconnected` |

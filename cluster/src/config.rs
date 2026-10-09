@@ -175,8 +175,9 @@ impl SessionBuilder {
         self
     }
 
-    /// Deadline for the connect sequence, keep-alives, and re-offers.
-    /// Default: 5 seconds.
+    /// Deadline for the connect sequence, keep-alives, and re-offers, and for
+    /// a new leader's ingress publication to connect after its
+    /// `NewLeaderEvent`. Default: 5 seconds.
     ///
     /// # Errors
     ///
@@ -189,7 +190,8 @@ impl SessionBuilder {
     /// Deadline for awaiting a `NewLeaderEvent` after the current leader is
     /// lost (mirrors Java `Context.newLeaderTimeoutNs`; default 5s). When it
     /// elapses, [`crate::AeronCluster::poll_state_changes`] transitions the
-    /// session to [`crate::ClusterError::Disconnected`].
+    /// session to [`crate::ClusterError::Disconnected`]. Once the event has
+    /// come, the message timeout bounds the wait instead.
     ///
     /// # Errors
     ///
