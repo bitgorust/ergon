@@ -167,6 +167,17 @@
   print the ClickHouse password with each UI's address.
 - Generate an opt-in cross-schema AnySchemaMessage dispatcher with typed errors
   and borrowed frames for persistence, including unknown schemas and templates.
+- Report the cluster client's ingress limits, so a client can refuse to start
+  when its largest message would not fit: `AeronCluster::ingress_max_message_length()`
+  (Java `ingressPublication().maxMessageLength()`), `ingress_max_payload_length()`
+  and `AeronCluster::SESSION_HEADER_LENGTH`. `offer` takes payloads up to the
+  first less the header, and `try_claim` up to the smaller of the two less the
+  header.
+- Report the egress image a cluster session is bound to:
+  `AeronCluster::egress_image_correlation_id()` and `egress_image_session_id()`.
+  As in Java, the session binds to the image that delivered its
+  `SessionEvent(OK)` or latest `NewLeaderEvent`, so a replaced image shows as a
+  new id.
 
 ### Changed
 - Check ergo-sbe's wire bytes against sbe-tool 1.40.2, up from a pre-1.40.0
@@ -384,6 +395,27 @@
 - The runtime claim benchmark writes each arm through its whole log before
   timing. A first touch of a sparse log page is then never timed, where
   before only one arm paid it.
+- Stop blocking in the cluster client's polls. `AsyncClusterConnect::poll`
+  adds the egress subscription, the ingress publication and a REDIRECT's
+  publication with Aeron's async add and picks them up on later polls, and
+  `poll_egress` handles a `NewLeaderEvent` the same way; each add used to wait
+  up to 5 s. Only the first `poll`, which creates the Aeron client, can still
+  wait, and only while the media driver is not running.
+- Follow a new cluster leader as Java's client does. After a `NewLeaderEvent`
+  the session stays `AwaitingNewLeader` until the new leader's ingress
+  publication has connected, within `message_timeout`; it used to be
+  `Connected` as soon as the publication was added. If that leader's egress
+  image closes first, the session waits for another `NewLeaderEvent` within
+  `new_leader_timeout`. The last `NewLeaderEvent` in one poll wins, and the
+  `Disconnected` reason names what the session was waiting for.
+- Detect cluster leader loss from the session's own egress image:
+  `AeronCluster::is_egress_connected()` is false once that image closes, even
+  while a replacement image is open. It used to count the subscription's
+  images.
+- Return `PayloadTooLarge` from `AeronCluster::try_claim` for a claim over the
+  ingress publication's max payload length, instead of Aeron's publication
+  error. `connect` and `finish` fail when the publication's limits cannot be
+  read, rather than skip the size checks.
 
 ### Fixed
 - Leave constant fields (declared on the field or on its type) out of a
@@ -568,6 +600,18 @@
   splices such a message into the schema; ergon produced no codec and no
   error. It is now a parse error that tells you to declare the message in the
   root schema.
+- Keep the ingress channel's settings when the cluster client follows a
+  REDIRECT or a new leader. It rebuilt the channel as
+  `aeron:udp?endpoint=<leader>`, dropping `term-length`, `mtu` and every other
+  setting, so the message limits could change after a failover. Now only a
+  unicast endpoint is replaced; IPC and multicast channels are re-added
+  unchanged, as Java does.
+- Apply a cluster `SessionEvent(CLOSED)` that arrives with or after a
+  `NewLeaderEvent`; it was dropped, and a `NewLeaderEvent` could revive a
+  closing session.
+- Print cluster channel URIs into a buffer of Aeron's 4096-byte URI limit and
+  refuse longer channels: Aeron's printer wrote past the end of the fixed 512-
+  or 256-byte buffer when a channel or endpoint was longer.
 
 ## [0.1.29] — 2026-09-19
 
