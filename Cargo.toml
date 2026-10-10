@@ -4,6 +4,7 @@ members = [
     "sbe/benchmarks",
     "cluster",
     "cluster-test-harness",
+    "wire",
     "runtime",
     "bridge",
     "runtime-server",
@@ -38,7 +39,7 @@ homepage = "https://github.com/mimran1980/ergon"
 authors = ["Mohammed Imran"]
 
 [workspace.dependencies]
-# Inherited by the cluster crate, ergon-runtime and ergon-runtime-server, each
+# Inherited by the cluster crate, ergon-wire and ergon-runtime-server, each
 # for both edges. Cargo 1.95 rejects overriding default-features on an
 # inherited dependency, so fancy is disabled here.
 ergo-sbe = { version = "0.1.30", path = "sbe", default-features = false }
