@@ -717,6 +717,7 @@ dependencies = [
  "ergo-sbe",
  "jiff",
  "proc-macro2",
+ "proptest",
  "serde",
  "serde_yaml",
  "syn 3.0.5",
