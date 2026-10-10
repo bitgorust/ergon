@@ -546,7 +546,8 @@ bench-cluster:
 # replacements against what they replaced, and the per-message cost of an
 # application loop over an IPC feed against the same loop by hand. Each gate
 # prints `GATE <name> <k>/20 slower pass|fail` and fails when the runtime is
-# slower in 16 or more of 20 alternated pairs. A failing gate fails the run
+# slower in 16 or more of 20 ABBA pairs, each arm of each pair a fresh child
+# process of the bench. A failing gate fails the run
 # only with GATE_ENFORCE=1 (the x86 gate VM, `just azure gate`); anywhere
 # else, the release recipes included, the run is a smoke test that prints
 # `fail (smoke: not enforced)` and exits 0. scripts/tests/test-bench-runtime-gate.sh
@@ -571,22 +572,22 @@ bench-runtime:
 # One runtime bench in one profile: lto (the bench profile) or no-lto, each
 # with its own Criterion tree under target/bench-runtime/, not bench-cluster's,
 # which the release packages as its cluster evidence. Needs the test media
-# driver for dispatch and hotpath.
+# driver for dispatch and hotpath. ARGS go to cargo (`--no-run` builds only).
 [private]
-_bench-runtime-one bench profile:
+_bench-runtime-one bench profile *args:
     #!/usr/bin/env bash
     set -euo pipefail
     root="{{justfile_directory()}}"
     crit="$root/target/bench-runtime/{{profile}}/criterion"
     mkdir -p "$crit"
     case "{{profile}}" in
-      lto) CRITERION_HOME="$crit" cargo bench -p ergon-runtime --bench "{{bench}}" ;;
+      lto) CRITERION_HOME="$crit" cargo bench -p ergon-runtime --bench "{{bench}}" {{args}} ;;
       no-lto)
         CARGO_TARGET_DIR="$root/target/bench-no-lto" \
           CARGO_PROFILE_BENCH_LTO=false \
           CARGO_PROFILE_BENCH_CODEGEN_UNITS=1 \
           CRITERION_HOME="$crit" \
-          cargo bench -p ergon-runtime --bench "{{bench}}" ;;
+          cargo bench -p ergon-runtime --bench "{{bench}}" {{args}} ;;
       *) echo "profile: lto or no-lto, not {{profile}}" >&2; exit 2 ;;
     esac
 
