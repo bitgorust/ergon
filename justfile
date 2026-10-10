@@ -75,7 +75,6 @@ preflight:
     @echo "=== clippy (same workspace set as CI) ==="
     cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster-test-harness -- -D warnings
     cargo clippy -p ergo-aeron-cluster --all-targets -- -D warnings
-    cargo clippy -p ergon-runtime --features mimalloc --all-targets -- -D warnings
     @echo "=== policy + ratchet self-tests (prove the checkers can fail) ==="
     bash scripts/tests/test-test-policy.sh
     bash scripts/tests/test-quality-ratchets.sh
@@ -118,7 +117,6 @@ check-local: policy _test-ingester-services
     cargo fmt --all --check
     cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster-test-harness -- -D warnings
     cargo clippy -p ergo-aeron-cluster --all-targets -- -D warnings
-    cargo clippy -p ergon-runtime --features mimalloc --all-targets -- -D warnings
     cargo test --workspace --all-features --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness -- --test-threads=1
     # runs the cluster doctests too — no separate `--doc` pass needed
     cargo test -p ergo-aeron-cluster -- --test-threads=1
@@ -324,7 +322,6 @@ test: policy _test-ingester-services
     @echo "=== 2/7 clippy (workspace + samples) ==="
     cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster-test-harness -- -D warnings
     cargo clippy -p ergo-aeron-cluster --all-targets -- -D warnings
-    cargo clippy -p ergon-runtime --features mimalloc --all-targets -- -D warnings
     @echo "=== 3/7 unit + integration tests ==="
     ./scripts/regenerate-golden.sh --check
     ./scripts/regenerate-sbe-tool-reference.sh --check
@@ -565,9 +562,6 @@ bench-runtime:
         just _bench-runtime-one "$bench" "$profile"
       done
     done
-    # One allocator-metrics sample, and dispatch with the feature compiled in.
-    cargo bench -p ergon-runtime --features mimalloc --bench alloc_sample
-    cargo bench -p ergon-runtime --features mimalloc --bench dispatch
 
 # One runtime bench in one profile: lto (the bench profile) or no-lto, each
 # with its own Criterion tree under target/bench-runtime/, not bench-cluster's,
