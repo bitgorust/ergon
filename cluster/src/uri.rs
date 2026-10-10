@@ -20,7 +20,7 @@
 use std::ffi::{CStr, CString};
 use std::net::IpAddr;
 
-use rusteron_client::{AeronCError, AeronUriStringBuilder, cformat};
+use rusteron_client::{AeronCError, AeronErrorType, AeronUriStringBuilder, cformat};
 
 use crate::ClusterError;
 
@@ -35,15 +35,24 @@ fn map_uri(e: AeronCError) -> ClusterError {
     ClusterError::ChannelUri { reason, source }
 }
 
-/// Room [`build`] leaves beyond its input: the media prefix, delimiters and
-/// the trailing NUL.
+/// Aeron's own limit on a channel URI, NUL included (`AERON_URI_MAX_LENGTH`).
+const URI_CAPACITY: usize = 4096;
+
+/// Room a printed URI may need beyond its input: the media prefix,
+/// delimiters, an added `endpoint=` key and the trailing NUL.
 const URI_SLACK: usize = 64;
 
-/// Print `builder` into a buffer sized from the input it was built from.
-/// Aeron's URI printer writes past the end of a buffer that is too short, so
-/// a fixed size is not safe for a long channel or endpoint.
+/// Print `builder` into a [`URI_CAPACITY`] buffer. Aeron's URI printer writes
+/// past the end of a buffer that is too short, so input that might not fit is
+/// refused before printing; Aeron would reject such a channel anyway.
 fn build(builder: &AeronUriStringBuilder, input_len: usize) -> Result<CString, ClusterError> {
-    let s = builder.build(input_len + URI_SLACK).map_err(map_uri)?;
+    if input_len + URI_SLACK > URI_CAPACITY {
+        return Err(ClusterError::ChannelUri {
+            reason: format!("a {input_len}-byte channel exceeds Aeron's {URI_CAPACITY}-byte URI limit"),
+            source: AeronCError::from(AeronErrorType::GenericError).into(),
+        });
+    }
+    let s = builder.build(URI_CAPACITY).map_err(map_uri)?;
     Ok(cformat!("{s}"))
 }
 
@@ -162,8 +171,22 @@ mod tests {
     }
 
     #[test]
+    fn channels_past_aerons_uri_limit_are_refused_before_printing() -> Result<(), Box<dyn std::error::Error>> {
+        let long = "a".repeat(URI_CAPACITY);
+        let template = channel_cstr(&format!("aeron:udp?endpoint=a:1|alias={}", "a".repeat(3_900)))?;
+        for result in [
+            channel_cstr(&format!("aeron:udp?endpoint=a:1|alias={long}")),
+            udp_endpoint_cstr(&format!("{long}:1")),
+            ingress_channel_for_endpoint(Some(&template), &format!("{}:1", "h".repeat(200))),
+        ] {
+            assert!(matches!(result, Err(ClusterError::ChannelUri { .. })), "{result:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn long_channels_and_endpoints_print_whole() -> Result<(), Box<dyn std::error::Error>> {
-        // Longer than any fixed buffer the builders once printed into.
+        // Longer than the 512 and 256 bytes the builders once printed into.
         let alias = "a".repeat(600);
         let template = channel_cstr(&format!("aeron:udp?endpoint=a:1|term-length=1m|alias={alias}"))?;
         let endpoint = format!("{}.example:2", "h".repeat(300));
