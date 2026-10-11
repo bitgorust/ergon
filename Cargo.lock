@@ -683,6 +683,7 @@ dependencies = [
  "minstant",
  "proptest",
  "rusteron-archive",
+ "rusteron-media-driver",
  "rustix",
  "serde",
  "serde_json",
