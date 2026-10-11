@@ -889,15 +889,11 @@ pub(crate) fn generate_message_encoder(
                 continue;
             }
             let fname_snake = to_snake_case(&f.name);
-            let is_converted = field_has_conversion_free(f, conversions);
-            let setter_ident = {
-                let base = resolve_field_ident(&fname_snake, &None, ENCODER_RESERVED);
-                if is_converted {
-                    syn::Ident::new(&format!("{}_wire", base), span)
-                } else {
-                    base
-                }
-            };
+            // The same resolution the setter's own emission uses: a `*_wire`
+            // name is never renamed against the reserved list.
+            let wire_name =
+                field_has_conversion_free(f, conversions).then(|| format!("{fname_snake}_wire"));
+            let setter_ident = resolve_field_ident(&fname_snake, &wire_name, ENCODER_RESERVED);
             let field_ident = syn::Ident::new(&fname_snake, span);
             if f.presence == crate::Presence::Optional {
                 // Some → write value; None → write exact schema null image so
@@ -1352,7 +1348,13 @@ pub(crate) fn generate_message_encoder(
             let vd_snake_unchecked =
                 syn::Ident::new(&format!("{}_unchecked", to_snake_case(&vd.name)), span);
             let vd_snake_with = syn::Ident::new(&format!("{}_with", to_snake_case(&vd.name)), span);
-            let taken = owner_accessor_names(&msg.fields, conversions, &[], core::iter::empty());
+            let taken = owner_accessor_names(
+                &msg.fields,
+                conversions,
+                domain_types,
+                &[],
+                core::iter::empty(),
+            );
             let str_setter = vardata_encode_str_setter(
                 &vd_snake,
                 &vd.name,

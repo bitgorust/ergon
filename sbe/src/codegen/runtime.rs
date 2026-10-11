@@ -259,7 +259,7 @@ pub(crate) fn generate_sbe_rt_src() -> String {
                 InvalidAscii { field: &'static str },
                 /// Boolean wire enum was `NullVal` or an unknown discriminant.
                 InvalidBoolean { field: &'static str, discriminant: u64 },
-                /// Domain `try_*` conversion failed.
+                /// A domain-type conversion failed.
                 DomainConversionFailed { field: &'static str, reason: &'static str },
             }
 
@@ -313,7 +313,7 @@ pub(crate) fn generate_sbe_rt_src() -> String {
                 GroupCountOverflow { maximum: u32, actual: u32 },
                 /// Checked arithmetic overflow in encoded length computation.
                 EncodedLengthOverflow,
-                /// Domain `try_*` conversion failed.
+                /// A domain-type conversion failed.
                 DomainConversionFailed { field: &'static str, reason: &'static str },
                 /// Nested decode failure during encode/verify paths.
                 Decode(DecodeError),

@@ -11,9 +11,9 @@ use crate::structured_ir::{
 };
 
 use super::conversion_helpers::{
-    FixedArrayTextKind, acting_accessors, enum_uses_null_as_option, field_has_conversion_free,
-    find_domain_type, fixed_array_from_bulk_bytes, fixed_array_text_kind, named_accessor_ident,
-    owner_accessor_names, tail_accessor_ident,
+    FixedArrayTextKind, acting_accessors, domain_accessor_ident, enum_uses_null_as_option,
+    field_has_conversion_free, find_domain_type, fixed_array_from_bulk_bytes,
+    fixed_array_text_kind, named_accessor_ident, owner_accessor_names, tail_accessor_ident,
 };
 use super::field_type::field_type_ident;
 use super::generate_entry_consuming_stages;
@@ -71,6 +71,7 @@ pub(crate) fn generate_group_decoder(
     let taken_entry_accessors = owner_accessor_names(
         &g.fields,
         conversions,
+        domain_types,
         &[],
         g.groups
             .iter()
@@ -1321,16 +1322,14 @@ pub(crate) fn generate_group_decoder(
                     }
                 }
 
-                // A constant has no wire discriminant to reject, so no `try_*_bool`
+                // A constant has no wire discriminant to reject, so no `*_bool`
                 // (message level emits none either).
                 if f.presence != Presence::Constant
                     && crate::structured_ir::is_bool_enum(elements, enum_name)
                 {
-                    // Group entries name every boolean accessor `try_*`, unlike
-                    // message level where an `Option`-returning one drops the
-                    // prefix. Consumers depend on these names, so the domain
-                    // DTO adapts to the location rather than the names moving.
-                    let bool_ident = quote::format_ident!("try_{}_bool", f_name);
+                    // Same name as the message-level getter and the entry's
+                    // `{field}_bool` setter; only the return type varies.
+                    let bool_ident = quote::format_ident!("{}_bool", f_name);
                     let f_name_lit = syn::LitStr::new(&f.name, proc_macro2::Span::call_site());
                     // `null_as_option` makes the raw enum accessor return
                     // `Option<T>`; `.as_bool()` cannot be called on that
@@ -1806,12 +1805,12 @@ pub(crate) fn generate_group_decoder(
         });
     }
 
-    // A domain-typed primitive/enum/set field uses the fallible `try_*`
-    // accessor for Display — the plain accessor is renamed to `*_wire` (or
+    // A domain-typed primitive/enum/set field uses the fallible domain
+    // getter for Display — the plain accessor is renamed to `*_wire` (or
     // removed) once a domain type is registered, so it no longer exists
     // under that name. Shared by the Primitive, Enum, and Set branches.
     fn domain_display_write(f_name: &str, field_name: &str, sep: &str) -> proc_macro2::TokenStream {
-        let try_ident = syn::Ident::new(&format!("try_{f_name}"), proc_macro2::Span::call_site());
+        let try_ident = domain_accessor_ident(f_name, &[]);
         let fmt_str = format!("{sep}{field_name}: {{:?}}");
         quote::quote! {
             { if let Ok(v) = self.#try_ident() { write!(f, #fmt_str, v)?; } }
@@ -1829,7 +1828,7 @@ pub(crate) fn generate_group_decoder(
                 if f.presence == Presence::Constant || length.is_some() {
                     continue;
                 }
-                // Domain-converted primitives use the fallible try_* accessor
+                // Domain-converted primitives use the fallible domain getter
                 // (the plain accessor is renamed to *_wire and no longer
                 // exists under that name once a domain type is registered —
                 // matches the message-level Primitive branch's handling).
@@ -1857,7 +1856,7 @@ pub(crate) fn generate_group_decoder(
                     continue;
                 }
                 // Same rationale as the Primitive branch above: a domain
-                // enum (e.g. bool) uses the fallible try_* accessor; the
+                // enum (e.g. bool) uses the fallible domain getter; the
                 // plain accessor no longer exists under that name.
                 if find_domain_type(f, domain_types).is_some() {
                     entry_display_body.extend(domain_display_write(&f_name, &f.name, sep));
@@ -1903,13 +1902,12 @@ pub(crate) fn generate_group_decoder(
                     // `Debug` — never assume `Display`.
                     let fmt_str = format!("{sep}{}: {{:?}}", f.name);
                     let err_fmt = format!("{sep}{}: <?>", f.name);
-                    // Go through the generated `try_*` accessor rather than
+                    // Go through the generated domain getter rather than
                     // re-deriving the conversion here. Re-deriving fed it the
                     // raw `*_value()`, which is `Option<T>` for a
                     // `sinceVersion > 0` composite — no `TryFromSbe<Option<T>>`
                     // impl exists and the entry would not compile.
-                    let try_ident =
-                        syn::Ident::new(&format!("try_{f_name}"), proc_macro2::Span::call_site());
+                    let try_ident = domain_accessor_ident(&f_name, &[]);
                     if f.since_version > 0 {
                         entry_display_body.extend(quote::quote! {
                             match self.#try_ident() {
@@ -2072,6 +2070,7 @@ pub(crate) fn generate_group_decoder(
         byte_order,
         enable_dispatch,
         conversions,
+        domain_types,
     ));
 
     ts

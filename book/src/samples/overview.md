@@ -33,7 +33,7 @@ cargo test --manifest-path samples/exchange-example/Cargo.toml
 
 | Sample | Config | Decode / encode surface |
 |--------|--------|-------------------------|
-| [L3 Order Book](l3-book.md) | **`with_domain_type` only** | `dec.try_price()?` → `Decimal`; `enc.try_price(d)?` |
+| [L3 Order Book](l3-book.md) | **`with_domain_type` only** | `dec.price()?` → `Decimal`; `enc.price(d)?` |
 | [Exchange Example](exchange-example.md) | **`with_conversion` only** | `dec.price_as::<T>()?`; `enc.price_from(&t)?` (+ app `TryFromSbe`) |
 | [SBE Feature Tour](sbe-feature-tour.md) | **All three** (different selectors) | bool/timestamp concrete (`Generated`); Decimal generic (`demo_conversion_only`); ManualDecimal concrete + app impl (`demo_domain_type_manual_impl`) |
 

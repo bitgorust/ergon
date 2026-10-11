@@ -3035,7 +3035,7 @@ fn debug_only_domain_type_formats_without_display() -> Result<(), Box<dyn std::e
             .fixed(&OrderFixedFields { total: self::Amount::new(0, 0) })
             .legs(1, |legs| {
                 legs.add(|leg| {
-                    leg.try_amount(7i64..9i64).map_err(|reason| {
+                    leg.amount(7i64..9i64).map_err(|reason| {
                         sbe_rt::EncodeError::DomainConversionFailed { field: "amount", reason }
                     })?;
                     Ok(())
@@ -3119,7 +3119,7 @@ fn group_entry_domain_mapped_set_formats_with_debug() -> Result<(), Box<dyn std:
             .fixed(&BatchFixedFields {})
             .rows(1, |rows| {
                 rows.add(|row| {
-                    row.try_flags(0..1).map_err(|reason| {
+                    row.flags(0..1).map_err(|reason| {
                         sbe_rt::EncodeError::DomainConversionFailed { field: "flags", reason }
                     })?;
                     Ok(())
@@ -3136,8 +3136,8 @@ fn group_entry_domain_mapped_set_formats_with_debug() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-/// `DomainImpl::Manual` gets the same concrete `try_price(...)?` /
-/// `try_price()?` signatures as `DomainImpl::Generated`, but ergo-sbe does
+/// `DomainImpl::Manual` gets the same concrete `price(...)?` /
+/// `price()?` signatures as `DomainImpl::Generated`, but ergo-sbe does
 /// not generate the `TryFromSbe`/`TryToSbe` impl for the built-in
 /// `rust_decimal` mapping — the caller supplies its own (deliberately
 /// different from the built-in: scaled by an extra factor of 10) to prove
@@ -3183,13 +3183,13 @@ fn domain_type_manual_impl_uses_callers_own_impl() -> Result<(), Box<dyn std::er
         let mut buf = [0u8; 256];
         let mut enc = OrderEncoder::wrap_and_apply_header(&mut buf, 0)
             .fixed(&OrderFixedFields { price: self::Decimal::new(0, 0), size: self::Decimal::new(0, 0) });
-        enc.try_price(Decimal::new(12345, 2))?;
-        enc.try_size(Decimal::new(100, 0))?;
+        enc.price(Decimal::new(12345, 2))?;
+        enc.size(Decimal::new(100, 0))?;
         let encoded = enc.as_bytes_with_header().to_vec();
 
         let dec = OrderDecoder::try_decode(&encoded, 0)?;
-        assert_eq!(dec.try_price()?, Decimal::new(12345, 2));
-        assert_eq!(dec.try_size()?, Decimal::new(100, 0));
+        assert_eq!(dec.price()?, Decimal::new(12345, 2));
+        assert_eq!(dec.size()?, Decimal::new(100, 0));
         // ANCHOR_END: with_domain_type_manual_impl_usage
         "#,
         "rust_decimal = \"1\"\n",
@@ -3199,7 +3199,7 @@ fn domain_type_manual_impl_uses_callers_own_impl() -> Result<(), Box<dyn std::er
 
 /// A `DomainImpl::Manual` field on one of the three built-in type paths
 /// (here `rust_decimal::Decimal`) gets a doc comment on its generated
-/// `try_*` accessor containing the exact impl `DomainImpl::Generated` would
+/// domain accessor containing the exact impl `DomainImpl::Generated` would
 /// have written — a ready-to-paste starting point (see
 /// `conversion_traits.rs::generate_manual_impl_snippets`). A non-built-in
 /// `rust_type` gets no snippet — there is no generated-impl template to
@@ -3305,7 +3305,7 @@ fn domain_type_manual_impl_doc_comment_covers_bool_and_chrono()
 
 /// Domain types (`rust_decimal::Decimal`, `chrono::DateTime`) must round-trip
 /// through **optional** fields. A composite decimal has no null image, so its
-/// `try_*` accessor is a plain `Result<Decimal>`; an optional primitive
+/// domain accessor is a plain `Result<Decimal>`; an optional primitive
 /// timestamp null-maps to `Option<DateTime>`. This also exercises multiple
 /// distinct decimal composites (Decimal64 + Decimal128) under one config.
 #[test]
@@ -3344,22 +3344,22 @@ fn optional_decimal_and_timestamp_domain_types_roundtrip() -> Result<(), Box<dyn
                 price128: None,
                 ts: None,
             })
-            .try_price64(Decimal::new(12345, 2))?
-            .try_size64(Decimal::new(100, 0))?
-            .try_price128(Decimal::new(99999, 1))?
-            .try_ts(DateTime::from_timestamp(42, 0).unwrap())?
+            .price64(Decimal::new(12345, 2))?
+            .size64(Decimal::new(100, 0))?
+            .price128(Decimal::new(99999, 1))?
+            .ts(DateTime::from_timestamp(42, 0).unwrap())?
             .encoded_length_with_header();
 
         let dec = QuoteDecoder::try_decode(&buf[..len], 0)?;
 
         // Optional decimal composites decode to a plain Decimal — a composite
         // has no null image, so `presence="optional"` does not become Option.
-        assert_eq!(dec.try_price64()?, Decimal::new(12345, 2));
-        assert_eq!(dec.try_size64()?, Decimal::new(100, 0));
-        assert_eq!(dec.try_price128()?, Decimal::new(99999, 1));
+        assert_eq!(dec.price64()?, Decimal::new(12345, 2));
+        assert_eq!(dec.size64()?, Decimal::new(100, 0));
+        assert_eq!(dec.price128()?, Decimal::new(99999, 1));
 
         // Optional primitive timestamp null-maps to Option<DateTime<Utc>>.
-        assert_eq!(dec.try_ts()?, Some(DateTime::from_timestamp(42, 0).unwrap()));
+        assert_eq!(dec.ts()?, Some(DateTime::from_timestamp(42, 0).unwrap()));
         "#,
         "chrono = \"0.4\"\nrust_decimal = \"1\"\n",
     );
@@ -3397,14 +3397,14 @@ fn constant_exponent_decimal_domain_type_rescales_exactly() -> Result<(), Box<dy
         use rust_decimal::Decimal;
 
         let mut buf = [0u8; FillEncoder::compute_length_with_header(1)];
-        // `try_*` setters return `&mut Self`; `legs` consumes the encoder.
+        // Domain setters return `&mut Self`; `legs` consumes the encoder.
         let mut enc = FillEncoder::wrap_and_apply_header(&mut buf, 0)
             .fixed(&FillFixedFields { price: Decimal9::new(0), notional: Hundreds::new(0) });
-        enc.try_price(Decimal::new(15, 1))?.try_notional(Decimal::new(12300, 0))?;
+        enc.price(Decimal::new(15, 1))?.notional(Decimal::new(12300, 0))?;
         let len = enc
             .legs(1, |g| {
                 g.add(|e| {
-                    e.try_px(Decimal::new(-25, 2)).map_err(|_| {
+                    e.px(Decimal::new(-25, 2)).map_err(|_| {
                         sbe_rt::EncodeError::DomainConversionFailed { field: "px", reason: "conversion" }
                     })?;
                     Ok(())
@@ -3418,11 +3418,11 @@ fn constant_exponent_decimal_domain_type_rescales_exactly() -> Result<(), Box<dy
         assert_eq!(dec.price_value().mantissa(), 1_500_000_000);
         assert_eq!(dec.notional_value().mantissa(), 123);
         // ...and it decodes back to the same value.
-        assert_eq!(dec.try_price()?, Decimal::new(15, 1));
-        assert_eq!(dec.try_notional()?, Decimal::new(12300, 0));
+        assert_eq!(dec.price()?, Decimal::new(15, 1));
+        assert_eq!(dec.notional()?, Decimal::new(12300, 0));
         for leg in dec.legs()? {
             assert_eq!(leg.px_value().mantissa(), -250_000_000);
-            assert_eq!(leg.try_px()?, Decimal::new(-25, 2));
+            assert_eq!(leg.px()?, Decimal::new(-25, 2));
         }
 
         // Scale already equal to -exponent: the mantissa is taken as is.
@@ -3476,26 +3476,26 @@ fn chrono_timestamp_domain_type_honours_time_unit() -> Result<(), Box<dyn std::e
         let nanos = DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
 
         let mut buf = [0u8; 256];
-        // `try_*` setters return `&mut Self`; `fills` consumes the encoder.
+        // Domain setters return `&mut Self`; `fills` consumes the encoder.
         let mut enc = StampsEncoder::wrap_and_apply_header(&mut buf, 0).fixed(&StampsFixedFields {
             ts_sec: 0, ts_ms: 0, ts_us: 0, ts_ns: 0, ts_default: 0, opt_ms: None,
         });
-        enc.try_ts_sec(secs)?
-            .try_ts_ms(millis)?
-            .try_ts_us(micros)?
-            .try_ts_ns(nanos)?
-            .try_ts_default(nanos)?
-            .try_opt_ms(millis)?;
+        enc.ts_sec(secs)?
+            .ts_ms(millis)?
+            .ts_us(micros)?
+            .ts_ns(nanos)?
+            .ts_default(nanos)?
+            .opt_ms(millis)?;
         let len = enc
             .fills(1, |g| {
                 g.add(|mut e| {
-                    e.try_at(micros).map_err(|_| {
+                    e.at(micros).map_err(|_| {
                         sbe_rt::EncodeError::DomainConversionFailed { field: "at", reason: "conversion" }
                     })?;
                     // The last tail closes the entry, so its result is the entry's.
                     e.legs(1, |lg| {
                         lg.add(|l| {
-                            l.try_when(millis).map_err(|_| {
+                            l.when(millis).map_err(|_| {
                                 sbe_rt::EncodeError::DomainConversionFailed { field: "when", reason: "conversion" }
                             })?;
                             Ok(())
@@ -3516,19 +3516,19 @@ fn chrono_timestamp_domain_type_honours_time_unit() -> Result<(), Box<dyn std::e
         assert_eq!(dec.ts_default_wire(), 1_700_000_000_123_456_789);
         assert_eq!(dec.opt_ms_wire(), Some(1_700_000_000_123));
         // ...and every field decodes back to the same instant.
-        assert_eq!(dec.try_ts_sec()?, secs);
-        assert_eq!(dec.try_ts_ms()?, millis);
-        assert_eq!(dec.try_ts_us()?, micros);
-        assert_eq!(dec.try_ts_ns()?, nanos);
-        assert_eq!(dec.try_ts_default()?, nanos);
-        assert_eq!(dec.try_opt_ms()?, Some(millis));
+        assert_eq!(dec.ts_sec()?, secs);
+        assert_eq!(dec.ts_ms()?, millis);
+        assert_eq!(dec.ts_us()?, micros);
+        assert_eq!(dec.ts_ns()?, nanos);
+        assert_eq!(dec.ts_default()?, nanos);
+        assert_eq!(dec.opt_ms()?, Some(millis));
         for fill in dec.fills()? {
             let fill = fill?;
             assert_eq!(fill.at_wire(), 1_700_000_000_123_456);
-            assert_eq!(fill.try_at()?, micros);
+            assert_eq!(fill.at()?, micros);
             for leg in fill.legs()? {
                 assert_eq!(leg.when_wire(), 1_700_000_000_123);
-                assert_eq!(leg.try_when()?, millis);
+                assert_eq!(leg.when()?, millis);
             }
         }
         // The domain DTO decodes through the same accessors.
@@ -3544,9 +3544,9 @@ fn chrono_timestamp_domain_type_honours_time_unit() -> Result<(), Box<dyn std::e
         let mut enc = StampsEncoder::wrap_and_apply_header(&mut scratch, 0).fixed(&StampsFixedFields {
             ts_sec: 0, ts_ms: 0, ts_us: 0, ts_ns: 0, ts_default: 0, opt_ms: None,
         });
-        assert!(enc.try_ts_ms(nanos).is_err());
-        assert!(enc.try_ts_sec(millis).is_err());
-        assert!(enc.try_ts_us(micros).is_ok());
+        assert!(enc.ts_ms(nanos).is_err());
+        assert!(enc.ts_sec(millis).is_err());
+        assert!(enc.ts_us(micros).is_ok());
         "#,
         "chrono = \"0.4\"\n",
     );
@@ -3562,7 +3562,7 @@ fn chrono_timestamp_domain_type_honours_time_unit() -> Result<(), Box<dyn std::e
 /// `Manual` and `Generated` share one `Option` rule
 /// (`converter_impls.rs::is_optional_domain_field`, computed before any
 /// impl-mode branching): an optional **composite** has no null image, so
-/// `try_*` stays a plain `Result<Decimal>`; an optional **primitive**
+/// the domain accessor stays a plain `Result<Decimal>`; an optional **primitive**
 /// null-maps to `Result<Option<DateTime>>`, `None` included. The caller's
 /// impls scale the mantissa by 10 so a silently generated built-in impl
 /// would show up as a wire mismatch, not a passing round-trip.
@@ -3633,26 +3633,26 @@ fn optional_domain_types_with_manual_impls_roundtrip() -> Result<(), Box<dyn std
                 price128: None,
                 ts: None,
             })
-            .try_price64(Decimal::new(12345, 2))?
-            .try_size64(Decimal::new(100, 0))?
-            .try_price128(Decimal::new(99999, 1))?
-            .try_ts(DateTime::from_timestamp(42, 0).ok_or("bad fixture timestamp")?)?
+            .price64(Decimal::new(12345, 2))?
+            .size64(Decimal::new(100, 0))?
+            .price128(Decimal::new(99999, 1))?
+            .ts(DateTime::from_timestamp(42, 0).ok_or("bad fixture timestamp")?)?
             .encoded_length_with_header();
 
         let dec = QuoteDecoder::try_decode(&buf[..len], 0)?;
 
         // Optional composites: plain Result<Decimal>, no Option wrapper —
         // annotated to fail compilation if the return type ever grows one.
-        let price64: Decimal = dec.try_price64()?;
+        let price64: Decimal = dec.price64()?;
         assert_eq!(price64, Decimal::new(12345, 2));
-        assert_eq!(dec.try_size64()?, Decimal::new(100, 0));
-        assert_eq!(dec.try_price128()?, Decimal::new(99999, 1));
+        assert_eq!(dec.size64()?, Decimal::new(100, 0));
+        assert_eq!(dec.price128()?, Decimal::new(99999, 1));
 
         // The caller's impl really ran: it scales the wire mantissa by 10.
         assert_eq!(dec.price64_value().mantissa(), 123_450);
 
         // Optional primitive null-maps to Option, Some on the written path.
-        assert_eq!(dec.try_ts()?, Some(DateTime::from_timestamp(42, 0).ok_or("bad fixture timestamp")?));
+        assert_eq!(dec.ts()?, Some(DateTime::from_timestamp(42, 0).ok_or("bad fixture timestamp")?));
 
         // ... and None when the field was never written. Absence is expressed
         // through FixedFields, not the domain setter (which takes a bare
@@ -3665,7 +3665,7 @@ fn optional_domain_types_with_manual_impls_roundtrip() -> Result<(), Box<dyn std
                 ts: None,
             })
             .encoded_length_with_header();
-        assert_eq!(QuoteDecoder::try_decode(&buf[..null_len], 0)?.try_ts()?, None);
+        assert_eq!(QuoteDecoder::try_decode(&buf[..null_len], 0)?.ts()?, None);
         "#,
         "chrono = \"0.4\"\nrust_decimal = \"1\"\n",
     );
@@ -3705,16 +3705,16 @@ fn optional_composite_member_null_image_roundtrip() -> Result<(), Box<dyn std::e
 
         let dec = QuoteDecoder::try_decode(&buf[..len], 0)?;
         assert_eq!(dec.price_value().mantissa(), None);
-        assert!(dec.try_price().is_err(), "null mantissa is not a valid Decimal");
+        assert!(dec.price().is_err(), "null mantissa is not a valid Decimal");
 
         // A real price round-trips through the null-aware member accessor.
         let len2 = QuoteEncoder::wrap_and_apply_header(&mut buf, 0)
             .fixed(&QuoteFixedFields { price: None, qty: 7 })
-            .try_price(Decimal::new(12345, 9))?
+            .price(Decimal::new(12345, 9))?
             .encoded_length_with_header();
         let dec2 = QuoteDecoder::try_decode(&buf[..len2], 0)?;
         assert_eq!(dec2.price_value().mantissa(), Some(12345));
-        assert_eq!(dec2.try_price()?, Decimal::new(12345, 9));
+        assert_eq!(dec2.price()?, Decimal::new(12345, 9));
         // ANCHOR_END: optional_composite_null_image
         "#,
         "rust_decimal = \"1\"\n",
@@ -3930,10 +3930,11 @@ fn fixed_and_raw_fixed_replace_try_fixed() -> Result<(), Box<dyn std::error::Err
     );
     assert!(
         !common::impl_for_type_defines_method(&src, "CarEncoder", "try_fixed"),
-        "CarEncoder::try_fixed must NOT be generated (no fixed-phase bypass). \
-         The decoder's ordered lane legitimately defines its own `try_fixed` \
-         (the error-typed twin of `fixed()`, see ordered_lane_test); that is a \
-         different type and a different invariant from this one."
+        "CarEncoder::try_fixed must NOT be generated (no fixed-phase bypass)"
+    );
+    assert!(
+        !src.contains("fn try_fixed"),
+        "no type defines try_fixed: the ordered lane's error-typed twin is gone too"
     );
     Ok(())
 }
@@ -3976,35 +3977,6 @@ fn fixed_method_manual_equivalence() -> Result<(), Box<dyn std::error::Error>> {
             .to_vec();
         assert_eq!(a, b);
     "#,
-    );
-    Ok(())
-}
-
-/// Borrowed var-data slice must not escape a try_<data> callback (HRTB).
-#[test]
-fn callback_escape_try_data_is_compile_fail() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::path::PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/schemas/nested-message-payload.xml"
-    ));
-    let (_schema, src) = generate(&path, "cb_escape");
-    compile_fails_with_diagnostics(
-        "cb_escape",
-        &src,
-        r#"
-        let mut buf = [0u8; 256];
-        let complete = OuterEncoder::wrap_and_apply_header(&mut buf, 0)
-            .fixed(&OuterFixedFields { trace_id: 7 })
-            .app_name(b"test").unwrap().payload(b"data").unwrap();
-        let _ = complete.as_bytes_with_header();
-        let dec = OuterDecoder::try_decode(&buf, 0).unwrap();
-        let mut escaped: Option<&[u8]> = None;
-        let _ = dec.try_app_name::<sbe_rt::DecodeError, _>(|name| {
-            escaped = Some(name); // HRTB: borrowed data cannot escape closure
-            Ok(())
-        });
-    "#,
-        &["borrowed data escapes outside of closure"],
     );
     Ok(())
 }
@@ -4340,7 +4312,7 @@ fn decimal_converter_exact_adapter_matrix() -> Result<(), Box<dyn std::error::Er
 /// A group-entry field with a domain type AND `presence="optional"` used to
 /// fail to compile two different ways:
 /// (1) `emit_group_entry_impls` (converter_impls.rs) never Option-wrapped the
-///     `try_*` accessor's return type for optional group fields the way the
+///     domain accessor's return type for optional group fields the way the
 ///     message-level path does, so the raw accessor's `Option<Wire>` was
 ///     passed straight to `TryFromSbe<Wire>::try_from_sbe`, which expects an
 ///     unwrapped `Wire` — E0308.
@@ -4386,9 +4358,9 @@ fn group_entry_optional_domain_type_field_compiles_and_round_trips()
         let dec = BatchDecoder::try_decode(&buf[..len], 0)?;
         let entries: Vec<_> = dec.entries()?.collect();
         assert_eq!(entries.len(), 2);
-        let ts0 = entries[0].try_ts()?;
+        let ts0 = entries[0].ts()?;
         assert!(ts0.is_some(), "entry 0 wrote ts, decode must see Some: {ts0:?}");
-        let ts1 = entries[1].try_ts()?;
+        let ts1 = entries[1].ts()?;
         assert_eq!(ts1, None, "entry 1 never wrote ts, decode must see None");
         // Exercise the Display/Debug codegen this bug also broke.
         let rendered = format!("{}", entries[0]);

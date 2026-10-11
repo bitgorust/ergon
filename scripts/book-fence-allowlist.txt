@@ -6,7 +6,7 @@ book/src/cluster/chained-decoding.md:18 — deliberate; see page context
 book/src/cluster/chained-decoding.md:49 — deliberate; hidden cluster codec seam requires the cluster crate, which is outside the SBE book harness
 book/src/cluster/chained-decoding.md:87 — deliberate; hidden cluster codec seam requires the cluster crate, which is outside the SBE book harness
 book/src/cluster/session-builder.md:5 — deliberate; see page context
-book/src/cluster/session-builder.md:52 — deliberate; see page context
+book/src/cluster/session-builder.md:67 — deliberate; see page context
 book/src/samples/build-patterns.md:33 — deliberate; see page context
 book/src/samples/exchange-example.md:15 — deliberate; see page context
 book/src/samples/l3-book.md:14 — deliberate; see page context
@@ -45,17 +45,17 @@ book/src/sbe/design-notes/nullval.md:17 — deliberate; see page context
 book/src/sbe/design-notes/nullval.md:45 — deliberate; see page context
 book/src/sbe/design-notes/nullval.md:76 — deliberate; see page context
 book/src/sbe/design-notes/nullval.md:90 — deliberate; see page context
-book/src/sbe/design-notes/nullval.md:104 — deliberate; see page context
+book/src/sbe/design-notes/nullval.md:105 — deliberate; see page context
 book/src/sbe/design-notes/type-state.md:7 — deliberate; see page context
 book/src/sbe/design-notes/type-state.md:34 — deliberate; see page context
 book/src/sbe/feature-tour/decode-stages.md:64 — deliberate; illustrates application-supplied read_header/read_groups/read_final_tail helpers and input bytes, not a standalone program
 book/src/sbe/feature-tour/generated-code.md:7 — deliberate; see page context
 book/src/sbe/feature-tour/generated-code.md:47 — deliberate; see page context
-book/src/sbe/feature-tour/generated-code.md:110 — deliberate; see page context
-book/src/sbe/feature-tour/generated-code.md:124 — deliberate; see page context
-book/src/sbe/feature-tour/generated-code.md:135 — deliberate; see page context
-book/src/sbe/feature-tour/generated-code.md:165 — deliberate; see page context
-book/src/sbe/feature-tour/generated-code.md:186 — deliberate; see page context
+book/src/sbe/feature-tour/generated-code.md:111 — deliberate; see page context
+book/src/sbe/feature-tour/generated-code.md:125 — deliberate; see page context
+book/src/sbe/feature-tour/generated-code.md:136 — deliberate; see page context
+book/src/sbe/feature-tour/generated-code.md:166 — deliberate; see page context
+book/src/sbe/feature-tour/generated-code.md:187 — deliberate; see page context
 book/src/sbe/getting-started/encode-decode.md:54 — deliberate; see page context
 book/src/sbe/getting-started/error-diagnostics.md:85 — deliberate; illustrative error handling over a schema path that does not exist at doc-build time
 book/src/sbe/getting-started/from-sbe-tool.md:18 — deliberate; see page context

@@ -635,7 +635,7 @@ fn versioned_domain_type_schema() -> PathBuf {
 /// A versioned (`sinceVersion > 0`) field carrying a domain type — composite or
 /// primitive scalar — must materialise into the DTO exactly once.
 ///
-/// `try_*` on a versioned field already returns `Result<Option<T>, E>` (see
+/// The domain accessor on a versioned field already returns `Result<Option<T>, E>` (see
 /// `converter_impls::is_optional_domain_field`), so the DTO's `from_decoder`
 /// expression must **not** wrap it in `Some(..)` again — that yields
 /// `Option<Option<T>>` against an `Option<T>` field and the generated module
@@ -701,8 +701,8 @@ fn domain_versioned_fields_with_domain_type_materialise_single_option()
 
         let mut buf = [0u8; VersionedEncoder::compute_length_with_header()];
         let mut enc = VersionedEncoder::try_wrap_and_apply_header(&mut buf, 0).unwrap();
-        enc.try_scaled(Decimal::new(12345, 3))?
-            .try_extra(Decimal::new(799, 2))?
+        enc.scaled(Decimal::new(12345, 3))?
+            .extra(Decimal::new(799, 2))?
             .count(42);
         let dec = VersionedDecoder::try_decode(&buf, 0).unwrap();
 

@@ -2,7 +2,8 @@
 //! decoders and encoders (including nested group entries).
 
 use super::conversion_helpers::{
-    field_has_conversion_free, find_domain_selector, find_domain_type,
+    DECODER_RESERVED, ENCODER_RESERVED, domain_accessor_ident, field_has_conversion_free,
+    find_domain_selector, find_domain_type,
 };
 use super::runtime::{to_pascal_case, to_snake_case};
 use crate::structured_ir::{FieldType, MessageField, MessageGroup, MessageStructure, rust_type};
@@ -205,10 +206,11 @@ pub(crate) fn generate_converter_impls(
         if let Some(dt) = domain_type_path {
             let dt_ty: syn::Type =
                 syn::parse_str(dt).unwrap_or_else(|_| panic!("invalid domain type path: {dt}"));
-            let domain_ident = syn::Ident::new(&field_snake, span);
-
-            // checked domain accessors are fallible — no `.expect`.
-            let try_ident = syn::Ident::new(&format!("try_{field_snake}"), span);
+            // The domain accessors take the plain field name; the raw ones moved
+            // to `*_wire`. Getter and setter resolve against their own type's
+            // reserved list, exactly as raw accessors do.
+            let get_ident = domain_accessor_ident(&field_snake, DECODER_RESERVED);
+            let set_ident = domain_accessor_ident(&field_snake, ENCODER_RESERVED);
             let is_optional = is_optional_domain_field(f, null_as_option, all_enums_as_option);
             // DomainImpl::Manual doc comment: a ready-to-paste starting point,
             // shown on both the decoder and encoder accessor (IDE hover /
@@ -239,7 +241,7 @@ pub(crate) fn generate_converter_impls(
                 decoder_methods.extend(quote::quote! {
                     #manual_impl_doc
                     #[inline]
-                    pub fn #try_ident(
+                    pub fn #get_ident(
                         &self,
                     ) -> Result<Option<#dt_ty>, <#dt_ty as TryFromSbe<#wire_type_ident>>::Error> {
                         match self.#raw_decoder_getter() {
@@ -252,7 +254,7 @@ pub(crate) fn generate_converter_impls(
                 decoder_methods.extend(quote::quote! {
                     #manual_impl_doc
                     #[inline]
-                    pub fn #try_ident(
+                    pub fn #get_ident(
                         &self,
                     ) -> Result<#dt_ty, <#dt_ty as TryFromSbe<#wire_type_ident>>::Error> {
                         #decode
@@ -270,7 +272,7 @@ pub(crate) fn generate_converter_impls(
             encoder_methods.extend(quote::quote! {
                 #manual_impl_doc
                 #[inline]
-                pub fn #try_ident(
+                pub fn #set_ident(
                     &mut self,
                     value: #dt_ty,
                 ) -> Result<&mut Self, <#dt_ty as TryToSbe<#wire_type_ident>>::Error> {
@@ -284,7 +286,7 @@ pub(crate) fn generate_converter_impls(
             let as_ident = syn::Ident::new(&format!("{field_snake}_as"), span);
             let from_ident = syn::Ident::new(&format!("{field_snake}_from"), span);
 
-            // Same `Option` rule as the domain `try_*` path: when the raw
+            // Same `Option` rule as the domain accessor path: when the raw
             // getter yields `Option<W>` the converter must unwrap it, or the
             // generated body feeds `Option<W>` to `TryFromSbe<W>`.
             decoder_methods.extend(if is_optional_domain_field(f, null_as_option, all_enums_as_option) {
@@ -366,8 +368,9 @@ pub(crate) fn generate_converter_impls(
             if let Some(dt) = find_domain_type(f, domain_types) {
                 let dt_ty: syn::Type =
                     syn::parse_str(dt).unwrap_or_else(|_| panic!("invalid domain type path: {dt}"));
-                let domain_ident = syn::Ident::new(&field_snake, span);
-                let try_ident = syn::Ident::new(&format!("try_{field_snake}"), span);
+                // Group entries do not rename against a reserved list.
+                let get_ident = domain_accessor_ident(&field_snake, &[]);
+                let set_ident = get_ident.clone();
                 let is_optional = is_optional_domain_field(f, null_as_option, all_enums_as_option);
                 let DomainBodies {
                     decode,
@@ -382,7 +385,7 @@ pub(crate) fn generate_converter_impls(
                 if is_optional {
                     dec_methods.extend(quote::quote! {
                         #[inline]
-                        pub fn #try_ident(
+                        pub fn #get_ident(
                             &self,
                         ) -> Result<Option<#dt_ty>, <#dt_ty as TryFromSbe<#wire_type_ident>>::Error> {
                             match self.#raw_decoder_getter() {
@@ -394,7 +397,7 @@ pub(crate) fn generate_converter_impls(
                 } else {
                     dec_methods.extend(quote::quote! {
                         #[inline]
-                        pub fn #try_ident(
+                        pub fn #get_ident(
                             &self,
                         ) -> Result<#dt_ty, <#dt_ty as TryFromSbe<#wire_type_ident>>::Error> {
                             #decode
@@ -403,7 +406,7 @@ pub(crate) fn generate_converter_impls(
                 }
                 enc_methods.extend(quote::quote! {
                     #[inline]
-                    pub fn #try_ident(
+                    pub fn #set_ident(
                         &mut self,
                         value: #dt_ty,
                     ) -> Result<&mut Self, <#dt_ty as TryToSbe<#wire_type_ident>>::Error> {

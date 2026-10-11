@@ -63,21 +63,13 @@ pub(crate) fn generate_ordered_lane(
         .first()
         .map(|g| g.accessor_snake.as_str())
         .or_else(|| vardata.first().map(|v| v.accessor_snake.as_str()));
-    // Message-level `fixed` / `try_fixed` live on the same type as the first
-    // tail unless they consume into `OrderedFixed`. Each name yields through
-    // `named_accessor_ident`. The first tail also owns `try_{tail}`, so a
-    // group/var-data named `fixed` takes both `fixed()` and `try_fixed()`.
-    // A first tail named `tryFixed` only takes `try_fixed()`; `fixed()` stays.
-    let first_taken: Vec<String> = first_tail_snake
-        .map(|s| vec![s.to_string(), format!("try_{s}")])
-        .unwrap_or_default();
-    let emit_fixed_cb = is_message
+    // Message-level `fixed` lives on the same type as the first tail, so it
+    // yields through `named_accessor_ident` to a first tail named `fixed`;
+    // fixed fields are then read before `ordered()`.
+    let first_taken: Vec<String> = first_tail_snake.map(str::to_string).into_iter().collect();
+    let emit_fixed_phase = is_message
         && fixed_fields.is_some()
         && named_accessor_ident("fixed", &first_taken).is_some();
-    let emit_try_fixed = is_message
-        && fixed_fields.is_some()
-        && named_accessor_ident("try_fixed", &first_taken).is_some();
-    let emit_fixed_phase = emit_fixed_cb || emit_try_fixed;
 
     let mut ts = proc_macro2::TokenStream::new();
     let ordered_doc = if is_message {
@@ -131,56 +123,20 @@ pub(crate) fn generate_ordered_lane(
                 inner: sbe_rt::OrderedFixed { inner: self.inner },
             })
         };
-        let fixed_method = emit_fixed_cb.then(|| {
-            if emit_try_fixed {
-                quote::quote! {
-                    /// Read the fixed block before any tail, then continue from a
-                    /// distinct stage that carries only the tail methods. Yields
-                    /// when the first tail is named `fixed`; use [`Self::try_fixed`]
-                    /// there.
-                    #[inline]
-                    pub fn fixed<F>(
-                        self,
-                        f: F,
-                    ) -> Result<#after_fixed_ty, sbe_rt::DecodeError>
-                    where
-                        F: FnOnce(&#view_ident<'_, 'a>) -> Result<(), sbe_rt::DecodeError>,
-                    {
-                        self.try_fixed(f)
-                    }
-                }
-            } else {
-                quote::quote! {
-                    /// Read the fixed block before any tail, then continue from a
-                    /// distinct stage that carries only the tail methods. Standalone
-                    /// because the first tail owns `try_fixed()`.
-                    #[inline]
-                    pub fn fixed<F>(
-                        self,
-                        f: F,
-                    ) -> Result<#after_fixed_ty, sbe_rt::DecodeError>
-                    where
-                        F: FnOnce(&#view_ident<'_, 'a>) -> Result<(), sbe_rt::DecodeError>,
-                    {
-                        #advance
-                    }
-                }
+        let fixed_method = quote::quote! {
+            /// Read the fixed block before any tail, then continue from a
+            /// distinct stage that carries only the tail methods.
+            #[inline]
+            pub fn fixed<F>(
+                self,
+                f: F,
+            ) -> Result<#after_fixed_ty, sbe_rt::DecodeError>
+            where
+                F: FnOnce(&#view_ident<'_, 'a>) -> Result<(), sbe_rt::DecodeError>,
+            {
+                #advance
             }
-        });
-        let try_fixed_method = emit_try_fixed.then(|| {
-            quote::quote! {
-                /// Read the fixed block before any tail, with a caller error type.
-                /// Yields when the first tail is named `tryFixed`; use [`Self::fixed`]
-                /// there.
-                #[inline]
-                pub fn try_fixed<E, F>(self, f: F) -> Result<#after_fixed_ty, E>
-                where
-                    F: FnOnce(&#view_ident<'_, 'a>) -> Result<(), E>,
-                {
-                    #advance
-                }
-            }
-        });
+        };
         ts.extend(quote::quote! {
             /// Fixed-block view for the ordered lane's `fixed` callback.
             ///
@@ -199,7 +155,6 @@ pub(crate) fn generate_ordered_lane(
             }
             impl<'a> #decoder_ty {
                 #fixed_method
-                #try_fixed_method
             }
         });
     }
@@ -405,7 +360,6 @@ fn emit_group_methods(
     span: proc_macro2::Span,
 ) -> proc_macro2::TokenStream {
     let method = syn::Ident::new(&tg.accessor_snake, span);
-    let try_method = syn::Ident::new(&format!("try_{}", tg.accessor_snake), span);
     let into_ident = syn::Ident::new(&format!("into_{}", tg.accessor_snake), span);
     let into_with_info = syn::Ident::new(&format!("into_{}_with_info", tg.accessor_snake), span);
     let entry_ident = syn::Ident::new(&tg.entry_decoder_ident, span);
@@ -427,25 +381,12 @@ fn emit_group_methods(
             /// `ordered()` walk may return `Ordered<completion>` directly;
             /// `.done()` is only needed to hand the staged complete out.
             #[inline]
-            pub fn #method<F, R>(self, f: F) -> Result<#next_ty, sbe_rt::DecodeError>
+            pub fn #method<F, R>(self, mut f: F) -> Result<#next_ty, sbe_rt::DecodeError>
             where
                 F: FnMut(
                     #entry_ident<'a>,
                     sbe_rt::EntryInfo,
                 ) -> Result<R, sbe_rt::DecodeError>,
-                R: sbe_rt::IntoEntryComplete<#complete_ident<'a>>,
-            {
-                self.#try_method(f)
-            }
-            #doc
-            #[inline]
-            pub fn #try_method<E, F, R>(self, mut f: F) -> Result<#next_ty, E>
-            where
-                E: From<sbe_rt::DecodeError>,
-                F: FnMut(
-                    #entry_ident<'a>,
-                    sbe_rt::EntryInfo,
-                ) -> Result<R, E>,
                 R: sbe_rt::IntoEntryComplete<#complete_ident<'a>>,
             {
                 let inner = #inner_access.#into_with_info(|entry, info| {
@@ -461,18 +402,9 @@ fn emit_group_methods(
             /// These entries have a fixed stride, so the callback returns
             /// `()` — there is no tail to complete.
             #[inline]
-            pub fn #method<F>(self, f: F) -> Result<#next_ty, sbe_rt::DecodeError>
+            pub fn #method<F>(self, mut f: F) -> Result<#next_ty, sbe_rt::DecodeError>
             where
                 F: FnMut(#entry_ident<'a>, sbe_rt::EntryInfo) -> Result<(), sbe_rt::DecodeError>,
-            {
-                self.#try_method(f)
-            }
-            #doc
-            #[inline]
-            pub fn #try_method<E, F>(self, mut f: F) -> Result<#next_ty, E>
-            where
-                E: From<sbe_rt::DecodeError>,
-                F: FnMut(#entry_ident<'a>, sbe_rt::EntryInfo) -> Result<(), E>,
             {
                 let mut iter = #inner_access.#into_ident()?;
                 let count = iter.remaining_entries();
@@ -496,7 +428,6 @@ fn emit_vardata_methods(
     span: proc_macro2::Span,
 ) -> proc_macro2::TokenStream {
     let method = syn::Ident::new(&vd.accessor_snake, span);
-    let try_method = syn::Ident::new(&format!("try_{}", vd.accessor_snake), span);
     let into_ident = syn::Ident::new(&format!("into_{}", vd.accessor_snake), span);
     let doc = format!(
         " Read `{}` as bytes, then advance to the next tail.",
@@ -510,15 +441,6 @@ fn emit_vardata_methods(
         where
             F: FnOnce(&'a [u8]) -> Result<(), sbe_rt::DecodeError>,
         {
-            self.#try_method(f)
-        }
-        #doc
-        #[inline]
-        pub fn #try_method<E, F>(self, f: F) -> Result<#next_ty, E>
-        where
-            E: From<sbe_rt::DecodeError>,
-            F: FnOnce(&'a [u8]) -> Result<(), E>,
-        {
             let (bytes, inner) = #inner_access.#into_ident()?;
             f(bytes)?;
             Ok(sbe_rt::Ordered { inner })
@@ -526,7 +448,6 @@ fn emit_vardata_methods(
     };
     if super::runtime::text_encoding_kind(vd.character_encoding.as_deref()).is_some() {
         let str_method = syn::Ident::new(&format!("{}_as_str", vd.accessor_snake), span);
-        let try_str = syn::Ident::new(&format!("try_{}_as_str", vd.accessor_snake), span);
         let into_str = syn::Ident::new(&format!("into_{}_as_str", vd.accessor_snake), span);
         let str_doc = super::runtime::doc_lines_tokens(&format!(
             " Read `{}` as `&str`, then advance to the next tail.\n\n\
@@ -539,15 +460,6 @@ fn emit_vardata_methods(
             pub fn #str_method<F>(self, f: F) -> Result<#next_ty, sbe_rt::DecodeError>
             where
                 F: FnOnce(&'a str) -> Result<(), sbe_rt::DecodeError>,
-            {
-                self.#try_str(f)
-            }
-            #str_doc
-            #[inline]
-            pub fn #try_str<E, F>(self, f: F) -> Result<#next_ty, E>
-            where
-                E: From<sbe_rt::DecodeError>,
-                F: FnOnce(&'a str) -> Result<(), E>,
             {
                 let (text, inner) = #inner_access.#into_str()?;
                 f(text)?;

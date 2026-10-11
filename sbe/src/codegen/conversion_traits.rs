@@ -18,7 +18,7 @@ pub(crate) fn emit_conversion_traits(src: &mut String) {
          #[diagnostic::on_unimplemented(\n\
              message = \"`{Self}` has no `TryFromSbe<{Wire}>` impl\",\n\
              label = \"missing `impl TryFromSbe<{Wire}> for {Self}`\",\n\
-             note = \"if this field uses DomainImpl::Manual, the generated `try_*` \
+             note = \"if this field uses DomainImpl::Manual, the generated domain \
 accessor's doc comment has a ready-to-paste starting point\"\n\
          )]\n\
          pub trait TryFromSbe<Wire>: Sized {\n\
@@ -29,7 +29,7 @@ accessor's doc comment has a ready-to-paste starting point\"\n\
          #[diagnostic::on_unimplemented(\n\
              message = \"`{Self}` has no `TryToSbe<{Wire}>` impl\",\n\
              label = \"missing `impl TryToSbe<{Wire}> for {Self}`\",\n\
-             note = \"if this field uses DomainImpl::Manual, the generated `try_*` \
+             note = \"if this field uses DomainImpl::Manual, the generated domain \
 accessor's doc comment has a ready-to-paste starting point\"\n\
          )]\n\
          pub trait TryToSbe<Wire> {\n\
@@ -275,7 +275,7 @@ fn composite_mantissa_is_optional(dec_composite: &[crate::ir::Token]) -> bool {
 /// three well-known built-in type paths (`bool` / `rust_decimal::Decimal` /
 /// `chrono::DateTime<Utc>`), render the exact impl ergo-sbe would otherwise
 /// have generated as pretty-printed Rust source — a copy-paste starting
-/// point for the doc comment on the field's generated `try_*` accessor (see
+/// point for the doc comment on the field's generated domain accessor (see
 /// `converter_impls.rs`).
 ///
 /// A `rust_type` outside those three never had generated-impl logic to offer

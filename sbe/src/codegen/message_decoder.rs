@@ -553,6 +553,7 @@ pub(crate) fn generate_message_decoder(
     let taken_accessor_names = owner_accessor_names(
         &msg.fields,
         conversions,
+        domain_types,
         DECODER_RESERVED,
         msg.groups
             .iter()
@@ -987,13 +988,12 @@ pub(crate) fn generate_message_decoder(
                         });
                     }
                     if crate::structured_ir::is_bool_value_enum(elements, enum_name) {
-                        // One name for the decoder's boolean getter at every
-                        // shape and location: `try_*` means fallible decode.
-                        // `{field}_bool` is the *encoder setter*, so using it
-                        // for a getter too collided on meaning, and naming the
-                        // two shapes differently is what let the domain DTO
-                        // call an accessor that did not exist.
-                        let fname_bool = quote::format_ident!("try_{}_bool", fname_snake);
+                        // One name for the boolean getter at every shape and
+                        // location, matching the `{field}_bool` encoder setter
+                        // as every other getter/setter pair does. Naming the
+                        // two shapes differently is what once let the domain
+                        // DTO call an accessor that did not exist.
+                        let fname_bool = quote::format_ident!("{}_bool", fname_snake);
                         impl_body.extend(quote::quote! {
                             /// Returns `Some(true)` / `Some(false)` for valid
                             /// boolean values, or `None` when the field is absent
@@ -1046,7 +1046,7 @@ pub(crate) fn generate_message_decoder(
                         impl_body.extend(raw_body);
                     }
                     if crate::structured_ir::is_bool_value_enum(elements, enum_name) {
-                        let fname_bool = quote::format_ident!("try_{}_bool", fname_snake);
+                        let fname_bool = quote::format_ident!("{}_bool", fname_snake);
                         // `null_as_option` makes the raw enum accessor return
                         // `Option<T>`, so `.as_bool()` cannot be called on it
                         // directly. The contract is unchanged — `NullVal` is

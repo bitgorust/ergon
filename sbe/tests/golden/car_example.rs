@@ -92,7 +92,7 @@ pub mod sbe_rt {
             ///Generated field `discriminant`.
             discriminant: u64,
         },
-        /// Domain `try_*` conversion failed.
+        /// A domain-type conversion failed.
         DomainConversionFailed {
             ///Generated field `field`.
             field: &'static str,
@@ -251,7 +251,7 @@ pub mod sbe_rt {
         },
         /// Checked arithmetic overflow in encoded length computation.
         EncodedLengthOverflow,
-        /// Domain `try_*` conversion failed.
+        /// A domain-type conversion failed.
         DomainConversionFailed {
             ///Generated field `field`.
             field: &'static str,
@@ -2474,7 +2474,7 @@ impl<'a> CarDecoder<'a> {
     /// Rejects `NullVal` or unknown raw discriminants —
     /// the SBE boolean wire type is tri-state (F, T, null).
     #[inline]
-    pub fn try_available_bool(&self) -> Result<bool, sbe_rt::DecodeError> {
+    pub fn available_bool(&self) -> Result<bool, sbe_rt::DecodeError> {
         self.available()
             .as_bool()
             .ok_or(sbe_rt::DecodeError::InvalidBoolean {
@@ -4294,23 +4294,6 @@ impl<'a> FuelFiguresEntryDecoder<'a> {
     }
 }
 impl<'a> FuelFiguresEntryDecoder<'a> {
-    /// Fallible scoped var-data accessor. Calls the closure with
-    /// the decoded bytes and returns the next stage on success.
-    #[inline]
-    pub fn try_usage_description<E, F>(
-        self,
-        f: F,
-    ) -> Result<FuelFiguresEntryDecoderComplete<'a>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(&[u8]) -> Result<(), E>,
-    {
-        let (data, next) = self.into_usage_description()?;
-        f(data)?;
-        Ok(next)
-    }
-}
-impl<'a> FuelFiguresEntryDecoder<'a> {
     /// Consume this stage, decode the var-data field as a nested
     /// SBE message via `AnyMessage::decode_frame`, and advance
     /// to the next stage.
@@ -4324,20 +4307,6 @@ impl<'a> FuelFiguresEntryDecoder<'a> {
         let (data, next) = self.into_usage_description()?;
         let frame = AnyMessage::decode_frame(data, 0, data.len())?;
         Ok((frame, next))
-    }
-    /// Fallible scoped nested-message accessor.
-    #[inline]
-    pub fn try_usage_description_as_message<E, F>(
-        self,
-        f: F,
-    ) -> Result<FuelFiguresEntryDecoderComplete<'a>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(DecodedFrame<'a>) -> Result<(), E>,
-    {
-        let (frame, next) = self.into_usage_description_as_message()?;
-        f(frame)?;
-        Ok(next)
     }
 }
 impl<'a> FuelFiguresEntryDecoderComplete<'a> {
@@ -4416,18 +4385,6 @@ impl<'a> sbe_rt::Ordered<FuelFiguresEntryDecoder<'a>> {
     where
         F: FnOnce(&'a [u8]) -> Result<(), sbe_rt::DecodeError>,
     {
-        self.try_usage_description(f)
-    }
-    /// Read `usage_description` as bytes, then advance to the next tail.
-    #[inline]
-    pub fn try_usage_description<E, F>(
-        self,
-        f: F,
-    ) -> Result<sbe_rt::Ordered<FuelFiguresEntryDecoderComplete<'a>>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(&'a [u8]) -> Result<(), E>,
-    {
         let (bytes, inner) = self.inner.into_usage_description()?;
         f(bytes)?;
         Ok(sbe_rt::Ordered { inner })
@@ -4445,20 +4402,6 @@ impl<'a> sbe_rt::Ordered<FuelFiguresEntryDecoder<'a>> {
     >
     where
         F: FnOnce(&'a str) -> Result<(), sbe_rt::DecodeError>,
-    {
-        self.try_usage_description_as_str(f)
-    }
-    /// Read `usage_description` as `&str`, then advance to the next tail.
-    ///
-    /// Only this field is validated; invalid text is an error, never a sentinel.
-    #[inline]
-    pub fn try_usage_description_as_str<E, F>(
-        self,
-        f: F,
-    ) -> Result<sbe_rt::Ordered<FuelFiguresEntryDecoderComplete<'a>>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(&'a str) -> Result<(), E>,
     {
         let (text, inner) = self.inner.into_usage_description_as_str()?;
         f(text)?;
@@ -5939,7 +5882,7 @@ impl<'a> sbe_rt::Ordered<PerformanceFiguresEntryDecoder<'a>> {
     #[inline]
     pub fn acceleration<F>(
         self,
-        f: F,
+        mut f: F,
     ) -> Result<
         sbe_rt::Ordered<PerformanceFiguresEntryDecoderComplete<'a>>,
         sbe_rt::DecodeError,
@@ -5949,23 +5892,6 @@ impl<'a> sbe_rt::Ordered<PerformanceFiguresEntryDecoder<'a>> {
             PerformanceFiguresAccelerationEntryDecoder<'a>,
             sbe_rt::EntryInfo,
         ) -> Result<(), sbe_rt::DecodeError>,
-    {
-        self.try_acceleration(f)
-    }
-    /// Visit every `acceleration` entry in wire order, then advance to the next tail.
-    ///
-    /// The callback receives the entry and an [`sbe_rt::EntryInfo`] carrying its index, the wire-declared count and the acting block length. Empty groups invoke it zero times.
-    #[inline]
-    pub fn try_acceleration<E, F>(
-        self,
-        mut f: F,
-    ) -> Result<sbe_rt::Ordered<PerformanceFiguresEntryDecoderComplete<'a>>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnMut(
-            PerformanceFiguresAccelerationEntryDecoder<'a>,
-            sbe_rt::EntryInfo,
-        ) -> Result<(), E>,
     {
         let mut iter = self.inner.into_acceleration()?;
         let count = iter.remaining_entries();
@@ -6251,23 +6177,6 @@ impl<'a> CarDecoderAfterPerformanceFigures<'a> {
     }
 }
 impl<'a> CarDecoderAfterPerformanceFigures<'a> {
-    /// Fallible scoped var-data accessor. Calls the closure with
-    /// the decoded bytes and returns the next stage on success.
-    #[inline]
-    pub fn try_manufacturer<E, F>(
-        self,
-        f: F,
-    ) -> Result<CarDecoderAfterManufacturer<'a>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(&[u8]) -> Result<(), E>,
-    {
-        let (data, next) = self.into_manufacturer()?;
-        f(data)?;
-        Ok(next)
-    }
-}
-impl<'a> CarDecoderAfterPerformanceFigures<'a> {
     /// Consume this stage, decode the var-data field as a nested
     /// SBE message via `AnyMessage::decode_frame`, and advance
     /// to the next stage.
@@ -6281,20 +6190,6 @@ impl<'a> CarDecoderAfterPerformanceFigures<'a> {
         let (data, next) = self.into_manufacturer()?;
         let frame = AnyMessage::decode_frame(data, 0, data.len())?;
         Ok((frame, next))
-    }
-    /// Fallible scoped nested-message accessor.
-    #[inline]
-    pub fn try_manufacturer_as_message<E, F>(
-        self,
-        f: F,
-    ) -> Result<CarDecoderAfterManufacturer<'a>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(DecodedFrame<'a>) -> Result<(), E>,
-    {
-        let (frame, next) = self.into_manufacturer_as_message()?;
-        f(frame)?;
-        Ok(next)
     }
 }
 impl<'a> CarDecoderAfterManufacturer<'a> {
@@ -6417,20 +6312,6 @@ impl<'a> CarDecoderAfterManufacturer<'a> {
     }
 }
 impl<'a> CarDecoderAfterManufacturer<'a> {
-    /// Fallible scoped var-data accessor. Calls the closure with
-    /// the decoded bytes and returns the next stage on success.
-    #[inline]
-    pub fn try_model<E, F>(self, f: F) -> Result<CarDecoderAfterModel<'a>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(&[u8]) -> Result<(), E>,
-    {
-        let (data, next) = self.into_model()?;
-        f(data)?;
-        Ok(next)
-    }
-}
-impl<'a> CarDecoderAfterManufacturer<'a> {
     /// Consume this stage, decode the var-data field as a nested
     /// SBE message via `AnyMessage::decode_frame`, and advance
     /// to the next stage.
@@ -6441,17 +6322,6 @@ impl<'a> CarDecoderAfterManufacturer<'a> {
         let (data, next) = self.into_model()?;
         let frame = AnyMessage::decode_frame(data, 0, data.len())?;
         Ok((frame, next))
-    }
-    /// Fallible scoped nested-message accessor.
-    #[inline]
-    pub fn try_model_as_message<E, F>(self, f: F) -> Result<CarDecoderAfterModel<'a>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(DecodedFrame<'a>) -> Result<(), E>,
-    {
-        let (frame, next) = self.into_model_as_message()?;
-        f(frame)?;
-        Ok(next)
     }
 }
 impl<'a> CarDecoderAfterModel<'a> {
@@ -6573,20 +6443,6 @@ impl<'a> CarDecoderAfterModel<'a> {
     }
 }
 impl<'a> CarDecoderAfterModel<'a> {
-    /// Fallible scoped var-data accessor. Calls the closure with
-    /// the decoded bytes and returns the next stage on success.
-    #[inline]
-    pub fn try_activation_code<E, F>(self, f: F) -> Result<CarDecoderComplete<'a>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(&[u8]) -> Result<(), E>,
-    {
-        let (data, next) = self.into_activation_code()?;
-        f(data)?;
-        Ok(next)
-    }
-}
-impl<'a> CarDecoderAfterModel<'a> {
     /// Consume this stage, decode the var-data field as a nested
     /// SBE message via `AnyMessage::decode_frame`, and advance
     /// to the next stage.
@@ -6597,20 +6453,6 @@ impl<'a> CarDecoderAfterModel<'a> {
         let (data, next) = self.into_activation_code()?;
         let frame = AnyMessage::decode_frame(data, 0, data.len())?;
         Ok((frame, next))
-    }
-    /// Fallible scoped nested-message accessor.
-    #[inline]
-    pub fn try_activation_code_as_message<E, F>(
-        self,
-        f: F,
-    ) -> Result<CarDecoderComplete<'a>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(DecodedFrame<'a>) -> Result<(), E>,
-    {
-        let (frame, next) = self.into_activation_code_as_message()?;
-        f(frame)?;
-        Ok(next)
     }
 }
 impl<'a> FuelFiguresDecoder<'a, sbe_rt::Attached> {
@@ -7084,9 +6926,7 @@ impl<'v, 'a> CarDecoderFixedView<'v, 'a> {
 }
 impl<'a> sbe_rt::Ordered<CarDecoder<'a>> {
     /// Read the fixed block before any tail, then continue from a
-    /// distinct stage that carries only the tail methods. Yields
-    /// when the first tail is named `fixed`; use [`Self::try_fixed`]
-    /// there.
+    /// distinct stage that carries only the tail methods.
     #[inline]
     pub fn fixed<F>(
         self,
@@ -7097,19 +6937,6 @@ impl<'a> sbe_rt::Ordered<CarDecoder<'a>> {
     >
     where
         F: FnOnce(&CarDecoderFixedView<'_, 'a>) -> Result<(), sbe_rt::DecodeError>,
-    {
-        self.try_fixed(f)
-    }
-    /// Read the fixed block before any tail, with a caller error type.
-    /// Yields when the first tail is named `tryFixed`; use [`Self::fixed`]
-    /// there.
-    #[inline]
-    pub fn try_fixed<E, F>(
-        self,
-        f: F,
-    ) -> Result<sbe_rt::Ordered<sbe_rt::OrderedFixed<CarDecoder<'a>>>, E>
-    where
-        F: FnOnce(&CarDecoderFixedView<'_, 'a>) -> Result<(), E>,
     {
         let view = CarDecoderFixedView {
             inner: &self.inner,
@@ -7153,28 +6980,13 @@ impl<'a> sbe_rt::Ordered<CarDecoder<'a>> {
     #[inline]
     pub fn fuel_figures<F, R>(
         self,
-        f: F,
+        mut f: F,
     ) -> Result<sbe_rt::Ordered<CarDecoderAfterFuelFigures<'a>>, sbe_rt::DecodeError>
     where
         F: FnMut(
             FuelFiguresEntryDecoder<'a>,
             sbe_rt::EntryInfo,
         ) -> Result<R, sbe_rt::DecodeError>,
-        R: sbe_rt::IntoEntryComplete<FuelFiguresEntryDecoderComplete<'a>>,
-    {
-        self.try_fuel_figures(f)
-    }
-    /// Visit every `fuel_figures` entry in wire order, then advance to the next tail.
-    ///
-    /// The callback receives the entry and an [`sbe_rt::EntryInfo`] carrying its index, the wire-declared count and the acting block length. Empty groups invoke it zero times.
-    #[inline]
-    pub fn try_fuel_figures<E, F, R>(
-        self,
-        mut f: F,
-    ) -> Result<sbe_rt::Ordered<CarDecoderAfterFuelFigures<'a>>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnMut(FuelFiguresEntryDecoder<'a>, sbe_rt::EntryInfo) -> Result<R, E>,
         R: sbe_rt::IntoEntryComplete<FuelFiguresEntryDecoderComplete<'a>>,
     {
         let inner = self
@@ -7216,28 +7028,13 @@ impl<'a> sbe_rt::Ordered<sbe_rt::OrderedFixed<CarDecoder<'a>>> {
     #[inline]
     pub fn fuel_figures<F, R>(
         self,
-        f: F,
+        mut f: F,
     ) -> Result<sbe_rt::Ordered<CarDecoderAfterFuelFigures<'a>>, sbe_rt::DecodeError>
     where
         F: FnMut(
             FuelFiguresEntryDecoder<'a>,
             sbe_rt::EntryInfo,
         ) -> Result<R, sbe_rt::DecodeError>,
-        R: sbe_rt::IntoEntryComplete<FuelFiguresEntryDecoderComplete<'a>>,
-    {
-        self.try_fuel_figures(f)
-    }
-    /// Visit every `fuel_figures` entry in wire order, then advance to the next tail.
-    ///
-    /// The callback receives the entry and an [`sbe_rt::EntryInfo`] carrying its index, the wire-declared count and the acting block length. Empty groups invoke it zero times.
-    #[inline]
-    pub fn try_fuel_figures<E, F, R>(
-        self,
-        mut f: F,
-    ) -> Result<sbe_rt::Ordered<CarDecoderAfterFuelFigures<'a>>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnMut(FuelFiguresEntryDecoder<'a>, sbe_rt::EntryInfo) -> Result<R, E>,
         R: sbe_rt::IntoEntryComplete<FuelFiguresEntryDecoderComplete<'a>>,
     {
         let inner = self
@@ -7280,7 +7077,7 @@ impl<'a> sbe_rt::Ordered<CarDecoderAfterFuelFigures<'a>> {
     #[inline]
     pub fn performance_figures<F, R>(
         self,
-        f: F,
+        mut f: F,
     ) -> Result<
         sbe_rt::Ordered<CarDecoderAfterPerformanceFigures<'a>>,
         sbe_rt::DecodeError,
@@ -7290,21 +7087,6 @@ impl<'a> sbe_rt::Ordered<CarDecoderAfterFuelFigures<'a>> {
             PerformanceFiguresEntryDecoder<'a>,
             sbe_rt::EntryInfo,
         ) -> Result<R, sbe_rt::DecodeError>,
-        R: sbe_rt::IntoEntryComplete<PerformanceFiguresEntryDecoderComplete<'a>>,
-    {
-        self.try_performance_figures(f)
-    }
-    /// Visit every `performance_figures` entry in wire order, then advance to the next tail.
-    ///
-    /// The callback receives the entry and an [`sbe_rt::EntryInfo`] carrying its index, the wire-declared count and the acting block length. Empty groups invoke it zero times.
-    #[inline]
-    pub fn try_performance_figures<E, F, R>(
-        self,
-        mut f: F,
-    ) -> Result<sbe_rt::Ordered<CarDecoderAfterPerformanceFigures<'a>>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnMut(PerformanceFiguresEntryDecoder<'a>, sbe_rt::EntryInfo) -> Result<R, E>,
         R: sbe_rt::IntoEntryComplete<PerformanceFiguresEntryDecoderComplete<'a>>,
     {
         let inner = self
@@ -7343,18 +7125,6 @@ impl<'a> sbe_rt::Ordered<CarDecoderAfterPerformanceFigures<'a>> {
     where
         F: FnOnce(&'a [u8]) -> Result<(), sbe_rt::DecodeError>,
     {
-        self.try_manufacturer(f)
-    }
-    /// Read `manufacturer` as bytes, then advance to the next tail.
-    #[inline]
-    pub fn try_manufacturer<E, F>(
-        self,
-        f: F,
-    ) -> Result<sbe_rt::Ordered<CarDecoderAfterManufacturer<'a>>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(&'a [u8]) -> Result<(), E>,
-    {
         let (bytes, inner) = self.inner.into_manufacturer()?;
         f(bytes)?;
         Ok(sbe_rt::Ordered { inner })
@@ -7369,20 +7139,6 @@ impl<'a> sbe_rt::Ordered<CarDecoderAfterPerformanceFigures<'a>> {
     ) -> Result<sbe_rt::Ordered<CarDecoderAfterManufacturer<'a>>, sbe_rt::DecodeError>
     where
         F: FnOnce(&'a str) -> Result<(), sbe_rt::DecodeError>,
-    {
-        self.try_manufacturer_as_str(f)
-    }
-    /// Read `manufacturer` as `&str`, then advance to the next tail.
-    ///
-    /// Only this field is validated; invalid text is an error, never a sentinel.
-    #[inline]
-    pub fn try_manufacturer_as_str<E, F>(
-        self,
-        f: F,
-    ) -> Result<sbe_rt::Ordered<CarDecoderAfterManufacturer<'a>>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(&'a str) -> Result<(), E>,
     {
         let (text, inner) = self.inner.into_manufacturer_as_str()?;
         f(text)?;
@@ -7417,18 +7173,6 @@ impl<'a> sbe_rt::Ordered<CarDecoderAfterManufacturer<'a>> {
     where
         F: FnOnce(&'a [u8]) -> Result<(), sbe_rt::DecodeError>,
     {
-        self.try_model(f)
-    }
-    /// Read `model` as bytes, then advance to the next tail.
-    #[inline]
-    pub fn try_model<E, F>(
-        self,
-        f: F,
-    ) -> Result<sbe_rt::Ordered<CarDecoderAfterModel<'a>>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(&'a [u8]) -> Result<(), E>,
-    {
         let (bytes, inner) = self.inner.into_model()?;
         f(bytes)?;
         Ok(sbe_rt::Ordered { inner })
@@ -7443,20 +7187,6 @@ impl<'a> sbe_rt::Ordered<CarDecoderAfterManufacturer<'a>> {
     ) -> Result<sbe_rt::Ordered<CarDecoderAfterModel<'a>>, sbe_rt::DecodeError>
     where
         F: FnOnce(&'a str) -> Result<(), sbe_rt::DecodeError>,
-    {
-        self.try_model_as_str(f)
-    }
-    /// Read `model` as `&str`, then advance to the next tail.
-    ///
-    /// Only this field is validated; invalid text is an error, never a sentinel.
-    #[inline]
-    pub fn try_model_as_str<E, F>(
-        self,
-        f: F,
-    ) -> Result<sbe_rt::Ordered<CarDecoderAfterModel<'a>>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(&'a str) -> Result<(), E>,
     {
         let (text, inner) = self.inner.into_model_as_str()?;
         f(text)?;
@@ -7491,18 +7221,6 @@ impl<'a> sbe_rt::Ordered<CarDecoderAfterModel<'a>> {
     where
         F: FnOnce(&'a [u8]) -> Result<(), sbe_rt::DecodeError>,
     {
-        self.try_activation_code(f)
-    }
-    /// Read `activation_code` as bytes, then advance to the next tail.
-    #[inline]
-    pub fn try_activation_code<E, F>(
-        self,
-        f: F,
-    ) -> Result<sbe_rt::Ordered<CarDecoderComplete<'a>>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(&'a [u8]) -> Result<(), E>,
-    {
         let (bytes, inner) = self.inner.into_activation_code()?;
         f(bytes)?;
         Ok(sbe_rt::Ordered { inner })
@@ -7517,20 +7235,6 @@ impl<'a> sbe_rt::Ordered<CarDecoderAfterModel<'a>> {
     ) -> Result<sbe_rt::Ordered<CarDecoderComplete<'a>>, sbe_rt::DecodeError>
     where
         F: FnOnce(&'a str) -> Result<(), sbe_rt::DecodeError>,
-    {
-        self.try_activation_code_as_str(f)
-    }
-    /// Read `activation_code` as `&str`, then advance to the next tail.
-    ///
-    /// Only this field is validated; invalid text is an error, never a sentinel.
-    #[inline]
-    pub fn try_activation_code_as_str<E, F>(
-        self,
-        f: F,
-    ) -> Result<sbe_rt::Ordered<CarDecoderComplete<'a>>, E>
-    where
-        E: From<sbe_rt::DecodeError>,
-        F: FnOnce(&'a str) -> Result<(), E>,
     {
         let (text, inner) = self.inner.into_activation_code_as_str()?;
         f(text)?;
@@ -7891,7 +7595,7 @@ impl CarDomain {
         Ok(Self {
             serial_number: dec.serial_number(),
             model_year: dec.model_year(),
-            available: dec.try_available_bool()?,
+            available: dec.available_bool()?,
             code: dec.code(),
             some_numbers: dec.some_numbers(),
             vehicle_code: dec.vehicle_code(),

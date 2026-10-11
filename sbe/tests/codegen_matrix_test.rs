@@ -95,7 +95,7 @@ fn expected_cells() -> Vec<(String, &'static str)> {
 }
 
 /// `TryFromSbe`/`TryToSbe` impls for every wire type the matrix maps to a
-/// domain type. Domain `try_*` accessors name these in their signatures, so the
+/// domain type. Domain accessors name these in their signatures, so the
 /// generated module does not compile without them.
 const DOMAIN_IMPLS: &str = r#"
         use rust_decimal::Decimal;
@@ -160,7 +160,7 @@ fn with_matrix_domain_types(c: GenerationConfig) -> GenerationConfig {
 }
 
 /// Conversion selectors only — no domain type, so the generated surface is
-/// `*_as` / `*_from` plus `*_wire` raw renames rather than `try_*`.
+/// `*_as` / `*_from` plus `*_wire` raw renames rather than domain accessors.
 fn with_matrix_conversions(c: GenerationConfig) -> GenerationConfig {
     c.with_conversion(ConversionSelector::semantic_type("ScaledPrice"))
         .with_conversion(ConversionSelector::named_type("Money"))
@@ -507,7 +507,7 @@ fn selector_precedence_field_path_beats_semantic_beats_named()
 }
 
 /// A domain type configured for an **enum** or **set** field must reach the
-/// DTO. `converter_impls` generated `try_*` accessors for these fields all
+/// DTO. `converter_impls` generated domain accessors for these fields all
 /// along, but the domain-DTO generator ignored them and emitted the raw
 /// generated type — the configured mapping silently did nothing.
 #[test]

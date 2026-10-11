@@ -180,6 +180,21 @@
   new id.
 
 ### Changed
+- Breaking (generated API): drop `try_` from the per-field and closure
+  methods.
+  - A domain-typed field's getter and setter take the plain field name
+    (`price()?`, `price(v)?`); the raw accessor stays `price_wire`. A field
+    named after a reserved method takes the same `_field` rename its raw
+    accessor would.
+  - The decoder's boolean getter is `{field}_bool()` again, reversing
+    0.1.24's `try_{field}_bool()`; it shares its name with the encoder
+    setter, and only the return type varies with shape.
+  - The `Ordered` lane's `try_fixed`, `try_<group>`, `try_<data>` and
+    `try_<data>_as_str` twins are removed; their plain forms return
+    `DecodeError`; map a custom error into it inside the closure.
+  - The raw stages' `try_<data>(f)` and `try_<data>_as_message(f)`
+    callbacks are removed; use `into_<data>()` / `into_<data>_as_message()`,
+    or `.ordered()`.
 - Check ergo-sbe's wire bytes against sbe-tool 1.40.2, up from a pre-1.40.0
   snapshot: the reference codecs and the benchmark comparators are
   regenerated from it, and the parity suite adds its `issue1116`,
@@ -424,7 +439,7 @@
   for such schemas change width. Message blocks were already right.
 - Return a constant enum in a group entry from its `valueRef`, as message
   level does. The entry accessor read the wire past the entry's block; its
-  entry setters and its `raw_` and `try_*_bool` accessors, which wrote or
+  entry setters and its `raw_` and `*_bool` accessors, which wrote or
   read there, are removed.
 - Count a group entry's DTO `encoded_length()` from the stride the encoder
   writes. It ignored a group's declared `blockLength` padding and took the
@@ -577,14 +592,14 @@
   encoded as `0.000000015`; only values whose scale already matched the
   exponent came out right. It now rescales to the exponent, and a value that
   cannot be represented exactly (more digits than the exponent allows, or out
-  of `i64` range) is an error, never rounded. This affects every `try_*`
+  of `i64` range) is an error, never rounded. This affects every domain
   setter of such a field under
   `with_domain_type(…, "rust_decimal::Decimal")`, and the impl the
   `DomainImpl::Manual` doc snippet suggests.
 - **A `UTCTimestamp` field's `timeUnit` was ignored by the built-in
   `chrono::DateTime<Utc>` conversion.** It always assumed nanoseconds, so a
   `timeUnit="second"` field was written as nanoseconds and a millisecond field
-  decoded 10⁶× too early. The `try_*` accessors now convert between the
+  decoded 10⁶× too early. The domain accessors now convert between the
   field's unit and the nanoseconds the conversion works in, at message level,
   in group and nested group entries, and in domain DTOs. A value more precise
   than the field holds is an error, never truncated. Under

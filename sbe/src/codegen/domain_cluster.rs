@@ -5,8 +5,9 @@
 //! [`super::conversion_helpers`], [`super::runtime`], and `structured_ir` types.
 
 use super::conversion_helpers::{
-    domain_encode_setter_name, dto_domain_type, enum_uses_null_as_option,
-    field_has_conversion_free, find_domain_type, message_field_infos,
+    DECODER_RESERVED, ENCODER_RESERVED, domain_accessor_ident, domain_encode_setter_name,
+    dto_domain_type, enum_uses_null_as_option, field_has_conversion_free, find_domain_type,
+    message_field_infos,
 };
 use super::runtime::{to_pascal_case, to_snake_case};
 use crate::ir::{ByteOrder, Presence, PrimitiveType};
@@ -197,9 +198,9 @@ fn dto_enum_or_null(
 /// Push the DTO field, `from_decoder` expression, and encode statement for a
 /// field whose wire type is a generated named type (non-boolean enum, set).
 ///
-/// With a domain type configured these go through the fallible `try_*`
+/// With a domain type configured these go through the fallible domain
 /// accessors, exactly as composites do; without one they use the generated type
-/// directly. `try_*` on a `sinceVersion > 0` field already returns
+/// directly. The domain getter on a `sinceVersion > 0` field already returns
 /// `Result<Option<T>, E>`, so the versioned domain arm must not re-wrap in
 /// `Some(..)` — that is the `Option<Option<T>>` defect this file shipped twice.
 #[allow(clippy::too_many_arguments)]
@@ -207,6 +208,8 @@ fn push_named_type_cell(
     f: &MessageField,
     f_ident: &syn::Ident,
     f_snake: &str,
+    // Resolved domain getter / setter names (see `domain_accessor_ident`).
+    (dom_get, dom_set): (&syn::Ident, &syn::Ident),
     type_ident: &syn::Ident,
     domain_ty: Option<&str>,
     // The raw accessor already returns `Option<T>` independently of version
@@ -239,21 +242,20 @@ fn push_named_type_cell(
     };
 
     let dt_ty: syn::Type = syn::parse_str(dt).unwrap();
-    let try_g = syn::Ident::new(&format!("try_{f_snake}"), span);
     let field_lit = syn::LitStr::new(f_snake, span);
     let decode = quote::quote! {
-        #f_ident: dec.#try_g().map_err(|_| {
+        #f_ident: dec.#dom_get().map_err(|_| {
             sbe_rt::DecodeError::DomainConversionFailed {
                 field: #field_lit,
-                reason: "try_* conversion rejected wire value",
+                reason: "domain conversion rejected wire value",
             }
         })?
     };
     let encode_one = quote::quote! {
-        enc.#try_g(v).map_err(|_| {
+        enc.#dom_set(v).map_err(|_| {
             sbe_rt::EncodeError::DomainConversionFailed {
                 field: #field_lit,
-                reason: "try_* conversion rejected domain value",
+                reason: "domain conversion rejected domain value",
             }
         })?;
     };
@@ -348,6 +350,13 @@ pub(crate) fn generate_domain_recursive(
     let domain_ident = syn::Ident::new(&format!("{struct_prefix}Domain"), span);
     let decoder_ident = syn::Ident::new(&format!("{decoder_name}Decoder"), span);
 
+    // Message DTOs call the message decoder/encoder, which rename against
+    // their reserved lists; group entries never rename.
+    let (get_reserved, set_reserved): (&[&str], &[&str]) = if is_entry {
+        (&[], &[])
+    } else {
+        (DECODER_RESERVED, ENCODER_RESERVED)
+    };
     let mut struct_fields: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut from_exprs: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut encode_stmts: Vec<proc_macro2::TokenStream> = Vec::new();
@@ -360,6 +369,8 @@ pub(crate) fn generate_domain_recursive(
         }
         let f_snake = to_snake_case(&f.name);
         let f_ident = syn::Ident::new(&f_snake, span);
+        let dom_get = domain_accessor_ident(&f_snake, get_reserved);
+        let dom_set = domain_accessor_ident(&f_snake, set_reserved);
         match &f.field_type {
             FieldType::Primitive(prim, length) => {
                 let r_type_str = rust_type(*prim);
@@ -375,7 +386,14 @@ pub(crate) fn generate_domain_recursive(
                     None => r_type.clone(),
                 };
                 let enc_setter = syn::Ident::new(
-                    &domain_encode_setter_name(f, conversions, domain_types, &f_snake, elements),
+                    &domain_encode_setter_name(
+                        f,
+                        conversions,
+                        domain_types,
+                        &f_snake,
+                        elements,
+                        set_reserved,
+                    ),
                     span,
                 );
                 // Arrays and optional scalars keep the wire type, but a
@@ -407,22 +425,21 @@ pub(crate) fn generate_domain_recursive(
                         }
                     });
                 } else {
-                    // Domain-typed scalars use fallible `try_*`.
+                    // Domain-typed scalars use the fallible domain accessors.
                     // Conversion-only renames the raw flyweight getter to *_wire.
                     if f.since_version > 0 {
                         struct_fields.push(quote::quote! { pub #f_ident: Option<#scalar_ty> });
                         if scalar_domain.is_some() {
-                            let try_g = syn::Ident::new(&format!("try_{f_snake}"), span);
                             let field_lit = syn::LitStr::new(&f_snake, span);
-                            // `try_*` on a versioned field already yields
+                            // The domain getter on a versioned field already yields
                             // `Option<T>` (see `is_optional_domain_field`), so
                             // do not wrap it in `Some(..)` — that would build
                             // `Option<Option<T>>` for an `Option<T>` field.
                             from_exprs.push(quote::quote! {
-                                #f_ident: dec.#try_g().map_err(|_| {
+                                #f_ident: dec.#dom_get().map_err(|_| {
                                     sbe_rt::DecodeError::DomainConversionFailed {
                                         field: #field_lit,
-                                        reason: "try_* conversion rejected wire value",
+                                        reason: "domain conversion rejected wire value",
                                     }
                                 })?
                             });
@@ -431,7 +448,7 @@ pub(crate) fn generate_domain_recursive(
                                     enc.#enc_setter(v).map_err(|_| {
                                         sbe_rt::EncodeError::DomainConversionFailed {
                                             field: #field_lit,
-                                            reason: "try_* conversion rejected domain value",
+                                            reason: "domain conversion rejected domain value",
                                         }
                                     })?;
                                 }
@@ -455,13 +472,12 @@ pub(crate) fn generate_domain_recursive(
                     } else {
                         struct_fields.push(quote::quote! { pub #f_ident: #scalar_ty });
                         if scalar_domain.is_some() {
-                            let try_g = syn::Ident::new(&format!("try_{f_snake}"), span);
                             let field_lit = syn::LitStr::new(&f_snake, span);
                             from_exprs.push(quote::quote! {
-                                #f_ident: dec.#try_g().map_err(|_| {
+                                #f_ident: dec.#dom_get().map_err(|_| {
                                     sbe_rt::DecodeError::DomainConversionFailed {
                                         field: #field_lit,
-                                        reason: "try_* conversion rejected wire value",
+                                        reason: "domain conversion rejected wire value",
                                     }
                                 })?
                             });
@@ -469,7 +485,7 @@ pub(crate) fn generate_domain_recursive(
                                 enc.#enc_setter(self.#f_ident).map_err(|_| {
                                     sbe_rt::EncodeError::DomainConversionFailed {
                                             field: #field_lit,
-                                            reason: "try_* conversion rejected domain value",
+                                            reason: "domain conversion rejected domain value",
                                         }
                                 })?;
                             });
@@ -505,7 +521,14 @@ pub(crate) fn generate_domain_recursive(
                 // domain type and reads/writes via the domain accessors.
                 let domain_ty = find_domain_type(f, domain_types);
                 let enc_setter = syn::Ident::new(
-                    &domain_encode_setter_name(f, conversions, domain_types, &f_snake, elements),
+                    &domain_encode_setter_name(
+                        f,
+                        conversions,
+                        domain_types,
+                        &f_snake,
+                        elements,
+                        set_reserved,
+                    ),
                     span,
                 );
                 let field_ty: proc_macro2::TokenStream = match domain_ty {
@@ -520,17 +543,16 @@ pub(crate) fn generate_domain_recursive(
                 if f.since_version > 0 {
                     struct_fields.push(quote::quote! { pub #f_ident: Option<#field_ty> });
                     if domain_ty.is_some() {
-                        let try_g = syn::Ident::new(&format!("try_{f_snake}"), span);
                         let field_lit = syn::LitStr::new(&f_snake, span);
-                        // `try_*` on a versioned field already yields
+                        // The domain getter on a versioned field already yields
                         // `Option<T>` (see `is_optional_domain_field`), so do
                         // not wrap it in `Some(..)` — that would build
                         // `Option<Option<T>>` for an `Option<T>` field.
                         from_exprs.push(quote::quote! {
-                            #f_ident: dec.#try_g().map_err(|_| {
+                            #f_ident: dec.#dom_get().map_err(|_| {
                                 sbe_rt::DecodeError::DomainConversionFailed {
                                         field: #field_lit,
-                                        reason: "try_* conversion rejected wire value",
+                                        reason: "domain conversion rejected wire value",
                                     }
                             })?
                         });
@@ -539,7 +561,7 @@ pub(crate) fn generate_domain_recursive(
                                 enc.#enc_setter(v).map_err(|_| {
                                     sbe_rt::EncodeError::DomainConversionFailed {
                                             field: #field_lit,
-                                            reason: "try_* conversion rejected domain value",
+                                            reason: "domain conversion rejected domain value",
                                         }
                                 })?;
                             }
@@ -552,13 +574,12 @@ pub(crate) fn generate_domain_recursive(
                 } else {
                     struct_fields.push(quote::quote! { pub #f_ident: #field_ty });
                     if domain_ty.is_some() {
-                        let try_g = syn::Ident::new(&format!("try_{f_snake}"), span);
                         let field_lit = syn::LitStr::new(&f_snake, span);
                         from_exprs.push(quote::quote! {
-                            #f_ident: dec.#try_g().map_err(|_| {
+                            #f_ident: dec.#dom_get().map_err(|_| {
                                 sbe_rt::DecodeError::DomainConversionFailed {
                                         field: #field_lit,
-                                        reason: "try_* conversion rejected wire value",
+                                        reason: "domain conversion rejected wire value",
                                     }
                             })?
                         });
@@ -566,7 +587,7 @@ pub(crate) fn generate_domain_recursive(
                             enc.#enc_setter(self.#f_ident).map_err(|_| {
                                 sbe_rt::EncodeError::DomainConversionFailed {
                                             field: #field_lit,
-                                            reason: "try_* conversion rejected domain value",
+                                            reason: "domain conversion rejected domain value",
                                         }
                             })?;
                         });
@@ -581,9 +602,9 @@ pub(crate) fn generate_domain_recursive(
             } => {
                 if crate::structured_ir::is_bool_enum(elements, enum_name) {
                     // bool enums → plain bool in DTO; NullVal rejected at decode
-                    // time. The decoder getter is `try_*_bool` at every shape
-                    // and location; `{field}_bool` is the encoder setter.
-                    let get_bool = syn::Ident::new(&format!("try_{f_snake}_bool"), span);
+                    // time. `{field}_bool` names the decoder getter and the
+                    // encoder setter at every shape and location.
+                    let get_bool = syn::Ident::new(&format!("{f_snake}_bool"), span);
                     let set_bool = syn::Ident::new(&format!("{f_snake}_bool"), span);
                     // Only version-gating makes the getter `Option`-returning.
                     // `presence="optional"` does not (an optional enum carries
@@ -616,6 +637,7 @@ pub(crate) fn generate_domain_recursive(
                         f,
                         &f_ident,
                         &f_snake,
+                        (&dom_get, &dom_set),
                         &type_ident,
                         dto_domain_type(f, domain_types, elements),
                         accessor_optional,
@@ -635,6 +657,7 @@ pub(crate) fn generate_domain_recursive(
                         f,
                         &f_ident,
                         &f_snake,
+                        (&dom_get, &dom_set),
                         &type_ident,
                         Some(dt),
                         false,

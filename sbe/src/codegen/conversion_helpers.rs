@@ -310,22 +310,30 @@ pub(crate) fn resolve_field_ident(
 /// named `orders` wants, so checking fields alone still lets two definitions
 /// of `orders_count` reach the same `impl`.
 ///
+/// A domain-typed field owns its plain name too: the raw accessor moves to
+/// `*_wire` and the domain getter/setter takes the field name.
+///
 /// Pass `reserved` exactly as the owner's own emission site passes it:
 /// [`DECODER_RESERVED`] for message decoders and the memoized wrapper, and an
 /// empty slice for group entries, which do not rename.
 pub(crate) fn owner_accessor_names<'n>(
     fields: &[MessageField],
     conversions: &[crate::ConversionSelector],
+    domain_types: &[(crate::ConversionSelector, String)],
     reserved: &[&str],
     tail_names: impl IntoIterator<Item = &'n str>,
 ) -> Vec<String> {
     fields
         .iter()
-        .map(|f| {
+        .flat_map(|f| {
             let snake = crate::codegen::runtime::to_snake_case(&f.name);
             let wire_name =
                 field_has_conversion_free(f, conversions).then(|| format!("{snake}_wire"));
-            resolve_field_ident(&snake, &wire_name, reserved).to_string()
+            let raw = resolve_field_ident(&snake, &wire_name, reserved).to_string();
+            let domain = (f.presence != Presence::Constant
+                && find_domain_type(f, domain_types).is_some())
+            .then(|| domain_accessor_ident(&snake, reserved).to_string());
+            core::iter::once(raw).chain(domain)
         })
         .chain(
             tail_names
@@ -333,6 +341,13 @@ pub(crate) fn owner_accessor_names<'n>(
                 .map(crate::codegen::runtime::to_snake_case),
         )
         .collect()
+}
+
+/// The domain-typed getter or setter for a field: the plain field name, renamed
+/// against `reserved` like any raw accessor. Every emitter and caller of a
+/// domain accessor resolves the name here, so they cannot disagree.
+pub(crate) fn domain_accessor_ident(field_snake: &str, reserved: &[&str]) -> syn::Ident {
+    resolve_field_ident(field_snake, &None, reserved)
 }
 
 /// Name for a tail-derived convenience accessor (`<group>_count`,
@@ -517,7 +532,7 @@ pub(crate) fn find_domain_selector<'a>(
 /// It must stay the one predicate: when the DTO field type, the `from_decoder`
 /// expression, and the encode setter each decided this independently they
 /// drifted apart and produced modules that did not compile — an array field
-/// typed `[u8; 4]` written through a `try_*` setter taking the domain type, and
+/// typed `[u8; 4]` written through a domain setter taking the domain type, and
 /// an optional scalar typed `Option<i64>` written through one taking `Decimal`.
 ///
 /// Arrays and optional scalars deliberately keep the wire type. Composites,
@@ -525,7 +540,7 @@ pub(crate) fn find_domain_selector<'a>(
 ///
 /// Boolean enums are excluded: they already materialise as `bool` through
 /// `*_bool` accessors, and `with_bool_domain_type` registers `bool` as their
-/// domain type — routing them here would send the DTO down the `try_*` path
+/// domain type — routing them here would send the DTO down the domain-setter path
 /// while the field branch still emitted `*_bool`, which is exactly the drift
 /// this predicate exists to prevent.
 pub(crate) fn dto_domain_type<'a>(
@@ -557,7 +572,8 @@ pub(crate) fn dto_domain_type<'a>(
 /// Encoder setter name used by domain DTOs.
 ///
 /// - Conversion-only (no domain type): flyweight is `*_wire`.
-/// - Concrete domain type: fallible `try_*` setter.
+/// - Concrete domain type: the fallible domain setter, resolved against
+///   `reserved` ([`ENCODER_RESERVED`] for messages, empty for group entries).
 /// - Otherwise: bare field name.
 pub(crate) fn domain_encode_setter_name(
     field: &MessageField,
@@ -565,9 +581,10 @@ pub(crate) fn domain_encode_setter_name(
     domain_types: &[(crate::ConversionSelector, String)],
     field_snake: &str,
     elements: &crate::structured_ir::SchemaElements,
+    reserved: &[&str],
 ) -> String {
     if dto_domain_type(field, domain_types, elements).is_some() {
-        format!("try_{field_snake}")
+        domain_accessor_ident(field_snake, reserved).to_string()
     } else if field_has_conversion_free(field, conversions) {
         format!("{field_snake}_wire")
     } else {

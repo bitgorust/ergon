@@ -222,8 +222,8 @@ pub fn assert_source_ok(src: &str, expected: &[&str]) {
 ///
 /// A plain `src.contains(method)` check cannot tell a method on the type
 /// under test from a same-named method the generator emits on an unrelated
-/// type — e.g. the ordered decode lane's `try_fixed` and the encoder's
-/// (absent) fixed-phase bypass share a name but are different invariants.
+/// type — e.g. the ordered decode lane's `fixed` callback and the encoder's
+/// fixed phase share a name but are different invariants.
 /// Parsing scopes the check to the type that actually owns the invariant.
 pub fn impl_for_type_defines_method(src: &str, type_name: &str, method: &str) -> bool {
     let file = syn::parse_file(src).expect("generated code is not valid Rust");

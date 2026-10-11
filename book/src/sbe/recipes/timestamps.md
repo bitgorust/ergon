@@ -37,17 +37,17 @@ Schema:
 <field name="updated_at"  id="2" type="uint64" semanticType="UTCTimestampMicros"/>
 ```
 
-Generated API — `try_created_at()` returns `DateTime<Utc>`, `try_updated_at()`
+Generated API — `created_at()` returns `DateTime<Utc>`, `updated_at()`
 returns `NaiveDateTime`:
 
 ```rust,ignore
 // Decode
-let created: chrono::DateTime<chrono::Utc> = dec.try_created_at()?;
-let updated: chrono::NaiveDateTime = dec.try_updated_at()?;
+let created: chrono::DateTime<chrono::Utc> = dec.created_at()?;
+let updated: chrono::NaiveDateTime = dec.updated_at()?;
 
 // Encode
-enc.try_created_at(chrono::Utc::now())?;
-enc.try_updated_at(
+enc.created_at(chrono::Utc::now())?;
+enc.updated_at(
     chrono::DateTime::from_timestamp_micros(1_720_000_000_000_000)
         .ok_or("micros out of range")?
         .naive_utc(),
@@ -58,7 +58,7 @@ enc.try_updated_at(
 
 A `uint64` `UTCTimestamp` field may say what it counts with `timeUnit`
 (`second`, `millisecond`, `microsecond` or `nanosecond`; nanoseconds when
-absent). The built-in `DateTime<Utc>` conversion honours it: the `try_*`
+absent). The built-in `DateTime<Utc>` conversion honours it: the domain
 accessors read and write the field in its own unit, so one
 `semantic_type("UTCTimestamp")` mapping serves fields of every precision.
 
@@ -96,13 +96,13 @@ let config = GenerationConfig::new("msgs")
 All three fields get their own concrete accessor, generated from that one call:
 
 ```rust,ignore
-enc.try_created_at(chrono::Utc::now())?;
-enc.try_updated_at(chrono::Utc::now())?;
-enc.try_expires_at(chrono::Utc::now())?;
+enc.created_at(chrono::Utc::now())?;
+enc.updated_at(chrono::Utc::now())?;
+enc.expires_at(chrono::Utc::now())?;
 
-let created: chrono::DateTime<chrono::Utc> = dec.try_created_at()?;
-let updated: chrono::DateTime<chrono::Utc> = dec.try_updated_at()?;
-let expires: chrono::DateTime<chrono::Utc> = dec.try_expires_at()?;
+let created: chrono::DateTime<chrono::Utc> = dec.created_at()?;
+let updated: chrono::DateTime<chrono::Utc> = dec.updated_at()?;
+let expires: chrono::DateTime<chrono::Utc> = dec.expires_at()?;
 ```
 
 This is why `UTCTimestamp` and `UTCTimestampMicros` need **separate**
@@ -130,7 +130,7 @@ fields at three different wire precisions, all normalized to the **same**
 the three is the bare `uint64` + `semanticType="UTCTimestamp"` shape the
 built-in converter matches, so none gets an auto-generated impl — that's
 exactly the case [`DomainImpl::Manual`](../configuration/conversion-vs-domain.md#option-b-manual-impl--concrete-signatures-your-own-conversion-logic)
-is for: concrete `try_*` signatures from ergo-sbe, conversion body from you.
+is for: concrete domain accessor signatures from ergo-sbe, conversion body from you.
 
 Distinguish the three precisions with single-element composites (a distinct
 Rust type per precision — `TimestampMillis(u64)` is not `TimestampNanos(u64)`
@@ -229,13 +229,13 @@ wire precisions — the caller never has to know or care which precision a
 given field was wire-encoded at:
 
 ```rust,ignore
-let created: chrono::DateTime<chrono::Utc> = dec.try_created_at()?;
-let updated: chrono::DateTime<chrono::Utc> = dec.try_updated_at()?;
-let deleted: chrono::DateTime<chrono::Utc> = dec.try_deleted_at()?;
+let created: chrono::DateTime<chrono::Utc> = dec.created_at()?;
+let updated: chrono::DateTime<chrono::Utc> = dec.updated_at()?;
+let deleted: chrono::DateTime<chrono::Utc> = dec.deleted_at()?;
 
-enc.try_created_at(chrono::Utc::now())?;
-enc.try_updated_at(chrono::Utc::now())?;
-enc.try_deleted_at(chrono::Utc::now())?;
+enc.created_at(chrono::Utc::now())?;
+enc.updated_at(chrono::Utc::now())?;
+enc.deleted_at(chrono::Utc::now())?;
 ```
 
 If you forget one of the three impls, the compile error names it directly —

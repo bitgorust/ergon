@@ -20,8 +20,8 @@ use crate::structured_ir::{
 };
 
 use super::conversion_helpers::{
-    DECODER_RESERVED, acting_accessors, field_has_conversion_free, find_domain_type,
-    owner_accessor_names, resolve_field_ident, tail_accessor_ident,
+    DECODER_RESERVED, acting_accessors, domain_accessor_ident, field_has_conversion_free,
+    find_domain_type, owner_accessor_names, resolve_field_ident, tail_accessor_ident,
 };
 use super::converter_impls::is_optional_domain_field;
 use super::doc_attr_tokens;
@@ -142,6 +142,7 @@ pub(crate) fn generate_memoized_decoder(
     let taken_accessor_names = owner_accessor_names(
         &msg.fields,
         conversions,
+        domain_types,
         DECODER_RESERVED,
         msg.groups
             .iter()
@@ -452,23 +453,23 @@ fn forward_one_field(
 
     if let Some(dt) = find_domain_type(f, domain_types) {
         if let Ok(dt_ty) = syn::parse_str::<syn::Type>(dt) {
-            let try_ident = syn::Ident::new(&format!("try_{snake}"), span);
+            let get_ident = domain_accessor_ident(&snake, DECODER_RESERVED);
             if optional {
                 ts.extend(quote::quote! {
                     #[inline]
-                    pub fn #try_ident(
+                    pub fn #get_ident(
                         &self,
                     ) -> Result<Option<#dt_ty>, <#dt_ty as TryFromSbe<#wire_ty>>::Error> {
-                        self.inner.#try_ident()
+                        self.inner.#get_ident()
                     }
                 });
             } else {
                 ts.extend(quote::quote! {
                     #[inline]
-                    pub fn #try_ident(
+                    pub fn #get_ident(
                         &self,
                     ) -> Result<#dt_ty, <#dt_ty as TryFromSbe<#wire_ty>>::Error> {
-                        self.inner.#try_ident()
+                        self.inner.#get_ident()
                     }
                 });
             }

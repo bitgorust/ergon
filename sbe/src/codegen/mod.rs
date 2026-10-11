@@ -1991,7 +1991,7 @@ mod tests {
             "the versioned set at offset ten must require its complete eleventh byte"
         );
         assert!(
-            source.contains("pub fn try_enabled_bool(&self) -> Result<Option<bool>,")
+            source.contains("pub fn enabled_bool(&self) -> Result<Option<bool>,")
                 && source.contains("InvalidBoolean"),
             "a versioned BooleanType group field must carry the typed bool accessor"
         );
@@ -2124,7 +2124,7 @@ mod tests {
         let modules = generator.generate(&schema)?;
         let src = modules.modules().next().unwrap().source.clone();
         assert!(
-            src.contains("fn try_ts(") && src.contains("chrono::DateTime"),
+            src.contains("fn ts(") && src.contains("chrono::DateTime"),
             "should generate fallible concrete DateTime accessor for UTCTimestamp field"
         );
         assert!(
@@ -2418,7 +2418,7 @@ mod tests {
         // name stays as the wire-type accessor.
         let consumer_src = &collected[1].source;
         assert!(
-            consumer_src.contains("fn try_enabled_bool"),
+            consumer_src.contains("fn enabled_bool"),
             "with_bool_domain_type must produce bool getter in multi-schema; got:\n{consumer_src}",
         );
         Ok(())

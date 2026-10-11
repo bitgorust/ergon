@@ -32,12 +32,12 @@ fn l3book_converter_accessors() -> Result<(), Box<dyn std::error::Error>> {
         })
         .bids(1, |g| {
             g.add(|mut e| {
-                e.try_price(d(50800))
+                e.price(d(50800))
                     .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                         field: "price",
                         reason: "conversion",
                     })?;
-                e.try_size(d(15))
+                e.size(d(15))
                     .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                         field: "size",
                         reason: "conversion",
@@ -55,11 +55,11 @@ fn l3book_converter_accessors() -> Result<(), Box<dyn std::error::Error>> {
     let _len = complete.encoded_length_with_header();
 
     let dec = L3BookDecoder::try_from(complete.as_bytes_with_header())?;
-    let _ts = dec.try_exchange_timestamp()?;
-    assert!(dec.try_is_active()?);
+    let _ts = dec.exchange_timestamp()?;
+    assert!(dec.is_active()?);
     let e = dec.bids()?.next().transpose()?.unwrap();
-    let _price: Rd = e.try_price()?;
-    let _size: Rd = e.try_size()?;
+    let _price: Rd = e.price()?;
+    let _size: Rd = e.size()?;
     Ok(())
 }
 
@@ -114,12 +114,12 @@ fn l3book_vardata_direct_length_matches_encoded() -> Result<(), Box<dyn std::err
         .bids(bids.len() as u16, |g| {
             for (_, _, orders) in bids {
                 g.add(|mut e| {
-                    e.try_price(d(1))
+                    e.price(d(1))
                         .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                             field: "price",
                             reason: "conversion",
                         })?;
-                    e.try_size(d(1))
+                    e.size(d(1))
                         .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                             field: "size",
                             reason: "conversion",
@@ -127,7 +127,7 @@ fn l3book_vardata_direct_length_matches_encoded() -> Result<(), Box<dyn std::err
                     e.orders(orders.len() as u16, |og| {
                         for (q, oid) in *orders {
                             og.add(|mut o| {
-                                o.try_quantity(*q).map_err(|_| {
+                                o.quantity(*q).map_err(|_| {
                                     sbe_rt::EncodeError::DomainConversionFailed {
                                         field: "quantity",
                                         reason: "conversion",
@@ -145,12 +145,12 @@ fn l3book_vardata_direct_length_matches_encoded() -> Result<(), Box<dyn std::err
         .asks(asks.len() as u16, |g| {
             for (_, _, orders) in asks {
                 g.add(|mut e| {
-                    e.try_price(d(1))
+                    e.price(d(1))
                         .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                             field: "price",
                             reason: "conversion",
                         })?;
-                    e.try_size(d(1))
+                    e.size(d(1))
                         .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                             field: "size",
                             reason: "conversion",
@@ -158,7 +158,7 @@ fn l3book_vardata_direct_length_matches_encoded() -> Result<(), Box<dyn std::err
                     e.orders(orders.len() as u16, |og| {
                         for (q, oid) in *orders {
                             og.add(|mut o| {
-                                o.try_quantity(*q).map_err(|_| {
+                                o.quantity(*q).map_err(|_| {
                                     sbe_rt::EncodeError::DomainConversionFailed {
                                         field: "quantity",
                                         reason: "conversion",
@@ -316,19 +316,19 @@ fn l3book_vardata_nested_exact_length() -> Result<(), Box<dyn std::error::Error>
         })
         .bids(1, |g| {
             g.add(|mut e| {
-                e.try_price(d(50800))
+                e.price(d(50800))
                     .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                         field: "price",
                         reason: "conversion",
                     })?;
-                e.try_size(d(15))
+                e.size(d(15))
                     .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                         field: "size",
                         reason: "conversion",
                     })?;
                 e.orders(2, |og| {
                     og.add(|mut o| {
-                        o.try_quantity(d(5)).map_err(|_| {
+                        o.quantity(d(5)).map_err(|_| {
                             sbe_rt::EncodeError::DomainConversionFailed {
                                 field: "quantity",
                                 reason: "conversion",
@@ -337,7 +337,7 @@ fn l3book_vardata_nested_exact_length() -> Result<(), Box<dyn std::error::Error>
                         o.order_id(b"ORD-1")
                     })?;
                     og.add(|mut o| {
-                        o.try_quantity(d(10)).map_err(|_| {
+                        o.quantity(d(10)).map_err(|_| {
                             sbe_rt::EncodeError::DomainConversionFailed {
                                 field: "quantity",
                                 reason: "conversion",
@@ -359,10 +359,10 @@ fn l3book_vardata_nested_exact_length() -> Result<(), Box<dyn std::error::Error>
     let e = bids.next().transpose()?.unwrap();
     let mut orders = e.orders()?;
     let o1 = orders.next().transpose()?.unwrap();
-    assert_eq!(o1.try_quantity()?, d(5));
+    assert_eq!(o1.quantity()?, d(5));
     assert_eq!(o1.order_id()?, b"ORD-1");
     let o2 = orders.next().transpose()?.unwrap();
-    assert_eq!(o2.try_quantity()?, d(10));
+    assert_eq!(o2.quantity()?, d(10));
     assert_eq!(o2.order_id()?, b"ORD-2");
     assert!(orders.next().is_none());
     Ok(())
@@ -399,19 +399,19 @@ fn l3book_vardata_ragged_orders() -> Result<(), Box<dyn std::error::Error>> {
         })
         .bids(2, |g| {
             g.add(|mut e| {
-                e.try_price(d(100))
+                e.price(d(100))
                     .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                         field: "price",
                         reason: "conversion",
                     })?;
-                e.try_size(d(10))
+                e.size(d(10))
                     .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                         field: "size",
                         reason: "conversion",
                     })?;
                 e.orders(1, |og| {
                     og.add(|mut o| {
-                        o.try_quantity(d(1)).map_err(|_| {
+                        o.quantity(d(1)).map_err(|_| {
                             sbe_rt::EncodeError::DomainConversionFailed {
                                 field: "quantity",
                                 reason: "conversion",
@@ -422,19 +422,19 @@ fn l3book_vardata_ragged_orders() -> Result<(), Box<dyn std::error::Error>> {
                 })
             })?;
             g.add(|mut e| {
-                e.try_price(d(200))
+                e.price(d(200))
                     .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                         field: "price",
                         reason: "conversion",
                     })?;
-                e.try_size(d(20))
+                e.size(d(20))
                     .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                         field: "size",
                         reason: "conversion",
                     })?;
                 e.orders(3, |og| {
                     og.add(|mut o| {
-                        o.try_quantity(d(2)).map_err(|_| {
+                        o.quantity(d(2)).map_err(|_| {
                             sbe_rt::EncodeError::DomainConversionFailed {
                                 field: "quantity",
                                 reason: "conversion",
@@ -443,7 +443,7 @@ fn l3book_vardata_ragged_orders() -> Result<(), Box<dyn std::error::Error>> {
                         o.order_id(b"ID-AA")
                     })?;
                     og.add(|mut o| {
-                        o.try_quantity(d(3)).map_err(|_| {
+                        o.quantity(d(3)).map_err(|_| {
                             sbe_rt::EncodeError::DomainConversionFailed {
                                 field: "quantity",
                                 reason: "conversion",
@@ -452,7 +452,7 @@ fn l3book_vardata_ragged_orders() -> Result<(), Box<dyn std::error::Error>> {
                         o.order_id(b"ID-BB")
                     })?;
                     og.add(|mut o| {
-                        o.try_quantity(d(4)).map_err(|_| {
+                        o.quantity(d(4)).map_err(|_| {
                             sbe_rt::EncodeError::DomainConversionFailed {
                                 field: "quantity",
                                 reason: "conversion",
@@ -911,8 +911,8 @@ fn large_book_exceeds_64kb_and_roundtrips() -> Result<(), Box<dyn std::error::Er
             for i in 0..NUM_LEVELS {
                 g.add(|mut e| {
                     // Valid Decimal values — unwrap is safe here.
-                    e.try_price(d((i % 50000) as i64)).unwrap();
-                    e.try_size(d(100)).unwrap();
+                    e.price(d((i % 50000) as i64)).unwrap();
+                    e.size(d(100)).unwrap();
                     e.orders(0, |_og| Ok(()))
                 })?;
             }
@@ -921,8 +921,8 @@ fn large_book_exceeds_64kb_and_roundtrips() -> Result<(), Box<dyn std::error::Er
         .asks(NUM_LEVELS as u16, |g| {
             for i in 0..NUM_LEVELS {
                 g.add(|mut e| {
-                    e.try_price(d(((NUM_LEVELS - i) % 50000) as i64)).unwrap();
-                    e.try_size(d(50)).unwrap();
+                    e.price(d(((NUM_LEVELS - i) % 50000) as i64)).unwrap();
+                    e.size(d(50)).unwrap();
                     e.orders(0, |_og| Ok(()))
                 })?;
             }
@@ -939,12 +939,12 @@ fn large_book_exceeds_64kb_and_roundtrips() -> Result<(), Box<dyn std::error::Er
     // 3. Decode and spot-check.
     let book = L3BookDecoder::try_decode(&buf[..actual], 0)?;
     assert_eq!(
-        book.try_exchange_timestamp()?.timestamp_nanos_opt(),
+        book.exchange_timestamp()?.timestamp_nanos_opt(),
         Some(1_720_000_000_000_000_000)
     );
     let mut bids = book.bids()?;
     let first = bids.next().transpose()?.unwrap();
-    assert_eq!(first.try_price()?, rust_decimal::Decimal::new(0, 0));
+    assert_eq!(first.price()?, rust_decimal::Decimal::new(0, 0));
 
     Ok(())
 }
@@ -1050,9 +1050,9 @@ fn decode_random_access(wire: &[u8]) -> Result<Snapshot<'_>, Box<dyn std::error:
         // The outer `bids`/`asks` iterators yield `Result` because a dynamic
         // entry's extent can only be known once it is reached.
         for order in level.orders()? {
-            orders.push((order.order_id(), order.try_quantity()?));
+            orders.push((order.order_id(), order.quantity()?));
         }
-        bids.push((level.try_price()?, level.try_size()?, orders));
+        bids.push((level.price()?, level.size()?, orders));
     }
 
     let mut asks = Vec::new();
@@ -1060,15 +1060,15 @@ fn decode_random_access(wire: &[u8]) -> Result<Snapshot<'_>, Box<dyn std::error:
         let level = level?;
         let mut orders = Vec::new();
         for order in level.orders()? {
-            orders.push((order.order_id(), order.try_quantity()?));
+            orders.push((order.order_id(), order.quantity()?));
         }
-        asks.push((level.try_price()?, level.try_size()?, orders));
+        asks.push((level.price()?, level.size()?, orders));
     }
 
     Ok(Snapshot {
-        timestamp: dec.try_exchange_timestamp()?,
+        timestamp: dec.exchange_timestamp()?,
         sequence: dec.sequence(),
-        is_active: dec.try_is_active()?,
+        is_active: dec.is_active()?,
         bids,
         asks,
         symbol,
@@ -1081,9 +1081,9 @@ fn decode_random_access(wire: &[u8]) -> Result<Snapshot<'_>, Box<dyn std::error:
 /// iterator is the stage: `into_asks` skips unread bids.
 fn decode_staged(wire: &[u8]) -> Result<Snapshot<'_>, Box<dyn std::error::Error>> {
     let dec = L3BookDecoder::try_decode(wire, 0)?;
-    let timestamp = dec.try_exchange_timestamp()?;
+    let timestamp = dec.exchange_timestamp()?;
     let sequence = dec.sequence();
-    let is_active = dec.try_is_active()?;
+    let is_active = dec.is_active()?;
 
     // Levels carry a nested `orders` group, so they have no stride and take a
     // visit closure — the completion it returns is where the next level starts.
@@ -1092,23 +1092,23 @@ fn decode_staged(wire: &[u8]) -> Result<Snapshot<'_>, Box<dyn std::error::Error>
     let mut asks = Vec::new();
     let (symbol, _complete) = dec
         .into_bids(|level| -> Result<_, Box<dyn std::error::Error>> {
-            let price = level.try_price()?;
-            let size = level.try_size()?;
+            let price = level.price()?;
+            let size = level.size()?;
             let mut orders = Vec::new();
             let mut order_iter = level.into_orders()?;
             for order in &mut order_iter {
-                orders.push((order.order_id(), order.try_quantity()?));
+                orders.push((order.order_id(), order.quantity()?));
             }
             bids.push((price, size, orders));
             Ok(order_iter.finish()?)
         })?
         .into_asks(|level| -> Result<_, Box<dyn std::error::Error>> {
-            let price = level.try_price()?;
-            let size = level.try_size()?;
+            let price = level.price()?;
+            let size = level.size()?;
             let mut orders = Vec::new();
             let mut order_iter = level.into_orders()?;
             for order in &mut order_iter {
-                orders.push((order.order_id(), order.try_quantity()?));
+                orders.push((order.order_id(), order.quantity()?));
             }
             asks.push((price, size, orders));
             Ok(order_iter.finish()?)
@@ -1143,9 +1143,9 @@ fn decode_memoized(wire: &[u8]) -> Result<Snapshot<'_>, Box<dyn std::error::Erro
         let level = level?;
         let mut orders = Vec::new();
         for order in level.orders()? {
-            orders.push((order.order_id(), order.try_quantity()?));
+            orders.push((order.order_id(), order.quantity()?));
         }
-        bids.push((level.try_price()?, level.try_size()?, orders));
+        bids.push((level.price()?, level.size()?, orders));
     }
 
     let mut asks = Vec::new();
@@ -1153,9 +1153,9 @@ fn decode_memoized(wire: &[u8]) -> Result<Snapshot<'_>, Box<dyn std::error::Erro
         let level = level?;
         let mut orders = Vec::new();
         for order in level.orders()? {
-            orders.push((order.order_id(), order.try_quantity()?));
+            orders.push((order.order_id(), order.quantity()?));
         }
-        asks.push((level.try_price()?, level.try_size()?, orders));
+        asks.push((level.price()?, level.size()?, orders));
     }
 
     // Re-reading a tail is free once its boundary is known: the base lane
@@ -1163,9 +1163,9 @@ fn decode_memoized(wire: &[u8]) -> Result<Snapshot<'_>, Box<dyn std::error::Erro
     assert_eq!(dec.symbol_as_str()?, symbol, "re-read must be identical");
 
     Ok(Snapshot {
-        timestamp: dec.try_exchange_timestamp()?,
+        timestamp: dec.exchange_timestamp()?,
         sequence: dec.sequence(),
-        is_active: dec.try_is_active()?,
+        is_active: dec.is_active()?,
         bids,
         asks,
         symbol,
@@ -1202,6 +1202,15 @@ fn decode_memoized(wire: &[u8]) -> Result<Snapshot<'_>, Box<dyn std::error::Erro
 /// because their entry decoders are distinct types — the lane unifies how a
 /// tail is *reached*, not what its entries are.
 fn decode_ordered(wire: &[u8]) -> Result<Snapshot<'_>, Box<dyn std::error::Error>> {
+    // Ordered callbacks return `DecodeError`; a domain getter fails with its
+    // conversion's own error, mapped the way the generated DTO maps it.
+    fn domain<T, E>(field: &'static str, r: Result<T, E>) -> Result<T, sbe_rt::DecodeError> {
+        r.map_err(|_| sbe_rt::DecodeError::DomainConversionFailed {
+            field,
+            reason: "domain conversion rejected wire value",
+        })
+    }
+
     let mut timestamp = None;
     let mut sequence = 0u64;
     let mut is_active = false;
@@ -1211,47 +1220,43 @@ fn decode_ordered(wire: &[u8]) -> Result<Snapshot<'_>, Box<dyn std::error::Error
 
     let len = L3BookDecoder::try_decode(wire, 0)?
         .ordered()
-        .try_fixed(|d| -> Result<(), Box<dyn std::error::Error>> {
-            timestamp = Some(d.try_exchange_timestamp()?);
+        .fixed(|d| {
+            timestamp = Some(domain("exchange_timestamp", d.exchange_timestamp())?);
             sequence = d.sequence();
-            is_active = d.try_is_active()?;
+            is_active = domain("is_active", d.is_active())?;
             Ok(())
         })?
-        .try_bids(|level, info| -> Result<_, Box<dyn std::error::Error>> {
+        .bids(|level, info| {
             if info.is_first() {
                 bids.reserve_exact(info.count);
             }
-            let price = level.try_price()?;
-            let size = level.try_size()?;
+            let price = domain("price", level.price())?;
+            let size = domain("size", level.size())?;
             // Nested `ordered()` returns the completion the parent owes —
             // no `.done()` on the way out.
             let mut orders = Vec::new();
-            let complete = level.ordered().try_orders(
-                |order, _oinfo| -> Result<(), Box<dyn std::error::Error>> {
-                    orders.push((order.order_id(), order.try_quantity()?));
-                    Ok(())
-                },
-            )?;
+            let complete = level.ordered().orders(|order, _oinfo| {
+                orders.push((order.order_id(), domain("quantity", order.quantity())?));
+                Ok(())
+            })?;
             bids.push((price, size, orders));
             Ok(complete)
         })?
-        .try_asks(|level, info| -> Result<_, Box<dyn std::error::Error>> {
+        .asks(|level, info| {
             if info.is_first() {
                 asks.reserve_exact(info.count);
             }
-            let price = level.try_price()?;
-            let size = level.try_size()?;
+            let price = domain("price", level.price())?;
+            let size = domain("size", level.size())?;
             let mut orders = Vec::new();
-            let complete = level.ordered().try_orders(
-                |order, _oinfo| -> Result<(), Box<dyn std::error::Error>> {
-                    orders.push((order.order_id(), order.try_quantity()?));
-                    Ok(())
-                },
-            )?;
+            let complete = level.ordered().orders(|order, _oinfo| {
+                orders.push((order.order_id(), domain("quantity", order.quantity())?));
+                Ok(())
+            })?;
             asks.push((price, size, orders));
             Ok(complete)
         })?
-        .try_symbol_as_str(|s| -> Result<(), Box<dyn std::error::Error>> {
+        .symbol_as_str(|s| {
             symbol = Some(s);
             Ok(())
         })?

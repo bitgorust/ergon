@@ -839,7 +839,13 @@ pub(crate) fn generate_group_encoder(
         } else {
             quote::quote! {}
         };
-        let taken = owner_accessor_names(&g.fields, conversions, &[], core::iter::empty());
+        let taken = owner_accessor_names(
+            &g.fields,
+            conversions,
+            domain_types,
+            &[],
+            core::iter::empty(),
+        );
         let str_setter = vardata_encode_str_setter(
             &vd_snake,
             &vd.name,

@@ -136,7 +136,7 @@ cargo run --manifest-path samples/cluster-tutorial/Cargo.toml
 
 | Sample | Config | Decode / encode surface |
 |--------|--------|-------------------------|
-| [`l3-book/`](l3-book/) | **`with_domain_type` only** | `dec.try_price()?` → `Decimal`; `enc.try_price(d)?` |
+| [`l3-book/`](l3-book/) | **`with_domain_type` only** | `dec.price()?` → `Decimal`; `enc.price(d)?` |
 | [`exchange-example/`](exchange-example/) | **`with_conversion` only** | `dec.price_as::<T>()?`; `enc.price_from(&t)?` (+ app `TryFromSbe`) |
 | [`sbe-feature-tour/`](sbe-feature-tour/) | **All three** (different selectors) | bool/timestamp concrete (`Generated`); Decimal generic (`demo_conversion_only`); ManualDecimal concrete + app impl (`demo_domain_type_manual_impl`) |
 

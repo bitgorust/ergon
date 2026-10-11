@@ -5,7 +5,7 @@
 //! | API | When to use | Generated decode | Generated encode |
 //! |-----|-------------|------------------|------------------|
 //! | [`GenerationConfig::with_conversion`] | Pluggable adapters; no forced crate dep | `dec.price_as::<T>()?` | `enc.price_from(&t)?` |
-//! | [`GenerationConfig::with_domain_type`] | One canonical app type | `dec.try_price()? -> path::Type` | `enc.try_price(value)?` |
+//! | [`GenerationConfig::with_domain_type`] | One canonical app type | `dec.price()? -> path::Type` | `enc.price(value)?` |
 //!
 //! `with_domain_type` **implies** conversion for that selector. Do **not** also
 //! call `with_conversion` for the same selector.
@@ -129,7 +129,7 @@ pub enum DomainImpl {
     /// You write `impl TryFromSbe<Wire>` / `impl TryToSbe<Wire>` yourself —
     /// e.g. a custom rounding rule, or null/validation behaviour the
     /// built-in impl doesn't match. ergo-sbe still generates the concrete
-    /// `try_price(...)?` / `try_price()?` signatures that call it.
+    /// `price(...)?` / `price()?` signatures that call it.
     Manual,
 }
 
@@ -404,7 +404,7 @@ pub struct GenerationConfig {
     /// Implicitly enables conversion for the same selector.
     pub(crate) domain_types: Vec<(ConversionSelector, String)>,
     /// Selectors passed to [`Self::with_manual_domain_type`]:
-    /// get the same concrete `try_*` signatures as any other `domain_types`
+    /// get the same concrete domain accessor signatures as any other `domain_types`
     /// entry, but the built-in `TryFromSbe`/`TryToSbe` impl (for `bool` /
     /// `rust_decimal::Decimal` / `chrono::DateTime<Utc>`) is not generated —
     /// the caller supplies it.
@@ -669,7 +669,7 @@ impl GenerationConfig {
     /// # Generated API
     ///
     /// In build.rs: `.with_domain_type(ConversionSelector::named_type("Decimal"), "rust_decimal::Decimal")`
-    /// Application: `enc.try_price(rust_decimal::Decimal::new(12345, 2))?` / `let p = dec.try_price()?`.
+    /// Application: `enc.price(rust_decimal::Decimal::new(12345, 2))?` / `let p = dec.price()?`.
     ///
     /// # Example
     ///
@@ -697,7 +697,7 @@ impl GenerationConfig {
     /// / `impl TryToSbe<Wire>` yourself — e.g. a custom rounding rule, or
     /// null/validation behaviour the built-in impl does not match.
     ///
-    /// ergo-sbe still generates the concrete `try_price(...)?` / `try_price()?`
+    /// ergo-sbe still generates the concrete `price(...)?` / `price()?`
     /// signatures that call those impls. A missing impl fails closed with a
     /// named compile error, and for the three built-ins the generated
     /// accessor's rustdoc carries the exact impl `Generated` would have
