@@ -455,6 +455,15 @@
   read, rather than skip the size checks.
 
 ### Fixed
+- Deliver a restarted publisher's new session from its start through
+  `Bus::subscribe`. When the new session had published exactly as far as
+  the old recording stopped before the subscriber looked again, Aeron's
+  persistent subscription joined it live at that position, as if it
+  continued the old recording, and never delivered what it had sent. The
+  live stream is now pinned to the recording's session. While it is
+  neither live nor replaying, the subscriber asks the archive every second
+  which recording is current and follows a new one from its start, and
+  failing that gives up on the old session after 5 s with no live image.
 - Leave constant fields (declared on the field or on its type) out of a
   group entry's `blockLength`. ergo-sbe counted a constant that ends an
   entry, so each entry was wider than sbe-tool's; frames ergo-sbe encoded
