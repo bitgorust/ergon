@@ -255,7 +255,7 @@
   `frame`, `input`, the journal's `config` and the ingester's `coverage` are
   static, kept forever and never dropped; `kind: dynamic` or `ttl:` on one is
   refused, as is a switch other than `true` on a message's table, `frame`,
-  `input` or `coverage`. A static message table adds its message's new
+  `input`, `config` or `coverage`. A static message table adds its message's new
   fields only with `add_columns: true`. A dynamic table's rows expire a day
   after they are written (the ingester's `DYNAMIC_TABLE_TTL`, or the table's
   own `ttl:`), and an empty dynamic table is dropped, made again when rows
