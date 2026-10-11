@@ -662,6 +662,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ergon-relay"
+version = "0.1.30"
+dependencies = [
+ "log",
+ "rusteron-archive",
+ "signal-hook",
+ "thiserror",
+]
+
+[[package]]
 name = "ergon-runtime"
 version = "0.1.30"
 dependencies = [
