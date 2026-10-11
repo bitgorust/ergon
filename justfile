@@ -576,7 +576,16 @@ _bench-runtime-one bench profile *args:
     mkdir -p "$crit"
     case "{{profile}}" in
       lto) CRITERION_HOME="$crit" cargo bench -p ergon-runtime --bench "{{bench}}" {{args}} ;;
+      # Cross-language LTO's -Clinker-plugin-lto would make this an LTO build whatever the
+      # profile says: the gate VM (gate-node.sh) gives this arm ERGON_NO_LTO_RUSTFLAGS, and
+      # RUSTERON_CLANG goes, so its Aeron C stays gcc-built, as downstream crates get it.
       no-lto)
+        if [[ -n ${ERGON_NO_LTO_RUSTFLAGS+set} ]]; then export RUSTFLAGS=$ERGON_NO_LTO_RUSTFLAGS; fi
+        unset RUSTERON_CLANG
+        if [[ ${RUSTFLAGS:-} == *linker-plugin-lto* ]]; then
+          echo "no-lto: RUSTFLAGS has -Clinker-plugin-lto, an LTO build: set ERGON_NO_LTO_RUSTFLAGS" >&2
+          exit 2
+        fi
         CARGO_TARGET_DIR="$root/target/bench-no-lto" \
           CARGO_PROFILE_BENCH_LTO=false \
           CARGO_PROFILE_BENCH_CODEGEN_UNITS=1 \
