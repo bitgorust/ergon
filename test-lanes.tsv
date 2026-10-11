@@ -42,3 +42,5 @@ samples/clickhouse/schema/tests/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/aeron-bench/src/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/aeron-driver/src/*.rs	samples	cd samples/clickhouse && just test
 samples/clickhouse/aeron-bench/tests/*.rs	samples	cd samples/clickhouse && just test
+relay/src/*.rs	pr	cargo test -p ergon-relay --lib
+relay/tests/*.rs	pr	cd samples/clickhouse && just _test-aeron && cd ../.. && cargo test -p ergon-relay --tests

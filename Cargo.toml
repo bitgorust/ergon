@@ -9,6 +9,7 @@ members = [
     "bridge",
     "runtime-server",
     "runtime-log",
+    "relay",
 ]
 # Excluded because they require nightly toolchain:
 #   sbe/fuzz         — cargo-fuzz (libfuzzer), needs `cargo +nightly fuzz run`
