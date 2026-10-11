@@ -657,7 +657,6 @@ version = "0.1.30"
 dependencies = [
  "ergon-runtime",
  "log",
- "rusteron-archive",
  "tracing",
  "tracing-subscriber",
 ]
