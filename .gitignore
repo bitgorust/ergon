@@ -37,3 +37,4 @@ sbe/fuzz/artifacts/
 /.playwright-mcp/
 /Untitled
 /package-lock.json
+/docs/research/TODO.md
