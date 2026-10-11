@@ -254,13 +254,11 @@
   application recording a table from then on. Every message's table,
   `frame`, `input` and the journal's `config` are static, kept forever and
   never dropped; `kind: dynamic` or `ttl:` on one is refused, as is a switch
-  other than `true` on a message's table, `frame`, `input` or `config`. A
-  static message table adds its message's new fields only with
-  `add_columns: true`. A dynamic table's rows expire a day after they are
-  written (the ingester's `DYNAMIC_TABLE_TTL`, or the table's own `ttl:`),
-  and an empty dynamic table is dropped, made again when rows arrive. The
-  ingester now creates `input` even when `tables.yaml` leaves it out; it
-  stays empty until an app journals.
+  other than `true` on a message's table, `frame` or `input`. A static
+  message table adds its message's new fields only with `add_columns: true`.
+  A dynamic table's rows expire a day after they are written (the ingester's
+  `DYNAMIC_TABLE_TTL`, or the table's own `ttl:`), and an empty dynamic table
+  is dropped, made again when rows arrive.
 - Read the loop's and persist's settings from the cold file instead of
   `IDLE`, `TIMER_SLACK`, `CPU`, `MLOCK`, `JOURNAL` and the `PERSIST_*`
   variables, which the runtime no longer reads. Periods take `ns`, `us`, `ms`
