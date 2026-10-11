@@ -249,11 +249,18 @@
 - Breaking: every `Agent` declares `type Candidate`, what its
   `check_config` makes of a config file; `type Candidate = ();` for one that
   watches none.
-- Have the ingester keep the journal's `input` rows and the `config` rows
-  whatever `tables.yaml` says (`ALWAYS_KEPT`): an entry gives only their
-  `kind` (default `dynamic`) and `database`. The runtime records its own
-  `config` rows whatever the switch says. The ingester now creates `input` even
-  when `tables.yaml` leaves it out; it stays empty until an app journals.
+- Breaking: have the ingester write every row it receives, whatever
+  `tables.yaml`'s `enabled`, `apps` or `until` say: a switch only stops an
+  application recording a table from then on. Every message's table,
+  `frame`, `input` and the journal's `config` are static, kept forever and
+  never dropped; `kind: dynamic` or `ttl:` on one is refused, as is a switch
+  other than `true` on a message's table, `frame`, `input` or `config`. A
+  static message table adds its message's new fields only with
+  `add_columns: true`. A dynamic table's rows expire a day after they are
+  written (the ingester's `DYNAMIC_TABLE_TTL`, or the table's own `ttl:`),
+  and an empty dynamic table is dropped, made again when rows arrive. The
+  ingester now creates `input` even when `tables.yaml` leaves it out; it
+  stays empty until an app journals.
 - Read the loop's and persist's settings from the cold file instead of
   `IDLE`, `TIMER_SLACK`, `CPU`, `MLOCK`, `JOURNAL` and the `PERSIST_*`
   variables, which the runtime no longer reads. Periods take `ns`, `us`, `ms`
@@ -300,8 +307,8 @@
   functions are gone.
 - Record `tracing` events that name a `table`, and spans, from any thread
   through `Persist::layer`. The bridge publishes on a concurrent IPC
-  publication of its own, and the ingester applies `enabled`, `apps` and
-  `until` to those rows and to `otel_traces` for each app.
+  publication of its own, and applies `enabled`, `apps` and `until` to
+  those rows and to `otel_traces` for its app before publishing.
 - Record metrics only through `Metrics` handles. `tracing` events with a
   `counter`, `gauge` or `histogram` field are no longer recorded, and
   `LocalHistogram` is merged into `Histogram`.
@@ -484,10 +491,6 @@
   and an exact replay of such a journal failed, or took another session's
   frame. A journal recorded before this still replays: a replayed message
   the session does not find is looked up by its recording alone, as then.
-- Apply `tables.yaml` again when the ingester inserts what it queued: event
-  rows and spans at their own time, and a feed's frames by its `frames`
-  opt-in, as feed rows already were. Rows a failed insert left queued were
-  inserted even after their table, app or feed was switched off.
 - Cut each batch the ingester inserts by its records' places in the archive,
   not by place in its queue: each recording's part of the batch, laid end to
   end and cut every 1 MiB. After a crash the restart reads the batch again,
@@ -519,9 +522,9 @@
   A replay that ended while its batch was uncommitted (an insert failed, or
   an application exited) was opened again from the checkpoint, and its
   records were inserted twice with the next batch.
-- Drop the queued rows of a table taken out of `tables.yaml`, once two reads
-  of the file in a row miss it. They stayed queued for good, and the ingester
-  stopped reading its archive.
+- Write the queued rows of a table taken out of `tables.yaml` where it was
+  last listed, once two reads of the file in a row miss it. They stayed
+  queued for good, and the ingester stopped reading its archive.
 - Decode archive messages in the ingester with the checked `try_decode`. A
   trace, metrics or frame message too short for its body panicked the
   ingester, which then crashed on the same batch after every restart.
