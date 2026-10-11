@@ -252,13 +252,30 @@
 - Breaking: have the ingester write every row it receives, whatever
   `tables.yaml`'s `enabled`, `apps` or `until` say: a switch only stops an
   application recording a table from then on. Every message's table,
-  `frame`, `input` and the journal's `config` are static, kept forever and
-  never dropped; `kind: dynamic` or `ttl:` on one is refused, as is a switch
-  other than `true` on a message's table, `frame` or `input`. A static
-  message table adds its message's new fields only with `add_columns: true`.
-  A dynamic table's rows expire a day after they are written (the ingester's
-  `DYNAMIC_TABLE_TTL`, or the table's own `ttl:`), and an empty dynamic table
-  is dropped, made again when rows arrive.
+  `frame`, `input`, the journal's `config` and the ingester's `coverage` are
+  static, kept forever and never dropped; `kind: dynamic` or `ttl:` on one is
+  refused, as is a switch other than `true` on a message's table, `frame`,
+  `input` or `coverage`. A static message table adds its message's new
+  fields only with `add_columns: true`. A dynamic table's rows expire a day
+  after they are written (the ingester's `DYNAMIC_TABLE_TTL`, or the table's
+  own `ttl:`), and an empty dynamic table is dropped, made again when rows
+  arrive.
+- Breaking: name each node's archive in what the ingester writes, since
+  recording ids restart at 0 on every node. `Settings::new` takes the
+  archive instance (`Settings::archive`, at most 255 letters, digits, `.`,
+  `-` and `_`), and the sample ingester requires `NODE_NAME`. `Batch::new`
+  and every insert's dedup token name it, so two nodes' batches of the same
+  positions both land. `frame` gains `archive` and `key` columns (the
+  message's `semanticType="key"` fields as little-endian wire bytes, empty
+  when unkeyed) and a `key_bloom` skip index. An existing `frame` table, now
+  static, gains neither column by itself: run the `ALTER` the ingester logs,
+  or drop the table, and only a table made afresh has `key_bloom`.
+- Breaking: each commit publishes the saved checkpoint as rows of a new
+  static `coverage` table, and the ingester purges the archive only behind
+  coverage ClickHouse acknowledged. An ingester that finds another
+  archive's coverage under its instance name (its archive or checkpoint was
+  reset while ClickHouse kept the rows) refuses to start, before it reads or
+  inserts anything, with the new `Error::Instance`.
 - Read the loop's and persist's settings from the cold file instead of
   `IDLE`, `TIMER_SLACK`, `CPU`, `MLOCK`, `JOURNAL` and the `PERSIST_*`
   variables, which the runtime no longer reads. Periods take `ns`, `us`, `ms`
