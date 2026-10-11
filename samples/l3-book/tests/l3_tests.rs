@@ -23,8 +23,8 @@ fn l3book_converter_accessors() -> Result<(), Box<dyn std::error::Error>> {
         .encoded_length_with_header();
     let mut buf_storage = [0u8; 8192];
     assert!(len <= buf_storage.len(), "len exceeds stack pad");
-    let mut buf = &mut buf_storage[..len];
-    let complete = L3BookEncoder::try_wrap_and_apply_header(&mut buf, 0)?
+    let buf = &mut buf_storage[..len];
+    let complete = L3BookEncoder::try_wrap_and_apply_header(buf, 0)?
         .fixed(&L3BookFixedFields {
             exchange_timestamp: 1_720_000_000_000_000_000u64,
             sequence: 42,
@@ -72,8 +72,8 @@ fn l3book_empty_groups() -> Result<(), Box<dyn std::error::Error>> {
         .encoded_length_with_header();
     let mut buf_storage = [0u8; 8192];
     assert!(len <= buf_storage.len(), "len exceeds stack pad");
-    let mut buf = &mut buf_storage[..len];
-    let complete = L3BookEncoder::try_wrap_and_apply_header(&mut buf, 0)?
+    let buf = &mut buf_storage[..len];
+    let complete = L3BookEncoder::try_wrap_and_apply_header(buf, 0)?
         .fixed(&L3BookFixedFields {
             exchange_timestamp: 0,
             sequence: 0,
@@ -95,17 +95,17 @@ fn l3book_vardata_direct_length_matches_encoded() -> Result<(), Box<dyn std::err
     // differs per order. Direct length computation must match the encoder.
     let o1: [(Rd, &[u8]); 2] = [(d(5), b"ORD-1"), (d(10), b"ORD-22")];
     let o2: [(Rd, &[u8]); 1] = [(d(25), b"X")];
-    let bids: &[(Rd, Rd, &[(Rd, &[u8])])] = &[(d(50800), d(15), &o1), (d(50750), d(40), &o2)];
+    let bids: &VarDataSide<'_> = &[(d(50800), d(15), &o1), (d(50750), d(40), &o2)];
     let o3: [(Rd, &[u8]); 1] = [(d(10), b"AA")];
-    let asks: &[(Rd, Rd, &[(Rd, &[u8])])] = &[(d(50850), d(20), &o3)];
+    let asks: &VarDataSide<'_> = &[(d(50850), d(20), &o3)];
     let symbol = "BTCUSDT";
 
     let expected = l3_book::vardata_book_encoded_length(bids, asks, symbol)?;
 
     let mut buf_storage = [0u8; 8192];
     assert!(expected <= buf_storage.len(), "len exceeds stack pad");
-    let mut buf = &mut buf_storage[..expected];
-    let complete = L3BookVarDataEncoder::try_wrap_and_apply_header(&mut buf, 0)?
+    let buf = &mut buf_storage[..expected];
+    let complete = L3BookVarDataEncoder::try_wrap_and_apply_header(buf, 0)?
         .fixed(&L3BookVarDataFixedFields {
             exchange_timestamp: 1_720_000_000_000_000_000u64,
             sequence: 42,
@@ -185,11 +185,11 @@ fn l3book_unknown_size_length_matches_encoded() -> Result<(), Box<dyn std::error
     // add() calls). Must also match the actual encoded length.
     let o1 = [(1u64, d(5)), (2, d(10))];
     let o2 = [(3u64, d(25))];
-    let bids: &[(Rd, Rd, &[(u64, Rd)])] = &[(d(50800), d(15), &o1), (d(50750), d(40), &o2)];
+    let bids: &Side<'_> = &[(d(50800), d(15), &o1), (d(50750), d(40), &o2)];
     let o3 = [(4u64, d(10))];
     let o4 = [(5u64, d(20))];
     let o5 = [(6u64, d(40))];
-    let asks: &[(Rd, Rd, &[(u64, Rd)])] = &[
+    let asks: &Side<'_> = &[
         (d(50850), d(20), &o3),
         (d(50900), d(30), &o4),
         (d(50950), d(50), &o5),
@@ -199,8 +199,8 @@ fn l3book_unknown_size_length_matches_encoded() -> Result<(), Box<dyn std::error
     let len = l3_book::book_encoded_length(bids, asks, symbol)?;
     let mut buf_storage = [0u8; 8192];
     assert!(len <= buf_storage.len(), "len exceeds stack pad");
-    let mut buf = &mut buf_storage[..len];
-    let actual = l3_book::encode_book(&mut buf, bids, asks, symbol)?;
+    let buf = &mut buf_storage[..len];
+    let actual = l3_book::encode_book(buf, bids, asks, symbol)?;
     assert_eq!(len, actual, "book_encoded_length must match encode_book");
 
     let staged = L3BookEncoder::compute_length()
@@ -238,11 +238,11 @@ fn l3book_staged_length_matches_encoded() -> Result<(), Box<dyn std::error::Erro
     // Ragged data: bid1 has 2 orders, bid2 has 1; asks have 1 each.
     let o1 = [(1u64, d(5)), (2, d(10))];
     let o2 = [(3u64, d(25))];
-    let bids: &[(Rd, Rd, &[(u64, Rd)])] = &[(d(50800), d(15), &o1), (d(50750), d(40), &o2)];
+    let bids: &Side<'_> = &[(d(50800), d(15), &o1), (d(50750), d(40), &o2)];
     let o3 = [(4u64, d(10))];
     let o4 = [(5u64, d(20))];
     let o5 = [(6u64, d(40))];
-    let asks: &[(Rd, Rd, &[(u64, Rd)])] = &[
+    let asks: &Side<'_> = &[
         (d(50850), d(20), &o3),
         (d(50900), d(30), &o4),
         (d(50950), d(50), &o5),
@@ -253,8 +253,8 @@ fn l3book_staged_length_matches_encoded() -> Result<(), Box<dyn std::error::Erro
     let len = l3_book::book_encoded_length(bids, asks, symbol)?;
     let mut buf_storage = [0u8; 8192];
     assert!(len <= buf_storage.len(), "len exceeds stack pad");
-    let mut buf = &mut buf_storage[..len];
-    let actual = l3_book::encode_book(&mut buf, bids, asks, symbol)?;
+    let buf = &mut buf_storage[..len];
+    let actual = l3_book::encode_book(buf, bids, asks, symbol)?;
     assert_eq!(len, actual, "book_encoded_length must match encode_book");
 
     // Staged length builder (orders: dim=4, block=17 = u64 + Decimal).
@@ -307,8 +307,8 @@ fn l3book_vardata_nested_exact_length() -> Result<(), Box<dyn std::error::Error>
         .encoded_length_with_header();
     let mut buf_storage = [0u8; 8192];
     assert!(len <= buf_storage.len(), "len exceeds stack pad");
-    let mut buf = &mut buf_storage[..len];
-    let complete = L3BookVarDataEncoder::try_wrap_and_apply_header(&mut buf, 0)?
+    let buf = &mut buf_storage[..len];
+    let complete = L3BookVarDataEncoder::try_wrap_and_apply_header(buf, 0)?
         .fixed(&L3BookVarDataFixedFields {
             exchange_timestamp: 1_720_000_000_000_000_000u64,
             sequence: 42,
@@ -390,8 +390,8 @@ fn l3book_vardata_ragged_orders() -> Result<(), Box<dyn std::error::Error>> {
         .encoded_length_with_header();
     let mut buf_storage = [0u8; 8192];
     assert!(len <= buf_storage.len(), "len exceeds stack pad");
-    let mut buf = &mut buf_storage[..len];
-    let complete = L3BookVarDataEncoder::try_wrap_and_apply_header(&mut buf, 0)?
+    let buf = &mut buf_storage[..len];
+    let complete = L3BookVarDataEncoder::try_wrap_and_apply_header(buf, 0)?
         .fixed(&L3BookVarDataFixedFields {
             exchange_timestamp: 0,
             sequence: 0,
@@ -496,15 +496,15 @@ fn l3book_display_debug_tostring_comparison() -> Result<(), Box<dyn std::error::
     // decoder, encoder, and DTO. Also verify that Display/Debug on a TRUNCATED
     // buffer does NOT panic (panic safety for partial/invalid structures).
     let o1 = [(1u64, d(100))];
-    let bids: &[(Rd, Rd, &[(u64, Rd)])] = &[(d(50000), d(10), &o1)];
-    let asks: &[(Rd, Rd, &[(u64, Rd)])] = &[(d(50100), d(5), &o1)];
+    let bids: &Side<'_> = &[(d(50000), d(10), &o1)];
+    let asks: &Side<'_> = &[(d(50100), d(5), &o1)];
     let symbol = "BTC";
 
     let len = l3_book::book_encoded_length(bids, asks, symbol)?;
     let mut buf_storage = [0u8; 8192];
     assert!(len <= buf_storage.len(), "len exceeds stack pad");
-    let mut buf = &mut buf_storage[..len];
-    let actual = l3_book::encode_book(&mut buf, bids, asks, symbol)?;
+    let buf = &mut buf_storage[..len];
+    let actual = l3_book::encode_book(buf, bids, asks, symbol)?;
     assert_eq!(len, actual);
 
     // 1. Decoder Display + Debug — shows field values.
@@ -523,7 +523,7 @@ fn l3book_display_debug_tostring_comparison() -> Result<(), Box<dyn std::error::
     );
 
     // 2. Encoder Display + Debug — delegates to decoder for field values.
-    let enc = L3BookEncoder::try_wrap_and_apply_header(&mut buf, 0)?;
+    let enc = L3BookEncoder::try_wrap_and_apply_header(buf, 0)?;
     let enc_display = format!("{}", enc);
     eprintln!("encoder Display: {enc_display}");
     assert!(
@@ -570,14 +570,14 @@ fn roundrobin_all_messages_display_debug_safety() -> Result<(), Box<dyn std::err
     // ── L3Book ──
     {
         let o1 = [(1u64, d(100))];
-        let bids: &[(Rd, Rd, &[(u64, Rd)])] = &[(d(50000), d(10), &o1)];
-        let asks: &[(Rd, Rd, &[(u64, Rd)])] = &[(d(50100), d(5), &o1)];
+        let bids: &Side<'_> = &[(d(50000), d(10), &o1)];
+        let asks: &Side<'_> = &[(d(50100), d(5), &o1)];
         let symbol = "BTC";
         let len = l3_book::book_encoded_length(bids, asks, symbol)?;
         let mut buf_storage = [0u8; 8192];
         assert!(len <= buf_storage.len(), "len exceeds stack pad");
-        let mut buf = &mut buf_storage[..len];
-        let actual = l3_book::encode_book(&mut buf, bids, asks, symbol)?;
+        let buf = &mut buf_storage[..len];
+        let actual = l3_book::encode_book(buf, bids, asks, symbol)?;
         assert_eq!(len, actual);
 
         let dec = L3BookDecoder::try_from(&buf[..actual])?;
@@ -588,7 +588,7 @@ fn roundrobin_all_messages_display_debug_safety() -> Result<(), Box<dyn std::err
         assert!(dec_display.contains("BTC"));
         assert!(dec_display.contains("50000"));
 
-        let enc = L3BookEncoder::try_wrap_and_apply_header(&mut buf, 0)?;
+        let enc = L3BookEncoder::try_wrap_and_apply_header(buf, 0)?;
         let enc_display = format!("{enc}");
         eprintln!("[L3Book] encoder Display: {enc_display}");
         assert!(enc_display.contains("BTC"));
@@ -598,8 +598,8 @@ fn roundrobin_all_messages_display_debug_safety() -> Result<(), Box<dyn std::err
         eprintln!("[L3Book] DTO Debug: {dto_debug}");
         let mut buf2_storage = [0u8; 8192];
         assert!(len <= buf2_storage.len(), "len exceeds stack pad");
-        let mut buf2 = &mut buf2_storage[..len];
-        let n = dto.encode(&mut buf2)?;
+        let buf2 = &mut buf2_storage[..len];
+        let n = dto.encode(buf2)?;
         assert_eq!(
             &buf[..actual],
             &buf2[..n],
@@ -618,14 +618,14 @@ fn roundrobin_all_messages_display_debug_safety() -> Result<(), Box<dyn std::err
     {
         let o1: [(Rd, &[u8]); 2] = [(d(1), b"ORD-1"), (d(2), b"ORD-22")];
         let o2: [(Rd, &[u8]); 1] = [(d(3), b"X")];
-        let bids: &[(Rd, Rd, &[(Rd, &[u8])])] = &[(d(100), d(10), &o1), (d(200), d(5), &o2)];
-        let asks: &[(Rd, Rd, &[(Rd, &[u8])])] = &[(d(150), d(8), &[(d(1), b"AA")])];
+        let bids: &VarDataSide<'_> = &[(d(100), d(10), &o1), (d(200), d(5), &o2)];
+        let asks: &VarDataSide<'_> = &[(d(150), d(8), &[(d(1), b"AA")])];
         let symbol = "LINK";
         let len = l3_book::vardata_book_encoded_length(bids, asks, symbol)?;
         let mut buf_storage = [0u8; 8192];
         assert!(len <= buf_storage.len(), "len exceeds stack pad");
-        let mut buf = &mut buf_storage[..len];
-        let actual = l3_book::encode_vardata_book(&mut buf, bids, asks, symbol)?;
+        let buf = &mut buf_storage[..len];
+        let actual = l3_book::encode_vardata_book(buf, bids, asks, symbol)?;
         assert_eq!(len, actual);
 
         let dec = L3BookVarDataDecoder::try_from(&buf[..actual])?;
@@ -652,8 +652,8 @@ fn roundrobin_all_messages_display_debug_safety() -> Result<(), Box<dyn std::err
         let len = l3_book::depth3_encoded_length(levels, desc)?;
         let mut buf_storage = [0u8; 8192];
         assert!(len <= buf_storage.len(), "len exceeds stack pad");
-        let mut buf = &mut buf_storage[..len];
-        let actual = l3_book::encode_depth3(&mut buf, 99, levels, desc)?;
+        let buf = &mut buf_storage[..len];
+        let actual = l3_book::encode_depth3(buf, 99, levels, desc)?;
         assert_eq!(len, actual);
 
         let dec = Depth3TestDecoder::try_from(&buf[..actual])?;
@@ -692,8 +692,8 @@ fn roundrobin_all_messages_display_debug_safety() -> Result<(), Box<dyn std::err
             .encoded_length_with_header();
         let mut buf_storage = [0u8; 8192];
         assert!(len <= buf_storage.len(), "len exceeds stack pad");
-        let mut buf = &mut buf_storage[..len];
-        let complete = L3BookEncoder::try_wrap_and_apply_header(&mut buf, 0)?
+        let buf = &mut buf_storage[..len];
+        let complete = L3BookEncoder::try_wrap_and_apply_header(buf, 0)?
             .fixed(&L3BookFixedFields {
                 exchange_timestamp: 0,
                 sequence: 0,
@@ -722,34 +722,31 @@ proptest::proptest! {
     /// Feed random bytes to L3BookDecoder — must never panic on Display or Debug.
     #[test]
     fn fuzz_l3book_display_debug(data in proptest::collection::vec(any::<u8>(), 0..512)) {
-        if data.len() >= 8 {
-            if let Ok(dec) = L3BookDecoder::try_from(&data[..]) {
+        if data.len() >= 8
+            && let Ok(dec) = L3BookDecoder::try_from(&data[..]) {
                 let _ = format!("{dec}");       // Display
                 let _ = format!("{dec:?}");     // Debug
             }
-        }
     }
 
     /// Feed random bytes to L3BookVarDataDecoder — must never panic.
     #[test]
     fn fuzz_l3book_vardata_display_debug(data in proptest::collection::vec(any::<u8>(), 0..512)) {
-        if data.len() >= 8 {
-            if let Ok(dec) = L3BookVarDataDecoder::try_from(&data[..]) {
+        if data.len() >= 8
+            && let Ok(dec) = L3BookVarDataDecoder::try_from(&data[..]) {
                 let _ = format!("{dec}");
                 let _ = format!("{dec:?}");
             }
-        }
     }
 
     /// Feed random bytes to Depth3TestDecoder — must never panic.
     #[test]
     fn fuzz_depth3_display_debug(data in proptest::collection::vec(any::<u8>(), 0..512)) {
-        if data.len() >= 8 {
-            if let Ok(dec) = Depth3TestDecoder::try_from(&data[..]) {
+        if data.len() >= 8
+            && let Ok(dec) = Depth3TestDecoder::try_from(&data[..]) {
                 let _ = format!("{dec}");
                 let _ = format!("{dec:?}");
             }
-        }
     }
 
     /// Feed random bytes through the egress adapter — must never panic.
@@ -817,8 +814,8 @@ fn depth3_staged_length_matches_encoded() -> Result<(), Box<dyn std::error::Erro
     // Encode the same data via the encoder to get the actual length.
     let mut buf_storage = [0u8; 8192];
     assert!(len <= buf_storage.len(), "len exceeds stack pad");
-    let mut buf = &mut buf_storage[..len];
-    let complete = Depth3TestEncoder::try_wrap_and_apply_header(&mut buf, 0)?
+    let buf = &mut buf_storage[..len];
+    let complete = Depth3TestEncoder::try_wrap_and_apply_header(buf, 0)?
         .fixed(&Depth3TestFixedFields { id: 42 })
         .levels(levels.len() as u16, |g| {
             for (name, items) in levels {
@@ -1301,7 +1298,8 @@ fn best_bid_and_depth(wire: &[u8]) -> Result<(i64, u64, usize, &str), sbe_rt::De
             }
             let mut orders = level.into_orders()?;
             // Fixed stride, so the count is exact without walking.
-            total_orders += (&mut orders).len() as u64;
+            let entries = &mut orders;
+            total_orders += entries.len() as u64;
             orders.finish()
         })?
         .skip_asks()?

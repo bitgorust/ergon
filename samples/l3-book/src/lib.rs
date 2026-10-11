@@ -145,12 +145,11 @@ pub fn encode_book(
         .bids(bids.len() as u16, |g| {
             for (price, size, orders) in bids {
                 g.add(|mut e| {
-                    e.price(*price).map_err(|_| {
-                        sbe_rt::EncodeError::DomainConversionFailed {
+                    e.price(*price)
+                        .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                             field: "price",
                             reason: "conversion",
-                        }
-                    })?;
+                        })?;
                     e.size(*size)
                         .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                             field: "size",
@@ -174,12 +173,11 @@ pub fn encode_book(
         .asks(asks.len() as u16, |g| {
             for (price, size, orders) in asks {
                 g.add(|mut e| {
-                    e.price(*price).map_err(|_| {
-                        sbe_rt::EncodeError::DomainConversionFailed {
+                    e.price(*price)
+                        .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                             field: "price",
                             reason: "conversion",
-                        }
-                    })?;
+                        })?;
                     e.size(*size)
                         .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                             field: "size",
@@ -221,12 +219,11 @@ pub fn encode_vardata_book(
         .bids(bids.len() as u16, |g| {
             for (price, size, orders) in bids {
                 g.add(|mut e| {
-                    e.price(*price).map_err(|_| {
-                        sbe_rt::EncodeError::DomainConversionFailed {
+                    e.price(*price)
+                        .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                             field: "price",
                             reason: "conversion",
-                        }
-                    })?;
+                        })?;
                     e.size(*size)
                         .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                             field: "size",
@@ -253,12 +250,11 @@ pub fn encode_vardata_book(
         .asks(asks.len() as u16, |g| {
             for (price, size, orders) in asks {
                 g.add(|mut e| {
-                    e.price(*price).map_err(|_| {
-                        sbe_rt::EncodeError::DomainConversionFailed {
+                    e.price(*price)
+                        .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                             field: "price",
                             reason: "conversion",
-                        }
-                    })?;
+                        })?;
                     e.size(*size)
                         .map_err(|_| sbe_rt::EncodeError::DomainConversionFailed {
                             field: "size",
