@@ -19,7 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ergo_aeron_cluster::cluster_codec_types::{
-    EventCode, NewLeaderEventEncoder, NewLeaderEventFixedFields, SessionEventEncoder,
+    AnyMessage, EventCode, NewLeaderEventEncoder, NewLeaderEventFixedFields, SessionEventEncoder,
     SessionEventFixedFields, SessionMessageHeaderDecoder,
 };
 use ergo_aeron_cluster::egress::EgressAdapter;
@@ -173,23 +173,18 @@ fn session_id(publication: &AeronExclusivePublication) -> Result<i32, Box<dyn Er
     Ok(publication.get_constants()?.session_id)
 }
 
-fn poll_any(subscription: &AeronSubscription) -> Result<bool, Box<dyn Error>> {
-    let mut any = false;
-    subscription.poll_fn(|_, _| any = true, 10)?;
-    Ok(any)
-}
-
 fn session_event(
     code: EventCode,
     leader_member_id: i32,
     detail: &str,
+    correlation_id: i64,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut buf =
         vec![0u8; SessionEventEncoder::compute_encoded_length_with_message_header(detail.len())];
     let len = SessionEventEncoder::wrap_and_apply_header(&mut buf, 0)
         .fixed(&SessionEventFixedFields {
             cluster_session_id: CLUSTER_SESSION_ID,
-            correlation_id: 0,
+            correlation_id,
             leadership_term_id: 1,
             leader_member_id,
             code,
@@ -289,15 +284,33 @@ impl FakeCluster {
     }
 
     /// Poll `connecting` until `member` hears its SessionConnectRequest, then
-    /// answer with `reply` over a new egress image.
+    /// answer over a new egress image. The reply echoes that request's
+    /// correlation id.
     fn answer(
         &self,
         connecting: &mut AsyncClusterConnect,
         member: usize,
-        reply: &[u8],
+        reply: impl Fn(i64) -> Result<Vec<u8>, Box<dyn Error>>,
     ) -> Result<AeronExclusivePublication, Box<dyn Error>> {
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !poll_any(&self.members[member])? {
+        let mut correlation = None;
+        while correlation.is_none() {
+            self.members[member].poll_fn(
+                |data, _| {
+                    if correlation.is_some() {
+                        return;
+                    }
+                    if let Ok(AnyMessage::SessionConnectRequest(decoder)) =
+                        AnyMessage::decode(data, 0)
+                    {
+                        correlation = Some(decoder.correlation_id());
+                    }
+                },
+                10,
+            )?;
+            if correlation.is_some() {
+                break;
+            }
             connecting.poll()?;
             if Instant::now() >= deadline {
                 return Err(format!(
@@ -308,8 +321,9 @@ impl FakeCluster {
             }
             thread::sleep(Duration::from_millis(1));
         }
+        let correlation = correlation.ok_or("connect request had no correlation id")?;
         let egress = self.egress()?;
-        offer(&egress, reply)?;
+        offer(&egress, &reply(correlation)?)?;
         Ok(egress)
     }
 
@@ -320,7 +334,9 @@ impl FakeCluster {
         client_driver: &JavaDriver,
     ) -> Result<(AeronCluster, AeronExclusivePublication), Box<dyn Error>> {
         let mut connecting = builder.connect_async(client_driver.dir.clone());
-        let egress = self.answer(&mut connecting, 0, &session_event(EventCode::OK, 0, "")?)?;
+        let egress = self.answer(&mut connecting, 0, |correlation| {
+            session_event(EventCode::OK, 0, "", correlation)
+        })?;
         Ok((finish(connecting)?, egress))
     }
 
@@ -498,11 +514,9 @@ fn redirect_adds_its_publication_without_waiting() -> Result<(), Box<dyn Error>>
     let mut connecting = builder(Duration::from_secs(10), Duration::from_secs(60))?
         .connect_async(client_driver.dir.clone());
     // Member 0 is a follower and redirects the client to member 1.
-    let _follower_egress = cluster.answer(
-        &mut connecting,
-        0,
-        &session_event(EventCode::REDIRECT, 1, ENDPOINTS)?,
-    )?;
+    let _follower_egress = cluster.answer(&mut connecting, 0, |correlation| {
+        session_event(EventCode::REDIRECT, 1, ENDPOINTS, correlation)
+    })?;
     let_land();
 
     client_driver.poll_frozen(|| {
@@ -515,8 +529,9 @@ fn redirect_adds_its_publication_without_waiting() -> Result<(), Box<dyn Error>>
         "the REDIRECT's publication waits for the driver, not the poll"
     );
 
-    let _leader_egress =
-        cluster.answer(&mut connecting, 1, &session_event(EventCode::OK, 1, "")?)?;
+    let _leader_egress = cluster.answer(&mut connecting, 1, |correlation| {
+        session_event(EventCode::OK, 1, "", correlation)
+    })?;
     let client = finish(connecting)?;
     assert_eq!(client.leader_member_id(), 1);
     assert_eq!(
@@ -643,7 +658,7 @@ fn closed_after_a_new_leader_in_one_poll_ends_the_session() -> Result<(), Box<dy
     )?;
     let new_egress = cluster.egress()?;
     offer(&new_egress, &new_leader_event(2, 1, ENDPOINTS)?)?;
-    offer(&new_egress, &session_event(EventCode::CLOSED, 1, "")?)?;
+    offer(&new_egress, &session_event(EventCode::CLOSED, 1, "", 0)?)?;
     let_land();
 
     Egress::regular().poll(&mut client)?;
@@ -667,7 +682,7 @@ fn closed_while_a_new_leader_is_pending_ends_the_session() -> Result<(), Box<dyn
     let mut egress = Egress::regular();
     egress.poll_until(&mut client, SessionState::AwaitingNewLeader)?;
 
-    offer(&new_egress, &session_event(EventCode::CLOSED, 1, "")?)?;
+    offer(&new_egress, &session_event(EventCode::CLOSED, 1, "", 0)?)?;
     let deadline = Instant::now() + Duration::from_secs(3);
     while client.state() != SessionState::Closed {
         egress.poll(&mut client)?;
@@ -708,7 +723,7 @@ fn closed_beside_a_failing_new_leader_event_ends_the_session() -> Result<(), Box
     let new_egress = cluster.egress()?;
     // Member 2 is not in the endpoint list, so this event alone would fail.
     offer(&new_egress, &new_leader_event(2, 2, ENDPOINTS)?)?;
-    offer(&new_egress, &session_event(EventCode::CLOSED, 1, "")?)?;
+    offer(&new_egress, &session_event(EventCode::CLOSED, 1, "", 0)?)?;
     let_land();
 
     Egress::regular().poll(&mut client)?;

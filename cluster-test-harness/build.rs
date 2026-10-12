@@ -43,8 +43,13 @@ fn compile_test_harness_java(manifest_dir: &Path, aeron_dir: &Path, java_out: &P
         .join("ClusterLauncher.java");
     let jar_dir = aeron_dir.join("aeron-all").join("build").join("libs");
     let cluster_jar = aeron_dir.join("aeron-cluster").join("build").join("libs");
-    let cp = std::env::join_paths([jar_dir.join("*"), cluster_jar.join("*")])
-        .expect("Java classpath entries must be valid paths");
+    let samples_jar = aeron_dir.join("aeron-samples").join("build").join("libs");
+    let cp = std::env::join_paths([
+        jar_dir.join("*"),
+        cluster_jar.join("*"),
+        samples_jar.join("*"),
+    ])
+    .expect("Java classpath entries must be valid paths");
     eprintln!("Compiling ClusterLauncher into {}", java_out.display());
     let _ = fs::create_dir_all(java_out);
     let status = std::process::Command::new("javac")

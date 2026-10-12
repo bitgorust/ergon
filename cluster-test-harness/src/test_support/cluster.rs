@@ -25,14 +25,20 @@ fn classpath() -> std::ffi::OsString {
 }
 
 fn launch_node(base_port: u16, member_id: u16, node_count: u16) -> Child {
-    launch_node_impl(base_port, member_id, node_count, false)
+    launch_node_impl(base_port, member_id, node_count, false, "echo")
 }
 
 fn launch_node_keep_dirs(base_port: u16, member_id: u16, node_count: u16) -> Child {
-    launch_node_impl(base_port, member_id, node_count, true)
+    launch_node_impl(base_port, member_id, node_count, true, "echo")
 }
 
-fn launch_node_impl(base_port: u16, member_id: u16, node_count: u16, keep: bool) -> Child {
+fn launch_node_impl(
+    base_port: u16,
+    member_id: u16,
+    node_count: u16,
+    keep: bool,
+    service: &str,
+) -> Child {
     let mut cmd = Command::new("java");
     cmd.args([
         "--add-opens",
@@ -48,6 +54,9 @@ fn launch_node_impl(base_port: u16, member_id: u16, node_count: u16, keep: bool)
     ]);
     if keep {
         cmd.arg("keep");
+    }
+    if service != "echo" {
+        cmd.arg(service);
     }
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -90,18 +99,27 @@ fn read_ready(child: &mut Child) -> (String, String, String) {
     (ingress, egress, aeron_dir)
 }
 
+fn single_node_with(service: &str) -> TestCluster {
+    let base_port = NEXT_BASE_PORT.fetch_add(100, Ordering::SeqCst);
+    let mut child = launch_node_impl(base_port, 0, 1, false, service);
+    let (ingress, egress, aeron_dir) = read_ready(&mut child);
+    TestCluster {
+        processes: vec![child],
+        ingress_channel: ingress,
+        egress_channel: egress,
+        aeron_dir: PathBuf::from(aeron_dir),
+        base_port,
+    }
+}
+
 impl TestCluster {
     pub fn single_node() -> Self {
-        let base_port = NEXT_BASE_PORT.fetch_add(100, Ordering::SeqCst);
-        let mut child = launch_node(base_port, 0, 1);
-        let (ingress, egress, aeron_dir) = read_ready(&mut child);
-        Self {
-            processes: vec![child],
-            ingress_channel: ingress,
-            egress_channel: egress,
-            aeron_dir: PathBuf::from(aeron_dir),
-            base_port,
-        }
+        single_node_with("echo")
+    }
+
+    /// One node running the official `BasicAuctionClusteredService`.
+    pub fn single_node_auction() -> Self {
+        single_node_with("auction")
     }
 
     /// Launch a 3-node static cluster. Node 0 is the leader.

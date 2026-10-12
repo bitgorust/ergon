@@ -99,6 +99,21 @@ fn has_multicast_endpoint(channel: &CStr) -> bool {
         })
 }
 
+/// Egress channel the client subscribes to.
+///
+/// Java forces `rejoin=false` on a UDP egress channel so a dropped image is
+/// not silently replaced. IPC and every other media stay as configured.
+pub(crate) fn egress_channel_disabling_rejoin(channel: &CStr) -> Result<CString, ClusterError> {
+    let bytes = channel.to_bytes();
+    if bytes != b"aeron:udp" && !bytes.starts_with(b"aeron:udp?") {
+        return Ok(channel.to_owned());
+    }
+    let builder = AeronUriStringBuilder::default();
+    builder.init_on_string(channel).map_err(map_uri)?;
+    builder.put(c"rejoin", c"false").map_err(map_uri)?;
+    build(&builder, bytes.len() + 16)
+}
+
 /// Build `aeron:udp?endpoint={endpoint}` as `CString` for rusteron.
 ///
 /// `endpoint` is `host:port` (no `aeron:` prefix).
@@ -167,6 +182,18 @@ mod tests {
             let c = ingress_channel_for_endpoint(Some(&template), "b:2")?;
             assert_eq!(c, template, "{channel}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn udp_egress_disables_rejoin_and_ipc_is_unchanged() -> Result<(), Box<dyn std::error::Error>> {
+        let udp = egress_channel_disabling_rejoin(&channel_cstr("aeron:udp?endpoint=localhost:9020")?)?;
+        let udp = udp.to_str()?;
+        assert!(udp.contains("endpoint=localhost:9020"), "{udp}");
+        assert!(udp.contains("rejoin=false"), "{udp}");
+
+        let ipc = channel_cstr("aeron:ipc")?;
+        assert_eq!(egress_channel_disabling_rejoin(&ipc)?, ipc);
         Ok(())
     }
 

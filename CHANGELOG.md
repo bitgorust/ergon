@@ -2,7 +2,27 @@
 
 ## [Unreleased]
 
+### Fixed
+- The cluster client opens an ingress publication to every member when
+  ingress endpoints are set, sends protocol version 0.3.0 (768), and accepts
+  a `SessionEvent` or `Challenge` only when its correlation id matches the
+  request in flight. A challenge response and a redirect each use a new
+  correlation id. UDP egress subscriptions set `rejoin=false`. An egress
+  channel of `endpoint=localhost:0` is resolved to the bound port before the
+  connect request is sent. An unset new-leader timeout is twice the leader
+  heartbeat from the OK event, or 20 seconds when that field is absent.
+  `NOT_CONNECTED` and `CLOSED` on the ingress publication wait for a new
+  leader; `MAX_POSITION_EXCEEDED` closes the session. `poll_egress` no longer
+  sends keep-alives. Admin requests are written into a claim.
+  `EgressEvent::SessionEvent` carries `leader_heartbeat_timeout_ns`.
+
 ### Added
+- `SessionBuilder::aeron`, `client_name`, and `error_handler`.
+- `AeronCluster::offer_vectors` gathers a session header plus up to seven
+  payload slices with no heap allocation.
+- `IngressSessionDecorator` prepends a session header on a raw publication.
+  `ClusterEvent` is the logged cluster event. Egress listeners gain
+  `on_message_with_reserved_value` and `on_extension_message`.
 - Generate an opt-in cross-schema AnySchemaMessage dispatcher with typed errors
   and borrowed frames for persistence, including unknown schemas and templates.
 - Report the cluster client's ingress limits, so a client can refuse to start
