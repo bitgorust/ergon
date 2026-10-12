@@ -22,11 +22,12 @@
   `AeronCluster::egress_image_correlation_id()` and `egress_image_session_id()`.
   As in Java, the session binds to the image that delivered its
   `SessionEvent(OK)` or latest `NewLeaderEvent`.
-- Read a fixed `char` array declared with a `characterEncoding` as text:
-  `<field>_as_str()` returns `Result<&str, DecodeError>` with trailing NUL
-  padding removed, at message and group-entry level. Group-entry encoders gain
-  the `<field>_str(&str)` setter message encoders already had. Both use the
-  new public `sbe_rt::encode_fixed_text` and `sbe_rt::decode_fixed_text`.
+- Read a fixed text array (any `char` array, or a `uint8` array whose
+  `characterEncoding` is ASCII or UTF-8) as text: `<field>_as_str()` returns
+  `Result<&str, DecodeError>` with trailing NUL padding removed, at message
+  and group-entry level. Group-entry encoders gain the `<field>_str(&str)`
+  setter message encoders already had. Both use the new public
+  `sbe_rt::encode_fixed_text` and `sbe_rt::decode_fixed_text`.
 
 ### Changed
 - Breaking (generated API): drop `try_` from the per-field and closure
