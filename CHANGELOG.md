@@ -38,6 +38,10 @@
   - The raw stages' `try_<data>(f)` and `try_<data>_as_message(f)`
     callbacks are removed; use `into_<data>()` / `into_<data>_as_message()`,
     or `.ordered()`.
+- Breaking (cluster API): `SessionBuilder` is no longer `Send` or `Sync`,
+  because it can hold a shared Aeron client (`SessionBuilder::aeron`), and
+  `EgressEvent::SessionEvent` gains `leader_heartbeat_timeout_ns`, so code
+  that builds or destructures that variant must name the field.
 - Depend on rusteron 0.2.11 from crates.io, which bundles Aeron 1.53.3.
 - Pin the `aeron` submodule and the vendored cluster session schema to 1.53.3.
   Session schema id 111 is SBE version 17. `ServiceTerminationPosition` gains
