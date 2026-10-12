@@ -39,6 +39,7 @@ SHAPES = [
     ("dOptNeg",    "OptNegD",   "",                            "optional double, finite nullValue -1.0"),
     ("eTdNull",    "Side",      "",                            "enum whose encodingType typedef declares nullValue"),
     ("cFloatNull", "Bounds",    "",                            "composite with float constant and non-NaN optional nulls"),
+    ("tsMs",       "uint64",    'semanticType="UTCTimestamp" timeUnit="millisecond"', "millisecond timestamp, built-in chrono domain type"),
 ]
 
 # sinceVersion values under test.

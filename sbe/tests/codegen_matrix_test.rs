@@ -78,6 +78,12 @@ const SHAPES: &[(&str, &str, &str)] = &[
     // The enum's null comes from its encodingType typedef.
     ("e_td_null", "Side", "Option<Side>"),
     ("c_float_null", "Bounds", "Option<Bounds>"),
+    // The built-in chrono conversion rescales a millisecond timeUnit.
+    (
+        "ts_ms",
+        "chrono::DateTime<chrono::Utc>",
+        "Option<chrono::DateTime<chrono::Utc>>",
+    ),
 ];
 
 const VERSIONS: &[u16] = &[0, 1];
@@ -157,7 +163,15 @@ fn with_matrix_domain_types(c: GenerationConfig) -> GenerationConfig {
         "rust_decimal::Decimal",
     )
     .with_manual_domain_type(ConversionSelector::semantic_type("TagText"), "u32")
+    .with_domain_type(
+        ConversionSelector::semantic_type("UTCTimestamp"),
+        "chrono::DateTime<chrono::Utc>",
+    )
 }
+
+/// Crates the domain-typed matrix cells name: `rust_decimal` for the manual
+/// impls, `chrono` for the built-in timestamp conversion.
+const DOMAIN_DEPS: &str = "rust_decimal = \"1\"\nchrono = \"0.4\"\n";
 
 /// Conversion selectors only — no domain type, so the generated surface is
 /// `*_as` / `*_from` plus `*_wire` raw renames rather than domain accessors.
@@ -424,7 +438,12 @@ fn domain_dto_shape_matrix_types_and_compiles() -> Result<(), Box<dyn std::error
         "a constant-presence field must not appear in the DTO"
     );
 
-    compile_and_run_with_deps("cm_shapes", &src, DOMAIN_IMPLS, "rust_decimal = \"1\"\n");
+    assert!(
+        src.contains("timestamp is more precise than the field's timeUnit"),
+        "the ts_ms cells must reach the built-in chrono rescale branch"
+    );
+
+    compile_and_run_with_deps("cm_shapes", &src, DOMAIN_IMPLS, DOMAIN_DEPS);
     Ok(())
 }
 
@@ -647,7 +666,7 @@ fn every_config_variant_compiles() -> Result<(), Box<dyn std::error::Error>> {
         }
         let src = format!("{src}\n{}", v.module_suffix);
         let (prelude, deps) = if v.domain_impls {
-            (DOMAIN_IMPLS, "rust_decimal = \"1\"\n")
+            (DOMAIN_IMPLS, DOMAIN_DEPS)
         } else {
             ("", "")
         };
@@ -902,7 +921,7 @@ fn generated_code_has_no_block_doc_comments() -> Result<(), Box<dyn std::error::
 
     let as_refs: Vec<(&str, &str)> = modules.iter().map(|(n, s)| (*n, s.as_str())).collect();
     let domain_impls = format!("const _: () = {{ use cm_docs_matrix::*; {DOMAIN_IMPLS} }};");
-    common::run_doctests("cm_docs", &as_refs, &domain_impls, "rust_decimal = \"1\"\n")
+    common::run_doctests("cm_docs", &as_refs, &domain_impls, DOMAIN_DEPS)
         .map_err(|out| format!("generated modules' doctests fail:\n{out}"))?;
     let prose = "/**\nFirst paragraph.\n\n    indented prose that rustdoc reads as code\n*/\npub struct Prose;\n";
     assert!(
