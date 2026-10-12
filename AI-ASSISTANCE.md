@@ -59,29 +59,34 @@ whether you continue evaluating the crate:
 
 Per-model high-water mark reconstructed from every `ccusage` snapshot committed
 to this file — 2026-08-03, 2026-08-07, 2026-08-13, 2026-08-15, 2026-08-19,
-2026-08-20, 2026-08-27, 2026-09-07, 2026-09-13, and 2026-09-14. Claude Code,
-Codex, and Grok Build CLI.
+2026-08-20, 2026-08-27, 2026-09-07, 2026-09-13 and 2026-09-14 — plus the
+2026-10-13 run. Claude Code, Codex, and Grok Build CLI.
 
 | Model | Input | Output | Cache Create | Cache Read | Reasoning Output | Total Tokens | Cost (USD) |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | claude-fable-5 | 403,485 | 1,349,254 | 12,230,126 | 487,557,778 | — | 501,540,643 | $802.28 |
 | claude-haiku-4-5-20251001 | 894 | 30,088 | 145,326 | 10,319,303 | — | 10,495,611 | $1.47 |
 | claude-opus-4-8 | 161,581 | 507,379 | 3,870,922 | 93,963,551 | — | 98,503,433 | $86.65 |
-| claude-opus-5 | 10,410,448 | 4,165,147 | 31,104,000 | 3,525,946,517 | — | 3,571,626,112 | $2,213.29 |
+| claude-opus-5 | 13,757,946 | 4,697,511 | 36,570,049 | 3,651,555,912 | — | 3,706,581,418 | $2,358.70 |
+| claude-opus-5-5 | 220,890,595 | 68,846,695 | 361,893,622 | 14,817,788,397 | — | 15,469,419,309 | $7,278.66 |
 | claude-sonnet-4-6 | 3 | 654 | 22,730 | 14,116 | — | 37,503 | $0.15 |
-| claude-sonnet-5 | 33,259 | 1,963,182 | 18,022,479 | 1,912,145,069 | — | 1,932,163,989 | $473.67 |
-| deepseek-v4-flash | 52,791,367 | 15,125,986 | — | 2,734,161,536 | — | 2,802,078,889 | $35.00 |
-| deepseek-v4-pro | 47,802,822 | 9,959,142 | — | 11,705,468,864 | — | 11,763,230,828 | $551.30 |
+| claude-sonnet-5 | 35,457 | 2,505,851 | 22,833,317 | 2,240,322,788 | — | 2,265,697,413 | $563.37 |
+| claude-sonnet-5-5 | 11,466 | 5,060,869 | 32,433,560 | 833,656,964 | — | 871,162,859 | $219.93 |
+| deepseek-flash | 8,991,713 | 5,070,512 | — | 3,202,997,632 | — | 3,217,059,857 | $28.00 |
+| deepseek-v4-flash | 52,791,367 | 17,446,045 | — | 2,734,161,536 | — | 2,802,078,889 | $35.00 |
+| deepseek-v4-pro | 85,359,087 | 21,733,136 | — | 24,546,493,056 | — | 24,653,585,279 | $551.30 |
 | glm-4.7 | 6,949,701 | 760,380 | — | 268,436,096 | — | 276,146,177 | $35.37 |
 | glm-5.2 | 27,277,618 | 3,460,625 | — | 2,274,775,808 | — | 2,305,514,051 | $644.86 |
 | gpt-5.5 | 1,781,759 | 117,119 | — | 18,613,504 | 31,270 | 20,543,652 | $21.73 |
 | gpt-5.6-luna | 1,552,433 | 172,891 | — | 46,894,592 | 98,393 | 48,718,309 | $35.97 |
 | gpt-5.6-sol | 54,416,465 | 4,892,696 | — | 1,437,418,112 | 2,493,867 | 1,499,221,140 | $950.21 |
 | gpt-5.6-terra | 484,995 | 29,907 | — | 6,463,744 | 14,882 | 6,993,528 | $3.69 |
-| gpt-6-astra | 1,476,025 | 153,291 | — | 35,774,848 | 65,192 | 37,404,164 | $55.94 |
+| gpt-6-astra | 6,414,831 | 495,245 | — | 96,016,896 | 160,336 | 103,087,308 | $169.74 |
+| gpt-6.1-sol | 13,175,237 | 1,749,352 | — | 373,847,936 | 835,254 | 389,607,779 | $94.16 |
 | grok-4.5-build | 10,030,758 | 881,349 | — | 177,071,360 | — | 187,983,467 | $114.67 |
-| grok-4.6-build | 40,082,011 | 2,648,838 | — | 748,189,952 | — | 790,920,801 | $260.76 |
-| **Total** | **255,655,624** | **46,217,928** | **65,395,583** | **25,483,214,750** | **2,703,604** | **25,853,122,297** | **$6,287.00** |
+| grok-4.6-build | 44,849,892 | 3,100,656 | — | 812,446,592 | — | 860,397,140 | $293.80 |
+| grok-4.7-build | 27,721,309 | 3,296,512 | — | 348,366,592 | — | 379,384,413 | $104.80 |
+| **Total** | **577,058,592** | **146,204,726** | **469,999,652** | **58,479,182,265** | **3,634,002** | **59,673,759,178** | **$14,394.52** |
 
 **Notes:**
 
@@ -90,22 +95,20 @@ Codex, and Grok Build CLI.
   Claude Code deletes transcripts older than `cleanupPeriodDays`. A
   `--since 20260628` query therefore *loses* its earliest days as time passes,
   so a later snapshot can report **fewer** tokens than an earlier one. The
-  figures above are the per-model, per-column maximum across all ten
+  figures above are the per-model, per-column maximum across all eleven
   snapshots; since the tool can only under-report, that maximum is the best
   available lower bound.
-- The 2026-09-14 run alone reported **21,452,166,522** tokens. Merging the
-  nine snapshots recovered from this file's git history adds
-  **4,400,955,775** tokens the current run can no longer see — about a sixth
-  of the total, and the reason this table is never overwritten with a fresh
-  run's numbers.
-- `claude-opus-5` (3.52B → 3.57B), `claude-sonnet-5` (1.91B → 1.93B),
-  `gpt-6-astra` (24.8M → 37.4M) and `grok-4.6-build` (578M → 791M) set new
-  total maxima on this run. `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`
-  and `deepseek-v4-pro` raised only their cost column. Every other model's
-  maximum is held by an earlier snapshot.
+- The 2026-10-13 run alone reported **57,084,644,123** tokens. Merging the
+  snapshots recovered from this file's git history adds **2,589,115,055**
+  tokens the current run can no longer see, which is why this table is never
+  overwritten with a fresh run's numbers.
+- New this run: `claude-opus-5-5`, `claude-sonnet-5-5`, `deepseek-flash`,
+  `gpt-6.1-sol` and `grok-4.7-build`. `claude-opus-5`, `claude-sonnet-5`,
+  `deepseek-v4-pro`, `gpt-6-astra` and `grok-4.6-build` set new total maxima.
+  Every other model's maximum is held by an earlier snapshot;
+  `grok-4.5-build` appears only in earlier snapshots.
 - Grok Build CLI rows come from `ccusage grok`, which extracts them from the
-  Grok CLI session logs. `grok-4.5-build`'s maximum is still held by an
-  earlier snapshot.
+  Grok CLI session logs.
 - No Antigravity/Gemini figures are included: the `observer` CLI that reported
   them is not installed on this host, so that source could not be sampled this
   cycle. Its absence understates the total rather than inflating it.
@@ -117,10 +120,11 @@ Codex, and Grok Build CLI.
   tool.
 - All costs are at enterprise/pay-as-you-go API rates observed by each tool.
   Subscription fees (Claude, OpenAI, Grok) are not included.
-- Sanity checks: the per-model column sums for the 2026-09-14 run reconcile
-  exactly against each tool's own reported totals (18,951,140,606 Claude Code +
-  1,561,857,282 Codex + 939,168,634 Grok = 21,452,166,522), and the grand total
-  is monotonic against the previously committed 25,545,791,819.
+- Sanity checks: the per-model column sums for the 2026-10-13 run reconcile
+  exactly against each tool's own reported totals (53,825,172,584 Claude Code +
+  2,019,689,986 Codex including 3,537,371 reasoning output + 1,239,781,553
+  Grok = 57,084,644,123), and the grand total is monotonic against the
+  previously committed 25,853,122,297.
 
 ## What-if: all tokens through a single provider
 
