@@ -1072,7 +1072,8 @@ impl AeronCluster {
     ///
     /// Encoded into a stack array sized to the generated
     /// [`SessionKeepAliveEncoder::ENCODED_LENGTH`] — no heap allocation.
-    /// Retries a back-pressured offer [`SEND_ATTEMPTS`] times. `poll_egress`
+    /// Retries a back-pressured offer up to three times, as Java's
+    /// `AeronCluster.SEND_ATTEMPTS` does. `poll_egress`
     /// does not call this; a caller that only polls loses the session when
     /// the cluster's message timeout elapses.
     pub fn send_keep_alive(&mut self) -> Result<(), ClusterError> {
