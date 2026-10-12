@@ -20,27 +20,3 @@ samples/l3-book/tests/*.rs	samples	cd samples/l3-book && cargo test
 samples/l3-book/benches/*.rs	benchmark	cd samples/l3-book && cargo bench --no-run
 samples/sbe-feature-tour/src/*.rs	samples	cd samples/sbe-feature-tour && cargo test
 samples/sbe-feature-tour/tests/*.rs	samples	cd samples/sbe-feature-tour && cargo test
-runtime/src/*.rs	pr	cd samples/clickhouse && just _test-clickhouse _test-aeron && cd ../.. && cargo test -p ergon-runtime --all-features --lib && cargo test -p ergon-runtime --all-features --doc
-runtime/tests/*.rs	pr	cd samples/clickhouse && just _test-aeron && cd ../.. && cargo test -p ergon-runtime --all-features --tests
-runtime/benches/*.rs	benchmark	cargo bench -p ergon-runtime --all-features --no-run
-wire/src/*.rs	pr	cargo test -p ergon-wire --all-features --lib && cargo test -p ergon-wire --all-features --doc
-wire/tests/*.rs	pr	cargo test -p ergon-wire --all-features --tests
-runtime-server/src/*.rs	pr	cd samples/clickhouse && just _test-clickhouse _test-aeron && cd ../.. && cargo test -p ergon-runtime-server --all-targets
-runtime-server/tests/*.rs	pr	cd samples/clickhouse && just _test-clickhouse _test-aeron && cd ../.. && cargo test -p ergon-runtime-server --all-targets
-bridge/src/*.rs	pr	cd samples/clickhouse && just _test-aeron && cd ../.. && cargo test -p ergon-bridge --all-targets && cargo test -p ergon-bridge --doc
-runtime-log/src/*.rs	pr	cd samples/clickhouse && just _test-aeron && cd ../.. && cargo test -p ergon-runtime-log --all-targets
-runtime-log/tests/*.rs	pr	cd samples/clickhouse && just _test-aeron && cd ../.. && cargo test -p ergon-runtime-log --all-targets
-samples/clickhouse/engine/src/*.rs	samples	cd samples/clickhouse && just test
-samples/clickhouse/engine/tests/*.rs	samples	cd samples/clickhouse && just test
-samples/clickhouse/ingester/src/*.rs	samples	cd samples/clickhouse && just test
-samples/clickhouse/ingester/tests/*.rs	samples	cd samples/clickhouse && just test
-samples/clickhouse/lab/src/*.rs	samples	cd samples/clickhouse && just test
-samples/clickhouse/lab/tests/*.rs	samples	cd samples/clickhouse && just test
-samples/clickhouse/md/src/*.rs	samples	cd samples/clickhouse && just test
-samples/clickhouse/schema/src/*.rs	samples	cd samples/clickhouse && just test
-samples/clickhouse/schema/tests/*.rs	samples	cd samples/clickhouse && just test
-samples/clickhouse/aeron-bench/src/*.rs	samples	cd samples/clickhouse && just test
-samples/clickhouse/aeron-driver/src/*.rs	samples	cd samples/clickhouse && just test
-samples/clickhouse/aeron-bench/tests/*.rs	samples	cd samples/clickhouse && just test
-relay/src/*.rs	pr	cargo test -p ergon-relay --lib
-relay/tests/*.rs	pr	cd samples/clickhouse && just _test-aeron && cd ../.. && cargo test -p ergon-relay --tests

@@ -109,12 +109,9 @@ jobs:
         with:
           submodules: recursive
 
-      # clippy: ergon-runtime's client_ban_lint lints scratch crates under its
-      # clippy.toml, outside the repository's rust-toolchain.toml.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
-          components: clippy
 
       - uses: actions/setup-java@v6
         with:
@@ -123,15 +120,6 @@ jobs:
 
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install -y libbsd-dev uuid-dev curl
-
-      - name: Start ClickHouse and the archiving media driver
-        run: |
-          if ! command -v just >/dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to "$HOME/.local/bin"
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-            export PATH="$HOME/.local/bin:$PATH"
-          fi
-          cd samples/clickhouse && just _test-clickhouse _test-aeron
 
       - run: ./scripts/regenerate-sbe-tool-reference.sh --check
       - run: ./scripts/regenerate-golden.sh --check
@@ -278,55 +266,6 @@ jobs:
 
       - name: sbe-feature-tour
         run: cd samples/sbe-feature-tour && cargo test -- --test-threads=1
-
-  # The ClickHouse lab's workspace: every crate linted, the clients (lab, md,
-  # engine) under their own clippy.toml (the client ban, runtime/clippy.toml's
-  # entries, which ergon-runtime's client_ban_lint test keeps in step, and the
-  # engine's determinism ban; the ingester and the Aeron tools have no ban),
-  # and the ingester's tests against the test ClickHouse and archive. The lab is its own
-  # workspace, on its own toolchain (NautilusTrader needs 1.98.1).
-  clickhouse-lab:
-    needs: policy
-    runs-on: ubuntu-24.04
-    # NautilusTrader's crates are large: a cold check takes a while.
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.98.1"
-          components: rustfmt, clippy
-
-      # rusteron builds Aeron's C client: CMake, clang, libbsd, libuuid, and a
-      # JDK for the archive codecs (samples/clickhouse/docker/builder.Dockerfile).
-      - uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libbsd-dev uuid-dev
-
-      - name: Lint the lab's workspace
-        run: |
-          cd samples/clickhouse
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Start the test ClickHouse and the archiving media driver
-        run: |
-          if ! command -v just >/dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to "$HOME/.local/bin"
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-            export PATH="$HOME/.local/bin:$PATH"
-          fi
-          cd samples/clickhouse && just _test-clickhouse _test-aeron
-
-      - name: The ingester's tests
-        run: cd samples/clickhouse && cargo test -p ingester -- --test-threads=2
 
   build:
     needs: policy

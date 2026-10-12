@@ -29,11 +29,7 @@ deployments. Criteria for lifting that disclaimer:
 | [`sbe/`](sbe/) | `ergo-sbe` | SBE schema parser and Rust codec generator |
 | [`sbe/benchmarks/`](sbe/benchmarks/) | `ergo-sbe-benchmarks` | Unpublished parity benchmarks |
 | [`cluster/`](cluster/) | `ergo-aeron-cluster` | Experimental Aeron Cluster client |
-| [`runtime/`](runtime/) | `ergon-runtime` | Client runtime for apps on the bus: one busy-spin thread each, low latency, no locks or channels, no atomic per message |
-| [`runtime-server/`](runtime-server/) | `ergon-runtime-server` | Ingester from the Aeron Archive into ClickHouse: throughput first, threads allowed |
-| [`bridge/`](bridge/) | `ergon-bridge` | The `tracing` bridge: events and spans from any thread into the ingester's stream. Shares its publication across threads through a private wrapper, so no crate enables rusteron's `multi-threaded` |
-| [`runtime-log/`](runtime-log/) | `ergon-runtime-log` | Prints a pod's log lines from the Aeron log stream as logfmt: the `logs` sidecar, or a local thread |
-| [`samples/`](samples/) | seven teaching crates, plus the ClickHouse lab | Unpublished integration playgrounds |
+| [`samples/`](samples/) | seven teaching crates | Unpublished integration playgrounds |
 
 The workspace requires Rust 1.88 or newer. The sample crates are intentionally
 excluded from the Cargo workspace and remain `publish = false`.

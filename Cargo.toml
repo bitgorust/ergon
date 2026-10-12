@@ -4,19 +4,11 @@ members = [
     "sbe/benchmarks",
     "cluster",
     "cluster-test-harness",
-    "wire",
-    "runtime",
-    "bridge",
-    "runtime-server",
-    "runtime-log",
-    "relay",
 ]
 # Excluded because they require nightly toolchain:
 #   sbe/fuzz         — cargo-fuzz (libfuzzer), needs `cargo +nightly fuzz run`
 #   sbe/miri-fixtures — cargo-miri, needs `cargo +nightly miri test`
 #   samples           — standalone crates, not workspace members.
-#     The ClickHouse lab links `ergon-runtime` and `ergon-runtime-server`
-#     (this workspace) by path.
 #
 # Value:
 #   fuzz — 6 targets hammering verify(), nested decode, AnyMessage dispatch,
@@ -40,16 +32,14 @@ homepage = "https://github.com/mimran1980/ergon"
 authors = ["Mohammed Imran"]
 
 [workspace.dependencies]
-# Inherited by the cluster crate, ergon-wire and ergon-runtime-server, each
-# for both edges. Cargo 1.95 rejects overriding default-features on an
-# inherited dependency, so fancy is disabled here.
+# Inherited by the cluster crate for both edges. Cargo 1.95 rejects
+# overriding default-features on an inherited dependency, so fancy is
+# disabled here.
 ergo-sbe = { version = "0.1.30", path = "sbe", default-features = false }
 # The newest rusteron 0.2. Each crate needs `rusteron-code-gen` at exactly its
-# own version, so all three resolve to one, and `cargo update` moves them
-# together.
+# own version, so both resolve to one, and `cargo update` moves them together.
 rusteron-client = "0.2"
 rusteron-media-driver = "0.2"
-rusteron-archive = { version = "0.2", features = ["static"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -70,11 +60,3 @@ codegen-units = 1
 [profile.release]
 lto = true
 codegen-units = 1
-
-# shortcut: builds against the local rusteron `improvements` checkout next to
-# this repo, whose additive APIs ship in 0.2.11; delete this table and require
-# 0.2.11 once it is on crates.io.
-[patch.crates-io]
-rusteron-client = { path = "../rusteron/rusteron-client" }
-rusteron-media-driver = { path = "../rusteron/rusteron-media-driver" }
-rusteron-archive = { path = "../rusteron/rusteron-archive" }

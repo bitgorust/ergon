@@ -36,17 +36,14 @@ policy:
     bash scripts/tests/test-public-api.sh
     bash scripts/tests/test-packaged-cluster-features.sh
     bash scripts/tests/test-bench-historic.sh
-    bash scripts/tests/test-bench-runtime-calibrate.sh
     bash scripts/tests/test-stale-deny-ignores.sh
     bash scripts/tests/test-cluster-ergo-sbe-features.sh
-    bash scripts/tests/test-bridge-isolation.sh
     bash scripts/tests/test-book-content.sh
     bash scripts/tests/test-rerun-if-changed.sh
     ./scripts/check-test-policy.sh
     ./scripts/check-mutation-config.sh
     ./scripts/check-stale-deny-ignores.sh
     ./scripts/check-cluster-ergo-sbe-features.sh
-    ./scripts/check-bridge-isolation.sh
     ./scripts/check-rerun-if-changed.sh
 
 # Every cheap correctness gate in one pass — the ones that otherwise only run
@@ -84,10 +81,8 @@ preflight:
     bash scripts/tests/test-instruction-probe-pairs.sh
     bash scripts/tests/test-packaged-cluster-features.sh
     bash scripts/tests/test-bench-historic.sh
-    bash scripts/tests/test-bench-runtime-calibrate.sh
     bash scripts/tests/test-stale-deny-ignores.sh
     bash scripts/tests/test-cluster-ergo-sbe-features.sh
-    bash scripts/tests/test-bridge-isolation.sh
     bash scripts/tests/test-book-content.sh
     bash scripts/tests/test-rerun-if-changed.sh
     bash scripts/test-package-bench-artifacts.sh
@@ -106,13 +101,12 @@ preflight:
     ./scripts/check-mutation-config.sh
     ./scripts/check-stale-deny-ignores.sh
     ./scripts/check-cluster-ergo-sbe-features.sh
-    ./scripts/check-bridge-isolation.sh
     ./scripts/check-rerun-if-changed.sh
     @echo ""
     @echo "audit: all cheap gates pass"
 
 # Full local check: hygiene, format, clippy, tests (no Java / Aeron jars).
-check-local: policy _test-ingester-services
+check-local: policy
     ./scripts/check-repository-hygiene.sh
     cargo fmt --all --check
     cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster-test-harness -- -D warnings
@@ -202,13 +196,6 @@ release-check: test check-coverage check-generated-rustdoc
 #   just bench-cluster && just bench && just bench-historic   # quiet machine
 #   just release-verified                                     # same commit
 #
-# `bench-runtime` leaves no evidence file to check, so this recipe runs it
-# first, while the machine is still quiet, with its negative test. Off the
-# gate VM (no GATE_ENFORCE=1) its timing gates are a smoke run: a failing
-# gate prints `fail (smoke: not enforced)` and does not stop the release.
-# The binding verdict is `just azure gate`'s; the negative test still proves
-# every gate can fail here.
-#
 # Re-run the benches if you commit anything afterwards; the manifest check will
 # reject stale evidence rather than let it through.
 # Release with benchmark gates already proven on a quiet machine
@@ -216,9 +203,6 @@ release-verified: _check-release-notes
     @echo "=== 0/8 confirm benchmark evidence exists for HEAD ==="
     bash scripts/package-bench-artifacts.sh /tmp/ergon-bench-evidence-precheck
     @rm -rf /tmp/ergon-bench-evidence-precheck
-    @echo "=== 0b/8 runtime benchmark gates + their negative test ==="
-    just bench-runtime
-    bash scripts/tests/test-bench-runtime-gate.sh
     just _release-pre
     just _release-post
 
@@ -227,18 +211,16 @@ release-verified: _check-release-notes
 # calling this. The version is read from workspace Cargo.toml.
 #
 # Runs the benchmark gates inline, ~40 min in, on a machine hot from the test
-# suite; `bench-runtime` is a smoke run there (see `release-verified`). If the tightest maintained ratio fails there, re-measure on an idle
+# suite. If the tightest maintained ratio fails there, re-measure on an idle
 # machine before believing it, then use `just release-verified`.
 # Full release: test, bench, publish, tag, GitHub release, version bump
 release: _check-release-notes
     just clean
     just _release-pre
-    @echo "=== 5/8 benchmark gates (cluster + parity + historic + runtime) ==="
+    @echo "=== 5/8 benchmark gates (cluster + parity + historic) ==="
     just bench-cluster
     just bench
     just bench-historic
-    just bench-runtime
-    bash scripts/tests/test-bench-runtime-gate.sh
     just _release-post
 
 # Gates 1-4. Shared by `release` and `release-verified`.
@@ -306,17 +288,11 @@ audit:
 
 # ── test ──────────────────────────────────────────────────────────────────
 
-# ClickHouse and an archiving media driver. `ergon-runtime-server`'s aeron and
-# ClickHouse tests fail closed when either is absent, so every root test lane
-# that runs the workspace starts both.
-_test-ingester-services:
-    cd samples/clickhouse && just _test-clickhouse _test-aeron
-
 # Comprehensive test suite: unit, integration, doctests/rustdoc, Java cluster
 # lifecycle tests, sample tests, and benchmark compilation. Missing Java,
 # Gradle, jars, or another required dependency is a failure.
 # Everything: unit, integration, doctests, Java cluster, samples, bench compile
-test: policy _test-ingester-services
+test: policy
     @echo "=== 1/7 fmt ==="
     cargo fmt --all --check
     @echo "=== 2/7 clippy (workspace + samples) ==="
@@ -342,7 +318,6 @@ test: policy _test-ingester-services
     cd samples/sbe-codegen-examples && cargo run --example flyweight >/dev/null && cargo run --example domain_objects >/dev/null
     cd samples/exchange-example && cargo test -- --test-threads=1
     cd samples/cluster-rfq && cargo build --examples
-    cd samples/clickhouse && just test
     @echo "=== 6/7 Aeron Cluster Java lifecycle + HA sample ==="
     just build-aeron-jars
     cargo test -p ergo-aeron-cluster-test-harness -- --test-threads=1
@@ -355,7 +330,7 @@ test: policy _test-ingester-services
     @echo "=== test: complete ==="
 
 # Workspace unit tests only.
-test-unit: policy _test-ingester-services
+test-unit: policy
     cargo test --workspace --all-features --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness -- --test-threads=1
     cargo test -p ergo-aeron-cluster -- --test-threads=1
 
@@ -536,75 +511,3 @@ bench-cluster:
     ./scripts/check-bench-gate.sh "$lto_crit" 0 cluster --run-id "$run_id"
     echo "=== Gate (no-LTO) ==="
     ./scripts/check-bench-gate.sh "$no_lto_crit" 0 cluster --run-id "$run_id"
-
-# The runtime benches' sign-test gates (ruling U1), both LTO profiles: the
-# deadline wheel against a pre-reserved lazy-delete heap (schedule ascending
-# and mixed, cancel, idle poll, fire, order-timeout churn), the hot-path
-# replacements against what they replaced, and the per-message cost of an
-# application loop over an IPC feed against the same loop by hand. Each gate
-# prints `GATE <name> <k>/20 slower pass|fail` and fails when the runtime is
-# slower in 16 or more of 20 ABBA pairs, each arm of each pair a fresh child
-# process of the bench. A failing gate fails the run
-# only with GATE_ENFORCE=1 (the x86 gate VM, `just azure gate`); anywhere
-# else, the release recipes included, the run is a smoke test that prints
-# `fail (smoke: not enforced)` and exits 0. scripts/tests/test-bench-runtime-gate.sh
-# proves each gate fails on a seeded regression, and that one failing gate
-# fails its bench. It stops at the first bench that fails; the gate VM runs
-# each bench and profile itself (`_bench-runtime-one`), so all get a verdict.
-# Runtime sign-test gates, both LTO profiles (a smoke run off the gate VM)
-bench-runtime:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # The dispatch bench publishes through a local media driver.
-    (cd samples/clickhouse && just _test-aeron)
-    for bench in timer dispatch hotpath; do
-      for profile in lto no-lto; do
-        just _bench-runtime-one "$bench" "$profile"
-      done
-    done
-
-# One runtime bench in one profile: lto (the bench profile) or no-lto, each
-# with its own Criterion tree under target/bench-runtime/, not bench-cluster's,
-# which the release packages as its cluster evidence. Needs the test media
-# driver for dispatch and hotpath. ARGS go to cargo (`--no-run` builds only).
-[private]
-_bench-runtime-one bench profile *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    root="{{justfile_directory()}}"
-    crit="$root/target/bench-runtime/{{profile}}/criterion"
-    mkdir -p "$crit"
-    case "{{profile}}" in
-      lto) CRITERION_HOME="$crit" cargo bench -p ergon-runtime --bench "{{bench}}" {{args}} ;;
-      # Cross-language LTO's -Clinker-plugin-lto would make this an LTO build whatever the
-      # profile says: the gate VM (gate-node.sh) gives this arm ERGON_NO_LTO_RUSTFLAGS, and
-      # RUSTERON_CLANG goes, so its Aeron C stays gcc-built, as downstream crates get it.
-      no-lto)
-        if [[ -n ${ERGON_NO_LTO_RUSTFLAGS+set} ]]; then export RUSTFLAGS=$ERGON_NO_LTO_RUSTFLAGS; fi
-        unset RUSTERON_CLANG
-        if [[ ${RUSTFLAGS:-} == *linker-plugin-lto* ]]; then
-          echo "no-lto: RUSTFLAGS has -Clinker-plugin-lto, an LTO build: set ERGON_NO_LTO_RUSTFLAGS" >&2
-          exit 2
-        fi
-        CARGO_TARGET_DIR="$root/target/bench-no-lto" \
-          CARGO_PROFILE_BENCH_LTO=false \
-          CARGO_PROFILE_BENCH_CODEGEN_UNITS=1 \
-          CRITERION_HOME="$crit" \
-          cargo bench -p ergon-runtime --bench "{{bench}}" {{args}} ;;
-      *) echo "profile: lto or no-lto, not {{profile}}" >&2; exit 2 ;;
-    esac
-
-# A/A calibration and seed power of the sign-test gates: R runs (default 20)
-# of every gate raw against raw, plain and with a 5% seed, into
-# target/bench-runtime/<UTC date>/calibration.json. Smoke: GATE_PAIRS=6 R=3.
-# A/A calibration and seed power of the runtime gates
-bench-runtime-calibrate *args:
-    bash scripts/bench-runtime-calibrate.sh {{args}}
-
-# The callgrind Ir gate: instructions per operation, runtime against raw, for
-# every gated comparison, refusing a verdict when the counts are not linear;
-# dispatch and claim are report-only (IR_REPORT_ONLY). Linux with valgrind
-# only (ir.json beside the above).
-# The callgrind Ir gate of the runtime benches (Linux + valgrind)
-bench-runtime-ir *args:
-    bash scripts/bench-runtime-ir.sh {{args}}

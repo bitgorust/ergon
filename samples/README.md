@@ -15,7 +15,6 @@ implementations — they move with experimental APIs on purpose.
 | Later | [`cluster-tutorial/`](cluster-tutorial/) | Connect, offer, poll, keep-alive, close |
 | Later | [`cluster-ha-orderbook/`](cluster-ha-orderbook/) | Claim-based Cluster publishing + HA-shaped book |
 | Later | [`cluster-rfq/`](cluster-rfq/) | RFQ / auction codecs over Cluster |
-| Lab | [`clickhouse/`](clickhouse/) | Record SBE messages and `tracing` events into ClickHouse via Aeron and a separate ingester; live table toggles; Grafana and a notebook on kind |
 
 ```sh
 # 1 — always start here
@@ -149,15 +148,6 @@ do not stack `with_conversion` on the same selector.
 // B — concrete (implies conversion)
 .with_domain_type(ConversionSelector::named_type("Decimal"), "rust_decimal::Decimal")
 ```
-
-## ClickHouse lab (`clickhouse/`)
-
-Record live market data, or any `tracing` event, into ClickHouse from a
-low-latency application: a small client publishes to Aeron, and a separate
-ingester replays the Aeron Archive into ClickHouse. `schema::AnySchemaMessage`
-decodes a frame that may be either compiled schema. Counters, gauges, and
-histograms can be `tracing` events as well as handles. See
-[`clickhouse/README.md`](clickhouse/README.md).
 
 ## Rules
 

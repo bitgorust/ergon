@@ -5,7 +5,7 @@
 | Component | Version | Notes |
 |-----------|---------|-------|
 | Aeron Java/C media driver | 1.52.2 | `aeron` submodule tag; archive + consensus module |
-| Aeron Cluster Java | 1.52.2 | clustered service container; same pin as the ClickHouse lab jar |
+| Aeron Cluster Java | 1.52.2 | clustered service container |
 | rusteron (Rust bindings) | 0.2.x | `rusteron-client`, `rusteron-archive` |
 | ergo-sbe (codec generator) | 0.1.x | schema 111 session + mark codecs |
 | Rust | 1.88+ | MSRV, edition 2024 |

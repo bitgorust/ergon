@@ -155,12 +155,6 @@ Both retain the supplied header and body. `as_bytes()` borrows the complete
 frame without allocating, including future-version fields and unknown frames,
 for persistence or forwarding.
 
-The ClickHouse lab generates this union for `market.xml` (id 88) and
-`trading.xml` (id 89). A decoded frame can be handed to its persistence writer
-with `writer.push(message.as_bytes(), source_id)`. The archive ingester still
-loads schema XML and routes on both header ids, so adding a schema does not
-require compiling its codecs into the persistence server.
-
 See also:
 [sbe-codegen-examples](https://github.com/mimran1980/ergon/tree/main/samples/sbe-codegen-examples)
 (reusable generator setup),
