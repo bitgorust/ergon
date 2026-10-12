@@ -2,46 +2,26 @@
 
 ## [Unreleased]
 
-### Changed
-
-- Pin the `aeron` submodule and the vendored cluster session schema to 1.53.3.
-  Session schema id 111 is SBE version 17. `ServiceTerminationPosition` gains
-  `ackRequired`.
-
-### Fixed
-- The cluster client opens an ingress publication to every member when
-  ingress endpoints are set, sends protocol version 0.3.0 (768), and accepts
-  a `SessionEvent` or `Challenge` only when its correlation id matches the
-  request in flight. A challenge response and a redirect each use a new
-  correlation id. UDP egress subscriptions set `rejoin=false`. An egress
-  channel of `endpoint=localhost:0` is resolved to the bound port before the
-  connect request is sent. An unset new-leader timeout is twice the leader
-  heartbeat from the OK event, or 20 seconds when that field is absent.
-  `NOT_CONNECTED` and `CLOSED` on the ingress publication wait for a new
-  leader; `MAX_POSITION_EXCEEDED` closes the session. `poll_egress` no longer
-  sends keep-alives. Admin requests are written into a claim.
-  `EgressEvent::SessionEvent` carries `leader_heartbeat_timeout_ns`.
+## [0.1.30] — 2026-10-13
 
 ### Added
-- `SessionBuilder::aeron`, `client_name`, and `error_handler`.
+- Generate an opt-in cross-schema `AnySchemaMessage` dispatcher
+  (`Generator::generate_schema_dispatch`) with typed errors and borrowed
+  frames, including unknown schemas and templates.
+- `SessionBuilder::aeron`, `client_name` and `error_handler`.
 - `AeronCluster::offer_vectors` gathers a session header plus up to seven
   payload slices with no heap allocation.
 - `IngressSessionDecorator` prepends a session header on a raw publication.
   `ClusterEvent` is the logged cluster event. Egress listeners gain
   `on_message_with_reserved_value` and `on_extension_message`.
-- Generate an opt-in cross-schema AnySchemaMessage dispatcher with typed errors
-  and borrowed frames for persistence, including unknown schemas and templates.
 - Report the cluster client's ingress limits, so a client can refuse to start
-  when its largest message would not fit: `AeronCluster::ingress_max_message_length()`
-  (Java `ingressPublication().maxMessageLength()`), `ingress_max_payload_length()`
-  and `AeronCluster::SESSION_HEADER_LENGTH`. `offer` takes payloads up to the
-  first less the header, and `try_claim` up to the smaller of the two less the
-  header.
+  when its largest message would not fit:
+  `AeronCluster::ingress_max_message_length()`, `ingress_max_payload_length()`
+  and `AeronCluster::SESSION_HEADER_LENGTH`.
 - Report the egress image a cluster session is bound to:
   `AeronCluster::egress_image_correlation_id()` and `egress_image_session_id()`.
   As in Java, the session binds to the image that delivered its
-  `SessionEvent(OK)` or latest `NewLeaderEvent`, so a replaced image shows as a
-  new id.
+  `SessionEvent(OK)` or latest `NewLeaderEvent`.
 
 ### Changed
 - Breaking (generated API): drop `try_` from the per-field and closure
@@ -51,147 +31,86 @@
     named after a reserved method takes the same `_field` rename its raw
     accessor would.
   - The decoder's boolean getter is `{field}_bool()` again, reversing
-    0.1.24's `try_{field}_bool()`; it shares its name with the encoder
-    setter, and only the return type varies with shape.
+    0.1.24's `try_{field}_bool()`.
   - The `Ordered` lane's `try_fixed`, `try_<group>`, `try_<data>` and
     `try_<data>_as_str` twins are removed; their plain forms return
-    `DecodeError`; map a custom error into it inside the closure.
+    `DecodeError`, so map a custom error into it inside the closure.
   - The raw stages' `try_<data>(f)` and `try_<data>_as_message(f)`
     callbacks are removed; use `into_<data>()` / `into_<data>_as_message()`,
     or `.ordered()`.
+- Depend on rusteron 0.2.11 from crates.io, which bundles Aeron 1.53.3.
+- Pin the `aeron` submodule and the vendored cluster session schema to 1.53.3.
+  Session schema id 111 is SBE version 17. `ServiceTerminationPosition` gains
+  `ackRequired`.
 - Check ergo-sbe's wire bytes against sbe-tool 1.40.2, up from a pre-1.40.0
-  snapshot: the reference codecs and the benchmark comparators are
-  regenerated from it, and the parity suite adds its `issue1116`,
-  `issue1118` and `floating-point-infinity-schema` schemas plus five more of
-  its test schemas (an explicit message `blockLength`, lower-case set choices
-  and enum values, `sinceVersion` messages and constant group fields).
-- ergo-sbe rejects a float or double `nullValue`, `minValue`, `maxValue` or
-  constant spelled `inf`, `infinity` or `nan` in any case other than
-  `Infinity` and `NaN` (with an optional sign), as sbe-tool does. A malformed
-  float constant now fails at parse time, not in the generated module.
-- ergo-sbe rejects `presence="constant"` on a set or composite field, and a
-  constant enum field given by `constantValue` rather than `valueRef`. A
-  constant takes no block space, so these read the wire past the block (or
-  failed to generate); sbe-tool rejects the enum form too.
-- Scalar body encode benchmarks write successive preallocated destinations with
-  symmetric input opacity, instead of measuring repeated black-box stack spills.
-- **`optional_enum_nullify` is gated at 1.00 in both profiles.** Both arms
-  keep four independent totals of the same three decoded fields, so the row
-  measures decode throughput. The 1.01 allowance was for a single running
-  total, which measured loop latency.
+  snapshot, and add its `issue1116`, `issue1118`,
+  `floating-point-infinity-schema` and five more test schemas to the parity
+  suite.
+- Reject a float or double `nullValue`, `minValue`, `maxValue` or constant
+  spelled `inf`, `infinity` or `nan` in any case other than `Infinity` and
+  `NaN` (with an optional sign), as sbe-tool does. A malformed float constant
+  now fails at parse time, not in the generated module.
+- Reject `presence="constant"` on a set or composite field, and a constant
+  enum field given by `constantValue` rather than `valueRef`, as sbe-tool
+  does for the enum form.
 - Stop blocking in the cluster client's polls. `AsyncClusterConnect::poll`
-  adds the egress subscription, the ingress publication and a REDIRECT's
-  publication with Aeron's async add and picks them up on later polls, and
-  `poll_egress` handles a `NewLeaderEvent` the same way; each add used to wait
-  up to 5 s. Only the first `poll`, which creates the Aeron client, can still
-  wait, and only while the media driver is not running.
-- Follow a new cluster leader as Java's client does. After a `NewLeaderEvent`
+  and `poll_egress` add publications and subscriptions with Aeron's async add
+  and pick them up on later polls; each add used to wait up to 5 s. Only the
+  first `poll`, which creates the Aeron client, can still wait.
+- Follow a new cluster leader as Java's client does: after a `NewLeaderEvent`
   the session stays `AwaitingNewLeader` until the new leader's ingress
-  publication has connected, within `message_timeout`; it used to be
-  `Connected` as soon as the publication was added. If that leader's egress
-  image closes first, the session waits for another `NewLeaderEvent` within
-  `new_leader_timeout`. The last `NewLeaderEvent` in one poll wins, and the
-  `Disconnected` reason names what the session was waiting for.
+  publication has connected, within `message_timeout`. The `Disconnected`
+  reason names what the session was waiting for.
 - Detect cluster leader loss from the session's own egress image:
   `AeronCluster::is_egress_connected()` is false once that image closes, even
-  while a replacement image is open. It used to count the subscription's
-  images.
+  while a replacement image is open.
 - Return `PayloadTooLarge` from `AeronCluster::try_claim` for a claim over the
-  ingress publication's max payload length, instead of Aeron's publication
-  error. `connect` and `finish` fail when the publication's limits cannot be
-  read, rather than skip the size checks.
+  ingress publication's max payload length. `connect` and `finish` fail when
+  the publication's limits cannot be read.
+- Align the cluster client's connect, failover and egress handling with the
+  Java client: open an ingress publication to every member when ingress
+  endpoints are set, send protocol version 0.3.0, accept a `SessionEvent` or
+  `Challenge` only for the request in flight, and wait for a new leader on
+  `NOT_CONNECTED` and `CLOSED`. `poll_egress` no longer sends keep-alives.
+  `EgressEvent::SessionEvent` carries `leader_heartbeat_timeout_ns`.
 
 ### Fixed
-- Leave constant fields (declared on the field or on its type) out of a
-  group entry's `blockLength`. ergo-sbe counted a constant that ends an
-  entry, so each entry was wider than sbe-tool's; frames ergo-sbe encoded
-  for such schemas change width. Message blocks were already right.
+- Leave constant fields out of a group entry's `blockLength`. Frames ergo-sbe
+  encoded for schemas with a constant ending an entry change width to match
+  sbe-tool.
 - Return a constant enum in a group entry from its `valueRef`, as message
-  level does. The entry accessor read the wire past the entry's block; its
-  entry setters and its `raw_` and `*_bool` accessors, which wrote or
-  read there, are removed.
+  level does; its wire-reading entry accessors and setters are removed.
 - Count a group entry's DTO `encoded_length()` from the stride the encoder
-  writes. It ignored a group's declared `blockLength` padding and took the
-  width of a nested group's entry when that was wider (the Car example's
-  `performanceFigures` entries by 5 bytes each).
+  writes, including a group's declared `blockLength` padding.
 - Take an enum's null from its `encodingType` typedef's `nullValue` when the
-  enum declares none, as sbe-tool does: `NullVal`, the `From` conversions and
-  an optional enum field's `None` now write that value (254 for
-  `nullValue="254"`), where they wrote the primitive default.
+  enum declares none, as sbe-tool does.
 - Generate float and double constants written `Infinity`, `-Infinity`,
-  `+Infinity` or `NaN`; they produced code that did not compile. A negative
-  constant such as `-1.5` is no longer mistaken for an `Enum.value` reference.
-- Decode an optional float or double whose `nullValue` is not NaN (such as
-  `Infinity` or `-1.0`) as `None` when it holds that value, at message level,
-  in group entries and in composite members. Only a NaN null still matches
-  any NaN.
+  `+Infinity` or `NaN`; they did not compile. A negative constant such as
+  `-1.5` is no longer mistaken for an `Enum.value` reference.
+- Decode an optional float or double whose `nullValue` is not NaN as `None`
+  when it holds that value, at every level.
 - Let fixed-text decoder helpers yield to schema field names at every depth.
-- Restore the Full Car generated-source budget to 450,000 bytes by sharing
-  wire-dimension validation, including when optional string adapters are enabled.
-- **The cluster crate enabled ergo-sbe's default `fancy` feature on both
-  the runtime dependency and the build dependency.** That pulls miette's
-  graphical renderer into the cluster build and changes no codec API.
-  `default-features = false` is set on the workspace dependency both edges
-  inherit. Cargo 1.95 rejects that key on an inherited dependency, and
-  leaving either edge on its own defaults keeps `fancy` through feature
-  unification.
-- **The gated 10k encode and decode benchmarks had no per-function
-  correctness check.** Both arms now share one per-message body with an
-  untimed preflight: the encode buffers match byte for byte, and the decode
-  totals equal 10_000 times the single baseline message. A file-level assert
-  no longer counts as that check.
-- **`verify` walked repeating groups at the compiled block length and
-  version 0.** A wire block longer than the schema was rejected because the
-  next tail was read out of the extension padding, and a nested group whose
-  wire block length was too short for its fields was accepted. The walk now
-  uses the dimension header's block length and the frame's acting version,
-  and rejects a short block the same way the group constructor does.
-- **A nested fixed-stride group reached through a warm parent entry accepted
-  `blockLength` shorter than its required fields.** `wrap_trusted` skipped
-  the check `wrap` already applied, so a frame with `numInGroup` 1 and a
-  zero block length panicked in `bulk_decode_into` (or read past the buffer)
-  from safe code. Both constructors now share that rejection.
-- **A `rust_decimal::Decimal` encoded into a decimal composite with a
-  constant exponent kept its own scale.** The built-in `TryToSbe` passed the
-  unscaled mantissa through, so `1.5` into a `mantissa × 10⁻⁹` composite
-  encoded as `0.000000015`; only values whose scale already matched the
-  exponent came out right. It now rescales to the exponent, and a value that
-  cannot be represented exactly (more digits than the exponent allows, or out
-  of `i64` range) is an error, never rounded. This affects every domain
-  setter of such a field under
-  `with_domain_type(…, "rust_decimal::Decimal")`, and the impl the
-  `DomainImpl::Manual` doc snippet suggests.
-- **A `UTCTimestamp` field's `timeUnit` was ignored by the built-in
-  `chrono::DateTime<Utc>` conversion.** It always assumed nanoseconds, so a
-  `timeUnit="second"` field was written as nanoseconds and a millisecond field
-  decoded 10⁶× too early. The domain accessors now convert between the
-  field's unit and the nanoseconds the conversion works in, at message level,
-  in group and nested group entries, and in domain DTOs. A value more precise
-  than the field holds is an error, never truncated. Under
-  `DomainImpl::Manual` the impl still receives the field's own unit.
-- **An invalid `valueRef` built silently.** A malformed reference, an unknown
-  enum, an unknown valid value, a non-enum target, or an enum other than the
-  field's own now fail the parse, as they do in sbe-tool. Before, the decoder
-  kept only the part after the dot, so `valueRef="Other.Buy"` on a `Side`
-  field returned `Side::Buy`. A primitive constant field may still reference
-  an enum whose encoding type matches its own. A literal constant belongs in
-  `constantValue`, not `valueRef`.
-- **An included file whose root is `<message>` was dropped silently.** sbe-tool
-  splices such a message into the schema; ergon produced no codec and no
-  error. It is now a parse error that tells you to declare the message in the
-  root schema.
+- Stop the cluster crate enabling ergo-sbe's default `fancy` feature, which
+  pulled miette's graphical renderer into the cluster build.
+- Walk `verify` at the dimension header's block length and the frame's acting
+  version, so an extended group block is accepted and a short nested block is
+  rejected.
+- Reject a nested group block shorter than its fields when reached through a
+  warm parent entry; `bulk_decode_into` could panic or read past the buffer.
+- Rescale a `rust_decimal::Decimal` to a decimal composite's constant
+  exponent instead of passing its mantissa through. A value that cannot be
+  represented exactly is an error, never rounded.
+- Honour a `UTCTimestamp` field's `timeUnit` in the built-in
+  `chrono::DateTime<Utc>` conversion, at every level and in domain DTOs. A
+  value more precise than the field holds is an error.
+- Reject an invalid `valueRef` at parse time, as sbe-tool does.
+- Reject an included file whose root is `<message>`; it was dropped silently.
 - Keep the ingress channel's settings when the cluster client follows a
-  REDIRECT or a new leader. It rebuilt the channel as
-  `aeron:udp?endpoint=<leader>`, dropping `term-length`, `mtu` and every other
-  setting, so the message limits could change after a failover. Now only a
-  unicast endpoint is replaced; IPC and multicast channels are re-added
-  unchanged, as Java does.
+  REDIRECT or a new leader; only a unicast endpoint is replaced.
 - Apply a cluster `SessionEvent(CLOSED)` that arrives with or after a
-  `NewLeaderEvent`; it was dropped, and a `NewLeaderEvent` could revive a
-  closing session.
-- Print cluster channel URIs into a buffer of Aeron's 4096-byte URI limit and
-  refuse longer channels: Aeron's printer wrote past the end of the fixed 512-
-  or 256-byte buffer when a channel or endpoint was longer.
+  `NewLeaderEvent`; it was dropped.
+- Refuse cluster channel URIs over Aeron's 4096-byte limit; Aeron's printer
+  wrote past a fixed 512- or 256-byte buffer.
 
 ### Removed
 - Moved the runtime, its server, the wire and bridge crates, the log printer
