@@ -22,6 +22,11 @@
   `AeronCluster::egress_image_correlation_id()` and `egress_image_session_id()`.
   As in Java, the session binds to the image that delivered its
   `SessionEvent(OK)` or latest `NewLeaderEvent`.
+- Read a fixed `char` array declared with a `characterEncoding` as text:
+  `<field>_as_str()` returns `Result<&str, DecodeError>` with trailing NUL
+  padding removed, at message and group-entry level. Group-entry encoders gain
+  the `<field>_str(&str)` setter message encoders already had. Both use the
+  new public `sbe_rt::encode_fixed_text` and `sbe_rt::decode_fixed_text`.
 
 ### Changed
 - Breaking (generated API): drop `try_` from the per-field and closure
@@ -100,6 +105,9 @@
 - Decode an optional float or double whose `nullValue` is not NaN as `None`
   when it holds that value, at every level.
 - Let fixed-text decoder helpers yield to schema field names at every depth.
+- Emit generated doc comments one `#[doc]` line at a time. A multi-paragraph
+  doc was rendered as a `/** … */` block whose indented prose rustdoc ran as a
+  failing doctest when the generated module was checked into `src/`.
 - Stop the cluster crate enabling ergo-sbe's default `fancy` feature, which
   pulled miette's graphical renderer into the cluster build.
 - Walk `verify` at the dimension header's block length and the frame's acting
