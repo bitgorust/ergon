@@ -181,7 +181,8 @@ use my_msgs::{TimestampMillis, TimestampMicros, TimestampNanos};
 impl TryFromSbe<TimestampNanos> for chrono::DateTime<chrono::Utc> {
     type Error = &'static str;
     fn try_from_sbe(wire: TimestampNanos) -> Result<Self, Self::Error> {
-        let ns = wire.0; // single-element composite is a transparent wrapper
+        // A single-member composite wraps its wire bytes: TimestampNanos([u8; 8]).
+        let ns = u64::from_le_bytes(wire.0);
         chrono::DateTime::from_timestamp((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as u32)
             .ok_or("timestamp out of range")
     }
@@ -189,14 +190,15 @@ impl TryFromSbe<TimestampNanos> for chrono::DateTime<chrono::Utc> {
 impl TryToSbe<TimestampNanos> for chrono::DateTime<chrono::Utc> {
     type Error = &'static str;
     fn try_to_sbe(&self) -> Result<TimestampNanos, Self::Error> {
-        Ok(TimestampNanos(self.timestamp_nanos_opt().ok_or("overflow")? as u64))
+        let ns = self.timestamp_nanos_opt().ok_or("overflow")? as u64;
+        Ok(TimestampNanos(ns.to_le_bytes()))
     }
 }
 
 impl TryFromSbe<TimestampMicros> for chrono::DateTime<chrono::Utc> {
     type Error = &'static str;
     fn try_from_sbe(wire: TimestampMicros) -> Result<Self, Self::Error> {
-        let us = wire.0;
+        let us = u64::from_le_bytes(wire.0);
         chrono::DateTime::from_timestamp((us / 1_000_000) as i64, ((us % 1_000_000) * 1_000) as u32)
             .ok_or("timestamp out of range")
     }
@@ -204,14 +206,14 @@ impl TryFromSbe<TimestampMicros> for chrono::DateTime<chrono::Utc> {
 impl TryToSbe<TimestampMicros> for chrono::DateTime<chrono::Utc> {
     type Error = &'static str;
     fn try_to_sbe(&self) -> Result<TimestampMicros, Self::Error> {
-        Ok(TimestampMicros(self.timestamp_micros() as u64))
+        Ok(TimestampMicros((self.timestamp_micros() as u64).to_le_bytes()))
     }
 }
 
 impl TryFromSbe<TimestampMillis> for chrono::DateTime<chrono::Utc> {
     type Error = &'static str;
     fn try_from_sbe(wire: TimestampMillis) -> Result<Self, Self::Error> {
-        let ms = wire.0;
+        let ms = u64::from_le_bytes(wire.0);
         chrono::DateTime::from_timestamp((ms / 1000) as i64, ((ms % 1000) * 1_000_000) as u32)
             .ok_or("timestamp out of range")
     }
@@ -219,7 +221,7 @@ impl TryFromSbe<TimestampMillis> for chrono::DateTime<chrono::Utc> {
 impl TryToSbe<TimestampMillis> for chrono::DateTime<chrono::Utc> {
     type Error = &'static str;
     fn try_to_sbe(&self) -> Result<TimestampMillis, Self::Error> {
-        Ok(TimestampMillis(self.timestamp_millis() as u64))
+        Ok(TimestampMillis((self.timestamp_millis() as u64).to_le_bytes()))
     }
 }
 ```
