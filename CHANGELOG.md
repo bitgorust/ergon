@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Pin the `aeron` submodule and the vendored cluster session schema to 1.53.3.
+  Session schema id 111 is SBE version 17. `ServiceTerminationPosition` gains
+  `ackRequired`.
+
 ### Fixed
 - The cluster client opens an ingress publication to every member when
   ingress endpoints are set, sends protocol version 0.3.0 (768), and accepts
