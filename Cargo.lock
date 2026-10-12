@@ -1319,9 +1319,9 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rusteron-client"
-version = "0.2.10"
+version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2512747e7a381d368362513952f5d266da1e15d19e9312cfacdafaeb08b6906"
+checksum = "64491b3f092615e98d365c2398bd466aeba527e096bb8714545dc6d223d7eb06"
 dependencies = [
  "bindgen",
  "cmake",
@@ -1335,9 +1335,9 @@ dependencies = [
 
 [[package]]
 name = "rusteron-code-gen"
-version = "0.2.10"
+version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71b18aa744e9c99d57b62a9be1267c77ac569c3502a90ccd6c1f8a9230b72a7e"
+checksum = "5660d4ec3a51e68e8b6c7aeaeda1f67267e5332229670a7cade470d313264da6"
 dependencies = [
  "itertools 0.15.0",
  "log",
@@ -1349,9 +1349,9 @@ dependencies = [
 
 [[package]]
 name = "rusteron-media-driver"
-version = "0.2.10"
+version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05de9b6c21ccef3637247d94eb87df8aa7bd8470c9648a86cfae2e177cc8fe59"
+checksum = "8bb6d287c468142fc2cb200f1a331dfb2072f2da3263a5894b42b2b07d66fbf2"
 dependencies = [
  "bindgen",
  "cmake",

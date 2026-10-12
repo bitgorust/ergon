@@ -6,7 +6,7 @@
 |-----------|---------|-------|
 | Aeron Java/C media driver | 1.53.3 | `aeron` submodule tag; archive + consensus module |
 | Aeron Cluster Java | 1.53.3 | clustered service container |
-| rusteron (Rust bindings) | 0.2.x | `rusteron-client`, `rusteron-archive` |
+| rusteron (Rust bindings) | 0.2.11+ | `rusteron-client`, `rusteron-media-driver`; bundles Aeron C 1.53.3 (the tutorial sample also uses `rusteron-archive`) |
 | ergo-sbe (codec generator) | 0.1.x | schema 111 session + mark codecs |
 | Rust | 1.88+ | MSRV, edition 2024 |
 | OS | Linux x86-64, macOS aarch64 | CI-tested |
