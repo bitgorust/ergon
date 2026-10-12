@@ -75,7 +75,11 @@
   Java client: open an ingress publication to every member when ingress
   endpoints are set, send protocol version 0.3.0, accept a `SessionEvent` or
   `Challenge` only for the request in flight, and wait for a new leader on
-  `NOT_CONNECTED` and `CLOSED`. `poll_egress` no longer sends keep-alives.
+  `NOT_CONNECTED` and `CLOSED`. `MAX_POSITION_EXCEEDED` closes the session.
+  An unset new-leader timeout is twice the leader heartbeat, or 20 s. UDP
+  egress subscriptions set `rejoin=false`, and an egress channel of
+  `endpoint=localhost:0` is resolved to the bound port before connecting.
+  `poll_egress` no longer sends keep-alives.
   `EgressEvent::SessionEvent` carries `leader_heartbeat_timeout_ns`.
 
 ### Fixed
@@ -87,7 +91,9 @@
 - Count a group entry's DTO `encoded_length()` from the stride the encoder
   writes, including a group's declared `blockLength` padding.
 - Take an enum's null from its `encodingType` typedef's `nullValue` when the
-  enum declares none, as sbe-tool does.
+  enum declares none, as sbe-tool does. `NullVal`, the `From` conversions and
+  an optional enum's `None` now write that value (254 for `nullValue="254"`),
+  where they wrote the primitive default.
 - Generate float and double constants written `Infinity`, `-Infinity`,
   `+Infinity` or `NaN`; they did not compile. A negative constant such as
   `-1.5` is no longer mistaken for an `Enum.value` reference.
