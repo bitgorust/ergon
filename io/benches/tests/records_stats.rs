@@ -1,0 +1,58 @@
+//! Record encoding, capture parsing and percentile maths.
+
+use io_bench::record::{Record, parse_capture, read_records, write_records};
+use io_bench::stats::{percentile, summarize};
+
+#[test]
+fn record_round_trip() {
+    let r = Record {
+        variant: 2,
+        conn: 1,
+        stream: 4,
+        pos: 3,
+        hw: 1,
+        id: -7,
+        src_ns: 1,
+        src2_ns: 2,
+        rx_sw_ns: 3,
+        rx_hw_ns: 4,
+        user_ns: 5,
+        read_seq: u64::MAX,
+    };
+    assert_eq!(Record::decode(&r.encode()), r);
+    let dir = std::env::temp_dir().join(format!("io-bench-rec-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("r.bin");
+    write_records(&p, &[r, Record::default()]).unwrap();
+    assert_eq!(read_records(&p).unwrap(), vec![r, Record::default()]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn capture_parse_ignores_truncated_tail() {
+    let mut b = Vec::new();
+    for (t, p) in [(10i64, &b"abc"[..]), (20, b"")] {
+        b.extend_from_slice(&t.to_le_bytes());
+        b.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        b.extend_from_slice(p);
+    }
+    b.extend_from_slice(&30i64.to_le_bytes());
+    b.extend_from_slice(&5u32.to_le_bytes());
+    b.extend_from_slice(b"ab");
+    let v = parse_capture(&b);
+    assert_eq!(v, vec![(10, &b"abc"[..]), (20, &b""[..])]);
+}
+
+#[test]
+fn nearest_rank_percentiles() {
+    let mut v: Vec<i64> = (1..=1000).rev().collect();
+    let s = summarize(&mut v).unwrap();
+    assert_eq!(
+        (s.p50, s.p90, s.p99, s.p999, s.min, s.max),
+        (500, 900, 990, 999, 1, 1000)
+    );
+    assert!((s.mean - 500.5).abs() < 1e-9);
+    assert_eq!(percentile(&[], 0.5), 0);
+    assert_eq!(percentile(&[42], 0.999), 42);
+    assert!(summarize(&mut []).is_none());
+}

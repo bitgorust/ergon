@@ -29,6 +29,8 @@ deployments. Criteria for lifting that disclaimer:
 | [`sbe/`](sbe/) | `ergo-sbe` | SBE schema parser and Rust codec generator |
 | [`sbe/benchmarks/`](sbe/benchmarks/) | `ergo-sbe-benchmarks` | Unpublished parity benchmarks |
 | [`cluster/`](cluster/) | `ergo-aeron-cluster` | Experimental Aeron Cluster client |
+| [`io/`](io/) | `ergon-io` | Unpublished busy-spin network I/O: switchable epoll / `io_uring` backends, in-place TLS 1.3, WebSocket, HTTP/1.1 with request signing, optional libcurl fallback |
+| [`io/benches/`](io/benches/) | `ergon-io-bench` | Standalone latency benchmark for the `ergon-io` backends; write-up in `io/benches/BENCHMARK.md` |
 | [`samples/`](samples/) | seven teaching crates | Unpublished integration playgrounds |
 
 The workspace requires Rust 1.88 or newer. The sample crates are intentionally

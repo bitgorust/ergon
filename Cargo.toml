@@ -4,6 +4,7 @@ members = [
     "sbe/benchmarks",
     "cluster",
     "cluster-test-harness",
+    "io",
 ]
 # Excluded because they require nightly toolchain:
 #   sbe/fuzz         — cargo-fuzz (libfuzzer), needs `cargo +nightly fuzz run`
@@ -19,7 +20,7 @@ members = [
 #          pointer casts that unit tests can't detect.
 #
 # Run with: just test-all
-exclude = ["samples", "sbe/fuzz", "sbe/miri-fixtures"]
+exclude = ["samples", "sbe/fuzz", "sbe/miri-fixtures", "io/benches"]
 resolver = "3"
 
 [workspace.package]

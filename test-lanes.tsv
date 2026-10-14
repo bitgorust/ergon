@@ -12,6 +12,10 @@ cluster/tests/*.rs	pr	cargo test -p ergo-aeron-cluster
 cluster/benches/*.rs	benchmark	cargo bench -p ergo-aeron-cluster --no-run
 cluster-test-harness/src/*.rs	java-harness	cargo test -p ergo-aeron-cluster-test-harness -- --test-threads=1
 cluster-test-harness/tests/*.rs	java-harness	cargo test -p ergo-aeron-cluster-test-harness -- --test-threads=1
+io/src/driver/*.rs	pr	cargo test -p ergon-io --doc
+io/tests/*.rs	pr	cargo test -p ergon-io -- --test-threads=1
+io/benches/src/*.rs	benchmark	cd io/benches && cargo build --release --bins
+io/benches/tests/*.rs	samples	cd io/benches && cargo test
 samples/exchange-example/src/*.rs	samples	cd samples/exchange-example && cargo test
 samples/exchange-example/tests/*.rs	samples	cd samples/exchange-example && cargo test
 samples/cluster-ha-orderbook/src/*.rs	samples	cd samples/cluster-ha-orderbook && cargo test --features test-harness
