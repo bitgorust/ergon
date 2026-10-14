@@ -1206,7 +1206,7 @@ pub(crate) fn generate_message_encoder(
             let g_snake = syn::Ident::new(&to_snake_case(&g.name), span);
             let raw_enc_name = to_pascal_case(&g.name);
             let scoped_enc = if multi_message {
-                format!("{}{}", &name, raw_enc_name)
+                format!("{}{}", name, raw_enc_name)
             } else {
                 raw_enc_name
             };
@@ -1657,7 +1657,7 @@ pub(crate) fn generate_message_encoder(
         .map(|g| {
             let raw = to_pascal_case(&g.name);
             if multi_message {
-                format!("{}{}", &name, raw)
+                format!("{}{}", name, raw)
             } else {
                 raw
             }

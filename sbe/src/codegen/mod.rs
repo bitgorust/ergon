@@ -253,7 +253,6 @@ impl GeneratedModuleSet {
     }
 
     /// Iterate modules in a stable order (write each to `OUT_DIR`).
-    #[must_use]
     pub fn modules(&self) -> impl ExactSizeIterator<Item = &GeneratedModule> {
         self.modules.iter()
     }
@@ -379,7 +378,7 @@ impl Generator {
             Ok(())
         };
 
-        let schema_context = format!("schema '{}'", &schema.package);
+        let schema_context = format!("schema '{}'", schema.package);
         check("schemaId", u64::from(schema.id), schema_context.clone())?;
         check("version", u64::from(schema.version), schema_context)?;
 
@@ -1122,7 +1121,7 @@ impl Generator {
         writeln!(
             src,
             "/// Generated from SBE schema package `{}` id {} version {}.",
-            &schema.package, schema.id, schema.version
+            schema.package, schema.id, schema.version
         )
         .unwrap();
         // Lint allow list is intentionally narrow — do not re-add

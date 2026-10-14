@@ -1154,7 +1154,7 @@ pub(crate) fn generate_message_decoder(
         .map(|g| {
             let raw = to_pascal_case(&g.name);
             if multi_message {
-                format!("{}{}", &name, raw)
+                format!("{}{}", name, raw)
             } else {
                 raw
             }

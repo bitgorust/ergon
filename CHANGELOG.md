@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- The workspace toolchain is Rust 1.99.0.
+
 ## [0.1.30] — 2026-10-13
 
 ### Added

@@ -194,7 +194,7 @@ pub(crate) fn generate_decoder_display(
                     });
                 } else {
                     let f_value = syn::Ident::new(
-                        &format!("{}_value", &snake),
+                        &format!("{}_value", snake),
                         proc_macro2::Span::call_site(),
                     );
                     debug_body.extend(quote::quote! {
