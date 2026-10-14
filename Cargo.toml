@@ -4,6 +4,12 @@ members = [
     "sbe/benchmarks",
     "cluster",
     "cluster-test-harness",
+    # DPDK ENA kernel-bypass transport for the rusteron media driver. Its
+    # `dpdk` feature is Linux x86_64 only, so `--all-features` runs exclude
+    # it and the harness (see the justfile's dpdk recipes).
+    "md-dpdk",
+    "md-dpdk/harness",
+    "md-dpdk/device-plugin",
 ]
 # Excluded because they require nightly toolchain:
 #   sbe/fuzz         — cargo-fuzz (libfuzzer), needs `cargo +nightly fuzz run`

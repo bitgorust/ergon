@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+### Added
+- `ergon-md-dpdk`: an experimental DPDK ENA kernel-bypass UDP transport for
+  the rusteron Aeron media driver (Linux x86_64, `libdpdk >= 23.11`, `dpdk`
+  feature), installed through rusteron-media-driver 0.2.11's custom transport
+  bindings. Selected by `RUSTERON_MEDIA_DRIVER_TRANSPORT=dpdk-ena` in the
+  bundled `media_driver` or with `DpdkTransport::install`. Ships with an
+  interop harness, a kubelet device plugin and AWS EKS deployment assets
+  (unpublished). Runs on AWS (`net_ena`) and Azure (`net_netvsc` over MANA,
+  ports selected by `RUSTERON_DPDK_{SENDER,RECEIVER}_MAC`); pins the driver's
+  agents to `AERON_*_CPU_AFFINITY` (`pin_agents_to_configured_cpus`).
+  Benchmarks against kernel UDP on Azure: `md-dpdk/BENCHMARKS.md`.
+  Times with a calibrated invariant TSC in nanoseconds (falling back to
+  `CLOCK_MONOTONIC`, reported by counter type 80), and with
+  `RUSTERON_DPDK_RX_HW_TIMESTAMP=1` takes the NIC's hardware RX timestamps (AWS
+  ENA in a precision-time placement group, DPDK >= 25.11), reporting NIC arrival
+  to dispatch per port (type 81).
+  Nothing periodic runs on the driver's agents: a learned ARP next hop is
+  refreshed in the background while sends keep using it, and the 1 Hz statistics
+  sample runs on a housekeeping thread.
+  Behaves as the kernel UDP sockets Aeron's own transport uses, so it
+  interoperates with kernel peers: wildcard binds get an ephemeral port
+  (previously port 0 went on the wire and kernel peers could never answer),
+  duplicate binds fail with `EADDRINUSE`, foreign bind addresses with
+  `EADDRNOTAVAIL`, connected transports hear only their peer, RFC 768
+  checksums (`0xFFFF` was wrongly rejected), IP options, ICMP echo and port
+  unreachable, software checksums without offload, unanswered ARP reported
+  as `EHOSTUNREACH`, jumbo `max_aeron_mtu` up to 8960, and peers with a larger
+  MTU rejected at SETUP. Loopback and host-local channels run on kernel
+  sockets in the same driver, woken by an epoll thread so idle ones cost the
+  DPDK duty cycle nothing (and opened by that thread, never by an agent); a
+  `0.0.0.0` subscription also hears localhost. The ARP table replaces next
+  hops idle for 60 s instead of filling for good. Bandwidth allowances keep
+  sends below a VM's cap (`RUSTERON_DPDK_TX_RATE_MBPS`) and a slower link's
+  (`RUSTERON_DPDK_TX_ROUTE_MBPS`), and `RUSTERON_DPDK_TX_LOW_STREAMS` holds
+  streams that can wait below the rest under them, so a latency-critical
+  stream never queues behind bulk; frames the NIC refuses are not charged to
+  them. A host-local socket whose agent reads it every cycle comes off the
+  local-I/O thread's epoll, so busy localhost senders no longer wake that
+  thread with every datagram, and the EAL's own threads are confined to the
+  main lcore's CPUs, never the agents'. Malformed or overlong `RUSTERON_DPDK_*`
+  values (`RUSTERON_DPDK_WILDCARD_LOCAL=off`, `RUSTERON_DPDK_EAL_ARGS` past the
+  EAL's 1 KiB argument buffer) fail initialisation, naming the variable,
+  instead of being read loosely or cut short.
+
 ### Changed
 - The workspace toolchain is Rust 1.99.0.
 

@@ -64,12 +64,15 @@ jobs:
           components: rustfmt, clippy
 
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness --exclude ergon-md-dpdk --exclude ergon-md-dpdk-harness -- -D warnings
       - run: cargo clippy -p ergo-aeron-cluster --all-targets -- -D warnings
+      # ergon-md-dpdk without its Linux-only `dpdk` feature; the `dpdk` job lints the rest.
+      - run: cargo clippy -p ergon-md-dpdk -p ergon-md-dpdk-harness --all-targets -- -D warnings
       - run: cargo check --manifest-path sbe/fuzz/Cargo.toml --bins
       - run: cargo test --manifest-path sbe/miri-fixtures/Cargo.toml
       - run: RUSTDOCFLAGS='-D warnings' cargo doc -p ergo-sbe --all-features --no-deps
       - run: RUSTDOCFLAGS='-D warnings' cargo doc -p ergo-aeron-cluster --no-deps
+      - run: RUSTDOCFLAGS='-D warnings' cargo doc -p ergon-md-dpdk --no-deps
       # Prebuilt binary — check-public-api.sh only `cargo install`s from source
       # as a fallback if this isn't already on PATH. A from-source build took
       # 4m32s alone and regularly blew the job's timeout (2026-08-19).
@@ -124,14 +127,52 @@ jobs:
       - run: ./scripts/regenerate-sbe-tool-reference.sh --check
       - run: ./scripts/regenerate-golden.sh --check
       - run: ./scripts/regenerate-codegen-matrix-fixture.py --check
-      - run: cargo test --workspace --all-features --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness -- --test-threads=2
+      - run: cargo test --workspace --all-features --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness --exclude ergon-md-dpdk --exclude ergon-md-dpdk-harness -- --test-threads=2
       - run: cargo test -p ergo-aeron-cluster -- --test-threads=1
       - run: cargo test --doc --workspace --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness
+
+  # ergon-md-dpdk: the DPDK ENA kernel-bypass transport. The `dpdk` feature
+  # needs Linux x86_64 and libdpdk >= 23.11, which Ubuntu 24.04 ships. Runs the
+  # whole md-dpdk test lane (test-lanes.tsv: portable, dpdk, static+dpdk),
+  # the node bootstrap fixtures, and the virtual-device interop scenarios over
+  # tap devices on a bridge, which need root.
+  dpdk:
+    needs: policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          components: clippy
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libbsd-dev uuid-dev curl pkg-config clang libdpdk-dev
+
+      # rusteron's Aeron build needs CMake >= 3.30; ubuntu-24.04 apt ships 3.28.
+      - name: Install newer CMake
+        run: |
+          sudo python3 -m pip install --break-system-packages --no-cache-dir cmake
+          cmake --version
+
+      - run: cargo clippy -p ergon-md-dpdk -p ergon-md-dpdk-harness --all-targets --features ergon-md-dpdk/dpdk,ergon-md-dpdk-harness/dpdk -- -D warnings
+      - run: cargo test -p ergon-md-dpdk -- --test-threads=1
+      - run: cargo test -p ergon-md-dpdk --features dpdk -- --test-threads=1
+      - run: cargo test -p ergon-md-dpdk --features static,dpdk -- --test-threads=1
+      - run: bash md-dpdk/deploy/aws-eks/node/test/test-bootstrap.sh
+      - name: DPDK virtual-device interop (root)
+        # `sudo env "PATH=$PATH"` keeps the runner's cargo on root's PATH: the
+        # vdev script builds ergon-md-dpdk-harness itself.
+        run: sudo env "PATH=$PATH" scripts/test-dpdk-vdev.sh
 
   # Fail-fast gate: downstream jobs need this, so if policy, lint, or test
   # fails the gate is skipped and everything else is cancelled.
   gate:
-    needs: [policy, lint, test]
+    needs: [policy, lint, test, dpdk]
     runs-on: ubuntu-24.04
     timeout-minutes: 1
     steps:
