@@ -105,6 +105,9 @@ enum rusteron_dpdk_counter_kind
     RD_COUNTER_POLL_CYCLE_GAPS_20US, /* 87   such gaps of 20 to 50 µs */
     RD_COUNTER_POLL_CYCLE_GAPS_50US, /* 87   such gaps of 50 to 100 µs */
     RD_COUNTER_POLL_CYCLE_GAPS_100US, /* 87  such gaps of 100 µs or more */
+    RD_COUNTER_TX_QUEUED,            /* 78   frames the TX ring refused, queued to go first next */
+    RD_COUNTER_RX_BACKLOG_MAX,       /* 87   most frames one poll drained */
+    RD_COUNTER_RX_RING_FULL_SUSPECTED, /* 87 polls that drained within a burst of a full ring */
     RD_COUNTER_COUNT
 };
 
@@ -134,6 +137,7 @@ typedef struct rusteron_dpdk_counters_stct
     char *xstat_names;           /* backing store for name pointers */
     uint32_t missed_xstat_index; /* xstat whose name contains "missed" (UINT32_MAX = none) */
     uint64_t last_sample_ns;
+    uint64_t last_nic_sample_ns; /* the last read of the NIC's own statistics */
 } rusteron_dpdk_counters_t;
 
 /* Hot-path bump: a single relaxed atomic add into a pre-resolved value slot.
@@ -169,13 +173,13 @@ int rusteron_dpdk_counters_register(
  * already be gone with the driver): every later bump and sample is a no-op. */
 void rusteron_dpdk_counters_forget(rusteron_dpdk_counters_t *c);
 
-/* Refresh the mempool-availability counter and the PMD xstat mirrors, at most
- * once per second (plan §9: no metrics thread). Called from the owning agent's
- * hot path (transport_send / poller_receive) with the caller's clock read;
- * the gate makes it cheap. */
+/* Refresh the mempool-availability counter at most once per second, and the
+ * NIC's own statistics (basic stats and the PMD xstat mirrors) at most once
+ * every `nic_stats_ns` (0: never; on ENA each read is an admin command to the
+ * device). Called by the housekeeping thread, never the agents' hot path. */
 void rusteron_dpdk_counters_sample(
     rusteron_dpdk_counters_t *c, const struct rusteron_dpdk_port_stct *port,
-    const struct rusteron_dpdk_port_ops_stct *ops, uint64_t now_ns);
+    const struct rusteron_dpdk_port_ops_stct *ops, uint64_t now_ns, uint64_t nic_stats_ns);
 
 #ifdef __cplusplus
 }

@@ -72,7 +72,7 @@ pub mod ffi;
 pub use config::{DpdkPortConfig, DpdkTransportConfig, MacAddr};
 pub use env::Selector;
 pub use error::DpdkError;
-pub use ffi::{DpdkTransport, pin_agents_to_configured_cpus};
+pub use ffi::{DpdkTransport, lock_memory_from_env, pin_agents_to_configured_cpus};
 
 use rusteron_media_driver::AeronDriverContext;
 

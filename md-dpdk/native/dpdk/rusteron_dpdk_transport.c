@@ -762,6 +762,17 @@ static int rusteron_dpdk_transport_init_delegated(
         free(client);
         return -1;
     }
+    /* The port's counters too, as a DPDK channel registers them: its agent
+     * polls the port either way, and on localhost only these channels run,
+     * so its loop gaps would otherwise go uncounted. */
+    pthread_mutex_lock(&native->housekeeping_lock);
+    rusteron_dpdk_counters_register(
+        &port->counters,
+        NULL != context ? context->counters_manager : NULL,
+        port, native->ops);
+    port->open_transports++;
+    pthread_mutex_unlock(&native->housekeeping_lock);
+    rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_TRANSPORT, 1);
     rusteron_dpdk_transport_init_fields(transport, context);
     transport->bindings_clientd = client;
     transport->connected_address = NULL;
@@ -840,7 +851,7 @@ static int rusteron_dpdk_transport_close_transport(aeron_udp_channel_transport_t
         rusteron_dpdk_ksock_unregister(client->runtime, client->ksock, client->kernel_fd);
         client->ksock = -1;
         rusteron_dpdk_kernel_close(&client->kernel_fd);
-        if (!client->delegated && NULL != client->port)
+        if (NULL != client->port)
         {
             rusteron_dpdk_transport_t *native = client->runtime;
             rusteron_dpdk_counters_add(&client->port->counters, RD_COUNTER_TRANSPORT, -1);
@@ -852,17 +863,27 @@ static int rusteron_dpdk_transport_close_transport(aeron_udp_channel_transport_t
              * afresh (a new driver's manager). Nothing here touches the
              * manager, which is the conductor's alone. */
             pthread_mutex_lock(&native->housekeeping_lock);
-            if (--client->port->open_transports <= 0)
+            const int last = --client->port->open_transports <= 0;
+            if (last)
             {
                 client->port->open_transports = 0;
                 client->port->counters.dormant = 1;
             }
             pthread_mutex_unlock(&native->housekeeping_lock);
-            rusteron_dpdk_port_release(
-                native,
-                client->port == &native->sender ? &native->sender_ports : &native->receiver_ports,
-                client->bound_index,
-                client->local_udp_port);
+            /* nothing will send or poll this NIC again: its queued frames go */
+            if (last)
+            {
+                rusteron_dpdk_port_tx_drop_queued(native, client->port);
+            }
+            /* a host-local channel holds no DPDK port number */
+            if (!client->delegated)
+            {
+                rusteron_dpdk_port_release(
+                    native,
+                    client->port == &native->sender ? &native->sender_ports : &native->receiver_ports,
+                    client->bound_index,
+                    client->local_udp_port);
+            }
         }
     }
     transport->bindings_clientd = NULL;
@@ -997,13 +1018,11 @@ static int rusteron_dpdk_transport_send_local(
     return rc;
 }
 
-/* Transmit a burst: what the NIC's ring takes now; with
+/* Offer a burst: what the NIC's ring takes now; with
  * RUSTERON_DPDK_TX_RETRY_US set, the rest again as the NIC drains the ring,
- * until that long has passed (a partial send makes Aeron resend the whole
- * vector, duplicates included, so riding out a full ring briefly is
- * cheaper). Whatever is still refused is released. Returns the accepted
- * count, a prefix of `pkts`. */
-uint16_t rusteron_dpdk_port_tx(
+ * until that long has passed. Returns the accepted count, a prefix of `pkts`;
+ * the refused rest stays the caller's. */
+static uint16_t rusteron_dpdk_port_tx_offer(
     rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *port, rusteron_dpdk_mbuf_t **pkts, uint16_t nb)
 {
     const rusteron_dpdk_port_ops_t *ops = native->ops;
@@ -1016,11 +1035,51 @@ uint16_t rusteron_dpdk_port_tx(
             sent += ops->tx_burst(port->port_id, port->tx_queue_id, pkts + sent, (uint16_t)(nb - sent));
         } while (sent < nb && rusteron_dpdk_clock_now() < deadline);
     }
+    return sent;
+}
+
+/* Transmit a burst of control frames (ARP, ICMP): what the ring refuses is
+ * released, as a dropped control frame is answered again. Returns the
+ * accepted count, a prefix of `pkts`. */
+uint16_t rusteron_dpdk_port_tx(
+    rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *port, rusteron_dpdk_mbuf_t **pkts, uint16_t nb)
+{
+    const uint16_t sent = rusteron_dpdk_port_tx_offer(native, port, pkts, nb);
     for (uint16_t i = sent; i < nb; i++)
     {
-        ops->mbuf_release(pkts[i]);
+        native->ops->mbuf_release(pkts[i]);
     }
     return sent;
+}
+
+int rusteron_dpdk_port_tx_flush(rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *port)
+{
+    const uint16_t n = port->tx_queued_count;
+    if (0 == n)
+    {
+        return 1;
+    }
+    rusteron_dpdk_mbuf_t *pkts[RUSTERON_DPDK_TX_VECTOR_MAX];
+    for (uint16_t i = 0; i < n; i++)
+    {
+        pkts[i] = &port->tx_queued[i];
+    }
+    const uint16_t sent = native->ops->tx_burst(port->port_id, port->tx_queue_id, pkts, n);
+    if (sent < n)
+    {
+        memmove(&port->tx_queued[0], &port->tx_queued[sent], (size_t)(n - sent) * sizeof(port->tx_queued[0]));
+    }
+    port->tx_queued_count = (uint16_t)(n - sent);
+    return 0 == port->tx_queued_count;
+}
+
+void rusteron_dpdk_port_tx_drop_queued(rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *port)
+{
+    for (uint16_t i = 0; i < port->tx_queued_count; i++)
+    {
+        native->ops->mbuf_release(&port->tx_queued[i]);
+    }
+    port->tx_queued_count = 0;
 }
 
 static int rusteron_dpdk_transport_send(
@@ -1186,6 +1245,23 @@ static int rusteron_dpdk_transport_send(
         }
     }
 
+    /* Frames an earlier send queued behind a full ring go first. While any
+     * still wait, this vector is refused whole before anything of it is
+     * built or charged: Aeron offers it again, so a send is all or nothing
+     * and no frame is ever sent twice. */
+    if (0 != port->tx_queued_count && !rusteron_dpdk_port_tx_flush(native, port))
+    {
+        rusteron_dpdk_counters_add(counters, RD_COUNTER_TX_EAGAIN, 1);
+        return 0;
+    }
+    if (iov_length > RUSTERON_DPDK_TX_VECTOR_MAX)
+    {
+        rusteron_dpdk_counters_add(counters, RD_COUNTER_ERROR, 1);
+        AERON_SET_ERR(EINVAL, "DPDK transport send: more than %d datagrams in one send", RUSTERON_DPDK_TX_VECTOR_MAX);
+        rusteron_dpdk_set_error("DPDK transport send: too many datagrams in one send");
+        return -1;
+    }
+
     /* The bandwidth allowances: the NIC's (RUSTERON_DPDK_TX_RATE_MBPS, below
      * the VM's allowance) and the destination's route
      * (RUSTERON_DPDK_TX_ROUTE_MBPS, a slower link on the way), token buckets
@@ -1195,7 +1271,15 @@ static int rusteron_dpdk_transport_send(
      * RUSTERON_DPDK_TX_PACE_SPIN_US, sends nothing (a zero result Aeron
      * retries whole: no partial send, so no duplicates). Above a link's
      * capacity the network drops packets unseen and Aeron falls into
-     * retransmission; this keeps each below its own. */
+     * retransmission; this keeps each below its own. The NIC's is on by
+     * default as a backstop (RUSTERON_DPDK_TX_RATE_MBPS_DEFAULT, in a bucket
+     * larger than a ring of 1,450-byte frames) that never waits: while it is
+     * in debt a send sends nothing, whatever a route allows. So every send
+     * pays for it: a refill (a subtraction, a compare and a multiply) on the
+     * clock read above, a sum of the vector's lengths and a charge. No clock
+     * read, syscall, lock, allocation or division of its own; a division by
+     * the rate, the backstop's compare and the clock reads of a wait only in
+     * debt. */
     rusteron_dpdk_pacer_t *route = NULL;
     int charged = 0;
     if (0 != native->tx_route_count)
@@ -1255,7 +1339,8 @@ static int rusteron_dpdk_transport_send(
         if (0 != wait_ns)
         {
             rusteron_dpdk_counters_add(counters, RD_COUNTER_TX_PACED, 1);
-            if (wait_ns > native->tx_pace_spin_ns)
+            /* the backstop's own debt never waits: the send goes later, whole */
+            if (wait_ns > native->tx_pace_spin_ns || rusteron_dpdk_pacer_defers(&port->tx_pacer))
             {
                 return 0;
             }
@@ -1274,23 +1359,23 @@ static int rusteron_dpdk_transport_send(
         }
         if (0 != port->tx_pacer.rate_mbps)
         {
-            port->tx_pacer.tokens -= wire;
+            rusteron_dpdk_pacer_charge(&port->tx_pacer, wire);
         }
         if (NULL != route)
         {
-            route->tokens -= wire;
+            rusteron_dpdk_pacer_charge(route, wire);
         }
         charged = 1;
     }
 
-    rusteron_dpdk_mbuf_t views[256];
-    rusteron_dpdk_mbuf_t *batch[256];
-    size_t batch_len = 0;
-    size_t sent = 0;
+    rusteron_dpdk_mbuf_t views[RUSTERON_DPDK_TX_VECTOR_MAX];
+    rusteron_dpdk_mbuf_t *batch[RUSTERON_DPDK_TX_VECTOR_MAX];
+    size_t built = 0;
     int oversized = 0;
+    int nobufs = 0;
 
-    /* Every iovec is one datagram (plan §7.4); burst_size only sizes each
-     * rte_eth_tx_burst flush, so consume the whole list. */
+    /* Every iovec is one datagram (plan §7.4): build them all first, so the
+     * vector is sent or queued whole. */
     for (size_t i = 0; i < iov_length; i++)
     {
         if (iov[i].iov_len > client->mtu)
@@ -1298,12 +1383,11 @@ static int rusteron_dpdk_transport_send(
             oversized = 1;
             break;
         }
-
-        rusteron_dpdk_mbuf_t *m = &views[batch_len];
+        rusteron_dpdk_mbuf_t *m = &views[built];
         if (ops->mbuf_alloc(port->mempool, m) < 0)
         {
-            rusteron_dpdk_counters_add(counters, RD_COUNTER_NOBUFS, 1);
-            break; /* mbuf exhaustion: flush the already-built prefix below */
+            nobufs = 1;
+            break;
         }
         if (rusteron_dpdk_packet_build_udp(
                 m, dst_mac, port->mac, dst_ip, src_ip,
@@ -1314,34 +1398,54 @@ static int rusteron_dpdk_transport_send(
             oversized = 1;
             break;
         }
-        batch[batch_len] = m;
-        batch_len++;
-
-        if (batch_len == native->config.burst_size)
-        {
-            uint16_t bs = rusteron_dpdk_port_tx(native, port, batch, (uint16_t)batch_len);
-            sent += bs;
-            batch_len = 0;
-            if (bs < native->config.burst_size)
-            {
-                rusteron_dpdk_counters_add(counters, RD_COUNTER_TX_EAGAIN, 1);
-                break; /* NIC backpressure: stop, report the accepted prefix */
-            }
-        }
+        batch[built++] = m;
     }
-    if (batch_len > 0)
+    if (nobufs)
     {
-        uint16_t bs = rusteron_dpdk_port_tx(native, port, batch, (uint16_t)batch_len);
-        if (bs < (uint16_t)batch_len)
+        /* Out of mbufs part-way: nothing of the vector goes, as part of it
+         * would make Aeron send the whole vector again, that part twice. */
+        rusteron_dpdk_counters_add(counters, RD_COUNTER_NOBUFS, 1);
+        for (size_t i = 0; i < built; i++)
         {
-            rusteron_dpdk_counters_add(counters, RD_COUNTER_TX_EAGAIN, 1);
+            ops->mbuf_release(batch[i]);
         }
-        sent += bs;
-        batch_len = 0;
+        built = 0;
     }
 
-    /* Frames refused (a full ring, no mbufs, oversized) were charged to the
-     * allowances above but not sent: refund them, as Aeron offers them again. */
+    /* To the ring a burst at a time; whatever it refuses is queued, built, to
+     * go first at this agent's next send or poll. The queue is empty here. */
+    size_t accepted = 0;
+    while (accepted < built)
+    {
+        size_t chunk = built - accepted;
+        if (chunk > native->config.burst_size)
+        {
+            chunk = native->config.burst_size;
+        }
+        const uint16_t bs = rusteron_dpdk_port_tx_offer(native, port, batch + accepted, (uint16_t)chunk);
+        accepted += bs;
+        if (bs < chunk)
+        {
+            break;
+        }
+    }
+    if (accepted < built)
+    {
+        const size_t queued = built - accepted;
+        for (size_t i = 0; i < queued; i++)
+        {
+            port->tx_queued[i] = *batch[accepted + i];
+        }
+        port->tx_queued_count = (uint16_t)queued;
+        rusteron_dpdk_counters_add(counters, RD_COUNTER_TX_EAGAIN, 1);
+        rusteron_dpdk_counters_add(counters, RD_COUNTER_TX_QUEUED, (int64_t)queued);
+    }
+    /* Sent or queued: either way Aeron's to forget. */
+    const size_t sent = built;
+
+    /* Frames charged to the allowances above but neither sent nor queued
+     * (no mbufs, an oversized datagram and those after it): refund them, as
+     * Aeron offers them again. */
     if (charged && sent < iov_length)
     {
         int64_t unsent = 0;
@@ -1351,15 +1455,15 @@ static int rusteron_dpdk_transport_send(
         }
         if (0 != port->tx_pacer.rate_mbps)
         {
-            port->tx_pacer.tokens += unsent;
+            rusteron_dpdk_pacer_charge(&port->tx_pacer, -unsent);
         }
         if (NULL != route)
         {
-            route->tokens += unsent;
+            rusteron_dpdk_pacer_charge(route, -unsent);
         }
     }
 
-    /* bytes_sent accrues only for the accepted prefix (plan §7.4). */
+    /* bytes_sent accrues for the datagrams sent or queued (plan §7.4). */
     for (size_t i = 0; i < sent; i++)
     {
         *bytes_sent += iov[i].iov_len;

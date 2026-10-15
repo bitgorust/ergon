@@ -31,6 +31,7 @@ use std::ptr;
 // Real Aeron types/functions from the generated bindings so we exercise the
 // genuine callback contract.
 // The Aeron types and functions of the driver this crate installs into.
+use common::transport::{Poller, RxDatagram};
 use rusteron_media_driver::bindings::*;
 
 // ---------------------------------------------------------------------------
@@ -202,6 +203,13 @@ impl Harness {
         let ip_str = CString::new(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])).unwrap();
         let rc = unsafe { rusteron_dpdk_transport_test_arp_seed(self.native, ip_str.as_ptr(), mac.as_ptr()) };
         assert_eq!(rc, 0, "arp_seed failed: {}", last_error());
+    }
+
+    /// A poller over this harness's transport, as the agent that owns it.
+    fn poller(&mut self) -> Poller {
+        let mut p = Poller::new(self.bindings);
+        p.add(&mut *self.transport);
+        p
     }
 
     fn arp_rx(&self, role: c_int, frame: &[u8]) -> c_int {
@@ -697,9 +705,18 @@ fn burst_flushes_at_burst_size_and_accumulates() {
     assert_no_leak();
 }
 
+/// The payloads of every frame the NIC has taken, in order.
+fn sent_payloads() -> Vec<Vec<u8>> {
+    captures().iter().map(|c| udp_payload(c).to_vec()).collect()
+}
+
+/// A full ring takes part of a vector: the rest waits, already built, in the
+/// port's queue, and the whole vector is reported sent, as a kernel socket
+/// queues what its NIC cannot take yet. Reporting the accepted prefix instead
+/// made Aeron send the whole vector again, the accepted frames a second time.
 #[test]
 #[serial]
-fn partial_burst_reports_accepted_prefix() {
+fn a_full_ring_queues_the_rest_and_reports_the_whole_vector() {
     let mut h = Harness::new_with_burst(4);
     h.init(
         aeron_udp_channel_transport_affinity_t::AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_SENDER,
@@ -710,18 +727,154 @@ fn partial_burst_reports_accepted_prefix() {
     );
     h.arp_seed([10, 0, 0, 5], [0x02, 0, 0, 0, 0, 0x50]);
 
-    // The NIC accepts only the first 2 frames of a 4-frame burst.
+    // The NIC accepts only 2 frames a burst.
     unsafe { rusteron_dpdk_fake_set_tx_burst_cap(2) };
-
     let payloads: Vec<Vec<u8>> = (0..8).map(|i| vec![i; 4]).collect();
     let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
     let (rc, bytes_sent) = h.send_to(([10, 0, 0, 5], 40123), &refs);
-    assert_eq!(rc, 2, "stops after the partial burst, reporting the accepted prefix");
-    assert_eq!(bytes_sent, 2 * 4);
-    let caps = captures();
-    assert_eq!(caps.len(), 2);
-    assert_eq!(udp_payload(&caps[0]), vec![0; 4].as_slice());
-    assert_eq!(udp_payload(&caps[1]), vec![1; 4].as_slice());
+    assert_eq!(rc, 8, "the whole vector: the refused frames are queued");
+    assert_eq!(bytes_sent, 8 * 4);
+    assert_eq!(sent_payloads(), vec![vec![0; 4], vec![1; 4]]);
+
+    // The ring drains: the queued frames go first, then the new one.
+    unsafe { rusteron_dpdk_fake_set_tx_burst_cap(64) };
+    assert_eq!(h.send_to(([10, 0, 0, 5], 40123), &[&[9u8; 4]]).0, 1);
+    let mut expected: Vec<Vec<u8>> = (0..8).map(|i| vec![i; 4]).collect();
+    expected.push(vec![9; 4]);
+    assert_eq!(sent_payloads(), expected, "each frame once, in order");
+    assert_no_leak();
+}
+
+/// Aeron advances only when a send takes the whole vector, and otherwise
+/// sends the same vector again. Whatever the NIC takes per call, every frame
+/// must reach the wire exactly once and in order.
+#[test]
+#[serial]
+fn aerons_resend_rule_never_duplicates_a_frame() {
+    let mut h = Harness::new();
+    h.init(
+        aeron_udp_channel_transport_affinity_t::AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_SENDER,
+        SENDER_IP,
+        40000,
+        None,
+        1472,
+    );
+    h.arp_seed([10, 0, 0, 5], [0x02, 0, 0, 0, 0, 0x50]);
+    // The NIC takes 1, 2 or 3 frames a call: three 4-frame vectors each.
+    for (round, cap) in [1u16, 2, 3].into_iter().enumerate() {
+        unsafe { rusteron_dpdk_fake_set_tx_burst_cap(cap) };
+        for v in 0..3u32 {
+            let first = u32::try_from(round).unwrap() * 12 + v * 4;
+            let payloads: Vec<Vec<u8>> = (first..first + 4).map(|i| i.to_le_bytes().to_vec()).collect();
+            let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+            let mut attempts = 0;
+            loop {
+                let (rc, _) = h.send_to(([10, 0, 0, 5], 40123), &refs);
+                assert!(rc == 0 || rc == 4, "all or nothing, never a part: {rc}");
+                if rc == 4 {
+                    break;
+                }
+                attempts += 1;
+                assert!(attempts < 100, "the vector never went out");
+            }
+        }
+    }
+    // Drain what is still queued.
+    unsafe { rusteron_dpdk_fake_set_tx_burst_cap(64) };
+    let mut p = h.poller();
+    let mut bytes = 0i64;
+    let mut dgrams: Vec<RxDatagram> = Vec::new();
+    let clientd = &mut dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    p.poll(16, clientd, &mut bytes);
+    let expected: Vec<Vec<u8>> = (0..36u32).map(|i| i.to_le_bytes().to_vec()).collect();
+    assert_eq!(sent_payloads(), expected, "every frame exactly once, in order");
+    drop(p);
+    assert_no_leak();
+}
+
+/// While queued frames cannot all go, a new vector is refused whole before
+/// anything of it is built: no mbuf taken, no copy made, nothing charged.
+#[test]
+#[serial]
+fn a_new_vector_is_refused_whole_while_frames_wait() {
+    let mut h = Harness::new();
+    h.init(
+        aeron_udp_channel_transport_affinity_t::AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_SENDER,
+        SENDER_IP,
+        40000,
+        None,
+        1472,
+    );
+    h.arp_seed([10, 0, 0, 5], [0x02, 0, 0, 0, 0, 0x50]);
+    unsafe { rusteron_dpdk_fake_set_tx_burst_cap(0) }; // a full ring
+    let first: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 4]).collect();
+    let refs: Vec<&[u8]> = first.iter().map(|p| p.as_slice()).collect();
+    assert_eq!(h.send_to(([10, 0, 0, 5], 40123), &refs).0, 4, "queued whole");
+    let allocated = unsafe { rusteron_dpdk_fake_allocated() };
+    let second: Vec<Vec<u8>> = (4..8).map(|i| vec![i; 4]).collect();
+    let refs2: Vec<&[u8]> = second.iter().map(|p| p.as_slice()).collect();
+    assert_eq!(h.send_to(([10, 0, 0, 5], 40123), &refs2).0, 0, "refused whole");
+    assert_eq!(
+        unsafe { rusteron_dpdk_fake_allocated() },
+        allocated,
+        "nothing built for it"
+    );
+    assert!(sent_payloads().is_empty());
+
+    unsafe { rusteron_dpdk_fake_set_tx_burst_cap(64) };
+    assert_eq!(h.send_to(([10, 0, 0, 5], 40123), &refs2).0, 4);
+    let expected: Vec<Vec<u8>> = (0..8).map(|i| vec![i; 4]).collect();
+    assert_eq!(sent_payloads(), expected);
+    assert_no_leak();
+}
+
+/// Queued frames do not wait for the next send: the agent's poll of the NIC
+/// sends them.
+#[test]
+#[serial]
+fn the_agents_poll_sends_queued_frames() {
+    let mut h = Harness::new();
+    h.init(
+        aeron_udp_channel_transport_affinity_t::AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_SENDER,
+        SENDER_IP,
+        40000,
+        None,
+        1472,
+    );
+    h.arp_seed([10, 0, 0, 5], [0x02, 0, 0, 0, 0, 0x50]);
+    let mut p = h.poller();
+    unsafe { rusteron_dpdk_fake_set_tx_burst_cap(0) };
+    assert_eq!(h.send_to(([10, 0, 0, 5], 40123), &[&[1u8; 4], &[2u8; 4]]).0, 2);
+    assert!(sent_payloads().is_empty());
+    unsafe { rusteron_dpdk_fake_set_tx_burst_cap(64) };
+    let mut bytes = 0i64;
+    let mut dgrams: Vec<RxDatagram> = Vec::new();
+    let clientd = &mut dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    p.poll(16, clientd, &mut bytes);
+    assert_eq!(sent_payloads(), vec![vec![1u8; 4], vec![2u8; 4]], "sent by the poll");
+    drop(p);
+    assert_no_leak();
+}
+
+/// Frames still queued when the NIC's last transport closes are released.
+#[test]
+#[serial]
+fn queued_frames_are_released_when_the_transport_closes() {
+    let mut h = Harness::new();
+    h.init(
+        aeron_udp_channel_transport_affinity_t::AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_SENDER,
+        SENDER_IP,
+        40000,
+        None,
+        1472,
+    );
+    h.arp_seed([10, 0, 0, 5], [0x02, 0, 0, 0, 0, 0x50]);
+    unsafe { rusteron_dpdk_fake_set_tx_burst_cap(0) };
+    assert_eq!(
+        h.send_to(([10, 0, 0, 5], 40123), &[&[1u8; 4], &[2u8; 4], &[3u8; 4]]).0,
+        3
+    );
+    drop(h);
     assert_no_leak();
 }
 
@@ -756,16 +909,19 @@ fn refused_tail_is_offered_again_within_the_retry_window() {
     }
     assert_no_leak();
 
-    // A ring that never drains: refused at the deadline, released, reported.
+    // A ring that never drains: still refused at the deadline, so queued.
     unsafe { rusteron_dpdk_fake_set_tx_burst_cap(0) };
     let (rc, _) = h.send_to(([10, 0, 0, 5], 40123), &refs);
-    assert_eq!(rc, 0);
+    assert_eq!(rc, 8, "queued behind the full ring");
+    drop(h);
     assert_no_leak();
 }
 
+/// Out of mbufs part-way through a vector, nothing of it is sent: a part
+/// would make Aeron send the whole vector again, the part a second time.
 #[test]
 #[serial]
-fn mbuf_exhaustion_flushes_prefix() {
+fn mbuf_exhaustion_sends_nothing_of_the_vector() {
     let mut h = Harness::new();
     h.init(
         aeron_udp_channel_transport_affinity_t::AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_SENDER,
@@ -782,9 +938,9 @@ fn mbuf_exhaustion_flushes_prefix() {
     let payloads: Vec<Vec<u8>> = (0..16).map(|i| vec![i; 4]).collect();
     let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
     let (rc, bytes_sent) = h.send_to(([10, 0, 0, 5], 40123), &refs);
-    assert_eq!(rc, 2, "mbuf exhaustion flushes and reports the built prefix");
-    assert_eq!(bytes_sent, 2 * 4);
-    assert_eq!(captures().len(), 2);
+    assert_eq!(rc, 0, "all or nothing: Aeron offers the vector again");
+    assert_eq!(bytes_sent, 0);
+    assert!(captures().is_empty());
     assert_no_leak();
 }
 
@@ -1352,6 +1508,46 @@ fn bandwidth_allowance_defers_sends_beyond_it() {
     assert_no_leak();
 }
 
+/// An allowance is credited for all the time between refills, however often
+/// they come: a sender retrying a deferred send more often than its
+/// allowance earns a whole byte (Aeron retries at its next duty cycle) still
+/// sends as soon as the debt is repaid, instead of losing each retry's
+/// fraction of a byte and never refilling.
+#[test]
+#[serial]
+fn an_allowance_refills_however_often_a_send_is_retried() {
+    let _rate = EnvGuard::set("RUSTERON_DPDK_TX_RATE_MBPS", "8"); // a byte a microsecond
+    let _bucket = EnvGuard::set("RUSTERON_DPDK_TX_BUCKET_BYTES", "1500");
+    let _spin = EnvGuard::set("RUSTERON_DPDK_TX_PACE_SPIN_US", "0");
+    let mut h = Harness::new();
+    const T0: u64 = 1_000_000_000;
+    pin_clock_ns(T0); // after the harness's reset
+    h.init(
+        aeron_udp_channel_transport_affinity_t::AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_SENDER,
+        SENDER_IP,
+        40000,
+        None,
+        1472,
+    );
+    h.arp_seed([10, 0, 0, 5], [0x02, 0, 0, 0, 0, 0x50]);
+    let payload = vec![7u8; 958]; // 1000 bytes on the wire with the headers
+    let dst = ([10, 0, 0, 5], 40123);
+    assert_eq!(h.send_to(dst, &[&payload]).0, 1, "within the bucket");
+    assert_eq!(h.send_to(dst, &[&payload]).0, 1, "the last token: 500 owed");
+    // retried every 500 ns: half a byte of allowance back each time
+    let mut sent_after_ns = None;
+    for retry in 1..=2_000u64 {
+        pin_clock_ns(T0 + retry * 500);
+        if 1 == h.send_to(dst, &[&payload]).0 {
+            sent_after_ns = Some(retry * 500);
+            break;
+        }
+    }
+    assert_eq!(sent_after_ns, Some(500_000), "the 500 bytes owed repaid in 500 µs");
+    assert_eq!(captures().len(), 3);
+    assert_no_leak();
+}
+
 /// RUSTERON_DPDK_TX_ROUTE_MBPS gives a destination prefix its own allowance
 /// (a slower link on the way, such as a direct link to another site), on top
 /// of the NIC's: the longest matching prefix applies, so one destination is
@@ -1360,6 +1556,8 @@ fn bandwidth_allowance_defers_sends_beyond_it() {
 #[serial]
 fn route_allowances_hold_each_destination_to_its_own_link() {
     let _routes = EnvGuard::set("RUSTERON_DPDK_TX_ROUTE_MBPS", "10.0.0.0/24=8000, 10.0.0.5/32=8");
+    // the NIC's off: its default allowance, in a 1500-byte bucket, would hold the fast route too
+    let _rate = EnvGuard::set("RUSTERON_DPDK_TX_RATE_MBPS", "0");
     let _bucket = EnvGuard::set("RUSTERON_DPDK_TX_BUCKET_BYTES", "1500");
     let _spin = EnvGuard::set("RUSTERON_DPDK_TX_PACE_SPIN_US", "0");
     let mut h = Harness::new();
@@ -1386,9 +1584,9 @@ fn route_allowances_hold_each_destination_to_its_own_link() {
     assert_no_leak();
 }
 
-/// Frames the NIC refuses are not charged to the allowance: Aeron sends them
-/// again, and charging every attempt would hold the NIC below its allowance
-/// whenever its ring fills.
+/// Frames queued behind a full ring are charged once, as they will be sent;
+/// a vector refused while they wait is not charged at all (Aeron offers it
+/// again), so a full ring never holds the NIC below its allowance.
 #[test]
 #[serial]
 fn refused_frames_are_not_charged_to_the_allowance() {
@@ -1408,12 +1606,20 @@ fn refused_frames_are_not_charged_to_the_allowance() {
     let payload = vec![7u8; 958]; // 1000 bytes on the wire with the headers
     let dst = ([10, 0, 0, 5], 40123);
     unsafe { rusteron_dpdk_fake_set_tx_burst_cap(0) }; // a full ring
+    assert_eq!(h.send_to(dst, &[&payload]).0, 1, "queued, charged once");
     for _ in 0..3 {
-        assert_eq!(h.send_to(dst, &[&payload]).0, 0, "refused by the NIC");
+        assert_eq!(
+            h.send_to(dst, &[&payload]).0,
+            0,
+            "refused whole while it waits: not charged"
+        );
     }
     unsafe { rusteron_dpdk_fake_set_tx_burst_cap(64) };
-    assert_eq!(h.send_to(dst, &[&payload]).0, 1, "the allowance is untouched");
-    assert_eq!(h.send_to(dst, &[&payload]).0, 1, "the last token: may overdraw");
+    assert_eq!(
+        h.send_to(dst, &[&payload]).0,
+        1,
+        "the queued frame goes, then this one on the last token"
+    );
     assert_eq!(h.send_to(dst, &[&payload]).0, 0, "in debt: deferred");
     assert_eq!(captures().len(), 2);
     assert_no_leak();

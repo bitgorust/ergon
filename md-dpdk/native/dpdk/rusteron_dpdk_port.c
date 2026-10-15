@@ -28,7 +28,6 @@
 #include <string.h>
 
 #define RUSTERON_DPDK_MBUF_DESC_COUNT 2048
-#define RUSTERON_DPDK_MBUF_CACHE_SIZE 256
 
 static int rusteron_dpdk_port_probe_port(const char *pci_bdf, const uint8_t *mac, uint16_t *port_id)
 {
@@ -68,7 +67,8 @@ static int rusteron_dpdk_port_dev_info(
     uint16_t port_id, const char *pci_bdf,
     uint8_t mac[RUSTERON_DPDK_ETH_ADDR_LEN],
     char *driver_name, size_t driver_name_len,
-    int *csum_offload_ok, int *ena_llq_available, int *rx_timestamp_ok, uint16_t *max_mtu)
+    int *csum_offload_ok, int *ena_llq_available, int *rx_timestamp_ok, uint16_t *max_mtu,
+    uint16_t desc_lim[4])
 {
     (void)pci_bdf; /* capabilities are read by port id once probed */
     struct rte_eth_dev_info info;
@@ -105,6 +105,10 @@ static int rusteron_dpdk_port_dev_info(
      * precision-time placement group on supporting instances. */
     *rx_timestamp_ok = 0 != (info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TIMESTAMP);
     *max_mtu = info.max_mtu;
+    desc_lim[0] = info.rx_desc_lim.nb_min;
+    desc_lim[1] = info.rx_desc_lim.nb_max;
+    desc_lim[2] = info.tx_desc_lim.nb_min;
+    desc_lim[3] = info.tx_desc_lim.nb_max;
 
     return 0;
 }
@@ -158,12 +162,9 @@ static int rusteron_dpdk_port_dev_configure(
     return rc;
 }
 
+/* `cache_size` as configured: 0 is no per-core cache, a valid choice. */
 static void *rusteron_dpdk_port_mempool_create(const char *name, uint32_t n, uint16_t cache_size, uint16_t data_room)
 {
-    if (cache_size == 0)
-    {
-        cache_size = RUSTERON_DPDK_MBUF_CACHE_SIZE;
-    }
     void *pool = rte_pktmbuf_pool_create(
         name, n, cache_size, 0, (uint16_t)(RTE_PKTMBUF_HEADROOM + data_room), SOCKET_ID_ANY);
     if (NULL == pool)

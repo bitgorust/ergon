@@ -518,6 +518,23 @@ static int rusteron_dpdk_dispatch_frame(
     return 1;
 }
 
+/* Counts a gap of 20 µs or more since the agent's last cycle on `port`
+ * (poll-cycle-gap-*); the caller sets last_poll_ns. */
+static inline void rusteron_dpdk_poll_cycle(rusteron_dpdk_port_t *port, uint64_t now_ns)
+{
+    if (0 != port->last_poll_ns && now_ns - port->last_poll_ns >= 20000)
+    {
+        const uint64_t cycle = now_ns - port->last_poll_ns;
+        rusteron_dpdk_counters_max(&port->counters, RD_COUNTER_POLL_CYCLE_GAP_MAX, (int64_t)cycle);
+        rusteron_dpdk_counters_add(
+            &port->counters,
+            cycle >= 100000  ? RD_COUNTER_POLL_CYCLE_GAPS_100US
+            : cycle >= 50000 ? RD_COUNTER_POLL_CYCLE_GAPS_50US
+                             : RD_COUNTER_POLL_CYCLE_GAPS_20US,
+            1);
+    }
+}
+
 int rusteron_dpdk_poller_receive(
     rusteron_dpdk_client_t *client,
     aeron_udp_channel_transport_t *only_transport,
@@ -547,10 +564,12 @@ int rusteron_dpdk_poller_receive(
     rusteron_dpdk_port_t *port = client->port;
     const rusteron_dpdk_port_ops_t *ops = native->ops;
 
-    /* Poll no more than min(Aeron vlen, configured burst size) mbufs per call
-     * (plan §7.6). */
-    size_t limit = vlen < native->config.burst_size ? vlen : native->config.burst_size;
-    if (0 == limit)
+    /* Up to the configured burst size a burst, whatever Aeron's vlen: every
+     * frame is dispatched through msgvec[0] the moment it is parsed (zero
+     * copy), so vlen sizes nothing here, and the sender's control poll
+     * (vlen 1) would otherwise take one frame a duty cycle. */
+    size_t limit = native->config.burst_size;
+    if (0 == vlen || 0 == limit)
     {
         return 0;
     }
@@ -566,8 +585,6 @@ int rusteron_dpdk_poller_receive(
         batch[i] = &views[i];
     }
 
-    uint16_t received = ops->rx_burst(port->port_id, port->rx_queue_id, batch, (uint16_t)limit);
-
     /* The per-frame tallies stay in locals and reach the shared counters once
      * per poll: one atomic add each, not several per frame. */
     int work_count = 0;
@@ -577,70 +594,92 @@ int rusteron_dpdk_poller_receive(
     uint64_t realtime_ns = 0; /* read once, at the first NIC-timestamped frame */
     int observed = 0;         /* the first datagram's source checked against ARP */
     const uint32_t on_link_mask = rusteron_dpdk_ipv4_mask(port->prefix_len);
-    for (uint16_t i = 0; i < received; i++)
+    /* A full burst means the ring may hold more: keep draining, a burst at a
+     * time up to rx_max_bursts, so a backlog a stall left clears in this duty
+     * cycle instead of one burst per cycle while the ring keeps filling (on
+     * MANA, overflowing without a count). */
+    size_t total = 0;
+    int full = 0;
+    for (uint32_t burst = 0; burst < native->rx_max_bursts; burst++)
     {
-        rusteron_dpdk_mbuf_t *m = &views[i];
-        rusteron_dpdk_parsed_frame_t frame;
-        rusteron_dpdk_rx_result_t result = rusteron_dpdk_packet_classify_rx(m, &frame);
+        const uint16_t received = ops->rx_burst(port->port_id, port->rx_queue_id, batch, (uint16_t)limit);
+        for (uint16_t i = 0; i < received; i++)
+        {
+            rusteron_dpdk_mbuf_t *m = &views[i];
+            rusteron_dpdk_parsed_frame_t frame;
+            rusteron_dpdk_rx_result_t result = rusteron_dpdk_packet_classify_rx(m, &frame);
 
-        if (RUSTERON_DPDK_RX_RESULT_OK == result)
-        {
-            sw_csum += frame.sw_checksum;
-            if (!observed)
+            if (RUSTERON_DPDK_RX_RESULT_OK == result)
             {
-                /* Once per poll: has the peer's MAC changed under us? Only an
-                 * on-link source is a next hop of its own; anything else
-                 * arrives from the gateway. */
-                if (((frame.src_ip ^ port->local_ip) & on_link_mask) == 0)
+                sw_csum += frame.sw_checksum;
+                if (!observed)
                 {
-                    rusteron_dpdk_arp_observe(&port->arp, frame.src_ip, m->data + RUSTERON_DPDK_ETH_ADDR_LEN);
+                    /* Once per poll: has the peer's MAC changed under us? Only an
+                     * on-link source is a next hop of its own; anything else
+                     * arrives from the gateway. */
+                    if (((frame.src_ip ^ port->local_ip) & on_link_mask) == 0)
+                    {
+                        rusteron_dpdk_arp_observe(&port->arp, frame.src_ip, m->data + RUSTERON_DPDK_ETH_ADDR_LEN);
+                    }
+                    observed = 1;
                 }
-                observed = 1;
-            }
-            if (0 != m->hw_rx_ns)
-            {
-                /* NIC arrival to dispatch: the NIC stamps with its PTP
-                 * hardware clock, which chrony keeps CLOCK_REALTIME on. */
-                if (0 == realtime_ns)
+                if (0 != m->hw_rx_ns)
                 {
-                    realtime_ns = rusteron_dpdk_realtime_ns();
+                    /* NIC arrival to dispatch: the NIC stamps with its PTP
+                     * hardware clock, which chrony keeps CLOCK_REALTIME on. */
+                    if (0 == realtime_ns)
+                    {
+                        realtime_ns = rusteron_dpdk_realtime_ns();
+                    }
+                    const int64_t delay = (int64_t)(realtime_ns - m->hw_rx_ns);
+                    hw_sum += delay;
+                    hw_count++;
+                    hw_max = delay > hw_max ? delay : hw_max;
                 }
-                const int64_t delay = (int64_t)(realtime_ns - m->hw_rx_ns);
-                hw_sum += delay;
-                hw_count++;
-                hw_max = delay > hw_max ? delay : hw_max;
+                const int dispatched = rusteron_dpdk_dispatch_frame(
+                    client, only_transport, endpoints, m, &frame, msgvec, bytes_rcved, recv_func, clientd);
+                work_count += dispatched;
+                rx_bytes += dispatched ? (int64_t)frame.payload_len : 0;
             }
-            const int dispatched = rusteron_dpdk_dispatch_frame(
-                client, only_transport, endpoints, m, &frame, msgvec, bytes_rcved, recv_func, clientd);
-            work_count += dispatched;
-            rx_bytes += dispatched ? (int64_t)frame.payload_len : 0;
-        }
-        else if (RUSTERON_DPDK_RX_RESULT_ICMP == result)
-        {
-            port->rx_stats.icmp++;
-            if (rusteron_dpdk_port_owns_ip(port, frame.dst_ip))
+            else if (RUSTERON_DPDK_RX_RESULT_ICMP == result)
             {
-                rusteron_dpdk_icmp_handle(native, port, m, &frame);
+                port->rx_stats.icmp++;
+                if (rusteron_dpdk_port_owns_ip(port, frame.dst_ip))
+                {
+                    rusteron_dpdk_icmp_handle(native, port, m, &frame);
+                }
             }
-        }
-        else if (RUSTERON_DPDK_RX_RESULT_ARP == result)
-        {
-            port->rx_stats.arp++;
-            rusteron_dpdk_arp_handle_frame(&port->arp, native, port, m->data, m->frame_len);
-        }
-        else
-        {
-            rusteron_dpdk_rx_count(&port->rx_stats, &port->counters, result);
-        }
+            else if (RUSTERON_DPDK_RX_RESULT_ARP == result)
+            {
+                port->rx_stats.arp++;
+                rusteron_dpdk_arp_handle_frame(&port->arp, native, port, m->data, m->frame_len);
+            }
+            else
+            {
+                rusteron_dpdk_rx_count(&port->rx_stats, &port->counters, result);
+            }
 
-        /* The callback has returned (and the ARP handler has run); the mbuf is
-         * recycled now and no later (plan §7.6). */
-        ops->mbuf_release(m);
+            /* The callback has returned (and the ARP handler has run); the mbuf is
+             * recycled now and no later (plan §7.6). */
+            ops->mbuf_release(m);
+        }
+        total += received;
+        if ((size_t)received < limit)
+        {
+            break;
+        }
+        full = 1;
     }
 
-    if (received > 0)
+    if (total > 0)
     {
-        rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_POLLER, received);
+        rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_POLLER, (int64_t)total);
+        rusteron_dpdk_counters_max(&port->counters, RD_COUNTER_RX_BACKLOG_MAX, (int64_t)total);
+        /* drained within a burst of the ring's size: it may have overflowed */
+        if (total + limit >= native->config.rx_descriptors)
+        {
+            rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_RX_RING_FULL_SUSPECTED, 1);
+        }
         if (work_count > 0)
         {
             rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_RX_PKTS, work_count);
@@ -665,18 +704,8 @@ int rusteron_dpdk_poller_receive(
     /* The agent's own loop: any gap since the port's last poll of 20 µs or
      * more is the agent not running (preempted, or its vCPU descheduled), so
      * a latency spike can be matched to it. The clock is read here anyway. */
-    if (0 != port->last_poll_ns && now_ns - port->last_poll_ns >= 20000)
-    {
-        const uint64_t cycle = now_ns - port->last_poll_ns;
-        rusteron_dpdk_counters_max(&port->counters, RD_COUNTER_POLL_CYCLE_GAP_MAX, (int64_t)cycle);
-        rusteron_dpdk_counters_add(
-            &port->counters,
-            cycle >= 100000  ? RD_COUNTER_POLL_CYCLE_GAPS_100US
-            : cycle >= 50000 ? RD_COUNTER_POLL_CYCLE_GAPS_50US
-                             : RD_COUNTER_POLL_CYCLE_GAPS_20US,
-            1);
-    }
-    if (received > 0 && 0 != port->last_poll_ns)
+    rusteron_dpdk_poll_cycle(port, now_ns);
+    if (total > 0 && 0 != port->last_poll_ns)
     {
         const int64_t gap = (int64_t)(now_ns - port->last_poll_ns);
         rusteron_dpdk_counters_max(&port->counters, RD_COUNTER_RX_POLL_GAP_MAX, gap);
@@ -685,7 +714,7 @@ int rusteron_dpdk_poller_receive(
             rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_RX_POLL_GAPS_100US, 1);
         }
     }
-    if ((size_t)received == limit)
+    if (full)
     {
         rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_RX_BURST_FULL, 1);
     }
@@ -796,6 +825,9 @@ static void rusteron_dpdk_poller_port_unref(
         }
         if (0 == --state->ports[i].refs)
         {
+            /* no longer polled here: the time until a transport of it comes
+             * back is not the agent's loop, so its timing starts afresh */
+            client->port->last_poll_ns = 0;
             state->ports[i] = state->ports[--state->port_count];
             return;
         }
@@ -934,6 +966,12 @@ int rusteron_dpdk_poller_remove(
     rusteron_dpdk_client_t *client = transport->bindings_clientd;
     if (NULL != state)
     {
+        /* the host-local channel that times its port's loop is leaving: the
+         * timing starts afresh with whichever channel times it next */
+        if (state->kernel_count > 0 && state->kernel[0] == transport && NULL != client && NULL != client->port)
+        {
+            client->port->last_poll_ns = 0;
+        }
         rusteron_dpdk_poller_kernel_remove(state, transport);
         if (NULL != client && NULL != client->port && !client->delegated)
         {
@@ -972,12 +1010,33 @@ int rusteron_dpdk_poller_poll(
 
     int work_count = 0;
 
+    /* Host-local channels only (every localhost run): no NIC to poll, so the
+     * agent's loop gaps are measured here instead, on the first channel's
+     * port, at one clock read a call. */
+    if (0 == state->port_count && state->kernel_count > 0)
+    {
+        rusteron_dpdk_client_t *first = state->kernel[0]->bindings_clientd;
+        if (NULL != first && NULL != first->port)
+        {
+            const uint64_t now = rusteron_dpdk_clock_now();
+            rusteron_dpdk_poll_cycle(first->port, now);
+            first->port->last_poll_ns = now;
+        }
+    }
+
     /* Each distinct NIC once per call (plan §7.6), through any of its
      * transports: the endpoint map dispatches to the right one. */
     for (size_t i = 0; i < state->port_count; i++)
     {
+        /* Frames queued behind a full TX ring go out as the ring drains, on
+         * this agent (it owns the NIC), not only at its next send. */
+        rusteron_dpdk_client_t *c = state->ports[i].client;
+        if (0 != c->port->tx_queued_count)
+        {
+            rusteron_dpdk_port_tx_flush(c->runtime, c->port);
+        }
         int received = rusteron_dpdk_poller_receive(
-            state->ports[i].client, NULL, &state->endpoints, msgvec, vlen, bytes_rcved, recv_func, clientd);
+            c, NULL, &state->endpoints, msgvec, vlen, bytes_rcved, recv_func, clientd);
         if (received < 0)
         {
             return -1;

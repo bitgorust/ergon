@@ -49,6 +49,13 @@ RUSTERON_MEDIA_DRIVER_TRANSPORT=dpdk-ena cargo run -p ergon-md-dpdk --features d
   failure exits non-zero; it never falls back to the socket driver.
 - Anything else: invalid, exits non-zero.
 
+`RUSTERON_MEDIA_DRIVER_MLOCKALL=1` (or `lock_memory_from_env()` in your own
+driver) locks the process's memory, present and future, before the driver
+starts: every log buffer the conductor maps is then faulted in by `mmap`, so
+the agents never take a page fault on one, nor wait on the memory-map lock
+behind the conductor mapping or unmapping another. It needs `CAP_IPC_LOCK` or
+a large enough `RLIMIT_MEMLOCK`.
+
 The variable names are rusteron's, so deployments written for rusteron's DPDK
 branch work unchanged. `RUSTERON_DPDK_EAL_ARGS` appends EAL options (log
 levels, lcore lists such as `-l 0`), at most 1 KiB with the device arguments. The DPDK configuration is read from the environment
@@ -72,7 +79,9 @@ Each data NIC's synthetic VMBus device must belong to `uio_hv_generic` (its
 kernel interface and VF down) so the netvsc PMD can take it and keep the VF data
 path switched in; `benches/cloud/vm.sh driver dpdk` shows the steps. MANA queues
 hold at most 256 descriptors (`RUSTERON_DPDK_RX_DESCRIPTORS` and
-`RUSTERON_DPDK_TX_DESCRIPTORS`), and the transport stops DPDK's automatic
+`RUSTERON_DPDK_TX_DESCRIPTORS`; the defaults are 1024 and 512, an ENA's
+transmit maximum), and a count outside a NIC's reported limits fails start
+naming them. The transport also stops DPDK's automatic
 vdev_netvsc fail-safe device, which would otherwise take the ports (and the
 primary NIC's).
 
@@ -106,9 +115,12 @@ Nothing periodic runs on them:
   rescheduled, a failover) makes the next send refresh at once. Only a solicited answer
   moves the next hop to a new MAC; unsolicited ARP never does. Each NIC keeps
   its own table, touched only by its own agent thread.
-- **Statistics.** The 1 Hz PMD extended statistics, the NIC's basic drop
-  counters (`nic-rx-errors`, `nic-rx-missed`, `nic-rx-nombuf`) and the mempool
-  sample (on ENA, some of those are admin commands to the device) run on a
+- **Statistics.** The PMD extended statistics and the NIC's basic drop
+  counters (`nic-rx-errors`, `nic-rx-missed`, `nic-rx-nombuf`), read once a
+  second (on ENA each read is an admin command to the device;
+  `RUSTERON_DPDK_NIC_STATS_MS` sets the interval, from 1000 to 3600000, and
+  0 stops the reads, leaving those counters at their first values), and the
+  mempool sample, once a second, run on a
   housekeeping thread. It and the local-I/O thread (see Host-local channels)
   share the conductor's core, the driver's housekeeping core: they run on
   `RUSTERON_DPDK_HOUSEKEEPING_CPU`; else on the conductor's CPU, unless the
@@ -124,6 +136,15 @@ Nothing periodic runs on them:
   inherit the process's CPUs, so start the driver confined to its
   housekeeping CPUs (`taskset -c 0 media_driver`); the agents are pinned
   explicitly and leave that mask.
+- **Receive drain.** A poll takes up to `RUSTERON_DPDK_BURST_SIZE` frames a
+  burst whatever Aeron's vlen (each frame is dispatched the moment it is
+  parsed, zero copy, so vlen sizes nothing on this path), and while bursts
+  come back full it keeps draining, up to `RUSTERON_DPDK_RX_MAX_BURSTS` bursts
+  (default: as many as fill the receive ring, at most 8; 1 to 64), so a
+  backlog a stall left clears in one duty cycle. Each port records the most
+  frames one poll drained (`rx-backlog-max`) and the polls that drained
+  within a burst of a full ring (`rx-ring-full-suspected`): a ring that full
+  may have overflowed, which MANA does without counting a drop.
 - **Receive-ring health.** Each port counts the longest gap between receive
   polls that found frames waiting (`rx-poll-gap-max-ns`), how many reached
   100 µs, and polls that drained a full burst (`rx-burst-full`), so a stall
@@ -170,37 +191,66 @@ so DPDK peers and kernel peers interoperate:
   exceeds it before any counter here sees it; Aeron then retransmits, and
   throughput collapses (measured on Azure: about 11 Gbps of 1,344-byte frames
   fell to 40 thousand messages a second). `RUSTERON_DPDK_TX_RATE_MBPS` caps
-  each NIC's transmit rate in megabits per second of frames (default 0: no
-  cap) with a token bucket of `RUSTERON_DPDK_TX_BUCKET_BYTES` (default 64 KiB):
-  a send that finds it overdrawn waits the debt out if that takes at most
-  `RUSTERON_DPDK_TX_PACE_SPIN_US` (default 20), else sends nothing, which Aeron
-  retries whole (counter `tx-paced`). Set it below the VM's allowance, shared
-  between the two NICs. A slower link on the way to some destinations (a
-  direct link to another site, say) gets its own allowance with
+  each NIC's transmit rate in megabits per second of frames with a token
+  bucket of `RUSTERON_DPDK_TX_BUCKET_BYTES` (default 64 KiB): a send that
+  finds it overdrawn waits the debt out if that takes at most
+  `RUSTERON_DPDK_TX_PACE_SPIN_US` (default 20), else sends nothing, which
+  Aeron retries whole (counter `tx-paced`). Frames are charged as they go to
+  the NIC's ring, not as they leave it, so a burst of more than the bucket
+  handed to the ring faster than the rate is held back too, even on a slower
+  NIC. `0` turns the cap off, and it goes up to 400000. Where the VM's
+  allowance is lower, set it below that, shared between the two NICs.
+  Unset, each NIC has a backstop of 25000: AWS's highest documented rate for
+  one flow (25 Gbit/s, with ENA Express) and above every per-NIC rate
+  measured (about 12 Gbit/s, DPDK flat out at 32 B on Azure), so no
+  sustained rate measured reaches it. The backstop bounds a sustained rate,
+  holding back a runaway sender, and leaves bursts alone: its bucket is
+  1 MiB unless `RUSTERON_DPDK_TX_BUCKET_BYTES` is set, more than a full ENA
+  ring of 1,450-byte frames (742,400 bytes; 117 jumbo frames fill it), and
+  it never makes the agent wait, whatever `RUSTERON_DPDK_TX_PACE_SPIN_US`
+  says: a send it would delay sends nothing at once (`tx-paced`), and Aeron
+  retries it whole. It is per NIC, summed over every flow the NIC carries:
+  on an instance whose NIC carries more than 25 Gbit/s over several flows,
+  such as c7i.metal-24xl (37.5 Gbit/s) or c7i.48xlarge (50), raise it or
+  set `0`. One flow (one channel, whatever its streams) AWS caps at about
+  8 Gbit/s of frames regardless, so raising it carries no channel past that;
+  spread a heavier stream over several channels on different ports
+  ([`BENCHMARKS.md`](BENCHMARKS.md#aws-one-flow-carries-about-8-gbits)). A
+  slower link on the way to some destinations (a direct link to another site,
+  say) gets its own allowance with
   `RUSTERON_DPDK_TX_ROUTE_MBPS="<a.b.c.d>/<len>=<Mbit/s>,..."` (up to 16
   prefixes; the longest match applies, on top of the NIC's), shared by every
-  channel crossing that link. Size each channel's receiver window (`rcv-wnd`)
-  to its link's bandwidth-delay product too, so one stream cannot burst past
-  it. Kernel UDP has no congestion control either: the same holds for the
-  kernel driver, which only lacks a pacer.
+  channel crossing that link. It has the bucket and the wait of a rate set,
+  under the backstop too, but while the backstop is in debt a send sends
+  nothing, whatever the route allows. Size each channel's receiver window
+  (`rcv-wnd`) to its link's bandwidth-delay product too, so one stream cannot
+  burst past it. Kernel UDP has no congestion control either: the same holds
+  for the kernel driver, which only lacks a pacer.
 - **Stream priority under the allowance.** Every stream on a NIC draws on its
   one allowance, so near the cap a latency-critical stream could wait behind
   bulk. `RUSTERON_DPDK_TX_LOW_STREAMS="<stream>|<first>-<last>,..."` (up to
   16, non-negative stream ids) holds streams that can wait below the rest:
   they send only from what leaves `RUSTERON_DPDK_TX_LOW_RESERVE_BYTES`
-  (default half the bucket) for the others, or from a full bucket, never
-  overdraw it and never wait for it (a zero result Aeron retries, counted as
-  `tx-paced`). Everything else, control frames included whatever stream they
-  name, then never queues behind them. It needs an allowance
-  (`RUSTERON_DPDK_TX_RATE_MBPS` or `RUSTERON_DPDK_TX_ROUTE_MBPS`): without
-  one nothing here queues, so there is nothing to reorder. Priority keys on
-  the stream id each data frame carries; a subscription's `reliable=false`
-  never reaches the publishing side, so it cannot.
-- **Full transmit ring.** A send the NIC's ring cannot take whole returns the
-  accepted prefix (a short send). Aeron then resends the whole vector, the
-  datagrams already sent included. `RUSTERON_DPDK_TX_RETRY_US` (default 0)
-  offers the refused tail again for up to that long while the NIC drains its
-  ring, trading a brief spin on the sender for no duplicates.
+  (default half of `RUSTERON_DPDK_TX_BUCKET_BYTES`) for the others, or from a
+  full bucket, never overdraw it and never wait for it (a zero result Aeron
+  retries, counted as `tx-paced`). Everything else, control frames included
+  whatever stream they name, then never queues behind them. It needs an
+  allowance set (`RUSTERON_DPDK_TX_RATE_MBPS`, even at 25000, or
+  `RUSTERON_DPDK_TX_ROUTE_MBPS`; unset or `0` does not count): the default
+  is a backstop above every link measured, not a link's capacity to share
+  out. Priority keys on the stream id each data frame carries; a
+  subscription's `reliable=false` never reaches the publishing side, so it
+  cannot.
+- **Full transmit ring.** A send is all or nothing, as a kernel socket's
+  queue: what the NIC's ring refuses of a vector waits, already built, in the
+  NIC's queue (counted as `tx-queued`), and the whole vector is reported sent.
+  The queued frames go first, in order, at the agent's next send or poll of
+  that NIC. While any still wait, a new vector is refused whole before
+  anything of it is built (a zero result Aeron retries), and out of mbufs
+  part-way, nothing of the vector is sent. Aeron advances only when a send
+  takes its whole vector, so reporting a part made it send the vector again,
+  that part twice. `RUSTERON_DPDK_TX_RETRY_US` (default 0) still offers the
+  refused frames again for up to that long before queueing them.
 - **Checksums out.** The NIC completes them when it offers both IPv4 and UDP
   checksum offload; otherwise the transport computes them.
 - **MTU.** `max_aeron_mtu` may be up to 8960 (jumbo frames, e.g. an AWS

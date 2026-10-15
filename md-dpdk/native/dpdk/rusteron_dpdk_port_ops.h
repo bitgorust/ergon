@@ -37,9 +37,10 @@ typedef struct rusteron_dpdk_port_ops_stct
     int (*probe_port)(const char *pci_bdf, const uint8_t *mac, uint16_t *port_id);
 
     /*
-     * Read the device MAC, driver name, and whether IPv4/UDP checksum offloads,
-     * ENA LLQ/write-combining and RX hardware timestamps are supported. 0 on
-     * success.
+     * Read the device MAC, driver name, whether IPv4/UDP checksum offloads,
+     * ENA LLQ/write-combining and RX hardware timestamps are supported, and the
+     * descriptor counts a queue may have: desc_lim is RX minimum, RX maximum,
+     * TX minimum, TX maximum (0: no limit reported). 0 on success.
      */
     int (*dev_info)(
         uint16_t port_id,
@@ -49,7 +50,8 @@ typedef struct rusteron_dpdk_port_ops_stct
         int *csum_offload_ok,
         int *ena_llq_available,
         int *rx_timestamp_ok,
-        uint16_t *max_mtu);
+        uint16_t *max_mtu,
+        uint16_t desc_lim[4]);
 
     /* Configure one RX and one TX queue plus the requested offloads. With
      * RUSTERON_DPDK_RX_OFFLOAD_TIMESTAMP, rx_burst fills hw_rx_ns. */

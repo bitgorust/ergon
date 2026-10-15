@@ -58,6 +58,9 @@ rusteron_dpdk_clock_t rusteron_dpdk_clock = { .mode = RUSTERON_DPDK_CLOCK_UNCALI
 static int rusteron_dpdk_clock_calibrated_source = RUSTERON_DPDK_CLOCK_MONOTONIC;
 static int rusteron_dpdk_clock_allow_tsc = 1; /* the setting the calibration used */
 static uint64_t rusteron_dpdk_test_clock_ns_value = 0;
+/* How far each of this thread's reads moves a pinned clock on: the test's
+ * own, so the local-I/O thread's reads never move it under the test. */
+static _Thread_local uint64_t rusteron_dpdk_test_clock_step_ns = 0;
 
 static uint64_t rusteron_dpdk_clock_read_ns(clockid_t clock);
 
@@ -170,7 +173,12 @@ uint64_t rusteron_dpdk_clock_ns_slow(void)
 {
     if (RUSTERON_DPDK_CLOCK_PINNED == rusteron_dpdk_clock.mode)
     {
-        return rusteron_dpdk_test_clock_ns_value;
+        const uint64_t now = rusteron_dpdk_test_clock_ns_value;
+        if (0 != rusteron_dpdk_test_clock_step_ns)
+        {
+            rusteron_dpdk_test_clock_ns_value = now + rusteron_dpdk_test_clock_step_ns;
+        }
+        return now;
     }
     if (RUSTERON_DPDK_CLOCK_UNCALIBRATED == rusteron_dpdk_clock.mode)
     {
@@ -204,6 +212,11 @@ void rusteron_dpdk_test_set_clock_ns(uint64_t ns)
     rusteron_dpdk_clock_init();
     rusteron_dpdk_test_clock_ns_value = ns;
     rusteron_dpdk_clock.mode = RUSTERON_DPDK_CLOCK_PINNED;
+}
+
+void rusteron_dpdk_test_set_clock_step_ns(uint64_t ns)
+{
+    rusteron_dpdk_test_clock_step_ns = ns;
 }
 
 int rusteron_dpdk_test_clock_recalibrate(int allow_tsc)
@@ -249,6 +262,7 @@ static void rusteron_dpdk_test_clock_unpin(void)
         rusteron_dpdk_clock.mode = rusteron_dpdk_clock_calibrated_source;
     }
     rusteron_dpdk_test_clock_ns_value = 0;
+    rusteron_dpdk_test_clock_step_ns = 0;
     rusteron_dpdk_test_realtime_ns_value = 0;
     rusteron_dpdk_test_realtime_pinned = 0;
 }
@@ -353,8 +367,9 @@ static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_d
     }
 
     char driver[64] = "";
+    uint16_t desc_lim[4] = { 0, 0, 0, 0 };
     if (ops->dev_info(p->port_id, p->pci, p->mac, driver, sizeof(driver),
-                      &p->csum_offload_ok, &p->ena_llq_available, &p->rx_timestamp_ok, &p->max_mtu) < 0)
+                      &p->csum_offload_ok, &p->ena_llq_available, &p->rx_timestamp_ok, &p->max_mtu, desc_lim) < 0)
     {
         snprintf(message, sizeof(message),
                  "cannot read capabilities of device %s (port %u)", p->pci, p->port_id);
@@ -447,6 +462,23 @@ static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_d
         rusteron_dpdk_set_error(message);
         return -1;
     }
+    /* Queue sizes the NIC takes (an ENA at most 512 TX descriptors), checked
+     * before anything is configured: DPDK refuses a queue outside them, and
+     * the port it leaves half set up cannot be closed (see port_teardown). */
+    for (int tx = 0; tx < 2; tx++)
+    {
+        const unsigned n = tx ? cfg->tx_descriptors : cfg->rx_descriptors;
+        const unsigned lo = desc_lim[2 * tx], hi = desc_lim[2 * tx + 1];
+        if (n < lo || (0 != hi && n > hi))
+        {
+            snprintf(message, sizeof(message),
+                     "%s (RUSTERON_DPDK_%s) %u is outside %s's limits %u..%u (driver %s): set it within them",
+                     tx ? "tx_descriptors" : "rx_descriptors", tx ? "TX_DESCRIPTORS" : "RX_DESCRIPTORS", n, p->pci,
+                     lo, 0 != hi ? hi : 65535U, driver);
+            rusteron_dpdk_set_error(message);
+            return -1;
+        }
+    }
     /* Checksum offloads only when the NIC offers both IPv4 and UDP (a vdev may
      * not: then both sides are done in software, never a half-done UDP sum). */
     p->tx_udp_csum_offload = p->csum_offload_ok;
@@ -506,6 +538,7 @@ static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_d
         return -1;
     }
     p->tx_queue_id = 0;
+    p->queues_ready = 1;
 
     if (ops->dev_set_mtu(p->port_id, l3_mtu) < 0)
     {
@@ -858,6 +891,45 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
             return -1;
         }
     }
+    /* How often housekeeping reads the NIC's own statistics (on ENA each read
+     * is an admin command to the device): every second by default, 0 never. */
+    native->nic_stats_ns = 1000000000ULL;
+    const char *nic_stats = getenv("RUSTERON_DPDK_NIC_STATS_MS");
+    if (NULL != nic_stats && '\0' != nic_stats[0])
+    {
+        char *end = NULL;
+        const unsigned long long ms = strtoull(nic_stats, &end, 10);
+        if ('\0' != *end || '-' == nic_stats[0] || (0 != ms && (ms < 1000ULL || ms > 3600000ULL)))
+        {
+            rusteron_dpdk_set_error("RUSTERON_DPDK_NIC_STATS_MS must be 0 (never) or milliseconds from 1000 to 3600000");
+            return -1;
+        }
+        native->nic_stats_ns = ms * 1000000ULL;
+    }
+    /* How many bursts one poll drains while they come back full: by default
+     * as many as fill the receive ring, at most 8, so a backlog a stall left
+     * clears in one duty cycle. */
+    native->rx_max_bursts = native->config.burst_size > 0 ? native->config.rx_descriptors / native->config.burst_size : 1;
+    if (native->rx_max_bursts > 8)
+    {
+        native->rx_max_bursts = 8;
+    }
+    if (native->rx_max_bursts < 1)
+    {
+        native->rx_max_bursts = 1;
+    }
+    const char *max_bursts = getenv("RUSTERON_DPDK_RX_MAX_BURSTS");
+    if (NULL != max_bursts && '\0' != max_bursts[0])
+    {
+        char *end = NULL;
+        const unsigned long long n = strtoull(max_bursts, &end, 10);
+        if ('\0' != *end || '-' == max_bursts[0] || n < 1 || n > 64)
+        {
+            rusteron_dpdk_set_error("RUSTERON_DPDK_RX_MAX_BURSTS must be a number of bursts from 1 to 64");
+            return -1;
+        }
+        native->rx_max_bursts = (uint32_t)n;
+    }
     native->tx_retry_ns = 0;
     const char *tx_retry = getenv("RUSTERON_DPDK_TX_RETRY_US");
     if (NULL != tx_retry && '\0' != tx_retry[0])
@@ -872,9 +944,11 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
         native->tx_retry_ns = us * 1000ULL;
     }
     /* The bandwidth allowance per NIC, megabits per second of frames (0 =
-     * none), its bucket (RUSTERON_DPDK_TX_BUCKET_BYTES, default 64 KiB) and
-     * the longest wait to repay a send's overdraft (default 20 us). */
-    uint64_t rate = 0, bucket = 65536, pace_spin_us = 20;
+     * none; unset, the backstop RUSTERON_DPDK_TX_RATE_MBPS_DEFAULT), its
+     * bucket (RUSTERON_DPDK_TX_BUCKET_BYTES, default 64 KiB, the backstop's
+     * RUSTERON_DPDK_TX_BACKSTOP_BUCKET_BYTES) and the longest wait to repay a
+     * send's overdraft (default 20 us; the backstop never waits). */
+    uint64_t rate = RUSTERON_DPDK_TX_RATE_MBPS_DEFAULT, bucket = 65536, pace_spin_us = 20;
     const struct { const char *name; uint64_t *value; uint64_t max; } pacing[] = {
         { "RUSTERON_DPDK_TX_RATE_MBPS", &rate, 400000ULL },
         { "RUSTERON_DPDK_TX_BUCKET_BYTES", &bucket, 1ULL << 30 },
@@ -899,6 +973,21 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
         }
     }
     native->tx_pace_spin_ns = pace_spin_us * 1000ULL;
+    /* An allowance the operator set: the default is a backstop above every
+     * link measured, not a link's capacity to share out, so only this can put
+     * low-priority streams below the rest. */
+    const char *rate_env = getenv("RUSTERON_DPDK_TX_RATE_MBPS");
+    const int rate_set = NULL != rate_env && '\0' != rate_env[0] && 0 != rate;
+    /* No rate set: the NIC's allowance is the backstop. It bounds a sustained
+     * rate and never shapes a burst: its bucket holds more than the NIC's
+     * ring of 1,450-byte frames (not of jumbo frames) unless
+     * RUSTERON_DPDK_TX_BUCKET_BYTES says otherwise, and it never makes the
+     * agent wait. A route allowance keeps the bucket and the wait. */
+    const int backstop = NULL == rate_env || '\0' == rate_env[0];
+    const char *bucket_env = getenv("RUSTERON_DPDK_TX_BUCKET_BYTES");
+    const uint64_t nic_bucket = backstop && (NULL == bucket_env || '\0' == bucket_env[0])
+        ? RUSTERON_DPDK_TX_BACKSTOP_BUCKET_BYTES
+        : bucket;
     /* RUSTERON_DPDK_TX_ROUTE_MBPS="<a.b.c.d>/<len>=<Mbit/s>,...": a slower link
      * on the way to those destinations (a direct link to another site, say),
      * each with its own allowance; the longest matching prefix applies. */
@@ -1007,10 +1096,11 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
             native->tx_low_last[native->tx_low_count] = (int32_t)last;
             native->tx_low_count++;
         }
-        if (0 == rate && 0 == native->tx_route_count)
+        if (!rate_set && 0 == native->tx_route_count)
         {
             rusteron_dpdk_set_error("RUSTERON_DPDK_TX_LOW_STREAMS needs an allowance to hold them back: set "
-                                    "RUSTERON_DPDK_TX_RATE_MBPS or RUSTERON_DPDK_TX_ROUTE_MBPS");
+                                    "RUSTERON_DPDK_TX_RATE_MBPS (its default is only a backstop) or "
+                                    "RUSTERON_DPDK_TX_ROUTE_MBPS");
             return -1;
         }
     }
@@ -1018,10 +1108,10 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
     rusteron_dpdk_port_t *paced[2] = { &native->sender, &native->receiver };
     for (int p = 0; p < 2; p++)
     {
-        rusteron_dpdk_pacer_init(&paced[p]->tx_pacer, rate, (int64_t)bucket, pacer_now);
+        rusteron_dpdk_pacer_init(&paced[p]->tx_pacer, rate, (int64_t)nic_bucket, backstop, pacer_now);
         for (uint32_t r = 0; r < native->tx_route_count; r++)
         {
-            rusteron_dpdk_pacer_init(&paced[p]->route_pacers[r], route_rate[r], (int64_t)bucket, pacer_now);
+            rusteron_dpdk_pacer_init(&paced[p]->route_pacers[r], route_rate[r], (int64_t)bucket, 0, pacer_now);
         }
     }
     /* RUSTERON_DPDK_LOCAL_UNWATCH=0 keeps hot sockets on the local-I/O
@@ -1154,11 +1244,11 @@ void rusteron_dpdk_housekeeping_tick(rusteron_dpdk_transport_t *native, uint64_t
     pthread_mutex_lock(&native->housekeeping_lock);
     if (native->sender.open_transports > 0)
     {
-        rusteron_dpdk_counters_sample(&native->sender.counters, &native->sender, native->ops, now_ns);
+        rusteron_dpdk_counters_sample(&native->sender.counters, &native->sender, native->ops, now_ns, native->nic_stats_ns);
     }
     if (native->receiver.open_transports > 0)
     {
-        rusteron_dpdk_counters_sample(&native->receiver.counters, &native->receiver, native->ops, now_ns);
+        rusteron_dpdk_counters_sample(&native->receiver.counters, &native->receiver, native->ops, now_ns, native->nic_stats_ns);
     }
     pthread_mutex_unlock(&native->housekeeping_lock);
 }
@@ -1480,7 +1570,11 @@ int rusteron_dpdk_runtime_init(rusteron_dpdk_transport_t *native)
     return 0;
 }
 
-/* Tear one role port down in reverse of its init order: stop, close, free pool. */
+/* Tear one role port down in reverse of its init order: stop, close, free pool.
+ * A port configured but without both queues set up is left open: DPDK's ENA
+ * close releases every configured queue without checking it was set up
+ * (ena_tx_queue_release, DPDK 24.11) and would crash the process; the process
+ * is failing to start anyway. */
 static void rusteron_dpdk_port_teardown(rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *p)
 {
     const rusteron_dpdk_port_ops_t *ops = native->ops;
@@ -1488,10 +1582,15 @@ static void rusteron_dpdk_port_teardown(rusteron_dpdk_transport_t *native, ruste
     {
         ops->dev_stop(p->port_id);
     }
-    if (p->configured)
+    if (p->configured && p->queues_ready)
     {
         ops->dev_close(p->port_id);
     }
+    p->started = 0;
+    p->configured = 0;
+    p->queues_ready = 0;
+    /* frames still queued are the mempool's: back before it goes */
+    rusteron_dpdk_port_tx_drop_queued(native, p);
     if (NULL != p->mempool)
     {
         ops->mempool_free(p->mempool);

@@ -42,6 +42,8 @@ static char rusteron_dpdk_fake_driver[64] = "net_ena";
 static int rusteron_dpdk_fake_csum_ok = 1;
 static int rusteron_dpdk_fake_rx_timestamp_ok = 0;
 static uint16_t rusteron_dpdk_fake_max_mtu = 9001;
+/* Descriptor limits the fake ports report: min/max per direction (0: none). */
+static uint16_t rusteron_dpdk_fake_desc_lim[4];
 static uint64_t rusteron_dpdk_fake_basic[3];
 static uint16_t rusteron_dpdk_fake_next_port = 0;
 static uintptr_t rusteron_dpdk_fake_next_pool = 0x1000;
@@ -114,6 +116,7 @@ void rusteron_dpdk_fake_reset(void)
     rusteron_dpdk_fake_csum_ok = 1;
     rusteron_dpdk_fake_rx_timestamp_ok = 0;
     rusteron_dpdk_fake_max_mtu = 9001;
+    memset(rusteron_dpdk_fake_desc_lim, 0, sizeof(rusteron_dpdk_fake_desc_lim));
     memset(rusteron_dpdk_fake_basic, 0, sizeof(rusteron_dpdk_fake_basic));
     rusteron_dpdk_fake_next_port = 0;
     rusteron_dpdk_fake_next_pool = 0x1000;
@@ -204,6 +207,14 @@ void rusteron_dpdk_fake_set_rx_timestamp_ok(int ok)
     rusteron_dpdk_fake_rx_timestamp_ok = ok;
 }
 
+void rusteron_dpdk_fake_set_desc_limits(uint16_t rx_min, uint16_t rx_max, uint16_t tx_min, uint16_t tx_max)
+{
+    rusteron_dpdk_fake_desc_lim[0] = rx_min;
+    rusteron_dpdk_fake_desc_lim[1] = rx_max;
+    rusteron_dpdk_fake_desc_lim[2] = tx_min;
+    rusteron_dpdk_fake_desc_lim[3] = tx_max;
+}
+
 void rusteron_dpdk_fake_set_max_mtu(uint16_t mtu)
 {
     rusteron_dpdk_fake_max_mtu = mtu;
@@ -277,7 +288,8 @@ static int rusteron_dpdk_fake_dev_info(
     uint16_t port_id, const char *pci_bdf,
     uint8_t mac[RUSTERON_DPDK_ETH_ADDR_LEN],
     char *driver_name, size_t driver_name_len,
-    int *csum_offload_ok, int *ena_llq_available, int *rx_timestamp_ok, uint16_t *max_mtu)
+    int *csum_offload_ok, int *ena_llq_available, int *rx_timestamp_ok, uint16_t *max_mtu,
+    uint16_t desc_lim[4])
 {
     rusteron_dpdk_fake_logf("info %s (port %u)", pci_bdf, port_id);
     if (rusteron_dpdk_fake_step() < 0)
@@ -294,6 +306,7 @@ static int rusteron_dpdk_fake_dev_info(
     *ena_llq_available = 0;
     *rx_timestamp_ok = rusteron_dpdk_fake_rx_timestamp_ok;
     *max_mtu = rusteron_dpdk_fake_max_mtu;
+    memcpy(desc_lim, rusteron_dpdk_fake_desc_lim, sizeof(rusteron_dpdk_fake_desc_lim));
     return 0;
 }
 

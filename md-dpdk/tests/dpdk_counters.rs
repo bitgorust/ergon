@@ -10,9 +10,10 @@
 //!   * TX packet/byte totals are monotonic and attribute exactly the accepted
 //!     prefix (plan §7.4: rejected datagrams are errors, not TX bytes),
 //!   * every approved TX error path bumps its counter (nobufs, tx-eagain, ARP
-//!     miss, validation error incl. oversized), and every RX reject class bumps
-//!     its own counter (checksum, fragmented, unsupported ethertype/protocol,
-//!     discard, queue-drop),
+//!     miss, validation error incl. oversized), the NIC's bandwidth allowance
+//!     (on by default) counts what it holds back as tx-paced, and every RX
+//!     reject class bumps its own counter (checksum, fragmented, unsupported
+//!     ethertype/protocol, discard, queue-drop),
 //!   * ENA SRD/Express extended statistics appear as type-92 counters with the
 //!     PMD's names, are re-read at most once per second (no metrics thread),
 //!     and a *missed* xstat mirrors the plan §9 type-84 counter.
@@ -355,12 +356,284 @@ fn tx_error_paths_counted() {
     assert_eq!(h.counter(TYPE_NOBUFS, "role=sender"), 1, "nobufs counted");
     unsafe { rusteron_dpdk_fake_set_pool_avail(64) };
 
-    // NIC backpressure: the fake accepts nothing in the flush.
+    // NIC backpressure: the ring takes nothing, so the datagram waits in the
+    // port's queue and is reported sent, counted once when it goes.
+    const TX: &str = "role=sender bdf=0000:00:01.0 port=0 q=0 dir=tx";
     unsafe { rusteron_dpdk_fake_set_tx_burst_cap(0) };
     let (rc, sent) = h.send_to((PEER_IP, 40123), &[b"x"]);
-    assert_eq!((rc, sent), (0, 0), "backpressure stops the burst");
-    assert_eq!(h.counter(TYPE_TX_EAGAIN, "role=sender"), 1, "tx-eagain counted");
+    assert_eq!((rc, sent), (1, 1), "queued behind the full ring");
+    assert_eq!(
+        h.counter(TYPE_TX_EAGAIN, &format!("{TX} tx-eagain")),
+        1,
+        "tx-eagain counted"
+    );
+    assert_eq!(
+        h.counter(TYPE_TX_EAGAIN, &format!("{TX} tx-queued")),
+        1,
+        "the queued frame counted"
+    );
     unsafe { rusteron_dpdk_fake_set_tx_burst_cap(64) };
+    assert_eq!(h.send_to((PEER_IP, 40123), &[b"y"]).0, 1, "the ring drained: both go");
+    assert_eq!(
+        h.counter(TYPE_PKTS, &format!("{TX} pkts")),
+        2,
+        "each datagram counted once"
+    );
+    assert_no_leak();
+}
+
+// ---------------------------------------------------------------------------
+// The NIC's bandwidth allowance: on by default, counted as tx-paced
+// ---------------------------------------------------------------------------
+
+const TX_PACED: &str = "role=sender bdf=0000:00:01.0 port=0 q=0 dir=tx tx-paced";
+
+/// One vector of `wire` bytes on the wire (each datagram's payload plus 42
+/// bytes of Ethernet, IPv4 and UDP headers): full 1,514-byte frames, then one
+/// for the rest. Returns the send's result.
+fn send_wire(h: &mut Harness, dst: ([u8; 4], u16), wire: usize) -> c_int {
+    const HEADERS: usize = 42;
+    const FULL: usize = 1472 + HEADERS;
+    let mut datagrams = vec![vec![7u8; 1472]; wire / FULL];
+    if wire % FULL != 0 {
+        assert!(wire % FULL > HEADERS, "the last datagram needs a payload");
+        datagrams.push(vec![7u8; wire % FULL - HEADERS]);
+    }
+    let payloads: Vec<&[u8]> = datagrams.iter().map(Vec::as_slice).collect();
+    h.send_to(dst, &payloads).0
+}
+
+/// With RUSTERON_DPDK_TX_RATE_MBPS unset the NIC's allowance is a backstop at
+/// 25000 Mbit/s (3.125 bytes a nanosecond) that never makes the agent wait.
+/// Drives one whose bucket is `bucket` bytes (whole 65,536-byte vectors): the
+/// bucket goes out at once, and a 78,125-byte overdraw with it (a bucket not
+/// in debt may be overdrawn). That debt takes 25,000 ns to repay: until then
+/// a send sends nothing (a zero result Aeron retries whole, counted as
+/// tx-paced) after one clock read, though the clock moves 1 µs a read, so a
+/// wait spun on it would end and send. A send 1 ns before the debt is repaid
+/// is deferred, which holds only at 25000 Mbit/s or less, and one at it goes,
+/// which holds only at 25000 or more.
+fn assert_the_backstop(h: &mut Harness, bucket: usize) {
+    const T0: u64 = 1_000_000_000;
+    const OVERDRAW: usize = 78_125; // 625,000,000 millibits: 25,000 ns at 25000 Mbit/s
+    pin_clock_ns(T0); // after the harness's reset: the first send finds the bucket full
+    h.init_tx(SENDER_IP, 40000, None, 1472);
+    h.arp_seed(PEER_IP, PEER_MAC);
+    let dst = (PEER_IP, 40123);
+    let sent = || unsafe { rusteron_dpdk_fake_capture_count() };
+
+    for _ in 0..bucket / 65_536 {
+        assert_eq!(send_wire(h, dst, 65_536), 44, "the whole bucket at once");
+    }
+    assert_eq!(send_wire(h, dst, OVERDRAW), 52, "a bucket not in debt may be overdrawn");
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 0, "nothing held back");
+    let burst = sent();
+    assert_eq!(burst, c_int::try_from(bucket / 65_536 * 44 + 52).unwrap());
+
+    step_pinned_clock_ns(1_000);
+    for (at, owed) in [(T0, "25,000 ns owed"), (T0 + 24_999, "1 ns owed")] {
+        pin_clock_ns(at);
+        assert_eq!(h.send_to(dst, &[b"x"]).0, 0, "{owed}: deferred, sends nothing");
+        assert_eq!(
+            unsafe { rusteron_dpdk_clock_ns() },
+            at + 1_000,
+            "{owed}: the send's one clock read, no wait"
+        );
+    }
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 2, "each deferral is tx-paced");
+    assert_eq!(sent(), burst);
+
+    pin_clock_ns(T0 + 25_000);
+    assert_eq!(h.send_to(dst, &[b"y"]).0, 1, "repaid: sent");
+    assert_eq!(unsafe { rusteron_dpdk_clock_ns() }, T0 + 26_000, "at once");
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 2, "not held back");
+    assert_eq!(sent(), burst + 1);
+    assert_no_leak();
+}
+
+/// With RUSTERON_DPDK_TX_RATE_MBPS and RUSTERON_DPDK_TX_BUCKET_BYTES unset the
+/// backstop's bucket is 1 MiB, more than a full ENA ring of 1,450-byte frames
+/// (742,400 bytes), so no burst of such frames the NIC can hold meets it;
+/// with the default RUSTERON_DPDK_TX_PACE_SPIN_US of 20 it still never waits,
+/// not even 1 ns.
+#[test]
+#[serial]
+fn the_default_allowance_is_a_backstop_at_25000_mbps() {
+    for unset in [
+        "RUSTERON_DPDK_TX_RATE_MBPS",
+        "RUSTERON_DPDK_TX_BUCKET_BYTES",
+        "RUSTERON_DPDK_TX_PACE_SPIN_US",
+    ] {
+        assert!(std::env::var_os(unset).is_none(), "the default: {unset} unset");
+    }
+    let mut h = Harness::new();
+    assert_the_backstop(&mut h, 1 << 20);
+}
+
+/// RUSTERON_DPDK_TX_BUCKET_BYTES set, with the rate unset, is the backstop's
+/// bucket: 128 KiB here, neither the backstop's 1 MiB nor the 64 KiB an
+/// operator-set rate takes by default.
+#[test]
+#[serial]
+fn the_backstop_takes_a_bucket_the_operator_set() {
+    let _bucket = EnvGuard::set("RUSTERON_DPDK_TX_BUCKET_BYTES", "131072");
+    let mut h = Harness::new();
+    assert_the_backstop(&mut h, 131_072);
+}
+
+/// However long RUSTERON_DPDK_TX_PACE_SPIN_US allows (here a second, the
+/// most), the backstop never waits. The bucket is set to 64 KiB, as an
+/// operator-set rate's, so that only the spin limit is under test.
+#[test]
+#[serial]
+fn the_backstop_never_waits_whatever_the_spin_limit() {
+    let _spin = EnvGuard::set("RUSTERON_DPDK_TX_PACE_SPIN_US", "1000000");
+    let _bucket = EnvGuard::set("RUSTERON_DPDK_TX_BUCKET_BYTES", "65536");
+    let mut h = Harness::new();
+    assert_the_backstop(&mut h, 65_536);
+}
+
+/// A route allowance (RUSTERON_DPDK_TX_ROUTE_MBPS) under the backstop keeps
+/// its 64 KiB default bucket and its wait: a send the route alone holds back
+/// waits the route's debt out within RUSTERON_DPDK_TX_PACE_SPIN_US (default
+/// 20). The backstop's own debt never causes a wait: while it lasts a send
+/// sends nothing, whatever the route owes.
+#[test]
+#[serial]
+fn under_the_backstop_only_a_route_allowance_waits() {
+    let _routes = EnvGuard::set("RUSTERON_DPDK_TX_ROUTE_MBPS", "10.0.0.5/32=8"); // a byte a microsecond
+    const T0: u64 = 1_000_000_000;
+    let mut h = Harness::new();
+    pin_clock_ns(T0); // after the harness's reset
+    h.init_tx(SENDER_IP, 40000, None, 1472);
+    h.arp_seed(PEER_IP, PEER_MAC);
+    h.arp_seed([10, 0, 0, 6], [0x02, 0, 0, 0, 0, 0x60]);
+    let slow = (PEER_IP, 40123); // 10.0.0.5: over the 8 Mbit/s route, and the NIC
+    let fast = ([10, 0, 0, 6], 40123); // the NIC alone
+    let sent = || unsafe { rusteron_dpdk_fake_capture_count() };
+
+    // the route's 64 KiB bucket less 40 bytes, then 12 bytes past it: 12 µs owed
+    assert_eq!(send_wire(&mut h, slow, 65_496), 44);
+    assert_eq!(send_wire(&mut h, slow, 52), 1, "a route not in debt may be overdrawn");
+    // the backstop's 1 MiB less those 65,548 bytes, then 1,000 past it: 320 ns owed
+    for _ in 0..14 {
+        assert_eq!(send_wire(&mut h, fast, 65_536), 44);
+    }
+    assert_eq!(
+        send_wire(&mut h, fast, 66_524),
+        44,
+        "a backstop not in debt may be overdrawn"
+    );
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 0, "nothing held back");
+    assert_eq!(sent(), 705);
+
+    // From here the pinned clock moves 1 µs a read, so a wait spun on it ends
+    // after a few reads instead of at the spin bound.
+    step_pinned_clock_ns(1_000);
+    for (dst, owed) in [
+        (slow, "the backstop 320 ns and the route 12 µs owed"),
+        (fast, "the backstop 320 ns owed"),
+    ] {
+        pin_clock_ns(T0);
+        assert_eq!(h.send_to(dst, &[b"x"]).0, 0, "{owed}: deferred, sends nothing");
+        assert_eq!(
+            unsafe { rusteron_dpdk_clock_ns() },
+            T0 + 1_000,
+            "{owed}: the send's one clock read, no wait"
+        );
+    }
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 2, "each deferral is tx-paced");
+    assert_eq!(sent(), 705);
+
+    // 320 ns on: the backstop is repaid; the route still owes 11,680 ns
+    pin_clock_ns(T0 + 320);
+    assert_eq!(
+        h.send_to(slow, &[b"y"]).0,
+        1,
+        "the route alone owed: waited out, then sent"
+    );
+    step_pinned_clock_ns(0);
+    assert_eq!(
+        unsafe { rusteron_dpdk_clock_ns() },
+        T0 + 320 + 13 * 1_000,
+        "the send's clock read and 12 µs of reads in the wait"
+    );
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 3, "a wait is counted too");
+    assert_eq!(sent(), 706);
+    assert_no_leak();
+}
+
+/// An allowance the operator set, even to the backstop's 25000 Mbit/s, keeps
+/// the 64 KiB default bucket and waits: a send that finds it overdrawn waits
+/// the debt out if that takes at most the default
+/// RUSTERON_DPDK_TX_PACE_SPIN_US of 20. The debt is set so that the first
+/// send after it would wait 1 ns more than 20 µs (it sends nothing), and the
+/// next, 1 ns later, exactly 20 µs (it waits, then sends): the first holds
+/// only at 25000 Mbit/s or less, the second only at 25000 or more.
+#[test]
+#[serial]
+fn an_operator_set_rate_waits_out_its_debt_within_the_spin_limit() {
+    let _rate = EnvGuard::set("RUSTERON_DPDK_TX_RATE_MBPS", "25000");
+    const T0: u64 = 1_000_000_000;
+    let mut h = Harness::new();
+    pin_clock_ns(T0); // after the harness's reset: the first send finds the bucket full
+    h.init_tx(SENDER_IP, 40000, None, 1472);
+    h.arp_seed(PEER_IP, PEER_MAC);
+    let dst = (PEER_IP, 40123);
+    let sent = || unsafe { rusteron_dpdk_fake_capture_count() };
+
+    assert_eq!(send_wire(&mut h, dst, 65_536), 44, "the whole bucket: 0 left");
+    assert_eq!(
+        send_wire(&mut h, dst, 62_504),
+        42,
+        "a bucket not in debt may be overdrawn"
+    );
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 0, "neither waited");
+
+    // From here the pinned clock moves 1 µs a read, so a wait spun on it ends
+    // after a few reads instead of at the spin bound.
+    step_pinned_clock_ns(1_000);
+    // 62,504 * 8000 / 25000 = 20,001 ns owed: past the 20 µs spin
+    assert_eq!(h.send_to(dst, &[b"x"]).0, 0, "deferred: sends nothing");
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 1, "counted as tx-paced");
+    assert_eq!(sent(), 86);
+    assert_eq!(
+        unsafe { rusteron_dpdk_clock_ns() },
+        T0 + 1_000,
+        "deferred at once: the send's one clock read, no wait"
+    );
+
+    // 1 ns on: 3.125 bytes of allowance back, 62,500.875 owed, 20,000 ns: at the limit
+    pin_clock_ns(T0 + 1);
+    assert_eq!(h.send_to(dst, &[b"y"]).0, 1, "waited the debt out, then sent");
+    step_pinned_clock_ns(0);
+    assert_eq!(
+        unsafe { rusteron_dpdk_clock_ns() },
+        T0 + 1 + 21 * 1_000,
+        "the send's clock read and 20 µs of reads in the wait"
+    );
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 2, "a wait is counted too");
+    assert_eq!(sent(), 87);
+    assert_no_leak();
+}
+
+/// RUSTERON_DPDK_TX_RATE_MBPS=0 turns the NIC's allowance off: the same sends
+/// as above all go out at once and none is paced.
+#[test]
+#[serial]
+fn an_explicit_zero_rate_turns_the_allowance_off() {
+    let _rate = EnvGuard::set("RUSTERON_DPDK_TX_RATE_MBPS", "0");
+    let mut h = Harness::new();
+    pin_clock_ns(1_000_000_000);
+    h.init_tx(SENDER_IP, 40000, None, 1472);
+    h.arp_seed(PEER_IP, PEER_MAC);
+    let dst = (PEER_IP, 40123);
+    assert_eq!(send_wire(&mut h, dst, 65_536), 44);
+    assert_eq!(send_wire(&mut h, dst, 62_504), 42);
+    assert_eq!(h.send_to(dst, &[b"x"]).0, 1, "nothing owed");
+    assert_eq!(h.send_to(dst, &[b"y"]).0, 1);
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 0, "nothing paced");
+    assert_eq!(unsafe { rusteron_dpdk_fake_capture_count() }, 88);
     assert_no_leak();
 }
 
@@ -426,6 +699,92 @@ fn agent_loop_gaps_counted_with_or_without_frames() {
     assert_no_leak();
 }
 
+/// A host-local channel (a kernel socket its agent reads, as in every
+/// localhost run) registers its port's counters too, so the agent's loop
+/// gaps are counted when nothing goes over DPDK.
+#[test]
+#[serial]
+fn a_host_local_channel_counts_the_agents_loop_gaps() {
+    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+    let mut h = Harness::new();
+    h.init_rx([127, 0, 0, 1], 0, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    pin_clock_ns(1_000_000);
+    p.poll(16, clientd, &mut bytes); // the reference
+    pin_clock_ns(1_040_000);
+    p.poll(16, clientd, &mut bytes);
+    assert_eq!(
+        h.counter(TYPE_POLLER, &format!("{RX} poll-cycle-gaps-20-50us")),
+        1,
+        "a 40 µs gap"
+    );
+    assert_eq!(h.counter(TYPE_POLLER, &format!("{RX} poll-cycle-gap-max-ns")), 40_000);
+    assert_no_leak();
+}
+
+/// A port none of a poller's transports uses any more is not polled, and that
+/// is not the agent stalling: when a transport of it comes back, its loop is
+/// timed from the first poll after, not from the last one before it left
+/// (a pong whose channels close and reopen between runs showed a "gap" of
+/// several seconds in every run).
+#[test]
+#[serial]
+fn a_port_away_from_its_poller_is_not_a_loop_gap() {
+    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+    let mut h = Harness::new();
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    let read = |h: &Harness| {
+        (
+            h.counter(TYPE_POLLER, &format!("{RX} poll-cycle-gap-max-ns")),
+            h.counter(TYPE_POLLER, &format!("{RX} poll-cycle-gaps-over-100us")),
+        )
+    };
+    pin_clock_ns(1_000_000);
+    p.poll(16, clientd, &mut bytes);
+    p.remove(&mut *h.rx);
+    pin_clock_ns(9_000_000_000);
+    p.add(&mut *h.rx);
+    p.poll(16, clientd, &mut bytes); // the reference again
+    assert_eq!(read(&h), (0, 0), "9 s away from the poller is not a loop gap");
+    pin_clock_ns(9_000_150_000);
+    p.poll(16, clientd, &mut bytes);
+    assert_eq!(read(&h), (150_000, 1), "gaps count again once it is back");
+    assert_no_leak();
+}
+
+/// The same for a host-local channel, whose port's loop is timed by the
+/// poller's first such channel.
+#[test]
+#[serial]
+fn a_host_local_channel_away_from_its_poller_is_not_a_loop_gap() {
+    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+    let mut h = Harness::new();
+    h.init_rx([127, 0, 0, 1], 0, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    pin_clock_ns(1_000_000);
+    p.poll(16, clientd, &mut bytes);
+    p.remove(&mut *h.rx);
+    pin_clock_ns(9_000_000_000);
+    p.add(&mut *h.rx);
+    p.poll(16, clientd, &mut bytes);
+    assert_eq!(
+        h.counter(TYPE_POLLER, &format!("{RX} poll-cycle-gap-max-ns")),
+        0,
+        "9 s away from the poller is not a loop gap"
+    );
+    assert_no_leak();
+}
+
 /// The receive poller records the longest gap between consecutive polls that
 /// found frames waiting, how many of those gaps reached 100 µs, and how many
 /// polls came back with a full burst: the evidence for a receive ring
@@ -479,11 +838,49 @@ fn rx_poll_gaps_and_full_bursts_counted() {
     );
     assert_eq!(full(&h), 0);
 
-    // A burst-sized backlog (vlen 16 < burst 64, so the limit is 16).
+    // A burst-sized backlog (burst 64, whatever Aeron's vlen).
     pin_clock_ns(1_510_000);
-    inject(16);
-    assert_eq!(p.poll(16, clientd, &mut bytes), 16);
+    inject(64);
+    assert_eq!(p.poll(16, clientd, &mut bytes), 64);
     assert_eq!(full(&h), 1, "the poll drained a full burst: a backlog");
+    assert_eq!(h.counter(TYPE_POLLER, &format!("{RX} rx-backlog-max")), 64);
+    assert_no_leak();
+}
+
+/// The largest backlog one poll drained, and the polls that drained nearly a
+/// whole ring: a ring that full may have overflowed, which MANA does without
+/// counting a drop.
+#[test]
+#[serial]
+fn a_near_full_ring_is_counted_as_a_suspected_overflow() {
+    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+    let mut config = rusteron_dpdk_config_t::valid();
+    config.rx_descriptors = 128;
+    config.burst_size = 32; // drains up to min(8, 128 / 32) = 4 bursts a poll
+    let mut h = Harness::with_config(config);
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let frame = frame_to_receiver(60000, b"ring");
+    let inject = |n: usize| {
+        for _ in 0..n {
+            assert_eq!(
+                unsafe { rusteron_dpdk_fake_rx_inject(RECEIVER_PORT, frame.as_ptr(), frame.len(), RX_GOOD, 1) },
+                0
+            );
+        }
+    };
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    let suspected = |h: &Harness| h.counter(TYPE_POLLER, &format!("{RX} rx-ring-full-suspected"));
+
+    inject(40);
+    assert_eq!(p.poll(16, clientd, &mut bytes), 40);
+    assert_eq!(suspected(&h), 0, "40 of 128: room to spare");
+    inject(100);
+    assert_eq!(p.poll(16, clientd, &mut bytes), 100);
+    assert_eq!(suspected(&h), 1, "100 of 128: within a burst of full");
+    assert_eq!(h.counter(TYPE_POLLER, &format!("{RX} rx-backlog-max")), 100);
     assert_no_leak();
 }
 
@@ -914,4 +1311,44 @@ fn ena_xstats_mirrored_and_sampled_at_1hz() {
     assert_eq!(h.counter(TYPE_MEMPOOL_AVAILABLE, "role=receiver"), 64);
 
     assert_no_leak();
+}
+
+/// RUSTERON_DPDK_NIC_STATS_MS sets how often housekeeping reads the NIC's
+/// statistics (on ENA each read is an admin command to the device), and 0
+/// stops it: the mirrors keep their values from registration. The mempool's
+/// availability, a local read, still refreshes once a second.
+#[test]
+#[serial]
+fn nic_stats_interval_is_configurable_and_0_turns_it_off() {
+    for (interval, reread_at_ms) in [("5000", Some(6_000u64)), ("0", None)] {
+        let _stats = EnvGuard::set("RUSTERON_DPDK_NIC_STATS_MS", interval);
+        let mut h = Harness::new();
+        install_xstats(&["rx_missed"], &[11]);
+        pin_clock_ms(1_000);
+        h.init_rx(RECEIVER_IP, 60000, 1472);
+        let mut p = h.poller();
+        p.add(&mut *h.rx);
+        install_xstats(&["rx_missed"], &[99]);
+        pin_clock_ms(2_000);
+        unsafe { rusteron_dpdk_test_housekeeping_tick(h.native) };
+        assert_eq!(h.counter(TYPE_EXTENDED_STATS, "rx_missed"), 11, "{interval}: not yet");
+        assert_eq!(
+            h.counter(TYPE_MEMPOOL_AVAILABLE, "role=receiver"),
+            64,
+            "{interval}: the mempool still refreshes at 1 Hz"
+        );
+        for at in [6_000u64, 60_000] {
+            pin_clock_ms(at);
+            unsafe { rusteron_dpdk_test_housekeeping_tick(h.native) };
+            let expect = if reread_at_ms.is_some_and(|r| at >= r) { 99 } else { 11 };
+            assert_eq!(
+                h.counter(TYPE_EXTENDED_STATS, "rx_missed"),
+                expect,
+                "{interval} at {at} ms"
+            );
+        }
+        drop(p);
+        drop(h);
+        assert_no_leak();
+    }
 }

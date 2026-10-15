@@ -97,17 +97,46 @@ typedef struct rusteron_dpdk_rx_stats_stct
 #define RUSTERON_DPDK_MAX_EXTRA_IPS 8
 #define RUSTERON_DPDK_MAX_KSOCKS 1024
 #define RUSTERON_DPDK_MAX_TX_ROUTES 16
+/* The most datagrams one send takes (Aeron offers at most 16): also how many
+ * refused frames a NIC can hold queued, one vector's worth. */
+#define RUSTERON_DPDK_TX_VECTOR_MAX 256
 #define RUSTERON_DPDK_MAX_TX_LOW 16 /* RUSTERON_DPDK_TX_LOW_STREAMS ranges */
+/* Each NIC's allowance while RUSTERON_DPDK_TX_RATE_MBPS is unset, megabits per
+ * second of frames: a backstop, which bounds a sustained rate and never
+ * shapes a burst. 25000 is AWS's highest documented rate for one flow
+ * (25 Gbit/s, ENA Express) and above every per-NIC rate measured (about
+ * 12 Gbit/s, DPDK flat out at 32 B on Azure), so no sustained rate measured
+ * reaches it; it holds back a runaway sender. Its bucket is
+ * RUSTERON_DPDK_TX_BACKSTOP_BUCKET_BYTES unless RUSTERON_DPDK_TX_BUCKET_BYTES
+ * is set, and it never makes the agent wait: a send it would delay sends
+ * nothing (a zero result Aeron retries whole), whatever
+ * RUSTERON_DPDK_TX_PACE_SPIN_US allows. It is per NIC: a NIC that carries
+ * more over several flows needs a higher RUSTERON_DPDK_TX_RATE_MBPS, or 0
+ * (off). */
+#define RUSTERON_DPDK_TX_RATE_MBPS_DEFAULT 25000ULL
+/* The backstop's bucket: more than a full ENA TX ring of 1,450-byte frames
+ * (512 x 1,450 = 742,400 bytes; MANA's ring holds 256), so no burst of such
+ * frames the NIC can hold meets it. Jumbo frames (9,002 bytes) fill it at
+ * 117, under a quarter of an ENA ring. */
+#define RUSTERON_DPDK_TX_BACKSTOP_BUCKET_BYTES 1048576ULL
 
-/* A transmit rate allowance: a token bucket in bytes, owned by one NIC's
- * agent alone (plain arithmetic, no atomics); it may go negative (debt). */
+/* A transmit rate allowance: a token bucket, owned by one NIC's agent alone
+ * (plain arithmetic, no atomics); it may go negative (debt). It counts
+ * millibits: a megabit a second is a millibit a nanosecond, so a refill
+ * credits all the time since the last, with no division and no fraction of a
+ * byte dropped however often it runs.
+ * Aligned so it never straddles two cache lines: every send touches it. */
+#define RUSTERON_DPDK_MILLIBITS_PER_BYTE 8000LL
 typedef struct rusteron_dpdk_pacer_stct
 {
-    uint64_t rate_mbps;   /* megabits per second of frames; 0 = no allowance */
-    int64_t bucket_bytes; /* the most it holds: the burst allowed at once */
-    int64_t tokens;
-    uint64_t last_ns;     /* last refill */
-} rusteron_dpdk_pacer_t;
+    uint32_t rate_mbps;       /* megabits per second of frames, at most 400000; 0 = no allowance */
+    uint32_t never_waits;     /* the backstop: a send its debt would delay sends nothing */
+    int64_t bucket_millibits; /* the most it holds: the burst allowed at once */
+    int64_t millibits;
+    uint64_t last_ns;         /* last refill */
+} __attribute__((aligned(32))) rusteron_dpdk_pacer_t;
+
+_Static_assert(32 == sizeof(rusteron_dpdk_pacer_t), "a pacer fills half a cache line");
 
 /* A kernel socket's readiness, raised by the local-I/O thread and cleared by
  * the agent that drains it; one per cache line, so flags of sockets drained by
@@ -139,6 +168,7 @@ typedef struct rusteron_dpdk_port_stct
     uint16_t tx_queue_id;
     int configured;               /* dev_configure succeeded */
     int started;                  /* dev_start succeeded */
+    int queues_ready;             /* both queues set up: only then may the port be closed */
     int link_up;                  /* link_wait_ready succeeded */
     int csum_offload_ok;          /* dev_info: IPv4/UDP checksum offloads */
     int ena_llq_available;        /* dev_info: ENA LLQ/write-combining */
@@ -171,6 +201,14 @@ typedef struct rusteron_dpdk_port_stct
      * both its sends and its polls run there. */
     rusteron_dpdk_rx_stats_t rx_stats;
     rusteron_dpdk_arp_table_t arp;
+    /* Frames the TX ring refused, built and waiting in order for this agent
+     * to send them first, at its next send or poll of the NIC. A send is all
+     * or nothing, as a kernel socket's queue: reporting the part of a vector
+     * the ring took made Aeron send the whole vector again, that part twice.
+     * At most one vector waits: while any frame does, a new vector is refused
+     * whole before anything of it is built. */
+    uint16_t tx_queued_count;
+    rusteron_dpdk_mbuf_t tx_queued[RUSTERON_DPDK_TX_VECTOR_MAX];
 } rusteron_dpdk_port_t;
 
 /* The UDP ports bound on one NIC, exclusively as a kernel socket would. Cold:
@@ -294,6 +332,8 @@ struct rusteron_dpdk_transport_stct
     uint64_t local_hot_ns;               /* adaptive: read every cycle this long after data */
     int local_unwatch;                   /* adaptive: hot sockets come off the epoll (RUSTERON_DPDK_LOCAL_UNWATCH) */
     uint64_t tx_retry_ns;                /* RUSTERON_DPDK_TX_RETRY_US: re-offer a refused tail this long */
+    uint64_t nic_stats_ns;               /* RUSTERON_DPDK_NIC_STATS_MS: housekeeping's NIC statistics reads, 0 never */
+    uint32_t rx_max_bursts;              /* RUSTERON_DPDK_RX_MAX_BURSTS: bursts one poll drains while they come back full */
     uint64_t tx_pace_spin_ns;            /* RUSTERON_DPDK_TX_PACE_SPIN_US: longest wait to repay pacing debt */
     /* RUSTERON_DPDK_TX_ROUTE_MBPS: destination prefixes with their own
      * allowance, longest first (network order); the pacers are per NIC. */
@@ -303,9 +343,9 @@ struct rusteron_dpdk_transport_stct
     /* RUSTERON_DPDK_TX_LOW_STREAMS: stream ids (inclusive ranges) held below
      * the rest under the allowances, and the bucket bytes they leave them
      * (RUSTERON_DPDK_TX_LOW_RESERVE_BYTES). */
+    uint32_t tx_low_count;
     int32_t tx_low_first[RUSTERON_DPDK_MAX_TX_LOW];
     int32_t tx_low_last[RUSTERON_DPDK_MAX_TX_LOW];
-    uint32_t tx_low_count;
     int64_t tx_low_reserve;
     /* The CPUs the creating thread may run on, taken once at create (before
      * the EAL or any pinning): the pool housekeeping picks from. */
@@ -343,37 +383,64 @@ struct rusteron_dpdk_transport_stct
     rusteron_dpdk_ksock_t ksocks[RUSTERON_DPDK_MAX_KSOCKS];
 };
 
+/* Every send reads both counts (the NIC's allowance is on by default), so
+ * they share a cache line: the transport is allocated 64-byte aligned. */
+_Static_assert(offsetof(struct rusteron_dpdk_transport_stct, tx_route_count) / 64 ==
+                   offsetof(struct rusteron_dpdk_transport_stct, tx_low_count) / 64,
+               "the route and low-stream counts share one cache line");
+
 /* Credit an allowance's bucket for the time since its last refill. */
 static inline void rusteron_dpdk_pacer_refill(rusteron_dpdk_pacer_t *p, uint64_t now_ns)
 {
     const uint64_t elapsed = now_ns - p->last_ns;
     p->last_ns = now_ns;
-    /* bytes = ns * Mbit/s / 8000; elapsed is capped so the product cannot overflow */
+    /* millibits = ns * Mbit/s; elapsed is capped so the product cannot overflow */
     const uint64_t capped = elapsed > 1000000000ULL ? 1000000000ULL : elapsed;
-    const int64_t tokens = p->tokens + (int64_t)(capped * p->rate_mbps / 8000ULL);
-    p->tokens = tokens > p->bucket_bytes ? p->bucket_bytes : tokens;
+    const int64_t millibits = p->millibits + (int64_t)(capped * p->rate_mbps);
+    p->millibits = millibits > p->bucket_millibits ? p->bucket_millibits : millibits;
 }
 
 /* Nanoseconds until an allowance's debt is repaid (0: none, or no allowance). */
 static inline uint64_t rusteron_dpdk_pacer_wait(const rusteron_dpdk_pacer_t *p)
 {
-    return 0 == p->rate_mbps || p->tokens >= 0 ? 0 : (uint64_t)(-p->tokens) * 8000ULL / p->rate_mbps;
+    return 0 == p->rate_mbps || p->millibits >= 0 ? 0 : (uint64_t)(-p->millibits) / p->rate_mbps;
+}
+
+/* Whether an allowance that never waits (the backstop) holds a send back: its
+ * wait would not be 0, a nanosecond or more of debt; no division. Only a
+ * NIC's allowance with a rate is ever one. */
+static inline int rusteron_dpdk_pacer_defers(const rusteron_dpdk_pacer_t *p)
+{
+    return p->never_waits && p->millibits <= -(int64_t)p->rate_mbps;
+}
+
+/* Charge `wire` bytes on the wire to an allowance (negative: refund them). */
+static inline void rusteron_dpdk_pacer_charge(rusteron_dpdk_pacer_t *p, int64_t wire)
+{
+    p->millibits -= wire * RUSTERON_DPDK_MILLIBITS_PER_BYTE;
 }
 
 /* Whether a low-priority send of `wire` bytes may draw on an allowance: it
- * leaves `reserve` in the bucket, or the bucket is full (so a batch larger
- * than the bucket less the reserve is held back, never starved). It never
- * overdraws, so the others never wait for its debt. No allowance: always. */
+ * leaves `reserve` bytes in the bucket, or the bucket is full (so a batch
+ * larger than the bucket less the reserve is held back, never starved). It
+ * never overdraws, so the others never wait for its debt. No allowance:
+ * always. */
 static inline int rusteron_dpdk_pacer_spare(const rusteron_dpdk_pacer_t *p, int64_t wire, int64_t reserve)
 {
-    return 0 == p->rate_mbps || p->tokens - wire >= reserve || p->tokens >= p->bucket_bytes;
+    return 0 == p->rate_mbps ||
+        p->millibits - wire * RUSTERON_DPDK_MILLIBITS_PER_BYTE >= reserve * RUSTERON_DPDK_MILLIBITS_PER_BYTE ||
+        p->millibits >= p->bucket_millibits;
 }
 
-static inline void rusteron_dpdk_pacer_init(rusteron_dpdk_pacer_t *p, uint64_t rate_mbps, int64_t bucket, uint64_t now_ns)
+/* `rate_mbps` at most 400000; `bucket` in bytes, at most 1 GiB: in
+ * millibits, far inside an int64. `never_waits`: the backstop. */
+static inline void rusteron_dpdk_pacer_init(rusteron_dpdk_pacer_t *p, uint64_t rate_mbps, int64_t bucket,
+                                            int never_waits, uint64_t now_ns)
 {
-    p->rate_mbps = rate_mbps;
-    p->bucket_bytes = bucket;
-    p->tokens = bucket;
+    p->rate_mbps = (uint32_t)rate_mbps;
+    p->never_waits = 0 != never_waits && 0 != rate_mbps;
+    p->bucket_millibits = bucket * RUSTERON_DPDK_MILLIBITS_PER_BYTE;
+    p->millibits = p->bucket_millibits;
     p->last_ns = now_ns;
 }
 
@@ -471,6 +538,11 @@ int rusteron_dpdk_ksock_register(rusteron_dpdk_transport_t *native, int fd);
 void rusteron_dpdk_ksock_unregister(rusteron_dpdk_transport_t *native, int slot, int fd);
 uint16_t rusteron_dpdk_port_tx(
     rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *port, rusteron_dpdk_mbuf_t **pkts, uint16_t nb);
+/* Send the frames queued behind a full ring, first in, first out: 1 when none
+ * are left, 0 while some still wait (the ring is full). Agent thread only. */
+int rusteron_dpdk_port_tx_flush(rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *port);
+/* Release the frames still queued: the NIC's last transport closed. */
+void rusteron_dpdk_port_tx_drop_queued(rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *port);
 void rusteron_dpdk_runtime_agents_known(
     rusteron_dpdk_transport_t *native, int conductor, int sender, int receiver, const char *conductor_idle);
 void rusteron_dpdk_local_io_open_requested(rusteron_dpdk_transport_t *native, uint64_t now_ns);
@@ -582,6 +654,9 @@ void rusteron_dpdk_clock_init(void);
 /* RUSTERON_DPDK_CLOCK_TSC or RUSTERON_DPDK_CLOCK_MONOTONIC. */
 int rusteron_dpdk_clock_source(void);
 void rusteron_dpdk_test_set_clock_ns(uint64_t ns);
+/* Move the pinned clock on by `ns` at every read from the calling thread (0:
+ * it stays put), so a wait spun on it ends; reset clears it. */
+void rusteron_dpdk_test_set_clock_step_ns(uint64_t ns);
 /* Recalibrate; allow_tsc == 0 forces the CLOCK_MONOTONIC fallback. */
 int rusteron_dpdk_test_clock_recalibrate(int allow_tsc);
 

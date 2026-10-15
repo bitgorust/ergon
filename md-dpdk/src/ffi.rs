@@ -420,3 +420,39 @@ fn wildcard_port_range(context: &AeronDriverContext, role: &str) -> Result<(u16,
     })?;
     Ok((low, high))
 }
+
+/// Locks the process's memory, present and future, when
+/// `RUSTERON_MEDIA_DRIVER_MLOCKALL=1`.
+///
+/// `mlockall(MCL_CURRENT | MCL_FUTURE)` makes each log buffer the driver's
+/// conductor maps fault in during `mmap` itself. The
+/// agents then never take a page fault on one, and a fault's read of the
+/// process's memory-map lock can no longer wait behind the conductor mapping or
+/// unmapping another buffer (both agents stalled together for a millisecond on
+/// Azure). Unset or `0` locks nothing. Call it before the driver starts; it
+/// needs `CAP_IPC_LOCK` or a large enough `RLIMIT_MEMLOCK`. Returns whether it
+/// locked.
+///
+/// # Errors
+///
+/// [`DpdkError::InvalidConfiguration`] for a value other than `0` or `1`;
+/// [`DpdkError::Native`] if `mlockall` fails.
+pub fn lock_memory_from_env() -> Result<bool, DpdkError> {
+    match std::env::var("RUSTERON_MEDIA_DRIVER_MLOCKALL").as_deref() {
+        Err(_) | Ok("" | "0") => Ok(false),
+        Ok("1") => {
+            // SAFETY: mlockall takes only flags and touches no Rust memory.
+            if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } == 0 {
+                Ok(true)
+            } else {
+                Err(DpdkError::Native(format!(
+                    "RUSTERON_MEDIA_DRIVER_MLOCKALL=1: mlockall failed: {} (needs CAP_IPC_LOCK or RLIMIT_MEMLOCK)",
+                    std::io::Error::last_os_error()
+                )))
+            }
+        }
+        Ok(other) => Err(DpdkError::InvalidConfiguration(format!(
+            "RUSTERON_MEDIA_DRIVER_MLOCKALL={other}: 0 or 1"
+        ))),
+    }
+}

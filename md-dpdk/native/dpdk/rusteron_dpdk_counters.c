@@ -75,6 +75,9 @@ static const rusteron_dpdk_counter_spec_t rusteron_dpdk_counter_specs[RD_COUNTER
     [RD_COUNTER_POLL_CYCLE_GAPS_20US] = { RUSTERON_DPDK_TYPE_POLLER, "poll-cycle-gaps-20-50us", "rx" },
     [RD_COUNTER_POLL_CYCLE_GAPS_50US] = { RUSTERON_DPDK_TYPE_POLLER, "poll-cycle-gaps-50-100us", "rx" },
     [RD_COUNTER_POLL_CYCLE_GAPS_100US] = { RUSTERON_DPDK_TYPE_POLLER, "poll-cycle-gaps-over-100us", "rx" },
+    [RD_COUNTER_TX_QUEUED] = { RUSTERON_DPDK_TYPE_TX_EAGAIN, "tx-queued", "tx" },
+    [RD_COUNTER_RX_BACKLOG_MAX] = { RUSTERON_DPDK_TYPE_POLLER, "rx-backlog-max", "rx" },
+    [RD_COUNTER_RX_RING_FULL_SUSPECTED] = { RUSTERON_DPDK_TYPE_POLLER, "rx-ring-full-suspected", "rx" },
 };
 
 static void rusteron_dpdk_counters_label(
@@ -289,6 +292,7 @@ int rusteron_dpdk_counters_register(
     }
 
     c->last_sample_ns = rusteron_dpdk_clock_now();
+    c->last_nic_sample_ns = c->last_sample_ns;
     c->registered = 1;
     c->dormant = 0;
     return 0;
@@ -296,7 +300,7 @@ int rusteron_dpdk_counters_register(
 
 void rusteron_dpdk_counters_sample(
     rusteron_dpdk_counters_t *c, const rusteron_dpdk_port_t *port,
-    const rusteron_dpdk_port_ops_t *ops, uint64_t now_ns)
+    const rusteron_dpdk_port_ops_t *ops, uint64_t now_ns, uint64_t nic_stats_ns)
 {
     if (NULL == c || !c->registered || NULL == port || NULL == ops)
     {
@@ -316,6 +320,14 @@ void rusteron_dpdk_counters_sample(
             c->addr[RD_COUNTER_MEMPOOL_AVAILABLE],
             (int64_t)ops->mempool_avail(port->mempool), __ATOMIC_RELAXED);
     }
+
+    /* The NIC's own statistics: on ENA each read is an admin command to the
+     * device, so as often as RUSTERON_DPDK_NIC_STATS_MS says (0: never). */
+    if (0 == nic_stats_ns || now_ns < c->last_nic_sample_ns || now_ns - c->last_nic_sample_ns < nic_stats_ns)
+    {
+        return;
+    }
+    c->last_nic_sample_ns = now_ns;
 
     uint64_t ierrors, imissed, rx_nombuf;
     if (NULL != ops->basic_stats && 0 == ops->basic_stats(port->port_id, &ierrors, &imissed, &rx_nombuf))

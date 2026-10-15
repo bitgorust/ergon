@@ -20,7 +20,34 @@
   to dispatch per port (type 81).
   Nothing periodic runs on the driver's agents: a learned ARP next hop is
   refreshed in the background while sends keep using it, and the 1 Hz statistics
-  sample runs on a housekeeping thread.
+  sample runs on a housekeeping thread (`RUSTERON_DPDK_NIC_STATS_MS` sets how
+  often it reads the NIC's own statistics, admin commands on ENA; 0 never).
+  An agent's loop-gap counters time only the agent: a port's absence from a
+  poller (its channels closed and reopened) is no longer counted as a gap.
+  A send is all or nothing: what a full TX ring refuses waits, built, in the
+  NIC's queue (`tx-queued`) and goes first at the agent's next send or poll,
+  and the whole vector is reported sent. Reporting the accepted part made
+  Aeron send the whole vector again, that part twice: on AWS ENA an estimated
+  third to half of flat-out frames were duplicates. Out of mbufs part-way, a
+  send now sends nothing instead of a prefix.
+  A receive poll is no longer capped by Aeron's vlen (frames are dispatched
+  one at a time, zero copy, so vlen sized nothing): it takes up to the burst
+  size a burst and keeps draining while bursts come back full, up to
+  `RUSTERON_DPDK_RX_MAX_BURSTS` (default: as many as fill the ring, at most
+  8), with `rx-backlog-max` and `rx-ring-full-suspected` counters. The
+  sender's control poll, which Aeron calls with vlen 1, took one frame a duty
+  cycle before. `RUSTERON_DPDK_MBUFS_PER_PORT` defaults to 16384 (what the
+  lab measured), and a mempool cache of 0 is honoured (no per-core cache)
+  instead of being replaced by 256, with more than 512 rejected.
+  The bundled `media_driver` sets receiver IO vectors to 16 under `dpdk-ena`
+  unless `AERON_RECEIVER_IO_VECTOR_CAPACITY` is set (never under the socket
+  transport), locks its memory with `RUSTERON_MEDIA_DRIVER_MLOCKALL=1`, and
+  stops cleanly on SIGTERM and SIGHUP as well as SIGINT; the device plugin
+  also stops on SIGTERM without waiting for kubelet's open stream. The EKS
+  node setup leaves `vm.min_free_kbytes` and the primary ENA's coalescing and
+  busy polling at the kernel's values, caps C-states only on virtualised
+  instances, turns transparent hugepages off from the kernel command line,
+  and accepts bare-metal nodes with the IOMMU in passthrough.
   Behaves as the kernel UDP sockets Aeron's own transport uses, so it
   interoperates with kernel peers: wildcard binds get an ephemeral port
   (previously port 0 went on the wire and kernel peers could never answer),
@@ -37,14 +64,27 @@
   sends below a VM's cap (`RUSTERON_DPDK_TX_RATE_MBPS`) and a slower link's
   (`RUSTERON_DPDK_TX_ROUTE_MBPS`), and `RUSTERON_DPDK_TX_LOW_STREAMS` holds
   streams that can wait below the rest under them, so a latency-critical
-  stream never queues behind bulk; frames the NIC refuses are not charged to
-  them. A host-local socket whose agent reads it every cycle comes off the
-  local-I/O thread's epoll, so busy localhost senders no longer wake that
+  stream never queues behind bulk; frames a send does not send or queue (out
+  of mbufs, an oversized datagram) are not charged to them, and frames a full
+  ring refuses are charged once, when queued. Each NIC's allowance defaults
+  to a backstop of 25000 Mbit/s (`0` turns it off), AWS's highest documented
+  rate for one flow and above every per-NIC rate measured: it bounds a
+  sustained rate and leaves bursts alone, with a 1 MiB bucket (more than a
+  full ENA ring of 1,450-byte frames) unless `RUSTERON_DPDK_TX_BUCKET_BYTES`
+  is set, and never makes the agent wait (a send it would delay sends
+  nothing, and Aeron retries it), so it holds back only a runaway sender. It
+  is per NIC: where one NIC carries more than 25 Gbit/s over several flows
+  (c7i.metal-24xl, c7i.48xlarge), raise it or set `0`.
+  `RUSTERON_DPDK_TX_LOW_STREAMS` still needs an allowance the operator set.
+  AWS holds one flow (one channel) to about 8 Gbit/s of frames whatever the
+  allowance. A host-local socket whose agent reads it every cycle comes off
+  the local-I/O thread's epoll, so busy localhost senders no longer wake that
   thread with every datagram, and the EAL's own threads are confined to the
-  main lcore's CPUs, never the agents'. Malformed or overlong `RUSTERON_DPDK_*`
-  values (`RUSTERON_DPDK_WILDCARD_LOCAL=off`, `RUSTERON_DPDK_EAL_ARGS` past the
-  EAL's 1 KiB argument buffer) fail initialisation, naming the variable,
-  instead of being read loosely or cut short.
+  main lcore's CPUs, never the agents'. Malformed or overlong
+  `RUSTERON_DPDK_*` values (`RUSTERON_DPDK_WILDCARD_LOCAL=off`,
+  `RUSTERON_DPDK_EAL_ARGS` past the EAL's 1 KiB argument buffer) fail
+  initialisation, naming the variable, instead of being read loosely or cut
+  short.
 
 ### Changed
 - The workspace toolchain is Rust 1.99.0.

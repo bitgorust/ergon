@@ -1134,9 +1134,13 @@ fn callback_before_recycle_ordering() {
     assert_no_leak();
 }
 
+/// Aeron's vlen does not cap a poll of the NIC: every frame is dispatched
+/// through the first msgvec entry the moment it is parsed (zero copy), so
+/// vlen sizes nothing here, and the sender's control poll (vlen 1) would
+/// otherwise drain one frame a duty cycle.
 #[test]
 #[serial]
-fn poll_caps_to_vlen_and_accumulates_bytes() {
+fn a_poll_is_not_capped_by_aerons_vlen() {
     let mut h = Harness::new();
     h.init(
         aeron_udp_channel_transport_affinity_t::AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_RECEIVER,
@@ -1147,37 +1151,47 @@ fn poll_caps_to_vlen_and_accumulates_bytes() {
     let mut p = h.poller();
     p.add(&mut *h.transport);
 
-    let f1 = frame_to_receiver(60000, b"one");
-    let f2 = frame_to_receiver(60000, b"two");
-    assert_eq!(
-        unsafe { rusteron_dpdk_fake_rx_inject(RECEIVER_PORT, f1.as_ptr(), f1.len(), 0, 1) },
-        0
-    );
-    assert_eq!(
-        unsafe { rusteron_dpdk_fake_rx_inject(RECEIVER_PORT, f2.as_ptr(), f2.len(), 0, 1) },
-        0
-    );
+    for payload in [b"one", b"two"] {
+        let f = frame_to_receiver(60000, payload);
+        assert_eq!(
+            unsafe { rusteron_dpdk_fake_rx_inject(RECEIVER_PORT, f.as_ptr(), f.len(), 0, 1) },
+            0
+        );
+    }
     let mut bytes = 0i64;
     let clientd = &mut h.rx as *mut Vec<RxDatagram> as *mut c_void;
-    assert_eq!(p.poll(1, clientd, &mut bytes), 1, "vlen=1 caps the poll");
-    assert_eq!(bytes, 3);
-    assert_eq!(h.rx.len(), 1);
-    assert_eq!(
-        unsafe { rusteron_dpdk_fake_rx_queued(RECEIVER_PORT) },
-        1,
-        "one frame still queued"
-    );
-
-    assert_eq!(p.poll(16, clientd, &mut bytes), 1, "the second poll drains the rest");
-    assert_eq!(bytes, 6, "bytes_rcved accumulates across polls");
+    assert_eq!(p.poll(1, clientd, &mut bytes), 2, "vlen 1 still drains both");
+    assert_eq!(bytes, 6);
     assert_eq!(h.rx.len(), 2);
-    assert_eq!(h.stats().accepted, 2);
+    assert_eq!(unsafe { rusteron_dpdk_fake_rx_queued(RECEIVER_PORT) }, 0);
+
+    let f = frame_to_receiver(60000, b"six");
+    assert_eq!(
+        unsafe { rusteron_dpdk_fake_rx_inject(RECEIVER_PORT, f.as_ptr(), f.len(), 0, 1) },
+        0
+    );
+    assert_eq!(p.poll(16, clientd, &mut bytes), 1);
+    assert_eq!(bytes, 9, "bytes_rcved accumulates across polls");
+    assert_eq!(h.stats().accepted, 3);
     assert_no_leak();
 }
 
+fn inject_n(n: usize) {
+    for i in 0..n {
+        let f = frame_to_receiver(60000, &[b'a' + (i % 26) as u8; 4]);
+        assert_eq!(
+            unsafe { rusteron_dpdk_fake_rx_inject(RECEIVER_PORT, f.as_ptr(), f.len(), 0, 1) },
+            0
+        );
+    }
+}
+
+/// A full burst means the ring may hold more: the poll keeps draining, a
+/// burst at a time, so a backlog a stall left behind clears in one duty
+/// cycle, not one burst per cycle while the ring keeps filling.
 #[test]
 #[serial]
-fn burst_size_caps_poll_batch() {
+fn a_full_burst_keeps_the_poll_draining() {
     let mut h = Harness::new_with_burst(2);
     h.init(
         aeron_udp_channel_transport_affinity_t::AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_RECEIVER,
@@ -1187,23 +1201,40 @@ fn burst_size_caps_poll_batch() {
     );
     let mut p = h.poller();
     p.add(&mut *h.transport);
-
-    let frames: Vec<Vec<u8>> = (0..3).map(|i| frame_to_receiver(60000, &[b'a' + i as u8; 4])).collect();
-    for f in &frames {
-        assert_eq!(
-            unsafe { rusteron_dpdk_fake_rx_inject(RECEIVER_PORT, f.as_ptr(), f.len(), 0, 1) },
-            0
-        );
-    }
+    inject_n(5);
     let mut bytes = 0i64;
     let clientd = &mut h.rx as *mut Vec<RxDatagram> as *mut c_void;
-    assert_eq!(p.poll(16, clientd, &mut bytes), 2, "burst_size caps the batch");
-    assert_eq!(h.rx.len(), 2);
-    assert_eq!(unsafe { rusteron_dpdk_fake_rx_queued(RECEIVER_PORT) }, 1);
-    assert_eq!(p.poll(16, clientd, &mut bytes), 1, "remaining frame on the next poll");
-    assert_eq!(h.rx.len(), 3);
-    assert_eq!(h.stats().accepted, 3);
+    assert_eq!(p.poll(16, clientd, &mut bytes), 5, "bursts of 2, 2 and 1 in one poll");
+    assert_eq!(h.rx.len(), 5);
+    assert_eq!(unsafe { rusteron_dpdk_fake_rx_queued(RECEIVER_PORT) }, 0);
     assert_no_leak();
+}
+
+/// RUSTERON_DPDK_RX_MAX_BURSTS caps the bursts one poll drains; 1 is one
+/// burst a poll.
+#[test]
+#[serial]
+fn rx_max_bursts_caps_the_drain() {
+    for (max_bursts, first, second) in [("1", 2, 2), ("2", 4, 3)] {
+        let _bursts = EnvGuard::set("RUSTERON_DPDK_RX_MAX_BURSTS", max_bursts);
+        let mut h = Harness::new_with_burst(2);
+        h.init(
+            aeron_udp_channel_transport_affinity_t::AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_RECEIVER,
+            RECEIVER_IP,
+            60000,
+            1472,
+        );
+        let mut p = h.poller();
+        p.add(&mut *h.transport);
+        inject_n(7);
+        let mut bytes = 0i64;
+        let clientd = &mut h.rx as *mut Vec<RxDatagram> as *mut c_void;
+        assert_eq!(p.poll(16, clientd, &mut bytes), first, "max {max_bursts}: first poll");
+        assert_eq!(p.poll(16, clientd, &mut bytes), second, "max {max_bursts}: second poll");
+        drop(p);
+        drop(h);
+        assert_no_leak();
+    }
 }
 
 #[test]

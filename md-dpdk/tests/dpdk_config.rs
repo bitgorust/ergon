@@ -119,6 +119,23 @@ fn set_env_from_canonical() {
 }
 
 /// Assert a validation error that names `needle` (the offending field).
+/// `RUSTERON_MEDIA_DRIVER_MLOCKALL` takes 0 or 1 (unset: 0, nothing locked);
+/// anything else is refused, naming the variable, before the driver starts.
+#[serial]
+#[test]
+fn mlockall_setting_is_validated() {
+    remove_var("RUSTERON_MEDIA_DRIVER_MLOCKALL");
+    assert!(!ergon_md_dpdk::lock_memory_from_env().unwrap(), "unset: nothing locked");
+    set_var("RUSTERON_MEDIA_DRIVER_MLOCKALL", "0");
+    assert!(!ergon_md_dpdk::lock_memory_from_env().unwrap(), "0: nothing locked");
+    for bad in ["yes", "2", "true"] {
+        set_var("RUSTERON_MEDIA_DRIVER_MLOCKALL", bad);
+        let e = ergon_md_dpdk::lock_memory_from_env().unwrap_err();
+        assert!(e.to_string().contains("RUSTERON_MEDIA_DRIVER_MLOCKALL"), "{bad}: {e}");
+    }
+    remove_var("RUSTERON_MEDIA_DRIVER_MLOCKALL");
+}
+
 fn assert_invalid_config(config: &DpdkTransportConfig, needle: &str) {
     let err = config.validate().unwrap_err();
     assert!(
@@ -423,6 +440,21 @@ fn validation_rejects_burst_above_256() {
     assert_invalid_config(&c, "burst_size");
 }
 
+/// DPDK takes a per-core mempool cache of 0 (none) to 512 entries: 0 is
+/// honoured, not replaced, and more than 512 is reported here instead of
+/// failing inside the pool's creation.
+#[serial]
+#[test]
+fn validation_bounds_the_mempool_cache() {
+    let mut c = canonical();
+    c.mempool_cache = 0;
+    assert!(c.validate().is_ok(), "no cache is a valid choice");
+    c.mempool_cache = 512;
+    assert!(c.validate().is_ok());
+    c.mempool_cache = 513;
+    assert_invalid_config(&c, "mempool_cache");
+}
+
 #[serial]
 #[test]
 fn validation_rejects_undersized_mbuf_pool() {
@@ -568,8 +600,8 @@ fn env_defaults_match_plan() {
     let c = env::config_from_env().unwrap();
     assert_eq!(c.hugepage_dir, std::path::PathBuf::from("/dev/hugepages"));
     assert_eq!(c.rx_descriptors, 1024);
-    assert_eq!(c.tx_descriptors, 1024);
-    assert_eq!(c.mbufs_per_port, 65536);
+    assert_eq!(c.tx_descriptors, 512); // an ENA's maximum
+    assert_eq!(c.mbufs_per_port, 16384, "what the lab measured");
     assert_eq!(c.mempool_cache, 256);
     assert_eq!(c.burst_size, 32);
     assert_eq!(c.max_aeron_mtu, 1408);

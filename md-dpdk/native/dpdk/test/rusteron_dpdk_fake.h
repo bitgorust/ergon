@@ -19,6 +19,7 @@ extern "C" {
 
 /* Reset all fake state (call via the Rust test setup between tests). */
 void rusteron_dpdk_fake_reset(void);
+void rusteron_dpdk_fake_set_desc_limits(uint16_t rx_min, uint16_t rx_max, uint16_t tx_min, uint16_t tx_max);
 
 /* Fail the n-th init step (1..=18; 1-9 hit the sender, 10-18 the receiver). */
 void rusteron_dpdk_fake_set_failure(int step);

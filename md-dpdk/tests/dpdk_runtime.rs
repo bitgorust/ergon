@@ -22,8 +22,8 @@
 mod common;
 use common::{
     EnvGuard, TestEnv, close, cpu_has_invariant_tsc, create, dump, last_error, last_error_code, rusteron_dpdk_clock_ns,
-    rusteron_dpdk_clock_source, rusteron_dpdk_config_t, rusteron_dpdk_fake_set_max_mtu,
-    rusteron_dpdk_test_clock_recalibrate,
+    rusteron_dpdk_clock_source, rusteron_dpdk_config_t, rusteron_dpdk_fake_set_desc_limits,
+    rusteron_dpdk_fake_set_max_mtu, rusteron_dpdk_test_clock_recalibrate,
 };
 use serial_test::serial;
 
@@ -386,6 +386,63 @@ fn max_aeron_mtu_above_the_nics_maximum_fails_start() {
     assert!(err.contains("maximum 1500") && err.contains("at most 1472"), "{err}");
 }
 
+/// Descriptor counts outside what the NIC reports (an ENA takes at most 512
+/// transmit descriptors) fail start, naming the variable and the limits,
+/// before any queue is configured: DPDK would refuse the queue and leave the
+/// port half set up.
+#[serial]
+#[test]
+fn descriptor_counts_outside_the_nics_limits_fail_start() {
+    let env = TestEnv::new();
+    for (rx, tx, needle) in [
+        (1024, 1024, "RUSTERON_DPDK_TX_DESCRIPTORS) 1024"),
+        (64, 512, "RUSTERON_DPDK_RX_DESCRIPTORS) 64"),
+    ] {
+        env.reset();
+        env.eal_skip();
+        unsafe { rusteron_dpdk_fake_set_desc_limits(128, 8192, 128, 512) };
+        let mut config = rusteron_dpdk_config_t::valid();
+        config.rx_descriptors = rx;
+        config.tx_descriptors = tx;
+        let err = create(&config).unwrap_err();
+        assert!(err.contains(needle) && err.contains("128.."), "{err}");
+        assert!(
+            log_index_containing(&env, "configure") < 0,
+            "configured before the check"
+        );
+    }
+    env.reset();
+    env.eal_skip();
+    unsafe { rusteron_dpdk_fake_set_desc_limits(128, 8192, 128, 512) };
+    let mut config = rusteron_dpdk_config_t::valid();
+    config.tx_descriptors = 512;
+    let t = create(&config).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(close(t), 0);
+}
+
+/// A port whose queues were not all set up is never closed: DPDK's ENA close
+/// releases every configured queue without checking it was set up
+/// (ena_tx_queue_release, DPDK 24.11), which crashed the driver on AWS. The
+/// set-up port and both pools are still torn down.
+#[serial]
+#[test]
+fn a_port_whose_queue_setup_failed_is_not_closed() {
+    let env = TestEnv::new();
+    env.eal_skip();
+    env.set_failure(15); // the receiver's transmit queue (steps 10..=18)
+    let err = create(&rusteron_dpdk_config_t::valid()).unwrap_err();
+    assert!(err.contains("tx queue setup failed"), "{err}");
+    assert!(
+        log_index_containing(&env, "close 1") < 0,
+        "the half-set-up receiver was closed"
+    );
+    assert!(log_index_containing(&env, "close 0") >= 0, "the sender was not closed");
+    assert!(
+        log_index_containing(&env, "free 0x1020") >= 0,
+        "the receiver's pool was not freed"
+    );
+}
+
 /// Jumbo frames: a NIC with a 9001-byte MTU carries max_aeron_mtu 8960.
 #[serial]
 #[test]
@@ -584,9 +641,9 @@ fn local_io_mode_is_validated() {
 }
 
 /// Low-priority streams: non-negative stream ids or ranges, under an
-/// allowance that can hold them back (the NIC's or a route's), with a
-/// reserve smaller than the bucket; anything else fails creation, naming the
-/// variable.
+/// allowance the operator set to hold them back (the NIC's or a route's: the
+/// NIC's built-in default is only a backstop), with a reserve smaller than
+/// the bucket; anything else fails creation, naming the variable.
 #[test]
 #[serial]
 fn low_priority_streams_are_validated() {
@@ -596,7 +653,10 @@ fn low_priority_streams_are_validated() {
         (Some("8000"), None, "3003", None, true),
         (Some("8000"), None, " 3003 , 5000-5999 ", Some("1000"), true),
         (None, Some("10.0.0.0/8=100"), "3003", None, true),
-        (None, None, "3003", None, false), // no allowance to hold them back
+        (Some("25000"), None, "3003", None, true), // set, even to the default's value
+        (None, None, "3003", None, false),         // the default rate does not count
+        (Some("0"), None, "3003", None, false),    // the NIC's allowance off
+        (Some(""), None, "3003", None, false),     // empty: unset
         (Some("8000"), None, "5999-5000", None, false),
         (Some("8000"), None, "-7", None, false),
         (Some("8000"), None, "x", None, false),
@@ -679,6 +739,76 @@ fn wildcard_local_is_validated() {
     }
 }
 
+/// RUSTERON_DPDK_NIC_STATS_MS, how often housekeeping reads the NIC's
+/// statistics, takes 0 (never) or whole milliseconds from a second to an hour;
+/// anything else fails creation, naming the variable.
+#[test]
+#[serial]
+fn nic_stats_interval_is_validated() {
+    let env = TestEnv::new();
+    env.eal_skip();
+    for (value, ok) in [
+        ("", true),
+        ("0", true),
+        ("1000", true),
+        ("3600000", true),
+        ("999", false),
+        ("1", false),
+        ("3600001", false),
+        ("1s", false),
+        ("-1", false),
+        ("1.5", false),
+    ] {
+        let _stats = EnvGuard::set("RUSTERON_DPDK_NIC_STATS_MS", value);
+        match create(&rusteron_dpdk_config_t::valid()) {
+            Ok(native) => {
+                assert!(ok, "{value:?} accepted");
+                close(native);
+            }
+            Err(e) => {
+                assert!(!ok, "{value:?}: {e}");
+                assert!(e.contains("RUSTERON_DPDK_NIC_STATS_MS"), "{e}");
+            }
+        }
+        env.reset();
+        env.eal_skip();
+    }
+}
+
+/// RUSTERON_DPDK_RX_MAX_BURSTS, the most bursts one poll drains, takes 1 to
+/// 64 (unset: as many as fill the receive ring, at most 8); anything else
+/// fails creation, naming the variable.
+#[test]
+#[serial]
+fn rx_max_bursts_is_validated() {
+    let env = TestEnv::new();
+    env.eal_skip();
+    for (value, ok) in [
+        ("", true),
+        ("1", true),
+        ("8", true),
+        ("64", true),
+        ("0", false),
+        ("65", false),
+        ("two", false),
+        ("-1", false),
+    ] {
+        let _bursts = EnvGuard::set("RUSTERON_DPDK_RX_MAX_BURSTS", value);
+        match create(&rusteron_dpdk_config_t::valid()) {
+            Ok(native) => {
+                assert!(ok, "{value:?} accepted");
+                close(native);
+            }
+            Err(e) => {
+                assert!(!ok, "{value:?}: {e}");
+                assert!(e.contains("RUSTERON_DPDK_RX_MAX_BURSTS"), "{e}");
+            }
+        }
+        env.reset();
+        env.eal_skip();
+    }
+}
+
 /// An extra-address list longer than the parser takes fails creation, naming
 /// the variable, instead of being cut short (losing the addresses past the cut).
 #[test]
@@ -694,6 +824,39 @@ fn extra_address_lists_are_never_cut_short() {
             panic!("a list cut short was accepted");
         }
         Err(e) => assert!(e.contains("RUSTERON_DPDK_SENDER_EXTRA_IPV4"), "{e}"),
+    }
+}
+
+/// RUSTERON_DPDK_TX_RATE_MBPS, the NIC's allowance, takes 0 (none) up to
+/// 400000 Mbit/s (unset or empty: 25000); anything else fails creation,
+/// naming the variable.
+#[test]
+#[serial]
+fn nic_rate_is_validated() {
+    let env = TestEnv::new();
+    env.eal_skip();
+    for (value, ok) in [
+        ("", true),
+        ("0", true),
+        ("25000", true),
+        ("400000", true),
+        ("400001", false),
+        ("-1", false),
+        ("8g", false),
+    ] {
+        let _rate = EnvGuard::set("RUSTERON_DPDK_TX_RATE_MBPS", value);
+        match create(&rusteron_dpdk_config_t::valid()) {
+            Ok(native) => {
+                assert!(ok, "{value:?} accepted");
+                close(native);
+            }
+            Err(e) => {
+                assert!(!ok, "{value:?}: {e}");
+                assert!(e.contains("RUSTERON_DPDK_TX_RATE_MBPS"), "{e}");
+            }
+        }
+        env.reset();
+        env.eal_skip();
     }
 }
 

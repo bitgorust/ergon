@@ -287,13 +287,22 @@ impl Harness {
         Self::build_with(TestEnv::adopt(), false)
     }
 
+    /// Over `config` instead of the default one.
+    pub fn with_config(config: rusteron_dpdk_config_t) -> Self {
+        Self::build_from(TestEnv::new(), config)
+    }
+
     fn build_with(env: TestEnv, rx_hw_timestamp: bool) -> Self {
-        env.eal_skip();
         let mut config = rusteron_dpdk_config_t::valid();
         if rx_hw_timestamp {
             env.set_rx_timestamp_ok(true);
             config.rx_hw_timestamp = 1;
         }
+        Self::build_from(env, config)
+    }
+
+    fn build_from(env: TestEnv, config: rusteron_dpdk_config_t) -> Self {
+        env.eal_skip();
         let native = create(&config).unwrap_or_else(|e| panic!("create failed: {e}"));
         let bindings = unsafe { rusteron_dpdk_transport_bindings() };
         assert!(!bindings.is_null());
@@ -527,6 +536,15 @@ impl Poller {
         };
         assert_eq!(rc, 0, "poller_add failed: {}", last_error());
         self.added.push(transport);
+    }
+
+    pub fn remove(&mut self, transport: *mut aeron_udp_channel_transport_t) {
+        let rc = unsafe {
+            let b = &*self.bindings;
+            b.poller_remove_func.unwrap()(&mut *self.inner, transport)
+        };
+        assert_eq!(rc, 0, "poller_remove failed: {}", last_error());
+        self.added.retain(|t| *t != transport);
     }
 
     /// One poll into a caller-owned `msgvec`, dispatching to `cb` (the

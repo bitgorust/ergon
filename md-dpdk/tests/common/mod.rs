@@ -388,6 +388,8 @@ unsafe extern "C" {
     /// for the clock benchmark: CLOCK_MONOTONIC in milliseconds.
     pub fn rusteron_dpdk_fake_legacy_clock_ms() -> u64;
     pub fn rusteron_dpdk_fake_set_max_mtu(mtu: u16);
+    /// The descriptor limits the fake ports report (0: none).
+    pub fn rusteron_dpdk_fake_set_desc_limits(rx_min: u16, rx_max: u16, tx_min: u16, tx_max: u16);
     pub fn rusteron_dpdk_fake_set_basic_stats(ierrors: u64, imissed: u64, rx_nombuf: u64);
     /// One housekeeping pass (the PMD statistics sample) on the calling thread.
     pub fn rusteron_dpdk_test_housekeeping_tick(transport: *mut c_void);
@@ -400,6 +402,7 @@ unsafe extern "C" {
     pub fn rusteron_dpdk_fake_allocated() -> c_int;
     pub fn rusteron_dpdk_fake_released() -> c_int;
     pub fn rusteron_dpdk_test_set_clock_ns(ns: u64);
+    pub fn rusteron_dpdk_test_set_clock_step_ns(ns: u64);
     pub fn rusteron_dpdk_clock_ns() -> u64;
     pub fn rusteron_dpdk_clock_source() -> c_int;
     pub fn rusteron_dpdk_test_clock_recalibrate(allow_tsc: c_int) -> c_int;
@@ -413,6 +416,14 @@ pub fn pin_clock_ms(ms: u64) {
 /// Pin the transport clock at `ns` nanoseconds; `TestEnv::new` clears the pin.
 pub fn pin_clock_ns(ns: u64) {
     unsafe { rusteron_dpdk_test_set_clock_ns(ns) };
+}
+
+/// Move the pinned clock on by `ns` at every read from this thread (0: it
+/// stays put), so a wait the transport spins out on it ends instead of
+/// running to the spin bound. Other threads' reads (the local-I/O thread's)
+/// leave it where it is. `TestEnv::new` clears it.
+pub fn step_pinned_clock_ns(ns: u64) {
+    unsafe { rusteron_dpdk_test_set_clock_step_ns(ns) };
 }
 
 /// Whether the CPU advertises an invariant TSC (`constant_tsc` and

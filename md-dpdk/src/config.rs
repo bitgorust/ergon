@@ -176,6 +176,14 @@ impl DpdkTransportConfig {
             )));
         }
 
+        // DPDK's per-core mempool cache: none (0) up to 512 entries.
+        if self.mempool_cache > 512 {
+            return Err(DpdkError::InvalidConfiguration(format!(
+                "mempool_cache {} is above DPDK's 512 (0 means no per-core cache)",
+                self.mempool_cache
+            )));
+        }
+
         // The mbuf pool must cover both descriptor rings plus four bursts of
         // headroom.
         let required = u64::from(self.rx_descriptors) + u64::from(self.tx_descriptors) + 4 * u64::from(self.burst_size);

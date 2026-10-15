@@ -771,6 +771,7 @@ dependencies = [
  "cc",
  "criterion",
  "ctrlc",
+ "libc",
  "log",
  "minstant",
  "pkg-config",

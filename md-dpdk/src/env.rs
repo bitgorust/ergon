@@ -48,7 +48,7 @@ pub fn selector() -> Result<Selector, DpdkError> {
 /// `RUSTERON_DPDK_RX_HW_TIMESTAMP=1` requests NIC hardware receive timestamps.
 /// Read natively at start (see the README): `RUSTERON_DPDK_EPHEMERAL_PORT_RANGE`,
 /// `RUSTERON_DPDK_{SENDER,RECEIVER}_EXTRA_IPV4`, `RUSTERON_DPDK_HOST_LOCAL`,
-/// `RUSTERON_DPDK_WILDCARD_LOCAL`, `RUSTERON_DPDK_LOCAL_IO`, `RUSTERON_DPDK_LOCAL_HOT_US`, `RUSTERON_DPDK_LOCAL_UNWATCH`, `RUSTERON_DPDK_TX_RETRY_US`, `RUSTERON_DPDK_TX_RATE_MBPS`, `RUSTERON_DPDK_TX_ROUTE_MBPS`,
+/// `RUSTERON_DPDK_WILDCARD_LOCAL`, `RUSTERON_DPDK_LOCAL_IO`, `RUSTERON_DPDK_LOCAL_HOT_US`, `RUSTERON_DPDK_LOCAL_UNWATCH`, `RUSTERON_DPDK_TX_RETRY_US`, `RUSTERON_DPDK_NIC_STATS_MS`, `RUSTERON_DPDK_RX_MAX_BURSTS`, `RUSTERON_DPDK_TX_RATE_MBPS`, `RUSTERON_DPDK_TX_ROUTE_MBPS`,
 /// `RUSTERON_DPDK_TX_BUCKET_BYTES`, `RUSTERON_DPDK_TX_PACE_SPIN_US`, `RUSTERON_DPDK_TX_LOW_STREAMS`,
 /// `RUSTERON_DPDK_TX_LOW_RESERVE_BYTES`,
 /// `RUSTERON_DPDK_CLOCK` and `RUSTERON_DPDK_HOUSEKEEPING_CPU`.
@@ -93,8 +93,8 @@ pub fn config_from_env() -> Result<DpdkTransportConfig, DpdkError> {
         test_vdev, // production selectors are PCI-only unless the test lever is set
         hugepage_dir: PathBuf::from(env::var("RUSTERON_DPDK_HUGE_DIR").unwrap_or_else(|_| "/dev/hugepages".into())),
         rx_descriptors: num_or("RUSTERON_DPDK_RX_DESCRIPTORS", 1024)?,
-        tx_descriptors: num_or("RUSTERON_DPDK_TX_DESCRIPTORS", 1024)?,
-        mbufs_per_port: num_or("RUSTERON_DPDK_MBUFS_PER_PORT", 65536)?,
+        tx_descriptors: num_or("RUSTERON_DPDK_TX_DESCRIPTORS", 512)?, // an ENA's maximum
+        mbufs_per_port: num_or("RUSTERON_DPDK_MBUFS_PER_PORT", 16384)?, // as the lab measured
         mempool_cache: num_or("RUSTERON_DPDK_MEMPOOL_CACHE", 256)?,
         burst_size: num_or("RUSTERON_DPDK_BURST_SIZE", 32)?,
         max_aeron_mtu: num_or("RUSTERON_DPDK_MAX_AERON_MTU", 1408)?,
