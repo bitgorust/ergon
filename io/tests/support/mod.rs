@@ -84,7 +84,10 @@ impl Lab {
                                     body.len()
                                 );
                                 let mut out = head.into_bytes();
-                                out.extend_from_slice(body);
+                                // A HEAD response announces the length only.
+                                if req.method != "HEAD" {
+                                    out.extend_from_slice(body);
+                                }
                                 if p.write(&out).is_err() || close {
                                     return;
                                 }

@@ -12,7 +12,7 @@ use rustls::ClientConfig;
 
 use crate::RxMeta;
 use crate::endpoint::sealed::{Deliver, DialIo, Io};
-use crate::endpoint::{ConnId, Handler};
+use crate::endpoint::{ConnId, ConnMut, Handler};
 use crate::error::{Error, Result};
 pub use crate::net::Target;
 use crate::net::{TlsDial, flush_nonblocking};
@@ -246,6 +246,17 @@ impl WsConn {
     }
 }
 
+/// A driver-owned [`WsConn`]: the same send method.
+impl ConnMut<'_, WsConn> {
+    /// [`WsConn::send_frame`].
+    ///
+    /// # Errors
+    /// As [`WsConn::send_frame`].
+    pub fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
+        self.inner().send_frame(opcode, payload)
+    }
+}
+
 /// A WebSocket connection being set up without blocking: TCP connect, TLS
 /// handshake and upgrade, each advanced by the driver's `poll`. Hand it to
 /// `Driver::connect`.
@@ -267,11 +278,27 @@ impl WsDial {
                 "receive buffer must hold at least 8 records".into(),
             ));
         }
+        // The path and headers go into the upgrade request verbatim: no CR/LF,
+        // valid tokens, and none of the fields the handshake sets itself.
+        let headers: Vec<(&str, &str)> = target
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        crate::http::validate_request("GET", &target.path, &headers)?;
+        if let Some((k, _)) = headers
+            .iter()
+            .find(|(k, _)| k.len() >= 14 && k[..14].eq_ignore_ascii_case("sec-websocket-"))
+        {
+            return Err(Error::Http(format!(
+                "header {k} is set by the WebSocket handshake"
+            )));
+        }
         let sni = target.host.clone();
         Ok(Self {
             target,
             buf_size,
-            tls: TlsDial::new(cfg, sni),
+            tls: TlsDial::new(cfg, sni)?,
             up: None,
         })
     }

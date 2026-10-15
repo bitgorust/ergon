@@ -61,27 +61,24 @@ fn query_is_answered_without_blocking_and_cached() -> R {
             answer(&server, Some(ip), Duration::from_millis(50)).map_err(|e| e.to_string())
         });
         let t0 = Instant::now();
+        // Never blocking means never sleeping: count the thread's voluntary
+        // context switches (wall time would also count preemption).
+        let (slept0, _) = ergon_io::clock::thread_ctx_switches();
         assert_eq!(
             r.lookup("api.example.test", monotonic_ns())?,
             Lookup::Pending
         );
-        let mut slowest = Duration::ZERO;
         let got = loop {
-            let t = Instant::now();
             r.poll(monotonic_ns());
-            let step = r.lookup("api.example.test", monotonic_ns())?;
-            slowest = slowest.max(t.elapsed());
-            if let Lookup::Ready(a) = step {
+            if let Lookup::Ready(a) = r.lookup("api.example.test", monotonic_ns())? {
                 break a;
             }
             assert!(t0.elapsed() < Duration::from_secs(5), "no answer");
         };
+        let (slept1, _) = ergon_io::clock::thread_ctx_switches();
         srv.join().map_err(|_| "server panicked")??;
         assert_eq!(got, ip);
-        assert!(
-            slowest < Duration::from_millis(5),
-            "a poll took {slowest:?}"
-        );
+        assert_eq!(slept1 - slept0, 0, "the resolver slept");
         Ok(())
     })?;
     // Cached: ready at once, no query.

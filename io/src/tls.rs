@@ -37,7 +37,8 @@ pub const CT_APPDATA: u8 = 23;
 const HS_NEW_SESSION_TICKET: u8 = 4;
 const HS_KEY_UPDATE: u8 = 24;
 
-/// A rustls client config restricted to TLS 1.3, with secret extraction enabled.
+/// A rustls client config restricted to TLS 1.3, with secret extraction enabled
+/// and a session store that never blocks ([`NonBlockingSessionStore`]).
 ///
 /// # Errors
 /// The ring provider rejects the protocol selection (it does not).
@@ -64,7 +65,92 @@ pub fn client_config_with(
         .with_no_client_auth();
     cfg.enable_secret_extraction = extract_secrets;
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    cfg.resumption = rustls::client::Resumption::store(Arc::new(NonBlockingSessionStore::new(256)));
     Ok(Arc::new(cfg))
+}
+
+/// Checks that `cfg` can feed this crate's record layer (secret extraction on).
+/// The protocol version is checked after the handshake: rustls does not expose
+/// a config's versions.
+pub(crate) fn check_client_config(cfg: &ClientConfig) -> Result<()> {
+    if cfg.enable_secret_extraction {
+        Ok(())
+    } else {
+        Err(Error::Config(
+            "the rustls ClientConfig needs enable_secret_extraction = true and TLS 1.3 only: \
+             build it with ergon_io::tls::client_config"
+                .into(),
+        ))
+    }
+}
+
+/// A TLS session store that never blocks the thread using it.
+///
+/// Session tickets arrive after the handshake and are stored by the polling
+/// thread, while a background connect may be reading the same store. rustls's
+/// own cache takes a mutex, so the polling thread could wait for (or sleep
+/// behind) the helper. Here every access only tries the lock: if the other
+/// thread holds it, the ticket is not stored, or the lookup finds nothing and
+/// that connect does a full handshake instead of resuming.
+#[derive(Debug)]
+pub struct NonBlockingSessionStore(std::sync::Mutex<rustls::client::ClientSessionMemoryCache>);
+
+impl NonBlockingSessionStore {
+    /// A store holding tickets for up to `size` servers.
+    #[must_use]
+    pub fn new(size: usize) -> Self {
+        Self(std::sync::Mutex::new(
+            rustls::client::ClientSessionMemoryCache::new(size),
+        ))
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&rustls::client::ClientSessionMemoryCache) -> T) -> Option<T> {
+        self.0.try_lock().ok().map(|c| f(&c))
+    }
+}
+
+impl rustls::client::ClientSessionStore for NonBlockingSessionStore {
+    fn set_kx_hint(&self, server_name: ServerName<'static>, group: rustls::NamedGroup) {
+        self.with(|c| c.set_kx_hint(server_name, group));
+    }
+
+    fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<rustls::NamedGroup> {
+        self.with(|c| c.kx_hint(server_name)).flatten()
+    }
+
+    fn set_tls12_session(
+        &self,
+        server_name: ServerName<'static>,
+        value: rustls::client::Tls12ClientSessionValue,
+    ) {
+        self.with(|c| c.set_tls12_session(server_name, value));
+    }
+
+    fn tls12_session(
+        &self,
+        server_name: &ServerName<'_>,
+    ) -> Option<rustls::client::Tls12ClientSessionValue> {
+        self.with(|c| c.tls12_session(server_name)).flatten()
+    }
+
+    fn remove_tls12_session(&self, server_name: &ServerName<'static>) {
+        self.with(|c| c.remove_tls12_session(server_name));
+    }
+
+    fn insert_tls13_ticket(
+        &self,
+        server_name: ServerName<'static>,
+        value: rustls::client::Tls13ClientSessionValue,
+    ) {
+        self.with(|c| c.insert_tls13_ticket(server_name, value));
+    }
+
+    fn take_tls13_ticket(
+        &self,
+        server_name: &ServerName<'static>,
+    ) -> Option<rustls::client::Tls13ClientSessionValue> {
+        self.with(|c| c.take_tls13_ticket(server_name)).flatten()
+    }
 }
 
 /// Mozilla's root store (feature `webpki-roots`).
@@ -356,6 +442,7 @@ impl TlsHandshake {
     /// # Errors
     /// Invalid server name or configuration.
     pub fn new(config: Arc<ClientConfig>, server_name: &str) -> Result<Self> {
+        check_client_config(&config)?;
         let name = ServerName::try_from(server_name.to_owned())
             .map_err(|e| Error::Config(e.to_string()))?;
         Ok(Self {
@@ -471,6 +558,13 @@ impl TlsHandshake {
     )> {
         if !self.done {
             return Err(Error::Record("handshake not complete"));
+        }
+        if self.conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3) {
+            return Err(Error::Config(
+                "the server negotiated TLS 1.2; the record layer needs TLS 1.3 \
+                 (restrict the ClientConfig to TLS 1.3, as ergon_io::tls::client_config does)"
+                    .into(),
+            ));
         }
         let (secrets, kconn) = self.conn.dangerous_into_kernel_connection()?;
         self.inc.truncate(self.inc_len);

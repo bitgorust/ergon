@@ -5,7 +5,7 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -45,12 +45,16 @@ impl CurlHandler for Collector {
 
 /// Sockets libcurl asked to watch (socket-action mode).
 struct Watch {
-    ep: RawFd,
+    /// Closed when the client drops, after `multi` (declared earlier), whose
+    /// clean-up still removes sockets from it.
+    ep: OwnedFd,
     /// Deadline for `curl_multi_socket_action(CURL_SOCKET_TIMEOUT)`, monotonic
     /// ns; `i64::MAX` when none.
     timer: Arc<AtomicI64>,
 }
 
+/// Fields drop in declaration order: `multi` (and with it libcurl's socket
+/// callbacks) goes before `watch` closes the epoll descriptor.
 pub struct CurlClient {
     multi: Multi,
     free: Vec<Easy2<Collector>>,
@@ -62,8 +66,6 @@ pub struct CurlClient {
     timeout: Duration,
     pool: usize,
     watch: Option<Watch>,
-    /// Socket-action mode: interest per socket, kept by the socket callback.
-    interest: Arc<Mutex<HashMap<RawFd, u32>>>,
 }
 
 impl CurlClient {
@@ -78,13 +80,15 @@ impl CurlClient {
         } else {
             format!("https://{}:{}", target.host, target.port)
         };
-        let interest = Arc::new(Mutex::new(HashMap::new()));
         let watch = if cfg.curl_drive == CurlDrive::SocketAction {
             // SAFETY: plain syscall.
-            let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-            if ep < 0 {
+            let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            if raw < 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
+            // SAFETY: a fresh descriptor we own; closed on every return path.
+            let ep_owned = unsafe { OwnedFd::from_raw_fd(raw) };
+            let ep = ep_owned.as_raw_fd();
             let timer = Arc::new(AtomicI64::new(i64::MAX));
             let t = timer.clone();
             multi
@@ -97,7 +101,8 @@ impl CurlClient {
                     true
                 })
                 .map_err(|e| Error::Http(format!("libcurl: {e}")))?;
-            let int = interest.clone();
+            // Interest per socket, owned by the socket callback.
+            let int: Mutex<HashMap<RawFd, u32>> = Mutex::new(HashMap::new());
             multi
                 .socket_function(move |sock, events, _token| {
                     let mut flags = 0u32;
@@ -127,7 +132,10 @@ impl CurlClient {
                     }
                 })
                 .map_err(|e| Error::Http(format!("libcurl: {e}")))?;
-            Some(Watch { ep, timer })
+            Some(Watch {
+                ep: ep_owned,
+                timer,
+            })
         } else {
             None
         };
@@ -148,7 +156,6 @@ impl CurlClient {
             timeout: Duration::from_millis(u64::from(cfg.request_timeout_ms)),
             pool: cfg.pool,
             watch,
-            interest,
         })
     }
 
@@ -210,7 +217,12 @@ impl CurlClient {
         // Never wait for a 100-continue.
         list.append("Expect:").map_err(map)?;
         e.http_headers(list).map_err(map)?;
-        if !body.is_empty() || matches!(method, "POST" | "PUT" | "PATCH") {
+        // HEAD: libcurl must not wait for the announced body (NOBODY); reused
+        // handles reset it for every other method.
+        let head = method == "HEAD";
+        e.nobody(head).map_err(map)?;
+        if head {
+        } else if !body.is_empty() || matches!(method, "POST" | "PUT" | "PATCH") {
             e.post(true).map_err(map)?;
             e.post_fields_copy(body).map_err(map)?;
         } else {
@@ -239,7 +251,7 @@ impl CurlClient {
             Some(w) => {
                 let mut evs = [libc::epoll_event { events: 0, u64: 0 }; 16];
                 // SAFETY: valid epoll fd and event buffer.
-                let n = unsafe { libc::epoll_wait(w.ep, evs.as_mut_ptr(), 16, 0) };
+                let n = unsafe { libc::epoll_wait(w.ep.as_raw_fd(), evs.as_mut_ptr(), 16, 0) };
                 for ev in evs.iter().take(usize::try_from(n).unwrap_or(0)) {
                     let fd = RawFd::try_from(ev.u64).unwrap_or(-1);
                     let mut e = Events::new();
@@ -310,10 +322,6 @@ impl Drop for CurlClient {
         for (_, h) in self.active.drain(..) {
             let _ = self.multi.remove2(h);
         }
-        if let Some(w) = &self.watch {
-            // SAFETY: closing our own epoll fd.
-            unsafe { libc::close(w.ep) };
-        }
-        let _ = &self.interest;
+        // The epoll descriptor closes with `watch`, after `multi`.
     }
 }

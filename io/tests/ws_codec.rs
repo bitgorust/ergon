@@ -113,3 +113,45 @@ fn client_response_checks() -> R {
     assert!(ws::parse_client_response(forbidden, key).is_err());
     Ok(())
 }
+
+#[test]
+fn upgrade_requests_reject_injected_or_reserved_fields() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = ergon_io::tls::client_config(rustls::RootCertStore::empty())?;
+    let target = |path: &str| ergon_io::Target::new("stream.example.test", 443, path);
+    for (t, why) in [
+        (
+            target("/ws").with_header("X-Key", "v\r\nHost: evil"),
+            "CR/LF in a value",
+        ),
+        (
+            target("/ws").with_header("Bad Name", "1"),
+            "space in a name",
+        ),
+        (
+            target("/ws").with_header("Sec-WebSocket-Key", "x"),
+            "a handshake field",
+        ),
+        (
+            target("/ws").with_header("Upgrade", "h2c"),
+            "a reserved field",
+        ),
+        (target("/a b"), "space in the path"),
+        (target("/a\r\nX: 1"), "CR/LF in the path"),
+    ] {
+        assert!(
+            ergon_io::WsDial::new(t, cfg.clone(), 1 << 20).is_err(),
+            "accepted {why}"
+        );
+    }
+    assert!(ergon_io::WsDial::new(target("/ws?x=1"), cfg, 1 << 20).is_ok());
+    Ok(())
+}
+
+#[test]
+fn upgrade_request_sends_only_the_callers_user_agent() {
+    let none = String::from_utf8_lossy(&ws::client_request("h", "/", "k", &[])).to_lowercase();
+    assert!(!none.contains("user-agent"), "{none}");
+    let one = String::from_utf8_lossy(&ws::client_request("h", "/", "k", &[("User-Agent", "me")]))
+        .to_lowercase();
+    assert_eq!(one.matches("user-agent").count(), 1, "{one}");
+}

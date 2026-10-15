@@ -42,6 +42,8 @@ curl = { version = "0.4.51", optional = true, default-features = false, features
 
 [dev-dependencies]
 rcgen = "0.14"
+# TLS 1.2 only in tests: proves a TLS 1.2 handshake is refused clearly.
+rustls = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
 
 [lints]
 workspace = true

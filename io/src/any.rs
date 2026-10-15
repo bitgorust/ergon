@@ -4,8 +4,8 @@
 use std::net::SocketAddr;
 
 use crate::RxMeta;
-use crate::endpoint::ConnId;
 use crate::endpoint::sealed::{Deliver, DialIo, Io};
+use crate::endpoint::{ConnId, ConnMut};
 use crate::error::Result;
 use crate::http::{HttpConn, HttpDial, HttpHandler};
 use crate::ws_conn::{WsConn, WsDial, WsHandler};
@@ -33,6 +33,19 @@ impl AnyConn {
             Self::Http(c) => Some(c),
             Self::Ws(_) => None,
         }
+    }
+}
+
+/// A driver-owned [`AnyConn`]: the protocol-specific handle.
+impl ConnMut<'_, AnyConn> {
+    /// The WebSocket connection, if it is one.
+    pub fn ws(&mut self) -> Option<ConnMut<'_, WsConn>> {
+        self.inner().ws().map(ConnMut::new)
+    }
+
+    /// The HTTP connection, if it is one.
+    pub fn http(&mut self) -> Option<ConnMut<'_, HttpConn>> {
+        self.inner().http().map(ConnMut::new)
     }
 }
 

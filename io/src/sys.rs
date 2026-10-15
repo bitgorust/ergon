@@ -30,6 +30,54 @@ pub fn set_busy_poll(fd: RawFd, usec: u32) -> io::Result<()> {
     setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_BUSY_POLL, to_int(usec)?)
 }
 
+const SO_PREFER_BUSY_POLL: libc::c_int = 69;
+const SO_BUSY_POLL_BUDGET: libc::c_int = 70;
+
+/// Sets `SO_PREFER_BUSY_POLL` (enabling it needs `CAP_NET_ADMIN`).
+///
+/// # Errors
+/// `setsockopt` fails (`EPERM` without the capability).
+pub fn set_prefer_busy_poll(fd: RawFd, on: bool) -> io::Result<()> {
+    setsockopt_int(fd, libc::SOL_SOCKET, SO_PREFER_BUSY_POLL, i32::from(on))
+}
+
+/// Sets `SO_BUSY_POLL_BUDGET`, packets per busy-poll pass (raising it needs
+/// `CAP_NET_ADMIN`).
+///
+/// # Errors
+/// `setsockopt` fails (`EPERM` without the capability).
+pub fn set_busy_poll_budget(fd: RawFd, packets: u16) -> io::Result<()> {
+    setsockopt_int(
+        fd,
+        libc::SOL_SOCKET,
+        SO_BUSY_POLL_BUDGET,
+        i32::from(packets),
+    )
+}
+
+/// A socket's busy-poll settings (the kernel does not report
+/// `SO_BUSY_POLL_BUDGET` back).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BusyPoll {
+    /// `SO_BUSY_POLL`, microseconds.
+    pub usec: u32,
+    /// `SO_PREFER_BUSY_POLL`.
+    pub prefer: bool,
+}
+
+/// Reads `SO_BUSY_POLL` and `SO_PREFER_BUSY_POLL`.
+///
+/// # Errors
+/// `getsockopt` fails.
+pub fn busy_poll_settings(fd: RawFd) -> io::Result<BusyPoll> {
+    let get = |opt| getsockopt_int(fd, libc::SOL_SOCKET, opt);
+    Ok(BusyPoll {
+        usec: u32::try_from(get(libc::SO_BUSY_POLL)?)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?,
+        prefer: get(SO_PREFER_BUSY_POLL)? != 0,
+    })
+}
+
 /// Sets `SO_RCVBUF`.
 ///
 /// # Errors
@@ -131,6 +179,85 @@ pub fn set_affinity(cpus: &[usize]) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+/// Starts a detached thread that runs only on `cpus`, from its first
+/// instruction.
+///
+/// The mask is set in the thread attributes, so unlike a thread that moves
+/// itself it never runs on its creator's (often isolated, busy-spinning) CPU.
+/// An empty `cpus` keeps the creator's affinity. The thread is named `name`
+/// (at most 15 bytes are kept); a panic in `f` ends the thread only.
+///
+/// # Errors
+/// The attributes are rejected or the thread cannot be created.
+pub fn spawn_pinned(
+    name: &str,
+    cpus: &[usize],
+    f: impl FnOnce() + Send + 'static,
+) -> io::Result<()> {
+    type Job = Box<dyn FnOnce() + Send>;
+    extern "C" fn start(arg: *mut libc::c_void) -> *mut libc::c_void {
+        // SAFETY: `arg` is the `Box<Job>` leaked by `spawn_pinned`, taken back
+        // exactly once, here.
+        let job = unsafe { Box::from_raw(arg.cast::<Job>()) };
+        // A panic must not unwind into the C caller.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        std::ptr::null_mut()
+    }
+    let check = |rc: libc::c_int| {
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(rc))
+        }
+    };
+    let cname = std::ffi::CString::new(
+        name.as_bytes()
+            .iter()
+            .take(15)
+            .copied()
+            .collect::<Vec<u8>>(),
+    )
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "thread name contains NUL"))?;
+    let job: Job = Box::new(move || {
+        // SAFETY: PR_SET_NAME reads a NUL-terminated string of at most 16 bytes.
+        unsafe { libc::prctl(libc::PR_SET_NAME, cname.as_ptr()) };
+        f();
+    });
+    // SAFETY: the attribute object is initialised before use and destroyed on
+    // every path; the cpu set is zeroed and filled within its bounds.
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        check(libc::pthread_attr_init(&raw mut attr))?;
+        let result = (|| {
+            if !cpus.is_empty() {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                for &c in cpus.iter().filter(|&&c| c < libc::CPU_SETSIZE as usize) {
+                    libc::CPU_SET(c, &mut set);
+                }
+                check(libc::pthread_attr_setaffinity_np(
+                    &raw mut attr,
+                    std::mem::size_of::<libc::cpu_set_t>(),
+                    &raw const set,
+                ))?;
+            }
+            check(libc::pthread_attr_setdetachstate(
+                &raw mut attr,
+                libc::PTHREAD_CREATE_DETACHED,
+            ))?;
+            let arg = Box::into_raw(Box::new(job)).cast::<libc::c_void>();
+            let mut tid: libc::pthread_t = 0;
+            let rc = libc::pthread_create(&raw mut tid, &raw const attr, start, arg);
+            if rc != 0 {
+                // The thread never started: take the job back.
+                drop(Box::from_raw(arg.cast::<Job>()));
+            }
+            check(rc)
+        })();
+        libc::pthread_attr_destroy(&raw mut attr);
+        result
     }
 }
 

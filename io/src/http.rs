@@ -43,7 +43,7 @@ use rustls::ClientConfig;
 use crate::RxMeta;
 use crate::clock::monotonic_ns;
 use crate::endpoint::sealed::{Deliver, DialIo, Io};
-use crate::endpoint::{ConnId, Handler};
+use crate::endpoint::{ConnId, ConnMut, Handler};
 use crate::error::{Error, Result};
 use crate::net::{Target, TlsDial};
 use crate::stream::TlsStream;
@@ -104,7 +104,7 @@ fn validate_header(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_request(method: &str, path: &str, headers: &[(&str, &str)]) -> Result<()> {
+pub(crate) fn validate_request(method: &str, path: &str, headers: &[(&str, &str)]) -> Result<()> {
     if method.is_empty() || !method.bytes().all(is_tchar) {
         return Err(Error::Http(format!("invalid method {method:?}")));
     }
@@ -463,6 +463,56 @@ impl HttpConn {
     }
 }
 
+/// A driver-owned [`HttpConn`]: the same request methods.
+impl ConnMut<'_, HttpConn> {
+    /// [`HttpConn::request`].
+    ///
+    /// # Errors
+    /// As [`HttpConn::request`].
+    pub fn request(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<u64> {
+        self.inner().request(method, path, headers, body)
+    }
+
+    /// [`HttpConn::signed_request`].
+    ///
+    /// # Errors
+    /// As [`HttpConn::signed_request`].
+    pub fn signed_request(
+        &mut self,
+        method: &str,
+        path: &str,
+        params: &str,
+        headers: &[(&str, &str)],
+        signer: &crate::auth::Signer,
+    ) -> Result<u64> {
+        self.inner()
+            .signed_request(method, path, params, headers, signer)
+    }
+
+    /// [`HttpConn::signed_request_at`].
+    ///
+    /// # Errors
+    /// As [`HttpConn::signed_request_at`].
+    pub fn signed_request_at(
+        &mut self,
+        method: &str,
+        path: &str,
+        params: &str,
+        headers: &[(&str, &str)],
+        signer: &crate::auth::Signer,
+        timestamp_ms: u64,
+    ) -> Result<u64> {
+        self.inner()
+            .signed_request_at(method, path, params, headers, signer, timestamp_ms)
+    }
+}
+
 enum Framing {
     Length(usize),
     Chunked,
@@ -594,7 +644,7 @@ impl HttpDial {
         Ok(Self {
             target,
             opts,
-            tls: TlsDial::new(cfg, sni),
+            tls: TlsDial::new(cfg, sni)?,
         })
     }
 

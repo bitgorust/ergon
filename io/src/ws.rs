@@ -215,7 +215,7 @@ pub fn client_request(
 ) -> Vec<u8> {
     let mut s = format!(
         "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nUser-Agent: ergon-io-bench\r\n"
+         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
     );
     for (k, v) in extra_headers {
         s.push_str(k);

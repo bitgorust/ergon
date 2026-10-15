@@ -113,12 +113,13 @@ pub(crate) struct TlsDial {
 }
 
 impl TlsDial {
-    pub(crate) const fn new(cfg: Arc<ClientConfig>, sni: String) -> Self {
-        Self {
+    pub(crate) fn new(cfg: Arc<ClientConfig>, sni: String) -> Result<Self> {
+        crate::tls::check_client_config(&cfg)?;
+        Ok(Self {
             cfg,
             sni,
             stage: Stage::Idle,
-        }
+        })
     }
 
     pub(crate) fn start(&mut self, addr: SocketAddr) -> Result<()> {

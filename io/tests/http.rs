@@ -180,7 +180,7 @@ fn in_flight_limit_and_pipelining() -> R {
         let mut h = Collect::default();
         let one = d.connect(dial(&lab, HttpOptions::default())?)?;
         poll_until(&mut d, &mut h, |h| h.opened.len() == 1)?;
-        let c = d.get_mut(one).ok_or("gone")?;
+        let mut c = d.get_mut(one).ok_or("gone")?;
         c.request("GET", "/a", &[], &[])?;
         assert!(matches!(
             c.request("GET", "/b", &[], &[]),
@@ -195,7 +195,7 @@ fn in_flight_limit_and_pipelining() -> R {
             },
         )?)?;
         poll_until(&mut d, &mut h, |h| h.opened.len() == 2)?;
-        let c = d.get_mut(four).ok_or("gone")?;
+        let mut c = d.get_mut(four).ok_or("gone")?;
         for p in ["/1", "/2", "/3", "/4"] {
             c.request("GET", p, &[], &[])?;
         }
@@ -342,7 +342,7 @@ fn invalid_requests_are_rejected_before_sending() -> R {
         let mut h = Collect::default();
         let id = d.connect(dial(&lab, HttpOptions::default())?)?;
         poll_until(&mut d, &mut h, |h| !h.opened.is_empty())?;
-        let c = d.get_mut(id).ok_or("gone")?;
+        let mut c = d.get_mut(id).ok_or("gone")?;
         assert!(c.request("GET", "/a\r\nX-Evil: 1", &[], &[]).is_err());
         assert!(c.request("GET", "/", &[("X", "a\nb")], &[]).is_err());
         assert!(c.request("POST", "/", &[], &vec![0; 20_000]).is_err());
@@ -385,8 +385,10 @@ fn websocket_and_http_share_one_driver() -> R {
         let http = d.connect(AnyDial::from(dial(&lab, HttpOptions::default())?))?;
         poll_until(&mut d, &mut h, |h| h.opened.len() == 2)?;
         for i in 0..10 {
-            let c = d.get_mut(http).and_then(AnyConn::http).ok_or("not http")?;
-            c.request("GET", &format!("/o{i}"), &[], &[])?;
+            let mut any = d.get_mut(http).ok_or("gone")?;
+            any.http()
+                .ok_or("not http")?
+                .request("GET", &format!("/o{i}"), &[], &[])?;
             poll_until(&mut d, &mut h, |h| h.responses.len() > i)?;
         }
         poll_until(&mut d, &mut h, |h| h.messages.len() == 10)?;
@@ -494,7 +496,7 @@ fn signed_request_reaches_the_server_with_a_valid_signature() -> R {
         )?)?;
         poll_until(&mut d, &mut h, |h| !h.opened.is_empty())?;
         let signer = ergon_io::Signer::hmac_sha256(secret);
-        let c = d.get_mut(id).ok_or("gone")?;
+        let mut c = d.get_mut(id).ok_or("gone")?;
         assert!(
             c.signed_request("POST", "/api/v3/order?x=1", "a=1", &[], &signer)
                 .is_err()

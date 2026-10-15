@@ -4,21 +4,37 @@
 //! | backend | how it waits | NIC polling | sleeps in the kernel | extra core |
 //! |---|---|---|---|---|
 //! | `epoll-spin` | `epoll_wait(0)` every poll, then `recvmsg` on ready sockets | no (interrupts) | never | no |
-//! | `recv-busy` | non-blocking `recvmsg` on every socket every poll, `SO_BUSY_POLL` set: an empty read runs one NAPI pass | yes, one pass per socket per poll | never | no |
+//! | `recv-busy` | non-blocking `recvmsg` on every socket every poll (with `per_queue`: one per NIC queue, then the sockets `epoll_wait(0)` reports ready), `SO_BUSY_POLL` set: an empty read runs one NAPI pass | yes, one pass per socket (or queue) per poll | never | no |
 //! | `uring-spin` | `IORING_OP_RECVMSG`, `DEFER_TASKRUN`; enters the kernel only when it flags work | no (interrupts) | never | no |
 //! | `uring-sqpoll` | `SQPOLL` kernel thread submits, completes and polls the NIC (NAPI) | yes, on the kernel thread | never (the application thread) | yes |
 //! | `epoll-busy` | `epoll_pwait2(wait_us)` with epoll busy poll for `busy_poll_us` | yes, inside the wait | up to `wait_us` | no |
 //! | `uring-napi` | `io_uring_enter(GETEVENTS, 1, wait_us)` with NAPI busy poll | yes, inside the wait | up to `wait_us`, and on every idle poll even with `wait_us = 0` | no |
 //!
-//! Use cases:
+//! Choosing one (measured on AWS `c7i` and Azure; `io/benches/BENCHMARK.md`):
+//! what decides it is how many sockets one loop serves and whether it may
+//! have a second core.
 //!
-//! - **Latency-critical busy-spin loop** (returns to the application every poll,
-//!   NIC polled): `recv-busy`, or `uring-sqpoll` if a core can be spared for the
-//!   kernel thread.
-//! - **Busy-spin loop, interrupt-driven** (never blocks; sees a packet once the
-//!   NIC interrupt has delivered it): `epoll-spin`, or `uring-spin`, which makes
-//!   far fewer syscalls for the same latency. `epoll_wait(0)` never blocks, but
-//!   with a zero timeout the kernel also skips its NIC busy-poll step.
+//! - **A few sockets per loop (up to about 10), one core:** `recv-busy`. It
+//!   polls the NIC itself, so a packet is read without waiting for an
+//!   interrupt; with one socket it equals `uring-sqpoll`. Its cost grows with
+//!   the sockets: one `recvmsg` per socket per poll.
+//! - **Many sockets per loop, a second core to spare:** `uring-sqpoll`. Its
+//!   kernel thread polls each NIC queue once per pass and completes every
+//!   socket's reads into one ring; best measured from 10 sockets up. It costs
+//!   a spinning kernel thread per ring (rings in one process can share one;
+//!   other processes cannot).
+//! - **Many sockets per loop, one physical core** (two hyperthreads, as a
+//!   pod with two vCPUs gets): `uring-sqpoll` with `sqpoll_cpu` set to the
+//!   loop CPU's hyperthread sibling, about 1.5 µs behind a core of its own and
+//!   still ahead of the single-CPU options.
+//! - **Many sockets per loop, a single CPU:** `recv-busy` with `per_queue` (one
+//!   busy-polled read per NIC queue, then only the sockets epoll reports
+//!   ready), or `epoll-spin`; plain `recv-busy` scans every socket every poll
+//!   and falls behind both from a few tens of sockets.
+//! - **Busy-spin loop where CPU matters more than the last microseconds:**
+//!   `uring-spin` (interrupt-driven like `epoll-spin`, about 1,000x fewer
+//!   syscalls). `epoll_wait(0)` never blocks, but with a zero timeout the
+//!   kernel also skips its NIC busy-poll step; mio is this path.
 //! - **Not latency-critical, CPU matters** (the thread may nap in the kernel):
 //!   `epoll-busy` and `uring-napi` poll the NIC only inside a timed wait.
 //!
@@ -139,6 +155,23 @@ pub struct Config {
     /// on the housekeeping CPUs (online, not isolated, not the polling CPU), so
     /// the handshake never competes with the polling thread for its core.
     pub connect_cpu: Option<u32>,
+    /// Preferred busy polling (`SO_PREFER_BUSY_POLL`, or the `io_uring` / epoll
+    /// equivalent): while the application keeps polling, the kernel leaves the
+    /// NIC queue to it instead of also processing it from interrupts. It only
+    /// suppresses interrupts when the device has `napi_defer_hard_irqs` and
+    /// `gro_flush_timeout` set (sysfs). Backends that poll the NIC only; the
+    /// socket option needs `CAP_NET_ADMIN`.
+    pub prefer_busy_poll: bool,
+    /// Packets per NIC busy-poll pass (`SO_BUSY_POLL_BUDGET`, or the epoll
+    /// budget); `None` keeps the kernel default (8). `recv-busy` and
+    /// `epoll-busy` only; raising it needs `CAP_NET_ADMIN`.
+    pub busy_poll_budget: Option<u16>,
+    /// `recv-busy` with many sockets: read one socket per NIC queue every
+    /// poll (which polls each queue once), then only the sockets
+    /// `epoll_wait(0)` reports ready, instead of reading every socket every
+    /// poll. Costs one `epoll_wait` per poll; pays off once sockets outnumber
+    /// the queues they share.
+    pub per_queue: bool,
 }
 
 impl Config {
@@ -161,15 +194,59 @@ impl Config {
             rx_timestamps: true,
             connect_timeout_ms: 10_000,
             connect_cpu: None,
+            prefer_busy_poll: false,
+            busy_poll_budget: None,
+            per_queue: false,
         }
     }
 
-    /// Parses `backend[,key=value...]`. Keys: `busy_poll_us`, `wait_us`,
-    /// `sqpoll_cpu`, `sqpoll_idle_ms`, `ring_entries`, `connect_timeout_ms`, `connect_cpu`, `rcvbuf` (0 keeps the
-    /// kernel default), `rx_timestamps` (`true`/`false`).
+    /// Checks that every setting applies to the backend.
     ///
     /// # Errors
-    /// Unknown backend or key, or a malformed value.
+    /// `busy_poll_us` above `i32::MAX`, `prefer_busy_poll` on a backend that
+    /// does not poll the NIC, or `busy_poll_budget` on one that does not poll
+    /// through the socket or epoll.
+    pub fn validate(&self) -> Result<()> {
+        // The kernel takes the busy-poll time as a signed int.
+        if i32::try_from(self.busy_poll_us).is_err() {
+            return Err(Error::Config(format!(
+                "busy_poll_us {} is above {}",
+                self.busy_poll_us,
+                i32::MAX
+            )));
+        }
+        if self.prefer_busy_poll && !self.backend.polls_nic() {
+            return Err(Error::Config(format!(
+                "prefer_busy_poll needs a backend that polls the NIC, not {}",
+                self.backend
+            )));
+        }
+        if self.per_queue && self.backend != Backend::RecvBusy {
+            return Err(Error::Config(format!(
+                "per_queue applies to recv-busy, not {}",
+                self.backend
+            )));
+        }
+        if self.busy_poll_budget.is_some()
+            && !matches!(self.backend, Backend::RecvBusy | Backend::EpollBusy)
+        {
+            return Err(Error::Config(format!(
+                "busy_poll_budget applies to recv-busy and epoll-busy, not {}",
+                self.backend
+            )));
+        }
+        Ok(())
+    }
+
+    /// Parses `backend[,key=value...]`. Keys: `busy_poll_us`, `wait_us`,
+    /// `sqpoll_cpu`, `sqpoll_idle_ms`, `ring_entries`, `connect_timeout_ms`,
+    /// `connect_cpu`, `rcvbuf` (0 keeps the kernel default), `rx_timestamps`
+    /// `prefer_busy_poll` and `per_queue` (`true`/`false`), `busy_poll_budget`
+    /// (0 keeps the kernel default).
+    ///
+    /// # Errors
+    /// Unknown backend or key, a malformed value, or a setting the backend
+    /// cannot use ([`Config::validate`]).
     pub fn parse(s: &str) -> Result<Self> {
         let mut parts = s.split(',').map(str::trim);
         let mut cfg = Self::new(parts.next().unwrap_or_default().parse()?);
@@ -181,6 +258,10 @@ impl Config {
                 v.parse()
                     .map_err(|_| Error::Config(format!("{k}: bad number {v:?}")))
             };
+            let flag = || -> Result<bool> {
+                v.parse()
+                    .map_err(|_| Error::Config(format!("{k}: bad bool {v:?}")))
+            };
             match k {
                 "busy_poll_us" => cfg.busy_poll_us = num()?,
                 "wait_us" => cfg.wait_us = num()?,
@@ -190,14 +271,18 @@ impl Config {
                 "connect_timeout_ms" => cfg.connect_timeout_ms = num()?,
                 "connect_cpu" => cfg.connect_cpu = Some(num()?),
                 "rcvbuf" => cfg.rcvbuf = Some(num()?).filter(|&b| b > 0),
-                "rx_timestamps" => {
-                    cfg.rx_timestamps = v
-                        .parse()
-                        .map_err(|_| Error::Config(format!("rx_timestamps: bad bool {v:?}")))?;
+                "rx_timestamps" => cfg.rx_timestamps = flag()?,
+                "prefer_busy_poll" => cfg.prefer_busy_poll = flag()?,
+                "per_queue" => cfg.per_queue = flag()?,
+                "busy_poll_budget" => {
+                    let b = u16::try_from(num()?)
+                        .map_err(|_| Error::Config(format!("{k}: above 65535: {v:?}")))?;
+                    cfg.busy_poll_budget = Some(b).filter(|&b| b > 0);
                 }
                 _ => return Err(Error::Config(format!("unknown key {k:?}"))),
             }
         }
+        cfg.validate()?;
         Ok(cfg)
     }
 }

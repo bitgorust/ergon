@@ -138,6 +138,15 @@ fn sends_and_receives_echo() -> R {
                 poll_until(&mut d, &mut h, |h| h.msgs.len() > i)?;
                 assert_eq!(h.msgs[i].2, body);
             }
+            // io_uring submits sends through io_uring_enter (or the SQPOLL
+            // thread): they are sends, not syscalls of their own.
+            let st = d.stats();
+            assert!(st.sends >= 50, "{b}: {st:?}");
+            if b.is_uring() {
+                assert_eq!(st.send_calls, 0, "{b}: {st:?}");
+            } else {
+                assert_eq!(st.send_calls, st.sends, "{b}: {st:?}");
+            }
             srv.join().map_err(|_| "server panicked")??;
             Ok(())
         })
@@ -205,8 +214,10 @@ fn stale_id_never_reaches_a_reused_slot() -> R {
             let old = d.add(WsConn::connect(&target, lab.client_cfg.clone(), 1 << 20)?)?;
             d.close(old);
             let mut h = Collect::default();
-            // Let io_uring release the slot, then reuse it.
-            for _ in 0..1000 {
+            // Let io_uring release the slot (the SQPOLL thread completes the
+            // cancel asynchronously), then reuse it.
+            let settle = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < settle {
                 d.poll(&mut h)?;
             }
             let new = d.add(WsConn::connect(&target, lab.client_cfg.clone(), 1 << 20)?)?;
@@ -253,6 +264,323 @@ fn drop_with_io_in_flight_closes_sockets() -> R {
             srv.join().map_err(|_| "server panicked")??;
             Ok(())
         })
+    })
+}
+
+#[test]
+fn busy_poll_preference_reaches_the_socket_or_fails_cleanly() -> R {
+    use std::os::fd::AsRawFd;
+    // SO_PREFER_BUSY_POLL and a raised SO_BUSY_POLL_BUDGET need CAP_NET_ADMIN:
+    // with it the options must reach the socket, without it `add` must fail
+    // with an error that says so and keep nothing.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let privileged = ergon_io::sys::set_prefer_busy_poll(probe.as_raw_fd(), true).is_ok();
+    for (prefer, budget) in [(true, None), (false, Some(16)), (true, Some(16))] {
+        let lab = Lab::new()?;
+        let mut cfg = Config::new(Backend::RecvBusy);
+        cfg.prefer_busy_poll = prefer;
+        cfg.busy_poll_budget = budget;
+        let mut d = Driver::new(cfg)?;
+        std::thread::scope(|s| -> R {
+            let srv = s.spawn(|| -> R {
+                let mut p = lab.accept()?;
+                let _ = p.client_closed()?;
+                Ok(())
+            });
+            let added = d.add(WsConn::connect(
+                &lab.target("/")?,
+                lab.client_cfg.clone(),
+                1 << 20,
+            )?);
+            if privileged {
+                let id = added?;
+                let fd = d.get(id).ok_or("conn gone")?.raw_fd();
+                let bp = ergon_io::sys::busy_poll_settings(fd)?;
+                assert_eq!(bp.prefer, prefer, "{bp:?}");
+                assert!(bp.usec >= 1, "{bp:?}");
+            } else {
+                let e = added.err().ok_or("added without CAP_NET_ADMIN")?;
+                assert!(e.to_string().contains("CAP_NET_ADMIN"), "{e}");
+                assert_eq!(d.len(), 0);
+            }
+            drop(d);
+            srv.join().map_err(|_| "server panicked")??;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn send_failures_found_by_flush_reach_the_next_poll() -> R {
+    for b in Backend::ALL.into_iter().filter(|b| !b.may_sleep()) {
+        let lab = Lab::new()?;
+        let mut d = driver(b)?;
+        let id = std::thread::scope(|s| -> R<ConnId> {
+            let srv = s.spawn(|| -> R {
+                // Once the client is connected, reset the connection: its next
+                // sends fail.
+                let mut p = lab.accept()?;
+                p.recv()?;
+                socket2::SockRef::from(&p.sock).set_linger(Some(Duration::ZERO))?;
+                drop(p);
+                Ok(())
+            });
+            let id = d.add(WsConn::connect(
+                &lab.target("/")?,
+                lab.client_cfg.clone(),
+                1 << 20,
+            )?)?;
+            d.get_mut(id)
+                .ok_or("conn gone")?
+                .send_frame(ws::OP_BINARY, b"connected")?;
+            d.flush()?;
+            srv.join().map_err(|_| "server panicked")??;
+            Ok(id)
+        })?;
+        // Send and flush without polling until the connection is gone (epoll
+        // backends close it inside `flush`) or the send is stuck in flight.
+        for _ in 0..200 {
+            let Some(mut c) = d.get_mut(id) else { break };
+            c.send_frame(ws::OP_BINARY, b"x")?;
+            d.flush()?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut h = Collect::default();
+        poll_until(&mut d, &mut h, |h| !h.closed.is_empty())
+            .map_err(|e| format!("{b}: close never reported: {e}"))?;
+        assert_eq!(h.closed.len(), 1, "{b}: {:?}", h.closed);
+        assert_eq!(h.closed[0].0, id, "{b}");
+    }
+    Ok(())
+}
+
+/// Opens `n` echoing connections on `d` (each server thread echoes until the
+/// client closes) and returns their ids.
+fn echo_conns<'s>(
+    s: &'s std::thread::Scope<'s, '_>,
+    lab: &'s Lab,
+    d: &mut Driver<WsConn>,
+    n: usize,
+) -> R<Vec<ConnId>> {
+    let mut ids = Vec::new();
+    for _ in 0..n {
+        let srv = s.spawn(|| -> R<support::Peer> { lab.accept() });
+        let conn = WsConn::connect(&lab.target("/")?, lab.client_cfg.clone(), 1 << 20);
+        let mut p = srv.join().map_err(|_| "server panicked")??;
+        let id = d.add(conn?)?;
+        // A driver that cannot reap its requests leaks its sockets on drop:
+        // time out instead of waiting for a close that never comes.
+        p.sock.set_read_timeout(Some(Duration::from_secs(20)))?;
+        s.spawn(move || {
+            while let Ok((op, body)) = p.recv() {
+                if p.send(op, true, &body).is_err() {
+                    break;
+                }
+            }
+        });
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+#[test]
+fn recv_busy_per_queue_reads_every_socket_that_has_data() -> R {
+    // Twenty connections, each echoing its own numbered messages: with one
+    // socket read per queue and the rest found by epoll, every reply arrives,
+    // in order on each connection, and nothing is closed.
+    let lab = Lab::new()?;
+    let mut cfg = Config::new(Backend::RecvBusy);
+    cfg.per_queue = true;
+    let mut d: Driver<WsConn> = Driver::new(cfg)?;
+    std::thread::scope(|s| -> R {
+        let ids = echo_conns(s, &lab, &mut d, 20)?;
+        let mut h = Collect::default();
+        for round in 0..50u32 {
+            for &id in &ids {
+                d.get_mut(id)
+                    .ok_or("connection gone")?
+                    .send_frame(ws::OP_TEXT, format!("{round}").as_bytes())?;
+            }
+            let want = (round as usize + 1) * ids.len();
+            poll_until(&mut d, &mut h, |h| {
+                h.msgs.len() >= want || !h.closed.is_empty()
+            })?;
+        }
+        assert!(h.closed.is_empty(), "closed {:?}", h.closed);
+        for &id in &ids {
+            let got: Vec<&[u8]> = h
+                .msgs
+                .iter()
+                .filter(|m| m.0 == id)
+                .map(|m| m.2.as_slice())
+                .collect();
+            let want: Vec<String> = (0..50).map(|r| r.to_string()).collect();
+            assert_eq!(got, want.iter().map(String::as_bytes).collect::<Vec<_>>());
+        }
+        assert!(d.stats().epoll_wait_calls > 0, "{:?}", d.stats());
+        drop(d);
+        Ok(())
+    })
+}
+
+#[test]
+fn uring_full_submission_queue_keeps_connections_open() -> R {
+    // 16 connections on a 4-entry ring: every round needs 32 submissions and
+    // overflows the completion queue too. Nothing may be closed.
+    for b in [Backend::UringSpin, Backend::UringSqpoll] {
+        let lab = Lab::new()?;
+        let mut cfg = Config::new(b);
+        cfg.ring_entries = 4;
+        let mut d = Driver::new(cfg)?;
+        std::thread::scope(|s| -> R {
+            let res = (|| -> R {
+                let ids = echo_conns(s, &lab, &mut d, 16)?;
+                let mut h = Collect::default();
+                for round in 0..3usize {
+                    for &id in &ids {
+                        d.get_mut(id)
+                            .ok_or("conn gone")?
+                            .send_frame(ws::OP_BINARY, &[u8::try_from(round)?; 32])?;
+                    }
+                    poll_until(&mut d, &mut h, |h| {
+                        h.msgs.len() == 16 * (round + 1) || !h.closed.is_empty()
+                    })?;
+                    if !h.closed.is_empty() {
+                        return Err(format!("round {round}: closed {:?}", h.closed).into());
+                    }
+                }
+                Ok(())
+            })();
+            // Closes the clients, so the echo threads end.
+            drop(d);
+            res
+        })
+        .map_err(|e| format!("{b}: {e}"))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn uring_close_and_reopen_under_a_full_queue_leaves_new_connections_alone() -> R {
+    // Closing many connections at once on a 2-entry ring defers their
+    // cancels; the slots and descriptors are then reused at once. A late
+    // cancel must never reach the newer connections.
+    for b in [Backend::UringSpin, Backend::UringSqpoll] {
+        let lab = Lab::new()?;
+        let mut cfg = Config::new(b);
+        cfg.ring_entries = 2;
+        let mut d = Driver::new(cfg)?;
+        std::thread::scope(|s| -> R {
+            let res = (|| -> R {
+                let mut h = Collect::default();
+                for cycle in 0..4usize {
+                    let ids = echo_conns(s, &lab, &mut d, 8)?;
+                    for &id in &ids {
+                        d.get_mut(id)
+                            .ok_or("conn gone")?
+                            .send_frame(ws::OP_BINARY, &[u8::try_from(cycle)?; 16])?;
+                    }
+                    let want = h.msgs.len() + 8;
+                    poll_until(&mut d, &mut h, |h| {
+                        h.msgs.len() == want || !h.closed.is_empty()
+                    })?;
+                    if !h.closed.is_empty() {
+                        return Err(format!("cycle {cycle}: closed {:?}", h.closed).into());
+                    }
+                    for &id in &ids {
+                        d.close(id);
+                    }
+                    // A few polls only: the cancels may still be queued when
+                    // the next cycle reuses the slots and descriptors.
+                    for _ in 0..3 {
+                        d.poll(&mut h)?;
+                    }
+                }
+                Ok(())
+            })();
+            drop(d);
+            res
+        })
+        .map_err(|e| format!("{b}: {e}"))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn pinned_threads_start_on_their_cpus() -> R {
+    let online =
+        ergon_io::sys::parse_cpu_list(&std::fs::read_to_string("/sys/devices/system/cpu/online")?);
+    let (&[here, there, ..], true) = (online.as_slice(), online.len() >= 2) else {
+        return Err("needs two CPUs".into());
+    };
+    // The creator sits on one CPU; the new thread must never run there, not
+    // even for its first instructions (an inherited mask would put it there).
+    ergon_io::sys::set_affinity(&[here])?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    ergon_io::sys::spawn_pinned("ergon-io-test", &[there], move || {
+        let _ = tx.send(ergon_io::sys::current_cpu());
+    })?;
+    let first = rx.recv_timeout(Duration::from_secs(5))?;
+    ergon_io::sys::set_affinity(&online)?;
+    assert_eq!(first, Some(there));
+    Ok(())
+}
+
+#[test]
+fn background_dns_waits_never_hold_up_other_connects() -> R {
+    use ergon_io::dns::DnsConfig;
+    // A name server that never answers: one connect waits on DNS while a
+    // second, with a pinned address, must open regardless; the first must
+    // still time out on schedule.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let dns = DnsConfig {
+        servers: vec![silent.local_addr()?],
+        timeout_ms: 10_000,
+        attempts: 1,
+        ..DnsConfig::system()
+    };
+    let lab = Lab::new()?;
+    let mut cfg = Config::new(Backend::EpollSpin);
+    cfg.connect_timeout_ms = 1_500;
+    let mut d = Driver::with_dns(cfg, dns)?;
+    std::thread::scope(|s| -> R {
+        let srv = s.spawn(|| -> R {
+            let mut p = lab.accept()?;
+            assert!(p.client_closed()?);
+            Ok(())
+        });
+        let t0 = Instant::now();
+        let stuck = d.connect_background(WsDial::new(
+            ergon_io::Target::new("never-answers.example", 443, "/"),
+            lab.client_cfg.clone(),
+            1 << 20,
+        )?)?;
+        let fine = d.connect_background(WsDial::new(
+            lab.target("/")?,
+            lab.client_cfg.clone(),
+            1 << 20,
+        )?)?;
+        let mut h = Collect::default();
+        poll_until(&mut d, &mut h, |h| h.opened.contains(&fine))?;
+        let opened_after = t0.elapsed();
+        poll_until(&mut d, &mut h, |h| h.closed.iter().any(|c| c.0 == stuck))?;
+        let failed_after = t0.elapsed();
+        // The helper must use the driver's resolver (and its servers), so the
+        // connect ends at its own deadline, not with a system resolver error.
+        let why = &h.closed.iter().find(|c| c.0 == stuck).ok_or("no close")?.1;
+        assert!(why.contains("timed out"), "{why}");
+        assert!(
+            opened_after < Duration::from_secs(1),
+            "the pinned connect waited {opened_after:?}"
+        );
+        assert!(
+            failed_after < Duration::from_secs(3),
+            "the deadline fired after {failed_after:?}"
+        );
+        drop(d);
+        srv.join().map_err(|_| "server panicked")??;
+        Ok(())
     })
 }
 
@@ -316,19 +644,26 @@ fn connect_never_blocks_the_poll_loop() -> R {
             let mut h = Collect::default();
             let mut slowest = Duration::ZERO;
             let end = Instant::now() + Duration::from_secs(10);
+            let (slept0, _) = ergon_io::clock::thread_ctx_switches();
             while h.msgs.is_empty() {
                 let t = Instant::now();
                 d.poll(&mut h)?;
                 slowest = slowest.max(t.elapsed());
                 assert!(Instant::now() < end, "never opened: {:?}", h.closed);
             }
+            let (slept1, _) = ergon_io::clock::thread_ctx_switches();
             assert_eq!(h.opened, vec![id]);
             assert_eq!(h.msgs[0].0, id);
             assert!(d.get(id).is_some());
-            // The worst poll is a handshake step's CPU, never the network wait.
+            // Never waiting for the network: the thread never slept, and no
+            // poll came near the server's 150 ms delay (the worst is one
+            // handshake step's CPU, slow in a debug build on a shared host).
+            if !b.may_sleep() {
+                assert_eq!(slept1 - slept0, 0, "{b}: the polling thread slept");
+            }
             assert!(
-                slowest < Duration::from_millis(20),
-                "a poll took {slowest:?}"
+                slowest < Duration::from_millis(100),
+                "{b}: a poll took {slowest:?}"
             );
             assert_eq!(d.stats().connects, 1);
             drop(d);

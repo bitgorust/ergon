@@ -35,7 +35,7 @@ use std::net::{IpAddr, SocketAddr};
 use crate::backend::{Backend, Config};
 use crate::clock::{monotonic_ns, rdtsc, ticks_per_us};
 use crate::dns::{DnsConfig, Lookup, Resolver};
-use crate::endpoint::{ConnId, Dial, DriverStats, Endpoint, Handler, Receive};
+use crate::endpoint::{ConnId, ConnMut, Dial, DriverStats, Endpoint, Handler, Receive};
 use crate::error::{Error, Result};
 use crate::{RxMeta, sys};
 
@@ -53,6 +53,9 @@ struct Conns<E> {
     closing: Vec<bool>,
     /// Reserved for a connection still being set up (no endpoint yet).
     reserved: Vec<bool>,
+    /// Closed endpoints the kernel no longer references, waiting to be freed
+    /// (on the helper thread when there is one: `Driver::free_closed`).
+    closed: Vec<E>,
 }
 
 impl<E> Conns<E> {
@@ -62,6 +65,7 @@ impl<E> Conns<E> {
             gens: Vec::new(),
             closing: Vec::new(),
             reserved: Vec::new(),
+            closed: Vec::new(),
         }
     }
 
@@ -144,11 +148,13 @@ impl<E> Conns<E> {
         self.closing.get(i) == Some(&true)
     }
 
-    /// Drops a closing endpoint.
+    /// Retires a closing endpoint (freed later, see `closed`).
     #[cfg_attr(not(feature = "uring"), allow(dead_code))]
     fn finish_close(&mut self, i: usize) {
         if self.is_closing(i) {
-            self.slots[i] = None;
+            if let Some(e) = self.slots[i].take() {
+                self.closed.push(e);
+            }
             self.closing[i] = false;
         }
     }
@@ -160,16 +166,16 @@ impl<E> Conns<E> {
         std::mem::forget(std::mem::take(&mut self.slots));
     }
 
-    /// Removes and returns slot `i`, invalidating its id.
-    fn take(&mut self, i: usize) -> Option<E> {
+    /// Removes slot `i` at once, invalidating its id; the endpoint is freed
+    /// later (see `closed`).
+    fn remove(&mut self, i: usize) {
         if self.is_closing(i) {
-            return None;
+            return;
         }
-        let e = self.slots.get_mut(i)?.take();
-        if e.is_some() {
+        if let Some(e) = self.slots.get_mut(i).and_then(Option::take) {
             self.gens[i] = self.gens[i].wrapping_add(1);
+            self.closed.push(e);
         }
-        e
     }
 }
 
@@ -195,6 +201,10 @@ struct SockOpts {
     timestamps: bool,
     rcvbuf: Option<u32>,
     busy_poll_us: u32,
+    /// `recv-busy` only: preferred busy polling and the packet budget (epoll
+    /// and `io_uring` take theirs on the instance).
+    prefer_busy_poll: bool,
+    busy_poll_budget: Option<u16>,
 }
 
 impl SockOpts {
@@ -208,6 +218,10 @@ impl SockOpts {
                 Backend::EpollBusy | Backend::RecvBusy => cfg.busy_poll_us.max(1),
                 _ => 0,
             },
+            prefer_busy_poll: cfg.backend == Backend::RecvBusy && cfg.prefer_busy_poll,
+            busy_poll_budget: cfg
+                .busy_poll_budget
+                .filter(|_| cfg.backend == Backend::RecvBusy),
         }
     }
 
@@ -219,6 +233,21 @@ impl SockOpts {
             sys::set_rcvbuf(fd, b)?;
         }
         sys::set_busy_poll(fd, self.busy_poll_us)?;
+        let privileged = |what: &str, e: std::io::Error| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                Error::Config(format!("{what} needs CAP_NET_ADMIN"))
+            } else {
+                Error::Io(e)
+            }
+        };
+        if self.prefer_busy_poll {
+            sys::set_prefer_busy_poll(fd, true)
+                .map_err(|e| privileged("prefer_busy_poll (SO_PREFER_BUSY_POLL)", e))?;
+        }
+        if let Some(b) = self.busy_poll_budget {
+            sys::set_busy_poll_budget(fd, b)
+                .map_err(|e| privileged("busy_poll_budget (SO_BUSY_POLL_BUDGET)", e))?;
+        }
         Ok(())
     }
 }
@@ -245,6 +274,9 @@ pub struct Driver<E> {
     /// `poll` delivers it before reading the socket.
     buffered: bool,
     pending: Vec<Pending<E>>,
+    /// Connections `flush` closed (it has no handler): reported by the next
+    /// `poll`.
+    unreported: Vec<(ConnId, Error)>,
     resolver: Resolver,
     ticks_per_us: f64,
     /// Counter value at which deadlines are next checked (`E::DEADLINES`).
@@ -254,7 +286,15 @@ pub struct Driver<E> {
     next_setup: u64,
     setup_ticks: u64,
     /// The background connect thread, started by the first `connect_background`.
+    /// It also frees closed connections.
     background: Option<background::Background<E>>,
+    /// Resolver settings for the background thread's own resolver.
+    dns: DnsConfig,
+    /// A socket with receive timestamps enabled for the driver's lifetime. The
+    /// first timestamping socket in a process enables a kernel static key (code
+    /// patched on every CPU) and the last one to close disables it again; this
+    /// one keeps it enabled, so connections opened later never flip it.
+    _timestamp_keeper: Option<socket2::Socket>,
 }
 
 impl<E: Endpoint> Driver<E> {
@@ -273,6 +313,7 @@ impl<E: Endpoint> Driver<E> {
     /// # Errors
     /// As [`Driver::new`].
     pub fn with_dns(cfg: Config, dns: DnsConfig) -> Result<Self> {
+        cfg.validate()?;
         let tpu = ticks_per_us();
         let imp = match cfg.backend {
             Backend::EpollSpin | Backend::EpollBusy | Backend::RecvBusy => {
@@ -290,14 +331,16 @@ impl<E: Endpoint> Driver<E> {
             }
         };
         Ok(Self {
-            cfg,
             imp,
             conns: Conns::new(),
             stats: DriverStats::default(),
             read_seq: 0,
             buffered: false,
             pending: Vec::new(),
-            resolver: Resolver::new(dns),
+            unreported: Vec::new(),
+            resolver: Resolver::new(dns.clone()),
+            dns,
+            _timestamp_keeper: cfg.rx_timestamps.then(timestamp_keeper).flatten(),
             // Calibrated once here, not on the first connect.
             ticks_per_us: tpu,
             next_expiry: 0,
@@ -307,6 +350,7 @@ impl<E: Endpoint> Driver<E> {
             background: None,
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             setup_ticks: (f64::from(SETUP_STEP_US) * tpu) as u64,
+            cfg,
         })
     }
 
@@ -366,7 +410,8 @@ impl<E: Endpoint> Driver<E> {
         Ok(id)
     }
 
-    /// Like [`Driver::connect`], but DNS (the system resolver), TCP, TLS and any
+    /// Like [`Driver::connect`], but DNS (the helper's own non-blocking
+    /// resolver, built from the driver's `DnsConfig`), TCP, TLS and any
     /// upgrade run on a helper thread the driver starts on first use, so the
     /// polling thread spends no handshake CPU. `poll` only takes the finished
     /// connection; [`Handler::on_open`] / [`Handler::on_closed`] report it as
@@ -381,7 +426,10 @@ impl<E: Endpoint> Driver<E> {
         E: Send + 'static,
     {
         if self.background.is_none() {
-            self.background = Some(background::Background::start(self.cfg.connect_cpu)?);
+            self.background = Some(background::Background::start(
+                self.cfg.connect_cpu,
+                self.dns.clone(),
+            )?);
         }
         let i = self.conns.reserve();
         let id = self.conns.id(i);
@@ -402,6 +450,24 @@ impl<E: Endpoint> Driver<E> {
         Ok(id)
     }
 
+    /// Frees the connections closed during the current call: on the helper
+    /// thread when there is one (their sockets close moments later, there),
+    /// otherwise here before the call returns. The helper takes the `munmap`
+    /// calls and the wait for their TLB shootdowns; the shootdown IPI itself
+    /// still reaches the polling CPU, which runs the same address space.
+    #[cold]
+    fn free_closed(&mut self) {
+        let Self {
+            conns, background, ..
+        } = self;
+        for c in conns.closed.drain(..) {
+            match background {
+                Some(b) => b.free(c),
+                None => drop(c),
+            }
+        }
+    }
+
     /// Installs connections finished on the helper thread.
     #[cold]
     fn take_background<H: Handler>(&mut self, handler: &mut H) {
@@ -414,8 +480,12 @@ impl<E: Endpoint> Driver<E> {
                 u32::try_from(done.slot).unwrap_or(u32::MAX),
                 done.generation,
             );
-            // Closed while connecting: the slot was released; drop the result.
+            // Closed while connecting: the slot was released; free the result
+            // with the other closed connections.
             if self.conns.lookup_reserved(id).is_none() {
+                if let Ok(ep) = done.result {
+                    self.conns.closed.push(ep);
+                }
                 continue;
             }
             match done
@@ -452,7 +522,10 @@ impl<E: Endpoint> Driver<E> {
 
     /// Socket options, backend registration and the slot.
     fn install(&mut self, i: usize, ep: E) -> Result<()> {
-        SockOpts::of(&self.cfg).apply(ep.fd())?;
+        if let Err(e) = SockOpts::of(&self.cfg).apply(ep.fd()) {
+            self.conns.closed.push(ep);
+            return Err(e);
+        }
         self.install_prepared(i, ep)
     }
 
@@ -462,10 +535,15 @@ impl<E: Endpoint> Driver<E> {
     fn install_prepared(&mut self, i: usize, mut ep: E) -> Result<()> {
         let fd = ep.fd();
         let id = self.conns.id(i);
-        match &mut self.imp {
-            Imp::Epoll(e) => e.add(fd, id)?,
+        let added = match &mut self.imp {
+            Imp::Epoll(e) => e.add(fd, id),
             #[cfg(feature = "uring")]
-            Imp::Uring(u) => u.add(&mut ep, i)?,
+            Imp::Uring(u) => u.add(&mut ep, i),
+        };
+        if let Err(e) = added {
+            // Nothing was armed: freed with the other closed connections.
+            self.conns.closed.push(ep);
+            return Err(e);
         }
         self.buffered |= ep.has_buffered_input();
         self.conns.install(i, ep);
@@ -521,9 +599,13 @@ impl<E: Endpoint> Driver<E> {
             .and_then(|i| self.conns.slots[i].as_ref())
     }
 
-    /// The connection, if `id` is still open, for queuing sends.
-    pub fn get_mut(&mut self, id: ConnId) -> Option<&mut E> {
-        self.conns.lookup(id).and_then(|i| self.conns.at(i))
+    /// The connection, if `id` is still open, for queuing sends. The handle
+    /// offers the connection's methods but cannot replace or move it.
+    pub fn get_mut(&mut self, id: ConnId) -> Option<ConnMut<'_, E>> {
+        self.conns
+            .lookup(id)
+            .and_then(|i| self.conns.at(i))
+            .map(ConnMut::new)
     }
 
     /// Open connections.
@@ -556,6 +638,7 @@ impl<E: Endpoint> Driver<E> {
     pub fn close(&mut self, id: ConnId) {
         if let Some(i) = self.conns.lookup(id) {
             close_index(&mut self.imp, &mut self.conns, i);
+            self.free_closed();
         } else if let Some(i) = self.conns.lookup_reserved(id) {
             // Still connecting: dropping the dial closes its socket (a
             // background result for the released slot is dropped on arrival).
@@ -589,7 +672,16 @@ impl<E: Endpoint> Driver<E> {
     {
         self.stats.polls += 1;
         let before = self.stats.messages;
-        if self.background.as_ref().is_some_and(|b| b.outstanding > 0) {
+        if !self.unreported.is_empty() {
+            for (id, e) in self.unreported.drain(..) {
+                handler.on_closed(id, e);
+            }
+        }
+        if self
+            .background
+            .as_ref()
+            .is_some_and(background::Background::has_outstanding)
+        {
             self.take_background(handler);
         }
         if !self.pending.is_empty() || self.resolver.busy() {
@@ -604,32 +696,32 @@ impl<E: Endpoint> Driver<E> {
             self.buffered = false;
             self.deliver_buffered(handler);
         }
-        match &mut self.imp {
-            Imp::Epoll(e) => {
-                e.poll(
-                    &mut self.conns,
-                    handler,
-                    &mut self.stats,
-                    &mut self.read_seq,
-                )?;
-            }
+        let mut r = match &mut self.imp {
+            Imp::Epoll(e) => e.poll(
+                &mut self.conns,
+                handler,
+                &mut self.stats,
+                &mut self.read_seq,
+            ),
             // Receives, sends and the kernel entry in one pass, so re-arms and
             // sends share one io_uring_enter.
             #[cfg(feature = "uring")]
-            Imp::Uring(u) => {
-                u.poll(
-                    &mut self.conns,
-                    handler,
-                    &mut self.stats,
-                    &mut self.read_seq,
-                )?;
-                self.check_deadlines(handler);
-                return Ok(usize::try_from(self.stats.messages - before).unwrap_or(usize::MAX));
-            }
+            Imp::Uring(u) => u.poll(
+                &mut self.conns,
+                handler,
+                &mut self.stats,
+                &mut self.read_seq,
+            ),
+        };
+        if r.is_ok() && matches!(self.imp, Imp::Epoll(_)) {
+            r = self.send_queued(handler);
         }
-        self.flush_with(handler)?;
         // After receiving, so a response already in the socket is not timed out.
         self.check_deadlines(handler);
+        if !self.conns.closed.is_empty() {
+            self.free_closed();
+        }
+        r?;
         Ok(usize::try_from(self.stats.messages - before).unwrap_or(usize::MAX))
     }
 
@@ -684,13 +776,10 @@ impl<E: Endpoint> Driver<E> {
             }
             // io_uring arms this connection's receive only now, after the
             // buffer layout has settled.
-            #[cfg_attr(not(feature = "uring"), allow(unused_mut))]
-            let mut r = c.on_received(id, 0, &meta, handler);
+            let r = c.on_received(id, 0, &meta, handler);
             #[cfg(feature = "uring")]
-            if let (Ok(_), Imp::Uring(u)) = (&r, &mut self.imp)
-                && let Err(e) = u.arm_initial(c, i)
-            {
-                r = Err(e);
+            if let (Ok(_), Imp::Uring(u)) = (&r, &mut self.imp) {
+                u.arm_initial(c, i);
             }
             match r {
                 Ok(n) => self.stats.messages += n as u64,
@@ -704,14 +793,22 @@ impl<E: Endpoint> Driver<E> {
     }
 
     /// Sends queued bytes now (`poll` also does this). Connections that fail are
-    /// closed; use [`Driver::flush_with`] to be told.
+    /// closed and reported to the handler of the next `poll`;
+    /// [`Driver::flush_with`] reports them at once.
     ///
     /// # Errors
     /// The backend itself failed.
     pub fn flush(&mut self) -> Result<()> {
-        struct Ignore;
-        impl Handler for Ignore {}
-        self.flush_with(&mut Ignore)
+        struct Defer(Vec<(ConnId, Error)>);
+        impl Handler for Defer {
+            fn on_closed(&mut self, id: ConnId, error: Error) {
+                self.0.push((id, error));
+            }
+        }
+        let mut d = Defer(std::mem::take(&mut self.unreported));
+        let r = self.flush_with(&mut d);
+        self.unreported = d.0;
+        r
     }
 
     /// Sends queued bytes now, reporting connections that fail to `handler`.
@@ -720,6 +817,16 @@ impl<E: Endpoint> Driver<E> {
     /// The backend itself failed.
     #[inline]
     pub fn flush_with<H: Handler>(&mut self, handler: &mut H) -> Result<()> {
+        let r = self.send_queued(handler);
+        if !self.conns.closed.is_empty() {
+            self.free_closed();
+        }
+        r
+    }
+
+    #[inline]
+    #[cfg_attr(not(feature = "uring"), allow(clippy::unnecessary_wraps))]
+    fn send_queued<H: Handler>(&mut self, handler: &mut H) -> Result<()> {
         match &mut self.imp {
             Imp::Epoll(e) => {
                 for i in 0..self.conns.len_slots() {
@@ -730,6 +837,7 @@ impl<E: Endpoint> Driver<E> {
                         continue;
                     }
                     self.stats.send_calls += 1;
+                    self.stats.sends += 1;
                     let fd = c.fd();
                     let q = c.tx_queue();
                     match sys::send(fd, q) {
@@ -739,7 +847,7 @@ impl<E: Endpoint> Driver<E> {
                         Err(err) => {
                             let id = self.conns.id(i);
                             e.remove(fd);
-                            self.conns.take(i);
+                            self.conns.remove(i);
                             self.stats.closed += 1;
                             handler.on_closed(id, err.into());
                         }
@@ -748,7 +856,7 @@ impl<E: Endpoint> Driver<E> {
                 Ok(())
             }
             #[cfg(feature = "uring")]
-            Imp::Uring(u) => u.flush(&mut self.conns, handler, &mut self.stats),
+            Imp::Uring(u) => u.flush(&mut self.conns, &mut self.stats),
         }
     }
 }
@@ -766,11 +874,21 @@ impl<E> Drop for Driver<E> {
     }
 }
 
+/// A UDP socket with software receive timestamps enabled (see
+/// `Driver::_timestamp_keeper`); `None` if the kernel refuses.
+fn timestamp_keeper() -> Option<socket2::Socket> {
+    use std::os::fd::AsRawFd;
+    let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).ok()?;
+    sys::enable_rx_timestamps(s.as_raw_fd()).ok()?;
+    Some(s)
+}
+
 fn close_index<E: Endpoint>(imp: &mut Imp, conns: &mut Conns<E>, i: usize) {
     match imp {
         Imp::Epoll(e) => {
-            if let Some(c) = conns.take(i) {
-                e.remove(c.fd());
+            if let Some(fd) = conns.at(i).map(|c| c.fd()) {
+                e.remove(fd);
+                conns.remove(i);
             }
         }
         #[cfg(feature = "uring")]

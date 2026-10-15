@@ -73,6 +73,14 @@ fn exercise(lab: &Lab, cfg: &HttpClientConfig) -> R {
                 "{body}"
             );
             assert!(body.contains("&signature="));
+            // HEAD: the length is announced, no body follows; both
+            // implementations must complete it at once.
+            let hid = c.request("HEAD", "/head", &[], &[])?;
+            poll_until(&mut c, &mut h, |_, h| {
+                h.ok.iter().any(|r| r.0 == hid) || !h.errors.is_empty()
+            })?;
+            let head = h.ok.iter().find(|r| r.0 == hid).ok_or("HEAD failed")?;
+            assert_eq!((head.1, head.2.as_str()), (200, ""));
             assert!(h.errors.is_empty(), "{:?}", h.errors);
             Ok(())
         })();
@@ -115,6 +123,70 @@ fn native_pool_replaces_a_dropped_connection() -> R {
         srv.join().map_err(|_| "server panicked")??;
         result
     })
+}
+
+#[derive(Default)]
+struct Counting {
+    seen: Seen,
+    connect_errors: usize,
+}
+
+impl ClientHandler for Counting {
+    fn on_response(&mut self, request: u64, r: &Response<'_>) {
+        self.seen.on_response(request, r);
+    }
+    fn on_error(&mut self, request: u64, error: Error) {
+        self.seen.on_error(request, error);
+    }
+    fn on_connect_error(&mut self, _error: Error) {
+        self.connect_errors += 1;
+    }
+}
+
+#[test]
+fn connect_failures_are_reported_not_returned() -> R {
+    let lab = Lab::new()?;
+    // TCP refuses a multicast destination inside connect() itself
+    // (ENETUNREACH): every attempt fails synchronously, on the polling thread.
+    let addr = std::net::SocketAddr::from(([224, 0, 0, 1], 443));
+    let target = ergon_io::Target::new("localhost", 443, "").with_addr(addr);
+    for background in [false, true] {
+        let mut cfg = HttpClientConfig::new(HttpImpl::Native);
+        cfg.pool = 2;
+        cfg.background_connect = background;
+        let mut c = HttpClient::new(&cfg, target.clone(), lab.client_cfg.clone())?;
+        let mut h = Counting::default();
+        let end = Instant::now() + Duration::from_secs(10);
+        while h.connect_errors < 4 {
+            c.poll(&mut h)?;
+            assert!(
+                Instant::now() < end,
+                "background={background}: connect errors not reported"
+            );
+        }
+        assert_eq!(c.idle(), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn unhandled_connect_failures_are_counted_and_warned() -> R {
+    // `Seen` does not implement on_connect_error: the default warns (stderr,
+    // from a background thread, rate-limited) and the client counts them.
+    let lab = Lab::new()?;
+    let addr = std::net::SocketAddr::from(([224, 0, 0, 1], 443));
+    let target = ergon_io::Target::new("localhost", 443, "").with_addr(addr);
+    let mut cfg = HttpClientConfig::new(HttpImpl::Native);
+    cfg.pool = 1;
+    let mut c = HttpClient::new(&cfg, target, lab.client_cfg)?;
+    let mut h = Seen::default();
+    let end = Instant::now() + Duration::from_secs(10);
+    while c.connect_failures() < 2 {
+        c.poll(&mut h)?;
+        assert!(Instant::now() < end, "connect failures not counted");
+    }
+    assert!(h.errors.is_empty(), "{:?}", h.errors);
+    Ok(())
 }
 
 #[test]

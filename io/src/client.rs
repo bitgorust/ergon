@@ -111,6 +111,87 @@ pub trait ClientHandler {
     fn on_error(&mut self, request: u64, error: Error) {
         let _ = (request, error);
     }
+    /// A pooled connection could not be opened (native implementation). The
+    /// pool keeps retrying with back-off (100 ms doubling to 5 s); `poll` itself
+    /// does not fail, and [`HttpClient::connect_failures`] counts them.
+    ///
+    /// The default prints a warning to stderr, at most one every 10 s across
+    /// the process (with the number held back). A thread started with the
+    /// client, on the housekeeping CPUs, makes the write, so the polling
+    /// thread only formats the line and queues it. Implement it to route
+    /// failures to your own logging or alerting.
+    fn on_connect_error(&mut self, error: Error) {
+        unhandled::warn("HttpClient could not open a connection", &error);
+    }
+}
+
+/// Warnings for failures the application does not handle itself.
+mod unhandled {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    use std::sync::mpsc::{self, Sender};
+
+    use crate::clock::monotonic_ns;
+    use crate::error::Error;
+
+    const EVERY_NS: i64 = 10_000_000_000;
+    static LAST_NS: AtomicI64 = AtomicI64::new(i64::MIN);
+    static HELD_BACK: AtomicU64 = AtomicU64::new(0);
+    static WRITER: OnceLock<Option<Sender<String>>> = OnceLock::new();
+
+    /// Starts the writer thread (on the housekeeping CPUs: stderr may be a
+    /// pipe that blocks). Called when a client is created, so neither the
+    /// sysfs reads nor the thread start land on the polling thread.
+    pub(super) fn prepare() {
+        WRITER.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<String>();
+            let cpus = crate::sys::housekeeping_cpus(crate::sys::current_cpu());
+            crate::sys::spawn_pinned("ergon-io-warn", &cpus, move || {
+                for m in rx {
+                    eprintln!("{m}");
+                }
+            })
+            .ok()
+            .map(|()| tx)
+        });
+    }
+
+    /// Queues `what: error` for the writer, at most once every 10 s; written
+    /// here only if the writer could not start. There is one writer per
+    /// process (`WRITER`), parked in `recv`: each queued line costs the polling
+    /// thread an allocation and a futex wake, bounded by the rate limit.
+    pub(super) fn warn(what: &str, error: &Error) {
+        let now = monotonic_ns();
+        let last = LAST_NS.load(Ordering::Relaxed);
+        let due = last == i64::MIN || now - last >= EVERY_NS;
+        // One winner per 10 s, even with clients on several threads.
+        if !due
+            || LAST_NS
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            HELD_BACK.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let held = HELD_BACK.swap(0, Ordering::Relaxed);
+        let msg = format!(
+            "ergon-io warning: {what}: {error}{}; retrying (implement \
+             ClientHandler::on_connect_error to handle this yourself)",
+            if held > 0 {
+                format!(" ({held} more since the last warning)")
+            } else {
+                String::new()
+            }
+        );
+        match WRITER.get().and_then(Option::as_ref) {
+            Some(tx) => {
+                if let Err(mpsc::SendError(m)) = tx.send(msg) {
+                    eprintln!("{m}");
+                }
+            }
+            None => eprintln!("{msg}"),
+        }
+    }
 }
 
 enum Imp {
@@ -127,11 +208,13 @@ pub struct HttpClient {
 
 impl HttpClient {
     /// A client for `target` (its headers, such as the API key, go with every
-    /// request). Native connections start opening at once.
+    /// request). Native connections start opening at once; a connection that
+    /// cannot be opened is reported to [`ClientHandler::on_connect_error`] from
+    /// `poll` and retried.
     ///
     /// # Errors
-    /// The implementation is not built in, or the driver or libcurl fails to
-    /// initialise.
+    /// The implementation is not built in, the configuration is invalid
+    /// (headers, TLS config), or the driver or libcurl fails to initialise.
     pub fn new(
         cfg: &HttpClientConfig,
         target: Target,
@@ -141,7 +224,12 @@ impl HttpClient {
             return Err(Error::Config("pool must be at least 1".into()));
         }
         let imp = match cfg.implementation {
-            HttpImpl::Native => Imp::Native(Box::new(Native::new(cfg, target, tls)?)),
+            HttpImpl::Native => {
+                // The default `on_connect_error` warning's writer, started now
+                // rather than on the polling thread at the first failure.
+                unhandled::prepare();
+                Imp::Native(Box::new(Native::new(cfg, target, tls)?))
+            }
             #[cfg(feature = "curl")]
             HttpImpl::Curl => {
                 let _ = tls;
@@ -164,6 +252,18 @@ impl HttpClient {
             Imp::Native(_) => HttpImpl::Native,
             #[cfg(feature = "curl")]
             Imp::Curl(_) => HttpImpl::Curl,
+        }
+    }
+
+    /// Connections the native pool failed to open since it was created (each
+    /// also went to [`ClientHandler::on_connect_error`]); 0 for libcurl, which
+    /// reports connect failures as request errors.
+    #[must_use]
+    pub fn connect_failures(&self) -> u64 {
+        match &self.imp {
+            Imp::Native(n) => n.connect_failures,
+            #[cfg(feature = "curl")]
+            Imp::Curl(_) => 0,
         }
     }
 
@@ -265,6 +365,7 @@ struct Native {
     background: bool,
     slots: Vec<Slot>,
     next: usize,
+    connect_failures: u64,
 }
 
 impl Native {
@@ -289,9 +390,13 @@ impl Native {
                 })
                 .collect(),
             next: 0,
+            connect_failures: 0,
         };
+        // Configuration errors (headers, TLS config) fail here; connect
+        // failures go to the handler from `poll`, which retries them.
+        HttpDial::new(n.target.clone(), n.tls.clone(), n.opts)?;
         for i in 0..n.slots.len() {
-            n.open(i)?;
+            let _ = n.open(i);
         }
         Ok(n)
     }
@@ -322,11 +427,11 @@ impl Native {
         else {
             return Err(Error::Busy("no idle connection in the pool"));
         };
-        let conn = self.slots[i]
+        let mut conn = self.slots[i]
             .id
             .and_then(|c| self.driver.get_mut(c))
             .ok_or(Error::Closed)?;
-        f(conn)?;
+        f(conn.inner())?;
         self.slots[i].request = Some(id);
         self.next = (i + 1) % n;
         Ok(())
@@ -337,9 +442,11 @@ impl Native {
             h: handler,
             slots: &mut self.slots,
             done: 0,
+            connect_failures: 0,
         };
         self.driver.poll(&mut a)?;
         let done = a.done;
+        self.connect_failures += a.connect_failures;
         // Replace dropped connections (with back-off on repeated failure).
         if self.slots.iter().any(|s| s.id.is_none()) {
             let now = monotonic_ns();
@@ -348,7 +455,12 @@ impl Native {
                     let s = &mut self.slots[i];
                     s.backoff_ms = (s.backoff_ms * 2).clamp(100, 5_000);
                     s.retry_at_ns = now + s.backoff_ms * 1_000_000;
-                    self.open(i)?;
+                    // A refused or unroutable connect fails here at once: report
+                    // it and retry later, as for one that fails while connecting.
+                    if let Err(e) = self.open(i) {
+                        self.connect_failures += 1;
+                        handler.on_connect_error(e);
+                    }
                 }
             }
         }
@@ -361,6 +473,7 @@ struct Adapter<'a, H> {
     h: &'a mut H,
     slots: &'a mut [Slot],
     done: usize,
+    connect_failures: u64,
 }
 
 impl<H> Adapter<'_, H> {
@@ -382,10 +495,14 @@ impl<H: ClientHandler> Handler for Adapter<'_, H> {
             return;
         };
         s.id = None;
-        s.open = false;
+        let was_open = std::mem::replace(&mut s.open, false);
         if let Some(r) = s.request.take() {
             self.done += 1;
             self.h.on_error(r, error);
+        } else if !was_open {
+            // It never opened: a failed connect.
+            self.connect_failures += 1;
+            self.h.on_connect_error(error);
         }
     }
 }

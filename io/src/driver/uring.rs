@@ -22,9 +22,15 @@
 //! buffer and send buffer until the matching completion is reaped. Closing a
 //! connection cancels its requests and keeps it alive until both completions
 //! arrive; dropping the driver cancels everything and reaps before freeing.
+//!
+//! Requests are tagged with the slot, its generation (bumped for every new
+//! connection in the slot) and the operation, and cancels match that exact tag,
+//! so a late cancel can never reach a later connection that reuses the slot or
+//! the descriptor. Submissions that do not fit in the queue wait in a backlog
+//! and go in on the next poll; they are never treated as failures.
 #![allow(unsafe_code)]
 
-use std::os::fd::RawFd;
+use std::collections::VecDeque;
 
 use io_uring::types::{CancelBuilder, Napi, NapiTracking};
 use io_uring::{IoUring, opcode, squeue, types};
@@ -54,8 +60,13 @@ struct Slot {
     send_off: usize,
     recv_armed: bool,
     send_active: bool,
-    /// A cancel that did not fit in the submission queue yet.
-    cancel_fd: Option<RawFd>,
+    /// Bumped for every connection placed in this slot (24 bits are tagged).
+    generation: u32,
+    /// Static NAPI tracking: whether this connection's NIC queue is known and
+    /// registered (it is learnt from the first packet the socket receives).
+    napi_known: bool,
+    /// The NAPI id this connection holds a reference to (0: none).
+    napi_id: u32,
 }
 
 pub(super) struct Uring {
@@ -65,9 +76,12 @@ pub(super) struct Uring {
     slots: Vec<Slot>,
     pending: usize,
     wait: types::Timespec,
-    napi_ids: Vec<u32>,
+    /// Static NAPI ids registered with the ring and how many open
+    /// connections use each; an id is deleted when its last one closes.
+    napi_refs: Vec<(u32, usize)>,
     napi_static: bool,
-    pending_cancels: bool,
+    /// Submissions that did not fit in the queue, in order.
+    backlog: VecDeque<squeue::Entry>,
 }
 
 impl Uring {
@@ -121,15 +135,26 @@ impl Uring {
             let register = |tracking| {
                 let mut napi = Napi::new()
                     .set_busy_poll_timeout(budget)
-                    .set_prefer_busy_poll(false)
+                    .set_prefer_busy_poll(cfg.prefer_busy_poll)
                     .set_tracking(tracking);
                 ring.submitter().register_napi(&mut napi)
             };
-            napi_static = register(NapiTracking::Static).is_ok();
-            if !napi_static {
-                register(NapiTracking::Dynamic).map_err(|_| {
+            let napi_error = |e: std::io::Error| match e.raw_os_error() {
+                Some(libc::EINVAL) => {
                     Error::Unsupported("IORING_REGISTER_NAPI needs Linux 6.9 or newer")
-                })?;
+                }
+                Some(libc::EOPNOTSUPP) => Error::Unsupported(
+                    "the kernel was built without busy polling (CONFIG_NET_RX_BUSY_POLL)",
+                ),
+                _ => Error::Io(e),
+            };
+            match register(NapiTracking::Static) {
+                Ok(()) => napi_static = true,
+                // Static tracking is 6.13+: only "unknown mode" falls back.
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                    register(NapiTracking::Dynamic).map_err(napi_error)?;
+                }
+                Err(e) => return Err(napi_error(e)),
             }
         }
         Ok(Self {
@@ -140,20 +165,13 @@ impl Uring {
             wait: types::Timespec::new()
                 .sec(u64::from(cfg.wait_us / 1_000_000))
                 .nsec((cfg.wait_us % 1_000_000) * 1000),
-            napi_ids: Vec::new(),
+            napi_refs: Vec::new(),
             napi_static,
-            pending_cancels: false,
+            backlog: VecDeque::with_capacity(cfg.ring_entries as usize),
         })
     }
 
     pub(super) fn add<E: Endpoint>(&mut self, ep: &mut E, i: usize) -> Result<()> {
-        if self.napi_static {
-            let id = sys::incoming_napi_id(ep.fd()).unwrap_or(0);
-            if id != 0 && !self.napi_ids.contains(&id) {
-                self.ring.submitter().register_napi_add_id(id)?;
-                self.napi_ids.push(id);
-            }
-        }
         while self.slots.len() <= i {
             self.slots.push(Slot {
                 msg: MsgSlot::new(),
@@ -161,60 +179,116 @@ impl Uring {
                 send_off: 0,
                 recv_armed: false,
                 send_active: false,
-                cancel_fd: None,
+                generation: 0,
+                napi_known: true,
+                napi_id: 0,
             });
+        }
+        let s = &mut self.slots[i];
+        s.generation = s.generation.wrapping_add(1) & GEN_MASK;
+        s.napi_known = !self.napi_static;
+        s.napi_id = 0;
+        // A socket that has received nothing yet has no NAPI id: its queue is
+        // registered on its first receive instead (`on_recv`).
+        if self.napi_static {
+            let known = self.register_napi_of(ep.fd(), i)?;
+            self.slots[i].napi_known = known;
         }
         // Input left from the handshake is decoded first (the driver's next
         // poll), which may move the buffer: arm after that (`arm_initial`).
-        if ep.has_buffered_input() {
-            return Ok(());
+        if !ep.has_buffered_input() {
+            self.arm_recv(ep, i);
         }
-        self.arm_recv(ep, i)
+        Ok(())
+    }
+
+    /// Registers the NIC queue that `fd`'s last packet came from (static
+    /// tracking) for slot `i`; `false` while the socket has received nothing.
+    /// A getsockopt, plus a register call for a new queue: once per
+    /// connection, at set-up or on its first receive, on the polling thread.
+    fn register_napi_of(&mut self, fd: std::os::fd::RawFd, i: usize) -> Result<bool> {
+        let id = sys::incoming_napi_id(fd).unwrap_or(0);
+        if id == 0 {
+            return Ok(false);
+        }
+        if let Some(r) = self.napi_refs.iter_mut().find(|r| r.0 == id) {
+            r.1 += 1;
+        } else {
+            self.ring.submitter().register_napi_add_id(id)?;
+            self.napi_refs.push((id, 1));
+        }
+        self.slots[i].napi_id = id;
+        Ok(true)
+    }
+
+    /// Drops slot `i`'s NAPI reference; the queue stops being polled when no
+    /// open connection uses it.
+    fn release_napi(&mut self, i: usize) {
+        let id = std::mem::take(&mut self.slots[i].napi_id);
+        if id == 0 {
+            return;
+        }
+        if let Some(k) = self.napi_refs.iter().position(|r| r.0 == id) {
+            self.napi_refs[k].1 -= 1;
+            if self.napi_refs[k].1 == 0 {
+                self.napi_refs.swap_remove(k);
+                let _ = self.ring.submitter().register_napi_del_id(id);
+            }
+        }
     }
 
     /// Arms the first receive of a connection added with buffered input.
-    pub(super) fn arm_initial<E: Io>(&mut self, ep: &mut E, i: usize) -> Result<()> {
+    pub(super) fn arm_initial<E: Io>(&mut self, ep: &mut E, i: usize) {
         if self.slots.get(i).is_some_and(|s| !s.recv_armed) {
-            self.arm_recv(ep, i)?;
+            self.arm_recv(ep, i);
         }
-        Ok(())
     }
 
     /// Starts closing slot `i`: cancels its requests, or drops it at once when
     /// nothing is in flight.
     pub(super) fn close<E: Endpoint>(&mut self, conns: &mut Conns<E>, i: usize) {
-        let Some(fd) = conns.at(i).map(|c| c.fd()) else {
+        if conns.at(i).is_none() {
             return;
-        };
+        }
         conns.begin_close(i);
-        self.cancel_fd(fd, i);
+        // Requests still in the backlog never reached the kernel: drop them.
+        self.purge_backlog(i);
+        if let Some(s) = self.slots.get(i) {
+            let g = s.generation;
+            for (armed, op) in [(s.recv_armed, RECV), (s.send_active, SEND)] {
+                if armed {
+                    let e = opcode::AsyncCancel2::new(CancelBuilder::user_data(tag(i, g, op)))
+                        .build()
+                        .user_data(tag(i, g, CANCEL));
+                    self.push(e);
+                }
+            }
+        }
         self.maybe_finish(conns, i);
     }
 
-    fn cancel_fd(&mut self, fd: RawFd, i: usize) {
-        let Some(s) = self.slots.get(i) else {
+    /// Removes slot `i`'s queued submissions (its current generation) and
+    /// clears the flags of the requests they would have started.
+    fn purge_backlog(&mut self, slot: usize) {
+        if self.backlog.is_empty() {
+            return;
+        }
+        let Some(state) = self.slots.get_mut(slot) else {
             return;
         };
-        if !s.recv_armed && !s.send_active {
-            return;
-        }
-        let e = opcode::AsyncCancel2::new(CancelBuilder::fd(types::Fd(fd)).all())
-            .build()
-            .user_data(tag(i, CANCEL));
-        // A full queue: retried on every poll until it fits.
-        if self.push(&e).is_err() {
-            self.slots[i].cancel_fd = Some(fd);
-            self.pending_cancels = true;
-        }
-    }
-
-    #[cold]
-    fn retry_cancels(&mut self) {
-        for i in 0..self.slots.len() {
-            if let Some(fd) = self.slots[i].cancel_fd.take() {
-                self.cancel_fd(fd, i);
+        let generation = state.generation;
+        self.backlog.retain(|entry| {
+            let (other, other_generation, op) = untag(entry.get_user_data());
+            if other != slot || other_generation != generation {
+                return true;
             }
-        }
+            match op {
+                RECV => state.recv_armed = false,
+                SEND => state.send_active = false,
+                _ => {}
+            }
+            false
+        });
     }
 
     fn maybe_finish<E>(&mut self, conns: &mut Conns<E>, i: usize) {
@@ -224,9 +298,14 @@ impl Uring {
                 .get(i)
                 .is_none_or(|s| !s.recv_armed && !s.send_active)
         {
+            // Leftover cancels for this connection are not needed any more.
+            self.purge_backlog(i);
             if let Some(s) = self.slots.get_mut(i) {
                 s.send_buf.clear();
                 s.send_off = 0;
+            }
+            if i < self.slots.len() {
+                self.release_napi(i);
             }
             conns.finish_close(i);
         }
@@ -261,14 +340,12 @@ impl Uring {
         E: Receive<H>,
         H: Handler,
     {
-        if self.pending_cancels {
-            self.pending_cancels = false;
-            self.retry_cancels();
-            self.pending_cancels = self.slots.iter().any(|s| s.cancel_fd.is_some());
+        if !self.backlog.is_empty() {
+            self.drain_backlog();
         }
         if self.ring.completion().is_empty() {
             // Idle fast path: nothing to reap.
-            self.push_sends(conns, handler, stats);
+            self.push_sends(conns, stats);
             return self.enter(true, stats);
         }
         let mut cqes = [(0u64, 0i32); MAX_CQES];
@@ -281,14 +358,19 @@ impl Uring {
             }
         }
         for &(ud, res) in &cqes[..n] {
-            let i = usize::try_from(ud >> 8).unwrap_or(usize::MAX);
-            match ud & 0xFF {
+            let (i, g, op) = untag(ud);
+            // Every request of a slot completes before the slot is reused, so
+            // a mismatch is a cancel's own completion at most; never act on it.
+            if self.slots.get(i).is_none_or(|s| s.generation != g) {
+                continue;
+            }
+            match op {
                 RECV => self.on_recv(conns, i, res, handler, stats, read_seq),
                 SEND => self.on_send(conns, i, res, handler, stats),
                 _ => {}
             }
         }
-        self.push_sends(conns, handler, stats);
+        self.push_sends(conns, stats);
         self.enter(n == 0, stats)
     }
 
@@ -317,6 +399,7 @@ impl Uring {
         let Some(conn) = conns.at(i) else {
             return;
         };
+        let napi_known = slot.napi_known;
         let outcome = match usize::try_from(res) {
             Ok(0) => Err(Error::Closed),
             Ok(len) => {
@@ -329,7 +412,16 @@ impl Uring {
             Err(_) if res == -libc::EAGAIN || res == -libc::EINTR => Ok(()),
             Err(_) => Err(Error::Io(std::io::Error::from_raw_os_error(-res))),
         };
-        let outcome = outcome.and_then(|()| self.arm_recv(conn, i));
+        // The first packet tells which NIC queue to poll (one getsockopt per
+        // connection).
+        let outcome = outcome.and_then(|()| {
+            if !napi_known && res > 0 {
+                let known = self.register_napi_of(conn.fd(), i)?;
+                self.slots[i].napi_known = known;
+            }
+            Ok(())
+        });
+        let outcome = outcome.map(|()| self.arm_recv(conn, i));
         if let Err(e) = outcome {
             self.fail(conns, i, e, handler, stats);
         }
@@ -358,9 +450,7 @@ impl Uring {
         };
         slot.send_off += sent;
         if slot.send_off < slot.send_buf.len() {
-            if let Err(e) = self.push_send(conns, i) {
-                self.fail(conns, i, e, handler, stats);
-            }
+            self.push_send(conns, i, stats);
         } else {
             slot.send_buf.clear();
             slot.send_off = 0;
@@ -370,12 +460,7 @@ impl Uring {
     /// Moves each idle connection's queued bytes into its in-flight send buffer
     /// (a swap, no copy) and queues the send.
     #[inline]
-    fn push_sends<E: Endpoint, H: Handler>(
-        &mut self,
-        conns: &mut Conns<E>,
-        handler: &mut H,
-        stats: &mut DriverStats,
-    ) {
+    fn push_sends<E: Endpoint>(&mut self, conns: &mut Conns<E>, stats: &mut DriverStats) {
         for i in 0..conns.len_slots().min(self.slots.len()) {
             if self.slots[i].send_active || !conns.is_open(i) {
                 continue;
@@ -390,20 +475,19 @@ impl Uring {
             let s = &mut self.slots[i];
             std::mem::swap(&mut s.send_buf, q);
             s.send_off = 0;
-            stats.send_calls += 1;
-            if let Err(e) = self.push_send(conns, i) {
-                self.fail(conns, i, e, handler, stats);
-            }
+            self.push_send(conns, i, stats);
         }
     }
 
-    pub(super) fn flush<E: Endpoint, H: Handler>(
+    pub(super) fn flush<E: Endpoint>(
         &mut self,
         conns: &mut Conns<E>,
-        handler: &mut H,
         stats: &mut DriverStats,
     ) -> Result<()> {
-        self.push_sends(conns, handler, stats);
+        if !self.backlog.is_empty() {
+            self.drain_backlog();
+        }
+        self.push_sends(conns, stats);
         self.enter(false, stats)
     }
 
@@ -411,9 +495,13 @@ impl Uring {
     fn enter(&mut self, idle: bool, stats: &mut DriverStats) -> Result<()> {
         match self.mode {
             Mode::Sqpoll => {
-                if self.pending > 0 {
-                    // A syscall happens only when the SQPOLL thread went to sleep.
-                    if self.ring.submission().need_wakeup() {
+                // Completions that overflowed the ring wait in the kernel until
+                // an enter collects them.
+                let overflow = self.ring.submission().cq_overflow();
+                if self.pending > 0 || overflow {
+                    // A syscall happens only when the SQPOLL thread went to
+                    // sleep or completions overflowed.
+                    if overflow || self.ring.submission().need_wakeup() {
                         stats.enter_calls += 1;
                     }
                     self.ring.submit()?;
@@ -435,7 +523,11 @@ impl Uring {
                 self.pending = 0;
             }
             _ => {
-                if self.pending > 0 || self.ring.submission().taskrun() {
+                let work = {
+                    let sq = self.ring.submission();
+                    sq.taskrun() || sq.cq_overflow()
+                };
+                if self.pending > 0 || work {
                     stats.enter_calls += 1;
                     self.ring.submitter().submit_and_wait(0)?;
                     self.pending = 0;
@@ -445,49 +537,72 @@ impl Uring {
         Ok(())
     }
 
-    fn arm_recv<E: Endpoint>(&mut self, conn: &mut E, i: usize) -> Result<()> {
+    fn arm_recv<E: Endpoint>(&mut self, conn: &mut E, i: usize) {
         let s = &mut self.slots[i];
         s.msg.arm(conn.rx_space());
         let e = opcode::RecvMsg::new(types::Fd(conn.fd()), &raw mut s.msg.hdr)
             .build()
-            .user_data(tag(i, RECV));
+            .user_data(tag(i, s.generation, RECV));
         s.recv_armed = true;
-        self.push(&e)
-            .inspect_err(|_| self.slots[i].recv_armed = false)
+        self.push(e);
     }
 
-    fn push_send<E: Endpoint>(&mut self, conns: &mut Conns<E>, i: usize) -> Result<()> {
+    fn push_send<E: Endpoint>(&mut self, conns: &mut Conns<E>, i: usize, stats: &mut DriverStats) {
         let Some(fd) = conns.at(i).map(|c| c.fd()) else {
-            return Ok(());
+            return;
         };
         let s = &mut self.slots[i];
         let rest = &s.send_buf[s.send_off..];
-        let len = u32::try_from(rest.len())
-            .map_err(|_| Error::Config("send larger than 4 GiB".into()))?;
+        // The kernel sends at most MAX_RW_COUNT per call anyway; `on_send`
+        // queues the rest.
+        let len = u32::try_from(rest.len()).unwrap_or(u32::MAX);
         let e = opcode::Send::new(types::Fd(fd), rest.as_ptr(), len)
             .flags(libc::MSG_NOSIGNAL)
             .build()
-            .user_data(tag(i, SEND));
+            .user_data(tag(i, s.generation, SEND));
         s.send_active = true;
-        self.push(&e)
-            .inspect_err(|_| self.slots[i].send_active = false)
+        // Submitted through io_uring_enter (or the SQPOLL thread): no syscall
+        // of its own.
+        stats.sends += 1;
+        self.push(e);
     }
 
-    fn push(&mut self, e: &squeue::Entry) -> Result<()> {
-        for _ in 0..2 {
+    /// Queues `e`, behind any backlog so submissions keep their order. A full
+    /// queue is not an error: the entry waits in the backlog for the next poll.
+    fn push(&mut self, e: squeue::Entry) {
+        if self.backlog.is_empty() {
             // SAFETY: every pointer in `e` (msghdr slot, receive buffer tail, send
             // buffer) stays valid and untouched until its completion is reaped:
             // slots are boxed and owned here, receive buffers belong to endpoints
             // that are only dropped after their completions (`maybe_finish`,
             // `shutdown`), and send buffers are only cleared after completion.
-            if unsafe { self.ring.submission().push(e) }.is_ok() {
+            // Entries waiting in the backlog keep the same guarantees.
+            if unsafe { self.ring.submission().push(&e) }.is_ok() {
                 self.pending += 1;
-                return Ok(());
+                return;
             }
-            self.ring.submit()?;
+        }
+        self.backlog.push_back(e);
+    }
+
+    /// Moves backlog entries into the submission queue while they fit. Without
+    /// `SQPOLL` an enter first makes room (the kernel consumes the whole queue).
+    #[cold]
+    fn drain_backlog(&mut self) {
+        if self.mode != Mode::Sqpoll
+            && self.ring.submission().is_full()
+            && self.ring.submit().is_ok()
+        {
             self.pending = 0;
         }
-        Err(Error::Config("io_uring submission queue full".into()))
+        while let Some(e) = self.backlog.front() {
+            // SAFETY: as in `push`.
+            if unsafe { self.ring.submission().push(e) }.is_err() {
+                break;
+            }
+            self.backlog.pop_front();
+            self.pending += 1;
+        }
     }
 
     /// Cancels every request and reaps until the kernel holds no buffer, for at
@@ -495,6 +610,20 @@ impl Uring {
     /// leak the endpoints.
     pub(super) fn shutdown(&mut self) -> bool {
         let inflight = |s: &[Slot]| s.iter().any(|s| s.recv_armed || s.send_active);
+        if !inflight(&self.slots) {
+            return true;
+        }
+        // Backlog entries never reached the kernel.
+        for e in std::mem::take(&mut self.backlog) {
+            let (i, g, op) = untag(e.get_user_data());
+            if let Some(s) = self.slots.get_mut(i).filter(|s| s.generation == g) {
+                match op {
+                    RECV => s.recv_armed = false,
+                    SEND => s.send_active = false,
+                    _ => {}
+                }
+            }
+        }
         if !inflight(&self.slots) {
             return true;
         }
@@ -512,9 +641,9 @@ impl Uring {
                 .register_sync_cancel(None, CancelBuilder::any());
             let _ = self.ring.submitter().submit_and_wait(0);
             for cqe in self.ring.completion() {
-                let i = usize::try_from(cqe.user_data() >> 8).unwrap_or(usize::MAX);
-                if let Some(s) = self.slots.get_mut(i) {
-                    match cqe.user_data() & 0xFF {
+                let (i, g, op) = untag(cqe.user_data());
+                if let Some(s) = self.slots.get_mut(i).filter(|s| s.generation == g) {
+                    match op {
                         RECV => s.recv_armed = false,
                         SEND => s.send_active = false,
                         _ => {}
@@ -532,6 +661,18 @@ impl Uring {
     }
 }
 
-const fn tag(i: usize, op: u64) -> u64 {
-    ((i as u64) << 8) | op
+/// Generations are tagged with 24 bits.
+const GEN_MASK: u32 = 0x00FF_FFFF;
+
+/// `user_data`: generation (24 bits) | slot (32 bits) | operation (8 bits).
+const fn tag(i: usize, generation: u32, op: u64) -> u64 {
+    ((generation & GEN_MASK) as u64) << 40 | ((i as u64) & 0xFFFF_FFFF) << 8 | op
+}
+
+const fn untag(ud: u64) -> (usize, u32, u64) {
+    (
+        ((ud >> 8) & 0xFFFF_FFFF) as usize,
+        (ud >> 40) as u32,
+        ud & 0xFF,
+    )
 }

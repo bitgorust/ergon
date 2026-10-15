@@ -3,23 +3,29 @@
 //! - `epoll-spin`: `epoll_wait(timeout = 0)` every poll, then one `recvmsg` per
 //!   ready socket (level-triggered, so data left behind is reported again).
 //! - `epoll-busy`: `epoll_pwait2(wait_us)` with busy poll enabled on the epoll
-//!   instance (`EPIOCSPARAMS`, `prefer_busy_poll` off): when nothing is ready the
-//!   kernel polls the NIC queue for up to `busy_poll_us`, then sleeps until an
-//!   event or the timeout. A zero timeout returns before the busy loop, so this
-//!   backend sleeps by design. An epoll instance tracks one NAPI id, so with
+//!   instance (`EPIOCSPARAMS`, carrying `Config::prefer_busy_poll` and
+//!   `busy_poll_budget`): when nothing is ready the kernel polls the NIC queue
+//!   for up to `busy_poll_us`, then sleeps until an event or the timeout. A
+//!   zero timeout returns before the busy loop, so this backend sleeps by
+//!   design. An epoll instance tracks one NAPI id, so with
 //!   sockets on several RX queues only one is polled.
 //! - `recv-busy`: no epoll; a non-blocking `recvmsg` on every socket every poll,
 //!   with `SO_BUSY_POLL` set (by [`super::Driver::add`]). An empty read runs
 //!   `sk_busy_loop(sk, nonblock)`: one NAPI pass, then `EAGAIN`. Never sleeps.
+//!   A poll costs one syscall per socket, so with many sockets
+//!   `Config::per_queue` reads one socket per NIC queue (its NAPI id; sockets
+//!   whose queue is not known yet are all read), which polls every queue
+//!   once, then `epoll_wait(0)` for the sockets those passes (or interrupts)
+//!   made ready: queues plus ready sockets per poll instead of every socket.
 #![allow(unsafe_code)]
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use super::{Conns, recv_one};
 use crate::backend::{Backend, Config};
-use crate::endpoint::{ConnId, DriverStats, Handler, Receive};
+use crate::endpoint::{ConnId, DriverStats, Endpoint, Handler, Receive};
 use crate::error::{Error, Result};
-use crate::sys::MsgSlot;
+use crate::sys::{self, MsgSlot};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -32,6 +38,17 @@ const MAX_EVENTS: usize = 64;
 
 pub(super) struct Epoll {
     mode: Mode,
+    /// `recv-busy` with `Config::per_queue`.
+    per_queue: bool,
+    /// Per slot: the socket's NAPI id once known (0 until then).
+    napi: Vec<u32>,
+    /// Per slot: read every poll (one per NIC queue, plus unknown queues).
+    polled: Vec<bool>,
+    /// The slots in `polled`, in order.
+    reps: Vec<usize>,
+    /// Sockets came or went, or a queue may have become known.
+    dirty: bool,
+    polls: u64,
     ep: Option<OwnedFd>,
     slot: Box<MsgSlot>,
     events: Box<[libc::epoll_event; MAX_EVENTS]>,
@@ -45,7 +62,8 @@ impl Epoll {
             Backend::RecvBusy => Mode::Recv,
             _ => Mode::Spin,
         };
-        let ep = if mode == Mode::Recv {
+        let per_queue = mode == Mode::Recv && cfg.per_queue;
+        let ep = if mode == Mode::Recv && !per_queue {
             None
         } else {
             // SAFETY: plain syscall.
@@ -57,10 +75,16 @@ impl Epoll {
             Some(unsafe { OwnedFd::from_raw_fd(fd) })
         };
         if let (Mode::Busy, Some(ep)) = (mode, &ep) {
-            set_epoll_busy_poll(ep.as_raw_fd(), cfg.busy_poll_us)?;
+            set_epoll_busy_poll(ep.as_raw_fd(), cfg)?;
         }
         Ok(Self {
             mode,
+            per_queue,
+            napi: Vec::new(),
+            polled: Vec::new(),
+            reps: Vec::new(),
+            dirty: true,
+            polls: 0,
             ep,
             slot: MsgSlot::new(),
             events: Box::new([libc::epoll_event { events: 0, u64: 0 }; MAX_EVENTS]),
@@ -71,7 +95,8 @@ impl Epoll {
         })
     }
 
-    pub(super) fn add(&self, fd: RawFd, id: ConnId) -> Result<()> {
+    pub(super) fn add(&mut self, fd: RawFd, id: ConnId) -> Result<()> {
+        self.dirty = true;
         let Some(ep) = &self.ep else {
             return Ok(());
         };
@@ -86,7 +111,8 @@ impl Epoll {
         Ok(())
     }
 
-    pub(super) fn remove(&self, fd: RawFd) {
+    pub(super) fn remove(&mut self, fd: RawFd) {
+        self.dirty = true;
         if let Some(ep) = &self.ep {
             // SAFETY: valid fds; a null event is allowed for DEL.
             unsafe {
@@ -112,8 +138,28 @@ impl Epoll {
         E: Receive<H>,
         H: Handler,
     {
-        if self.mode == Mode::Recv {
+        if self.mode == Mode::Recv && !self.per_queue {
             for i in 0..conns.len_slots() {
+                self.recv_index(conns, i, handler, stats, read_seq);
+            }
+        } else if self.per_queue {
+            // Queues are learnt from each socket's first packets: look again
+            // now and then until every socket's is known.
+            self.polls += 1;
+            if self.dirty || self.polls.is_multiple_of(4096) {
+                self.pick_reps(conns);
+            }
+            for k in 0..self.reps.len() {
+                let i = self.reps[k];
+                self.recv_index(conns, i, handler, stats, read_seq);
+            }
+            let n = self.wait(stats)?;
+            for k in 0..n {
+                let i = usize::try_from(self.events[k].u64).unwrap_or(usize::MAX);
+                // Read already this poll (anything left is reported again).
+                if self.polled.get(i).copied().unwrap_or(false) {
+                    continue;
+                }
                 self.recv_index(conns, i, handler, stats, read_seq);
             }
         } else {
@@ -144,10 +190,41 @@ impl Epoll {
         };
         if let Err(e) = recv_one(conn, id, &mut self.slot, handler, stats, read_seq) {
             self.remove(conn.fd());
-            conns.take(i);
+            conns.remove(i);
             stats.closed += 1;
             handler.on_closed(id, e);
         }
+    }
+
+    /// One slot per known NIC queue, plus every slot whose queue is unknown.
+    fn pick_reps<E: Endpoint>(&mut self, conns: &mut Conns<E>) {
+        let n = conns.len_slots();
+        self.napi.resize(n, 0);
+        self.polled.clear();
+        self.polled.resize(n, false);
+        self.reps.clear();
+        let mut seen: Vec<u32> = Vec::new();
+        let mut unknown = false;
+        for i in 0..n {
+            let Some(c) = conns.at(i) else {
+                self.napi[i] = 0;
+                continue;
+            };
+            if self.napi[i] == 0 {
+                self.napi[i] = sys::incoming_napi_id(c.fd()).unwrap_or(0);
+            }
+            let id = self.napi[i];
+            if id == 0 {
+                unknown = true;
+            } else if seen.contains(&id) {
+                continue;
+            } else {
+                seen.push(id);
+            }
+            self.polled[i] = true;
+            self.reps.push(i);
+        }
+        self.dirty = unknown;
     }
 
     fn wait(&mut self, stats: &mut DriverStats) -> Result<usize> {
@@ -200,18 +277,28 @@ struct EpollParams {
 /// `EPIOCSPARAMS = _IOW(0x8A, 0x01, struct epoll_params)`.
 const EPIOCSPARAMS: libc::c_ulong = (1 << 30) | (8 << 16) | (0x8A << 8) | 0x01;
 
-fn set_epoll_busy_poll(ep: RawFd, usec: u32) -> Result<()> {
+fn set_epoll_busy_poll(ep: RawFd, cfg: &Config) -> Result<()> {
     let p = EpollParams {
-        busy_poll_usecs: usec,
-        busy_poll_budget: 8,
-        prefer_busy_poll: 0,
+        busy_poll_usecs: cfg.busy_poll_us,
+        busy_poll_budget: cfg.busy_poll_budget.unwrap_or(8),
+        prefer_busy_poll: u8::from(cfg.prefer_busy_poll),
         pad: 0,
     };
     // SAFETY: `p` is a valid epoll_params for the duration of the call.
     if unsafe { libc::ioctl(ep, EPIOCSPARAMS as _, &raw const p) } != 0 {
-        return Err(Error::Unsupported(
-            "EPIOCSPARAMS (epoll busy poll) needs Linux 6.9 or newer",
-        ));
+        let e = std::io::Error::last_os_error();
+        return Err(match e.raw_os_error() {
+            Some(libc::ENOTTY) => {
+                Error::Unsupported("EPIOCSPARAMS (epoll busy poll) needs Linux 6.9 or newer")
+            }
+            Some(libc::EOPNOTSUPP) => Error::Unsupported(
+                "the kernel was built without busy polling (CONFIG_NET_RX_BUSY_POLL)",
+            ),
+            Some(libc::EPERM) => {
+                Error::Config("busy_poll_budget above 64 needs CAP_NET_ADMIN".to_owned())
+            }
+            _ => Error::Io(e),
+        });
     }
     Ok(())
 }

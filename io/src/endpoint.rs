@@ -114,6 +114,46 @@ impl<H: ?Sized, T: sealed::Deliver<H>> Receive<H> for T {}
 pub trait Dial: sealed::DialIo {}
 impl<T: sealed::DialIo> Dial for T {}
 
+/// Mutable access to a connection a `Driver` owns.
+///
+/// It offers every method of the connection but no way to replace, swap or
+/// move it out. With `io_uring` a receive is always armed into the
+/// connection's receive buffer, and every backend tracks the connection by its
+/// socket descriptor and slot, so the connection stays where it is until the
+/// driver closes it.
+///
+/// ```compile_fail,E0594
+/// fn replace(mut c: ergon_io::ConnMut<'_, ergon_io::WsConn>, other: ergon_io::WsConn) {
+///     *c = other;
+/// }
+/// ```
+///
+/// ```compile_fail,E0596
+/// fn swap(mut a: ergon_io::ConnMut<'_, ergon_io::WsConn>, mut b: ergon_io::ConnMut<'_, ergon_io::WsConn>) {
+///     std::mem::swap(&mut *a, &mut *b);
+/// }
+/// ```
+pub struct ConnMut<'a, E>(&'a mut E);
+
+impl<'a, E> ConnMut<'a, E> {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) const fn new(conn: &'a mut E) -> Self {
+        Self(conn)
+    }
+
+    /// The connection itself, for this crate's forwarding methods only.
+    pub(crate) const fn inner(&mut self) -> &mut E {
+        self.0
+    }
+}
+
+impl<E> std::ops::Deref for ConnMut<'_, E> {
+    type Target = E;
+    fn deref(&self) -> &E {
+        self.0
+    }
+}
+
 /// Connection lifecycle callbacks.
 pub trait Handler {
     /// A connection started with `Driver::connect` is ready.
@@ -138,8 +178,11 @@ pub struct DriverStats {
     pub recvmsg_eagain: u64,
     /// `epoll_wait` / `epoll_pwait2` calls.
     pub epoll_wait_calls: u64,
-    /// `send` calls.
+    /// `send` syscalls (epoll backends; `io_uring` sends are submitted through
+    /// `io_uring_enter` or the `SQPOLL` thread and are not syscalls of their own).
     pub send_calls: u64,
+    /// Sends started, one per batch of queued bytes, on every backend.
+    pub sends: u64,
     /// `io_uring_enter` calls.
     pub enter_calls: u64,
     /// Receive completions with data.
