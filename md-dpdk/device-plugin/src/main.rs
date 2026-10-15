@@ -5,12 +5,13 @@
 //! DevicePlugin services on a unix socket under /var/lib/kubelet/device-plugins/,
 //! and keeps re-registering while the kubelet is up (including after kubelet
 //! restarts, when its socket reappears). The plugin exits nonzero rather than
-//! register an unsafe inventory.
+//! register an unsafe inventory, re-reads the inventory whenever the file
+//! changes, and stops on SIGTERM (how kubelet stops its pod) or SIGINT.
 
 mod inventory;
 mod service;
 
-use crate::inventory::Inventory;
+use crate::inventory::InventoryFile;
 use crate::service::{DevicePluginService, RegistrationService, SysfsRoots, sysfs_health};
 use hyper_util::rt::TokioIo;
 use std::error::Error;
@@ -55,11 +56,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // Reject duplicate/unsafe inventories before registering (plan §10.3).
-    let inventory = Inventory::load(&inventory_path)
+    // Later rewrites are re-read and revalidated as they happen.
+    let mut inventory = InventoryFile::open(&inventory_path)
         .map_err(|e| format!("refusing to start with {e}; run node/bootstrap-dpdk-ena.sh"))?;
     log::info!(
         "loaded {} ENA pair(s) from {}",
-        inventory.pairs.len(),
+        inventory.current().map_or(0, |i| i.pairs.len()),
         inventory_path.display()
     );
 
@@ -85,23 +87,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
     ));
 
-    Server::builder()
-        .add_service(registration_server::RegistrationServer::new(RegistrationService))
-        .add_service(device_plugin_server::DevicePluginServer::new(DevicePluginService::new(
-            inventory,
-            roots,
-            sysfs_health,
-            poll_interval,
-        )))
-        .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown_signal())
-        .await?;
+    serve(
+        listener,
+        DevicePluginService::new(inventory, roots, sysfs_health, poll_interval),
+        shutdown_signal(),
+    )
+    .await?;
 
     register_task.abort();
     Ok(())
 }
 
+/// Serve the Registration and DevicePlugin services on `listener` until
+/// `shutdown` resolves, then return at once. Not tonic's graceful shutdown:
+/// it waits for every open stream to end, and kubelet's ListAndWatch stream
+/// ends only with the plugin, so the stop would wait for the SIGKILL.
+async fn serve(
+    listener: UnixListener,
+    service: DevicePluginService,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), tonic::transport::Error> {
+    let server = Server::builder()
+        .add_service(registration_server::RegistrationServer::new(RegistrationService))
+        .add_service(device_plugin_server::DevicePluginServer::new(service))
+        .serve_with_incoming(UnixListenerStream::new(listener));
+    tokio::select! {
+        served = server => served,
+        () = shutdown => Ok(()),
+    }
+}
+
+/// SIGTERM (kubelet stopping the pod; as the container's PID 1 the plugin
+/// would otherwise ignore it until the grace period's SIGKILL) or SIGINT.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut terminate) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+        Err(e) => {
+            log::warn!("cannot watch for SIGTERM ({e}); stopping on SIGINT only");
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+    log::info!("stopping");
 }
 
 /// Register with the kubelet, re-registering after kubelet restarts (its
@@ -145,4 +177,59 @@ async fn register(kubelet_sock: &std::path::Path, request: &RegisterRequest) -> 
         .register(Request::new(request.clone()))
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::fixtures::{ScratchDir, fixture};
+    use crate::service::SysfsRoots;
+
+    /// Kubelet holds a ListAndWatch stream open for as long as the plugin runs,
+    /// so a stop that waits for every stream to end never comes before the
+    /// grace period's SIGKILL.
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_kubelets_list_and_watch_stream() {
+        let dir = ScratchDir::new("serve");
+        let sock = dir.0.join("plugin.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let service = DevicePluginService::new(
+            InventoryFile::fixed(fixture()),
+            SysfsRoots {
+                sys_root: PathBuf::from("/sys"),
+                vfio_root: PathBuf::from("/dev/vfio"),
+            },
+            |_, _| true,
+            Duration::from_millis(50),
+        );
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve(listener, service, async {
+            let _ = stopped.await;
+        }));
+
+        // Kubelet's side: connect and keep ListAndWatch open.
+        let channel = Endpoint::from_static("http://[::]")
+            .connect_with_connector(service_fn(move |_| {
+                let sock = sock.clone();
+                async move {
+                    let stream = tokio::net::UnixStream::connect(sock).await?;
+                    Ok::<_, std::io::Error>(TokioIo::new(stream))
+                }
+            }))
+            .await
+            .unwrap();
+        let mut stream = device_plugin_client::DevicePluginClient::new(channel)
+            .list_and_watch(Request::new(Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stream.message().await.unwrap().unwrap().devices.len(), 1);
+
+        stop.send(()).unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), server).await;
+        assert!(
+            matches!(stopped, Ok(Ok(Ok(())))),
+            "the plugin did not stop within 5 s of its stop signal: {stopped:?}"
+        );
+    }
 }

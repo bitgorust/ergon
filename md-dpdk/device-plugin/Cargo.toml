@@ -1,14 +1,14 @@
 # Kubelet device plugin for the ergon-md-dpdk ENA transport. Advertises
-# `rusteron.io/dpdk-ena-pair` (one device per healthy VFIO pair in
-# /var/lib/rusteron-dpdk/ena-pairs.json) and injects the pair's PCI/CIDR/
-# gateway env plus VFIO device nodes at Allocate time. Standalone tonic gRPC
-# binary; no dependency on the DPDK C stack.
+# `rusteron.io/dpdk-ena-pair` (one device per healthy vfio-pci or igb_uio pair
+# in /var/lib/rusteron-dpdk/ena-pairs.json) and injects the pair's PCI/CIDR/
+# gateway env plus its VFIO or UIO device nodes at Allocate time. Standalone
+# tonic gRPC binary; no dependency on the DPDK C stack.
 [package]
 name = "ergon-md-dpdk-device-plugin"
 version.workspace = true
 edition.workspace = true
 publish = false
-description = "Unpublished kubelet device plugin advertising VFIO ENA pairs for the ergon-md-dpdk media driver"
+description = "Unpublished kubelet device plugin advertising DPDK-bound ENA pairs for the ergon-md-dpdk media driver"
 license.workspace = true
 repository.workspace = true
 

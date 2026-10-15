@@ -14,8 +14,9 @@
 #   - built binaries: `cargo build -p ergon-md-dpdk-harness --features dpdk --release`
 #     and `cargo build -p ergon-md-dpdk --features dpdk --bin media_driver --release`
 #     (override with RUSTERON_HARNESS_BIN / RUSTERON_MEDIA_DRIVER_BIN)
-#   - the media-driver DaemonSet scaled to 0 in the test cell so the harness
-#     can bind the ENA pair itself (see md-dpdk/docs/aws-eks-dpdk-ena-runbook.md)
+#   - the media-driver DaemonSet parked off the test cell (a DaemonSet cannot
+#     be scaled: the runbook's §1 nodeSelector patch, md-dpdk/docs/aws-eks-dpdk-ena-runbook.md)
+#     so the harness can bind the ENA pair itself
 #
 # Usage:
 #   scripts/aws-dpdk-acceptance.sh [all|functional|bench|rollback|metadata]
@@ -131,6 +132,8 @@ write_pair_env() {
     gw_s=$(echo "$inv" | jq -r '.pairs[0].sender.gateway')
     gw_r=$(echo "$inv" | jq -r '.pairs[0].receiver.gateway')
     prefix=$(echo "$inv" | jq -r '.pairs[0].id')
+    # An ENA queue takes at most 512 TX descriptors, and the transport refuses
+    # a count outside the NIC's limits.
     cat > "$out" <<EOF
 RUSTERON_MEDIA_DRIVER_TRANSPORT=dpdk-ena
 RUSTERON_DPDK_FILE_PREFIX=rusteron-dpdk-$prefix
@@ -142,7 +145,7 @@ RUSTERON_DPDK_RECEIVER_IPV4_CIDR=$ip_r/$pre_r
 RUSTERON_DPDK_RECEIVER_GATEWAY=$gw_r
 RUSTERON_DPDK_HUGE_DIR=/dev/hugepages
 RUSTERON_DPDK_RX_DESCRIPTORS=1024
-RUSTERON_DPDK_TX_DESCRIPTORS=1024
+RUSTERON_DPDK_TX_DESCRIPTORS=512
 RUSTERON_DPDK_MBUFS_PER_PORT=65536
 RUSTERON_DPDK_MEMPOOL_CACHE=256
 RUSTERON_DPDK_BURST_SIZE=32
