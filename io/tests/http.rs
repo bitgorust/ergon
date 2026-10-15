@@ -422,7 +422,7 @@ fn hostile_lengths_close_the_connection_without_panicking() -> R {
             poll_until(&mut d, &mut h, |h| !h.opened.is_empty())?;
             d.get_mut(id).ok_or("gone")?.request("GET", "/", &[], &[])?;
             poll_until(&mut d, &mut h, |h| !h.closed.is_empty())?;
-            assert!(h.responses.is_empty());
+            assert_eq!(h.responses.len(), 0, "{:?}", h.responses);
             assert!(h.closed[0].1.starts_with("http:"), "{}", h.closed[0].1);
             srv.join().map_err(|_| "server panicked")??;
             Ok(())
