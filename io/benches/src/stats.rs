@@ -15,6 +15,8 @@ pub struct Summary {
     pub p99: i64,
     /// 99.9th percentile.
     pub p999: i64,
+    /// 99.99th percentile (needs about a million samples to mean much).
+    pub p9999: i64,
     /// Minimum.
     pub min: i64,
     /// Maximum.
@@ -46,6 +48,7 @@ pub fn summarize(v: &mut [i64]) -> Option<Summary> {
         p90: percentile(v, 0.90),
         p99: percentile(v, 0.99),
         p999: percentile(v, 0.999),
+        p9999: percentile(v, 0.9999),
         min: v[0],
         max: v[v.len() - 1],
     })
@@ -57,20 +60,21 @@ pub fn us(ns: i64) -> String {
     format!("{:.2}", ns as f64 / 1000.0)
 }
 
-/// A markdown table row: `label | n | mean | p50 | p90 | p99 | p99.9 | max` (µs).
+/// A markdown table row: `label | n | mean | p50 | p90 | p99 | p99.9 | p99.99 | max` (µs).
 #[must_use]
 pub fn row(label: &str, s: &Summary) -> String {
     format!(
-        "| {label} | {} | {:.2} | {} | {} | {} | {} | {} |",
+        "| {label} | {} | {:.2} | {} | {} | {} | {} | {} | {} |",
         s.n,
         s.mean / 1000.0,
         us(s.p50),
         us(s.p90),
         us(s.p99),
         us(s.p999),
+        us(s.p9999),
         us(s.max)
     )
 }
 
 /// Header matching [`row`].
-pub const HEADER: &str = "| | n | mean µs | p50 µs | p90 µs | p99 µs | p99.9 µs | max µs |\n|---|---|---|---|---|---|---|---|";
+pub const HEADER: &str = "| | n | mean µs | p50 µs | p90 µs | p99 µs | p99.9 µs | p99.99 µs | max µs |\n|---|---|---|---|---|---|---|---|---|";

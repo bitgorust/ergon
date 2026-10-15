@@ -5,7 +5,8 @@
 
 use ergon_io::{Backend, Config, Driver, Error, Result, WsConn, WsHandler};
 
-use crate::clock::{monotonic_ns, rdtsc, thread_cpu_ticks, thread_ctx_switches, ticks_per_us};
+use crate::clock::{monotonic_ns, thread_cpu_ticks, thread_ctx_switches, ticks_per_us};
+use crate::stalls::StallLog;
 
 /// An application driven by [`run`].
 pub trait App: WsHandler {
@@ -72,31 +73,47 @@ pub fn config(
     c
 }
 
+/// Applies the busy-poll flags under test: `--prefer-busy-poll` (backends that
+/// poll the NIC only) and `--busy-poll-budget N` (`recv-busy` / `epoll-busy`).
+///
+/// # Errors
+/// A malformed number.
+pub fn busy_poll_flags(c: &mut Config, a: &crate::args::Args) -> Result<()> {
+    if a.flag("prefer-busy-poll") && c.backend.polls_nic() {
+        c.prefer_busy_poll = true;
+    }
+    if a.flag("per-queue") && c.backend == Backend::RecvBusy {
+        c.per_queue = true;
+    }
+    let budget: u32 = a.num_or("busy-poll-budget", 0)?;
+    if budget > 0 && matches!(c.backend, Backend::RecvBusy | Backend::EpollBusy) {
+        c.busy_poll_budget = u16::try_from(budget).ok();
+    }
+    Ok(())
+}
+
 /// Polls `driver` until the deadline. A peer close within two seconds of the
 /// deadline is the normal end of a lab run (the server stops once any receiver
 /// finishes); any other connection error fails the run.
 ///
 /// # Errors
 /// The driver or a connection failed.
-pub fn run<A: App>(driver: &mut Driver<WsConn>, app: &mut A, opts: RunOpts) -> Result<LoopStats> {
+pub fn run<A: App>(
+    driver: &mut Driver<WsConn>,
+    app: &mut A,
+    opts: RunOpts,
+    stalls: &mut StallLog,
+) -> Result<LoopStats> {
     let mut st = LoopStats::default();
     let needs_idle = app.needs_idle();
-    let tpu = ticks_per_us();
-    st.ticks_per_us = tpu;
-    let thresholds = [5.0, 20.0, 100.0].map(|us| (us * tpu) as u64);
+    st.ticks_per_us = ticks_per_us();
     let (u0, s0) = thread_cpu_ticks();
     let (v0, i0) = thread_ctx_switches();
-    let mut last = rdtsc();
+    stalls.start(driver.stats().messages);
     let result = loop {
-        let now = rdtsc();
-        let gap = now.wrapping_sub(last);
-        last = now;
-        st.gap_max_ticks = st.gap_max_ticks.max(gap);
-        if gap > thresholds[0] {
-            for (c, &t) in st.gaps_over.iter_mut().zip(&thresholds) {
-                *c += u64::from(gap > t);
-            }
-        }
+        // One counter read per iteration; slow iterations are logged with
+        // the work they did.
+        stalls.tick(driver.stats().messages);
         st.spins += 1;
         if needs_idle && let Err(e) = app.on_idle(driver) {
             break Err(e);
@@ -116,6 +133,8 @@ pub fn run<A: App>(driver: &mut Driver<WsConn>, app: &mut A, opts: RunOpts) -> R
     };
     let (v1, i1) = thread_ctx_switches();
     let (u1, s1) = thread_cpu_ticks();
+    st.gap_max_ticks = stalls.max_ticks;
+    st.gaps_over = stalls.over;
     st.vol_ctx_switches = v1 - v0;
     st.invol_ctx_switches = i1 - i0;
     st.utime_ticks = u1 - u0;

@@ -14,8 +14,10 @@
 //! Every client sends the same bytes: `POST /api/v3/order` with form-encoded
 //! parameters, a 64-hex-digit signature, `X-MBX-APIKEY` and `Content-Type`.
 //! Records: `src_ns` = just before the request is handed to the client,
-//! `user_ns` = when the client returns the complete response; analysed as
-//! ping-pong round trips.
+//! `src2_ns` = when it was due on the paced schedule (0 when unpaced; the
+//! schedule never slips, so the time from it includes any wait behind a
+//! stall), `user_ns` = when the client returns the complete response;
+//! analysed as ping-pong round trips.
 
 use std::process::ExitCode;
 
@@ -51,6 +53,7 @@ mod imp {
     use io_bench::args::Args;
     use io_bench::clock::{monotonic_ns, pin_current_thread, realtime_ns, thread_ctx_switches};
     use io_bench::record::{Record, write_records};
+    use io_bench::stalls::StallLog;
     use io_bench::tls;
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject;
@@ -73,6 +76,8 @@ mod imp {
         pub records: Vec<Record>,
         pub connect_ns: i64,
         pub extra: String,
+        /// The timed loop's slow iterations.
+        pub stalls: StallLog,
     }
 
     struct Plan {
@@ -83,6 +88,7 @@ mod imp {
         rate: i64,
         duration_s: i64,
         capacity: usize,
+        stall_us: f64,
     }
 
     impl Plan {
@@ -93,6 +99,7 @@ mod imp {
                 1_000_000_000 / self.rate
             }
         }
+        #[cfg_attr(not(any(feature = "curl", feature = "reqwest")), allow(dead_code))]
         fn url(&self) -> String {
             if self.server.port() == 443 {
                 format!("https://{}{}", self.host, self.path)
@@ -104,6 +111,11 @@ mod imp {
 
     pub fn main() -> BoxResult<()> {
         let a = Args::from_env();
+        // As io_bench: fault every page in at allocation, not on the timed path
+        // (needs root; without it the run continues and the meta file says so).
+        // SAFETY: plain syscall with valid flags.
+        let locked = std::env::var_os("IO_BENCH_NO_MLOCK").is_none()
+            && unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } == 0;
         let _ = io_bench::clock::ticks_per_us();
         if let Some(c) = a.list("cpu", "").first() {
             pin_current_thread(c.parse()?)?;
@@ -128,6 +140,7 @@ mod imp {
             rate: a.num_or("rate", 1000)?,
             duration_s: a.num_or("duration", 30)?,
             capacity: a.num_or("capacity", 2_000_000)?,
+            stall_us: a.num_or("stall-us", 20.0)?,
         };
         let out = PathBuf::from(a.str_or("out", "results"));
         std::fs::create_dir_all(&out)?;
@@ -147,8 +160,14 @@ mod imp {
         };
         let (v1, _) = thread_ctx_switches();
         write_records(&out.join("records.bin"), &run.records)?;
+        run.stalls.write(&out.join("stalls-0.txt"))?;
         let mut m = String::new();
         let _ = writeln!(m, "mode=pingpong");
+        let _ = writeln!(m, "mlockall={locked}");
+        let _ = writeln!(m, "loop.0.gap_max_us={:.1}", run.stalls.max_us());
+        let _ = writeln!(m, "loop.0.gaps_over_5us={}", run.stalls.over[0]);
+        let _ = writeln!(m, "loop.0.gaps_over_20us={}", run.stalls.over[1]);
+        let _ = writeln!(m, "loop.0.gaps_over_100us={}", run.stalls.over[2]);
         let _ = writeln!(m, "variants={}", run.label);
         let _ = writeln!(m, "rate={}", plan.rate);
         let _ = writeln!(m, "duration_s={}", plan.duration_s);
@@ -186,20 +205,30 @@ mod imp {
         Ok(tls::client_config(roots)?)
     }
 
-    /// Paces sends: busy-waits to the next slot (never sleeps).
-    fn wait_slot(next: &mut i64, interval: i64) {
+    /// Paces sends: busy-waits to the next slot (never sleeps); every spin is
+    /// a loop iteration for the stall log. Returns the slot (monotonic), or 0
+    /// when unpaced.
+    fn wait_slot(next: &mut i64, interval: i64, stalls: &mut StallLog, done: u64) -> i64 {
         if interval == 0 {
-            return;
+            return 0;
         }
         while monotonic_ns() < *next {
-            std::hint::spin_loop();
+            stalls.tick(done);
         }
         *next += interval;
+        *next - interval
+    }
+
+    /// When a request sent at `sent` (wall clock, read just after `mono`) was
+    /// due: `sent` less its lateness against `slot`; 0 when unpaced.
+    const fn due(slot: i64, mono: i64, sent: i64) -> i64 {
+        if slot == 0 { 0 } else { sent - (mono - slot) }
     }
 
     struct Collect {
         records: Vec<Record>,
         sent_ns: i64,
+        due_ns: i64,
         seq: u64,
         done: bool,
         status: u16,
@@ -224,6 +253,7 @@ mod imp {
                 self.records.push(Record {
                     id: i64::try_from(self.seq).unwrap_or(i64::MAX),
                     src_ns: self.sent_ns,
+                    src2_ns: self.due_ns,
                     rx_sw_ns: meta.rx_sw_ns,
                     user_ns: now,
                     read_seq: meta.read_seq,
@@ -237,6 +267,7 @@ mod imp {
     fn ergon(a: &Args, plan: &Plan) -> BoxResult<Run> {
         let backend: Backend = a.str_or("backend", "epoll-spin").parse()?;
         let mut cfg = ergon_io::Config::new(backend);
+        io_bench::runner::busy_poll_flags(&mut cfg, a)?;
         cfg.sqpoll_cpu = a
             .list("sqpoll-cpu", "")
             .first()
@@ -254,6 +285,7 @@ mod imp {
         let mut h = Collect {
             records: Vec::with_capacity(plan.capacity),
             sent_ns: 0,
+            due_ns: 0,
             seq: 0,
             done: false,
             status: 0,
@@ -282,8 +314,10 @@ mod imp {
         let end = monotonic_ns() + plan.duration_s * 1_000_000_000;
         let mut next = monotonic_ns();
         let method = if plan.live { "GET" } else { "POST" };
+        let mut stalls = StallLog::new(plan.stall_us, 1 << 20);
+        stalls.start(0);
         while monotonic_ns() < end {
-            wait_slot(&mut next, interval);
+            let slot = wait_slot(&mut next, interval, &mut stalls, h.seq);
             h.seq += 1;
             let body = if plan.live {
                 String::new()
@@ -291,11 +325,15 @@ mod imp {
                 order_body(h.seq)
             };
             h.done = false;
+            stalls.tick(h.seq);
+            let mono = monotonic_ns();
             h.sent_ns = realtime_ns();
-            let c = d.get_mut(id).ok_or("connection closed")?;
+            h.due_ns = due(slot, mono, h.sent_ns);
+            let mut c = d.get_mut(id).ok_or("connection closed")?;
             c.request(method, &plan.path, &[], body.as_bytes())?;
             d.flush()?;
             while !h.done {
+                stalls.tick(h.seq - 1);
                 d.poll(&mut h)?;
                 if let Some(e) = h.closed.take() {
                     return Err(e.into());
@@ -326,6 +364,7 @@ mod imp {
             records: h.records,
             connect_ns,
             extra,
+            stalls,
         })
     }
 
@@ -335,6 +374,7 @@ mod imp {
         use ergon_io::{ClientHandler, CurlDrive, HttpClient, HttpClientConfig, HttpImpl};
         struct Done {
             sent_ns: i64,
+            due_ns: i64,
             seq: u64,
             done: bool,
             status: u16,
@@ -349,6 +389,7 @@ mod imp {
                     self.records.push(Record {
                         id: i64::try_from(self.seq).unwrap_or(i64::MAX),
                         src_ns: self.sent_ns,
+                        src2_ns: self.due_ns,
                         user_ns: now,
                         ..Record::default()
                     });
@@ -364,6 +405,7 @@ mod imp {
         let backend: Backend = a.str_or("backend", "recv-busy").parse()?;
         let mut cfg = HttpClientConfig::new(imp);
         cfg.driver = ergon_io::Config::new(backend);
+        io_bench::runner::busy_poll_flags(&mut cfg.driver, a)?;
         cfg.driver.sqpoll_cpu = a
             .list("sqpoll-cpu", "")
             .first()
@@ -389,6 +431,7 @@ mod imp {
         let mut c = HttpClient::new(&cfg, target, rustls_config(a, plan.live)?)?;
         let mut h = Done {
             sent_ns: 0,
+            due_ns: 0,
             seq: 0,
             done: false,
             status: 0,
@@ -403,8 +446,10 @@ mod imp {
         let end = monotonic_ns() + plan.duration_s * 1_000_000_000;
         let mut next = monotonic_ns();
         let method = if plan.live { "GET" } else { "POST" };
+        let mut stalls = StallLog::new(plan.stall_us, 1 << 20);
+        stalls.start(0);
         while monotonic_ns() < end {
-            wait_slot(&mut next, interval);
+            let slot = wait_slot(&mut next, interval, &mut stalls, h.seq);
             h.seq += 1;
             let body = if plan.live {
                 String::new()
@@ -412,9 +457,13 @@ mod imp {
                 order_body(h.seq)
             };
             h.done = false;
+            stalls.tick(h.seq);
+            let mono = monotonic_ns();
             h.sent_ns = realtime_ns();
+            h.due_ns = due(slot, mono, h.sent_ns);
             c.request(method, &plan.path, &[], body.as_bytes())?;
             while !h.done {
+                stalls.tick(h.seq - 1);
                 c.poll(&mut h)?;
             }
             if let Some(e) = h.error.take() {
@@ -442,6 +491,7 @@ mod imp {
             records,
             connect_ns,
             extra: String::new(),
+            stalls,
         })
     }
 
@@ -456,6 +506,7 @@ mod imp {
         let mut h = Collect {
             records: Vec::new(),
             sent_ns: 0,
+            due_ns: 0,
             seq: 0,
             done: false,
             status: 0,
@@ -539,8 +590,8 @@ mod imp {
         use curl::multi::Multi;
 
         use super::{
-            API_KEY, Args, BoxResult, Plan, Record, Run, monotonic_ns, order_body, realtime_ns,
-            wait_slot,
+            API_KEY, Args, BoxResult, Plan, Record, Run, StallLog, due, monotonic_ns, order_body,
+            realtime_ns, wait_slot,
         };
 
         struct Sink(Vec<u8>);
@@ -591,8 +642,10 @@ mod imp {
             let mut connect_ns = 0;
             let mut seq = 0u64;
             let mut slot = Some(easy);
+            let mut stalls = StallLog::new(plan.stall_us, 1 << 20);
+            stalls.start(0);
             while monotonic_ns() < end {
-                wait_slot(&mut next, interval);
+                let due_slot = wait_slot(&mut next, interval, &mut stalls, seq);
                 seq += 1;
                 let mut e = slot.take().ok_or("easy handle lost")?;
                 e.get_mut().0.clear();
@@ -603,6 +656,7 @@ mod imp {
                 let sent = realtime_ns();
                 let handle = multi.add2(e)?;
                 let result = loop {
+                    stalls.tick(seq - 1);
                     multi.perform()?;
                     let mut r = None;
                     multi.messages(|m| {
@@ -628,6 +682,7 @@ mod imp {
                     records.push(Record {
                         id: i64::try_from(seq).unwrap_or(i64::MAX),
                         src_ns: sent,
+                        src2_ns: due(due_slot, t_mono, sent),
                         user_ns: now,
                         ..Record::default()
                     });
@@ -652,6 +707,7 @@ mod imp {
                 records,
                 connect_ns,
                 extra,
+                stalls,
             })
         }
     }
@@ -659,8 +715,8 @@ mod imp {
     #[cfg(feature = "reqwest")]
     mod reqwest_client {
         use super::{
-            API_KEY, Args, BoxResult, Plan, Record, Run, monotonic_ns, order_body, realtime_ns,
-            wait_slot,
+            API_KEY, Args, BoxResult, Plan, Record, Run, StallLog, due, monotonic_ns, order_body,
+            realtime_ns, wait_slot,
         };
 
         pub fn run(a: &Args, plan: &Plan) -> BoxResult<Run> {
@@ -685,8 +741,13 @@ mod imp {
                 let mut next = monotonic_ns();
                 let mut connect_ns = 0;
                 let mut seq = 0u64;
+                // tokio owns the loop: only the pacing spin and one tick per
+                // request are timed.
+                let mut stalls = StallLog::new(plan.stall_us, 1 << 20);
+                stalls.start(0);
                 while monotonic_ns() < end {
-                    wait_slot(&mut next, interval);
+                    let due_slot = wait_slot(&mut next, interval, &mut stalls, seq);
+                    stalls.tick(seq);
                     seq += 1;
                     let t_mono = monotonic_ns();
                     let sent = realtime_ns();
@@ -711,6 +772,7 @@ mod imp {
                         records.push(Record {
                             id: i64::try_from(seq).unwrap_or(i64::MAX),
                             src_ns: sent,
+                            src2_ns: due(due_slot, t_mono, sent),
                             user_ns: now,
                             ..Record::default()
                         });
@@ -721,6 +783,7 @@ mod imp {
                     records,
                     connect_ns,
                     extra: "first_request_includes_connect=1\n".to_owned(),
+                    stalls,
                 })
             })
         }

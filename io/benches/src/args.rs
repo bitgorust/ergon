@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::{Error, Result};
 
 /// Parsed arguments: a subcommand followed by `--key value` pairs and `--flag`s.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Args {
     /// First positional argument.
     pub command: String,

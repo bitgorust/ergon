@@ -7,8 +7,13 @@
 
 pub mod args;
 pub mod clock;
+pub mod diag;
 pub mod json;
+pub mod matrix;
+pub mod mixed;
+pub mod periodic;
 pub mod record;
+pub mod stalls;
 pub mod stats;
 
 #[cfg(target_os = "linux")]

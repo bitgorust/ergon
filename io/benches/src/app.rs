@@ -136,8 +136,14 @@ pub struct PingPong {
     next_send: i64,
     seq: i64,
     outstanding: bool,
+    /// When the outstanding message was due on the paced schedule (0 when
+    /// unpaced).
+    due_ns: i64,
     payload_len: usize,
-    /// Round-trip records.
+    /// Round-trip records: `src_ns` is when the message was sent, `src2_ns`
+    /// when it was due on the schedule (0 when unpaced). A stall delays the
+    /// messages due during it, and the schedule never slips, so the time from
+    /// `src2_ns` includes that wait (no coordinated omission).
     pub records: Vec<Record>,
     /// Round trips not recorded because the vector was full.
     pub dropped: u64,
@@ -154,6 +160,7 @@ impl PingPong {
             next_send: 0,
             seq: 0,
             outstanding: false,
+            due_ns: 0,
             payload_len: payload_len.max(16),
             records: Vec::with_capacity(capacity),
             dropped: 0,
@@ -181,6 +188,7 @@ impl WsHandler for PingPong {
                 pos,
                 id: read_i64(payload, 0),
                 src_ns: read_i64(payload, 8),
+                src2_ns: self.due_ns,
                 rx_sw_ns: meta.rx_sw_ns,
                 rx_hw_ns: meta.rx_hw_ns,
                 user_ns: now,
@@ -225,11 +233,18 @@ impl App for PingPong {
             .ok_or(Error::Closed)?
             .send_frame(ws::OP_BINARY, &buf[..len])?;
         self.outstanding = true;
-        self.next_send = if self.interval_ns == 0 {
-            0
+        if self.interval_ns == 0 {
+            self.due_ns = 0;
         } else {
-            now.max(self.next_send) + self.interval_ns
-        };
+            // A fixed schedule: after a stall the late messages go back to
+            // back until it catches up.
+            self.due_ns = if self.next_send == 0 {
+                now
+            } else {
+                self.next_send
+            };
+            self.next_send = self.due_ns + self.interval_ns;
+        }
         Ok(())
     }
 }

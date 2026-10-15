@@ -13,3 +13,7 @@ results/**/job-*.log
 results/**/binance-args.txt
 results/**/replay_server
 results/**/relay.*
+results/**/records/
+results/**/logs/
+results/**/scripts/
+results/**/cond-warnings.txt

@@ -41,6 +41,7 @@ mod imp {
     use io_bench::clock::{monotonic_ns, pin_current_thread, read_costs, realtime_ns};
     use io_bench::record::{Record, write_records};
     use io_bench::runner::{self, App, LoopStats, RunOpts};
+    use io_bench::stalls::StallLog;
     use io_bench::{Error, tls};
     use rustls::ClientConfig;
     use rustls::pki_types::CertificateDer;
@@ -92,19 +93,30 @@ mod imp {
         Ok(d)
     }
 
-    /// Runs `app` on `driver` until the deadline and collects per-connection info.
+    /// What one loop reports: its counters, per-connection socket info and stats.
+    type Ran = (LoopStats, Vec<(u32, i32)>, Vec<WsStats>);
+
+    /// Runs `app` on `driver` until the deadline and collects per-connection
+    /// info; slow iterations go to `stalls`.
     fn run_app<A: App>(
         driver: &mut Driver<WsConn>,
         app: &mut A,
         duration_s: i64,
-    ) -> Result<(LoopStats, Vec<(u32, i32)>, Vec<WsStats>), Error> {
+        stalls: &mut StallLog,
+    ) -> Result<Ran, Error> {
         let opts = RunOpts {
             deadline_mono_ns: monotonic_ns() + duration_s * 1_000_000_000,
         };
-        let st = runner::run(driver, app, opts)?;
+        let st = runner::run(driver, app, opts, stalls)?;
         let sockets = driver.iter().map(|(_, c)| socket_info(c)).collect();
         let stats = driver.iter().map(|(_, c)| c.stats()).collect();
         Ok((st, sockets, stats))
+    }
+
+    /// The stall log for one loop: iterations over `--stall-us` (default 20).
+    fn stall_log(a: &Args) -> BoxResult<StallLog> {
+        let us: f64 = a.num_or("stall-us", 20.0)?;
+        Ok(StallLog::new(us, 1 << 20))
     }
 
     pub fn main() -> BoxResult<()> {
@@ -238,11 +250,22 @@ mod imp {
             }
             Mode::Lab => {
                 let (t, cfg) = lab_config(a)?;
-                (vec![t; conns_per_variant], vec!["lab".to_owned()], cfg)
+                // Each connection names its slot, so `replay_server --mode
+                // mixed` sends connection j of every variant the same stream
+                // (the other modes ignore the path).
+                let targets = (0..conns_per_variant)
+                    .map(|j| Target {
+                        path: format!("/slot/{j}"),
+                        ..t.clone()
+                    })
+                    .collect();
+                (targets, vec!["lab".to_owned()], cfg)
             }
         };
         let bp0 = busy_poll_rx_packets();
         let barrier = Arc::new(Barrier::new(variants.len()));
+        let stall_us: f64 = a.num_or("stall-us", 20.0)?;
+        let flags = a.clone();
         let mut handles = Vec::new();
         for (vi, &variant) in variants.iter().enumerate() {
             let cpu = cpus.get(vi).copied();
@@ -250,6 +273,8 @@ mod imp {
             let streams = streams.clone();
             let cfg = cfg.clone();
             let barrier = barrier.clone();
+            let out_dir = out.clone();
+            let flags = flags.clone();
             let opts_sqpoll = if variant == Variant::UringSqpoll {
                 sqpoll_cpu
             } else {
@@ -262,14 +287,20 @@ mod imp {
                         if let Some(c) = cpu {
                             pin_current_thread(c).map_err(|e| format!("pin {c}: {e}"))?;
                         }
-                        let dcfg = runner::config(variant, busy_poll_us, wait_us, opts_sqpoll);
+                        let mut dcfg = runner::config(variant, busy_poll_us, wait_us, opts_sqpoll);
+                        runner::busy_poll_flags(&mut dcfg, &flags)
+                            .map_err(|e| format!("flags: {e}"))?;
                         let mut driver = connect_all(&targets, &cfg, dcfg)
                             .map_err(|e| format!("{}: {e}", variant.name()))?;
                         let mut rec = Recorder::new(vi as u8, mode, &streams, capacity);
+                        let mut stalls = StallLog::new(stall_us, 1 << 20);
                         barrier.wait();
                         let (loop_stats, sockets, conn_stats) =
-                            run_app(&mut driver, &mut rec, duration_s)
+                            run_app(&mut driver, &mut rec, duration_s, &mut stalls)
                                 .map_err(|e| format!("{}: {e}", variant.name()))?;
+                        stalls
+                            .write(&out_dir.join(format!("stalls-{vi}.txt")))
+                            .map_err(|e| format!("stalls: {e}"))?;
                         Ok(ThreadResult {
                             variant,
                             sockets,
@@ -359,6 +390,7 @@ mod imp {
         let _ = writeln!(m, "busy_poll_us={busy_poll_us}");
         let _ = writeln!(m, "end_realtime_ns={}", realtime_ns());
         let _ = writeln!(m, "kernel={}", read("/proc/sys/kernel/osrelease"));
+        let _ = writeln!(m, "arch={}", std::env::consts::ARCH);
         let _ = writeln!(
             m,
             "clocksource={}",
@@ -437,20 +469,17 @@ mod imp {
             pin_current_thread(c)?;
         }
         let (t, cfg) = lab_config(a)?;
-        let mut driver = connect_all(
-            &[t],
-            &cfg,
-            runner::config(variant, busy_poll_us, wait_us, sqpoll_cpu),
-        )?;
+        let mut dcfg = runner::config(variant, busy_poll_us, wait_us, sqpoll_cpu);
+        runner::busy_poll_flags(&mut dcfg, a)?;
+        let mut driver = connect_all(&[t], &cfg, dcfg)?;
         let interval = if rate <= 0 { 0 } else { 1_000_000_000 / rate };
-        let mut app = PingPong::new(
-            0,
-            interval,
-            payload,
-            // Back-to-back round trips stay well under 200k/s on this path.
-            (rate.max(200_000) * duration_s) as usize,
-        );
-        let (stats, sockets, conn_stats) = run_app(&mut driver, &mut app, duration_s)?;
+        // Room for every round trip: the paced rate, or (back to back) well
+        // above the 50k/s this path reaches. mlockall faults it all in.
+        let per_s = if rate > 0 { rate } else { 100_000 };
+        let mut app = PingPong::new(0, interval, payload, (per_s * duration_s + 1_000) as usize);
+        let mut stalls = stall_log(a)?;
+        let (stats, sockets, conn_stats) = run_app(&mut driver, &mut app, duration_s, &mut stalls)?;
+        stalls.write(&out.join("stalls-0.txt"))?;
         write_records(&out.join("records.bin"), &app.records)?;
         let mut meta = base_meta("pingpong", duration_s, busy_poll_us);
         let _ = writeln!(meta, "variants={}", variant.name());
@@ -492,7 +521,12 @@ mod imp {
             count: 0,
             closed: None,
         };
-        run_app(&mut driver, &mut app, duration_s)?;
+        run_app(
+            &mut driver,
+            &mut app,
+            duration_s,
+            &mut StallLog::new(1e9, 0),
+        )?;
         write_capture(&out, &app)?;
         Ok(())
     }

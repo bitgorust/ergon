@@ -21,7 +21,8 @@ pub struct Record {
     pub id: i64,
     /// Source timestamp in ns (Binance `E`, or the lab sender's send time).
     pub src_ns: i64,
-    /// Secondary source timestamp in ns (Binance `T`, or the capture time).
+    /// Secondary source timestamp in ns (Binance `T`, the capture time, or
+    /// when a paced ping-pong or HTTP request was due; 0 if none).
     pub src2_ns: i64,
     /// Kernel software receive timestamp (`CLOCK_REALTIME`, ns).
     pub rx_sw_ns: i64,
@@ -93,12 +94,51 @@ pub fn write_records(path: &Path, records: &[Record]) -> std::io::Result<()> {
     w.flush()
 }
 
-/// Reads all records from `path`.
+/// Opens `path`, or, when only that exists, its zstd-compressed copy
+/// `path.zst` (results are compressed on the VM before they are copied).
+///
+/// # Errors
+/// Neither file can be opened, or the compressed one is not zstd.
+pub fn open_maybe_compressed(path: &Path) -> std::io::Result<Box<dyn Read>> {
+    match std::fs::File::open(path) {
+        Ok(f) => Ok(Box::new(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let f = std::fs::File::open(compressed(path)).map_err(|_| e)?;
+            Ok(Box::new(zstd::stream::read::Decoder::new(f)?))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `path` with `.zst` appended.
+fn compressed(path: &Path) -> std::path::PathBuf {
+    let mut z = path.as_os_str().to_owned();
+    z.push(".zst");
+    z.into()
+}
+
+/// Reads a text file, or its `.zst` copy ([`open_maybe_compressed`]).
+///
+/// # Errors
+/// As [`open_maybe_compressed`], or the text is not UTF-8.
+pub fn read_text(path: &Path) -> std::io::Result<String> {
+    let mut s = String::new();
+    open_maybe_compressed(path)?.read_to_string(&mut s)?;
+    Ok(s)
+}
+
+/// Whether `path` or its `.zst` copy exists.
+#[must_use]
+pub fn exists_maybe_compressed(path: &Path) -> bool {
+    path.exists() || compressed(path).exists()
+}
+
+/// Reads all records from `path` (or `path.zst`).
 ///
 /// # Errors
 /// File I/O failure or a truncated file.
 pub fn read_records(path: &Path) -> std::io::Result<Vec<Record>> {
-    let mut r = BufReader::new(std::fs::File::open(path)?);
+    let mut r = BufReader::new(open_maybe_compressed(path)?);
     let mut out = Vec::new();
     let mut b = [0u8; RECORD_LEN];
     loop {

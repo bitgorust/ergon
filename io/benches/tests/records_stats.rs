@@ -56,3 +56,34 @@ fn nearest_rank_percentiles() {
     assert_eq!(percentile(&[42], 0.999), 42);
     assert!(summarize(&mut []).is_none());
 }
+
+#[test]
+fn records_and_text_are_read_from_their_zstd_copies() -> Result<(), Box<dyn std::error::Error>> {
+    use io_bench::record::{exists_maybe_compressed, read_records, read_text, write_records};
+    let dir = std::env::temp_dir().join(format!("zst-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let records: Vec<_> = (1..=1000)
+        .map(|i| io_bench::record::Record {
+            id: i,
+            src_ns: i * 100,
+            user_ns: i * 100 + 45_000,
+            ..io_bench::record::Record::default()
+        })
+        .collect();
+    let plain = dir.join("records.bin");
+    write_records(&plain, &records)?;
+    let z = zstd::encode_all(std::fs::File::open(&plain)?, 10)?;
+    std::fs::write(dir.join("records.bin.zst"), z)?;
+    std::fs::remove_file(&plain)?;
+    assert_eq!(read_records(&plain)?, records);
+    std::fs::write(
+        dir.join("trace.txt.zst"),
+        zstd::encode_all("a trace line\n".as_bytes(), 10)?,
+    )?;
+    assert!(exists_maybe_compressed(&dir.join("trace.txt")));
+    assert_eq!(read_text(&dir.join("trace.txt"))?, "a trace line\n");
+    assert!(read_records(&dir.join("missing.bin")).is_err());
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}

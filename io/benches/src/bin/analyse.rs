@@ -2,7 +2,11 @@
 //!
 //! ```text
 //! analyse [--warmup-s 10] results/<stamp>/res/lab-... results/<stamp>/res/live-... > tables.md
+//! analyse --matrix results/flags-<cloud>-<stamp>/res > tables.md
 //! ```
+//!
+//! `--matrix` prints the settings-matrix tables (`io_bench::matrix`) and then
+//! the detailed tables of every run.
 //!
 //! Headline metric: the paired `Δuser` (same message, two loops, one clock). In
 //! lab runs it is corrected for the replay server's alternating write order.
@@ -16,6 +20,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use io_bench::record::{Record, read_records};
+use io_bench::stalls::{self, Attribution, StallSummary};
 use io_bench::stats::{HEADER, Summary, row, summarize, us};
 
 type BoxResult<T> = Result<T, Box<dyn Error>>;
@@ -24,16 +29,45 @@ type Meta = HashMap<String, String>;
 fn main() -> ExitCode {
     let mut warmup_s = 10i64;
     let mut dirs: Vec<String> = Vec::new();
+    let mut matrix_root: Option<String> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         if a == "--warmup-s" {
             warmup_s = it.next().and_then(|v| v.parse().ok()).unwrap_or(10);
+        } else if a == "--matrix" {
+            matrix_root = it.next();
         } else {
             dirs.push(a);
         }
     }
+    let mut head = String::new();
+    if let Some(root) = &matrix_root {
+        let (tags, skipped) = match io_bench::matrix::load(Path::new(root), warmup_s) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{root}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        head = io_bench::matrix::report(&tags, &skipped);
+        head.push_str(&io_bench::diag::report(&Path::new(root).join("diag")));
+        head.push_str(&io_bench::periodic::report(Path::new(root)));
+        head.push_str("# Every run in detail\n\n");
+        for t in &tags {
+            let mut runs: Vec<&String> = t.runs.keys().collect();
+            runs.sort();
+            for r in runs {
+                dirs.push(format!("{root}/{}/{r}", t.name));
+            }
+        }
+    }
     if dirs.is_empty() {
-        eprintln!("usage: analyse [--warmup-s N] DIR...");
+        // A diagnosis-only run: its reports are all in the head.
+        if matrix_root.is_some() {
+            print!("{head}");
+            return ExitCode::SUCCESS;
+        }
+        eprintln!("usage: analyse [--warmup-s N] DIR... | analyse --matrix ROOT");
         return ExitCode::FAILURE;
     }
     let mut out = String::new();
@@ -54,7 +88,7 @@ fn main() -> ExitCode {
     if !pingpong_rows.is_empty() {
         let _ = writeln!(
             out,
-            "## Ping-pong round trip (client send → echo decoded)\n"
+            "## Ping-pong round trip (client send → echo decoded; \"from when due\": from the slot on the paced schedule, including any wait behind a stall)\n"
         );
         let _ = writeln!(out, "{}", HEADER.replacen("| |", "| variant @ rate |", 1));
         for r in &pingpong_rows {
@@ -65,8 +99,8 @@ fn main() -> ExitCode {
     if !summary_rows.is_empty() {
         let mut head = String::from(
             "## Summary: paired runs (µs; Δ = B − A, negative means B decoded first)\n\n\
-             | run | A | B | paired msgs | Δuser p50 | Δuser p90 | Δuser p99 | Δrx p50 | Δstack p50 | Δstack p99 | A syscalls/s | B syscalls/s | A kernel CPU % | B kernel CPU % | shared RX queue |\n\
-             |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+             | run | A | B | paired msgs | Δuser p50 | Δuser p90 | Δuser p99 | Δuser p99.9 | Δuser max | Δrx p50 | Δstack p50 | Δstack p99 | A syscalls/s | B syscalls/s | A kernel CPU % | B kernel CPU % | shared RX queue |\n\
+             |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
         );
         for r in &summary_rows {
             head.push_str(r);
@@ -75,7 +109,7 @@ fn main() -> ExitCode {
         head.push('\n');
         out.insert_str(0, &head);
     }
-    print!("{out}");
+    print!("{head}{out}");
     ExitCode::SUCCESS
 }
 
@@ -104,35 +138,69 @@ fn analyse(
     summary: &mut Vec<String>,
 ) -> BoxResult<()> {
     let meta = load_meta(dir)?;
-    let all = read_records(&dir.join("records.bin"))?;
     let mode = get(&meta, "mode").to_owned();
+    // `tag/run` when the run sits in a condition directory.
+    let name = match (dir.parent().and_then(Path::file_name), dir.file_name()) {
+        (Some(p), Some(n)) if p != "." && p != "res" => {
+            format!("{}/{}", p.to_string_lossy(), n.to_string_lossy())
+        }
+        (_, Some(n)) => n.to_string_lossy().into_owned(),
+        _ => dir.display().to_string(),
+    };
+    if mode == "noise" {
+        let _ = writeln!(
+            out,
+            "## {name}: platform noise on CPU {} ({} s, a loop that only reads the counter)\n",
+            get(&meta, "cpu"),
+            get(&meta, "duration_s")
+        );
+        stall_section(dir, out, &name)?;
+        return Ok(());
+    }
+    let all = read_records(&dir.join("records.bin"))?;
     let variants: Vec<String> = get(&meta, "variants")
         .split(',')
         .map(str::to_owned)
         .collect();
-    let name = dir.file_name().map_or_else(
-        || dir.display().to_string(),
-        |n| n.to_string_lossy().into_owned(),
-    );
-
     if mode == "pingpong" {
         // Ping-pong runs are short; keep every round trip but the first second.
         let t0 = all.iter().map(|r| r.user_ns).min().unwrap_or(0);
+        let skip = io_bench::matrix::ROUND_TRIP_WARMUP_S * 1_000_000_000;
         let mut rtt: Vec<i64> = all
             .iter()
-            .filter(|r| r.user_ns >= t0 + 1_000_000_000)
+            .filter(|r| r.user_ns >= t0 + skip)
             .map(|r| r.user_ns - r.src_ns)
             .collect();
+        let p50 = summarize(&mut rtt.clone()).map_or(0, |s| s.p50);
         if let Some(s) = summarize(&mut rtt) {
             pingpong.push(row(
-                &format!("{} @ {}/s", variants[0], get(&meta, "rate")),
+                &format!("{name}: {} @ {}/s", variants[0], get(&meta, "rate")),
                 &s,
             ));
         }
-        // HTTP client runs (http_bench) carry no loop counters.
+        // Paced runs: the same round trips from when each was due.
+        let mut from_due: Vec<i64> = all
+            .iter()
+            .filter(|r| r.user_ns >= t0 + skip && r.src2_ns > 0)
+            .map(|r| r.user_ns - r.src2_ns)
+            .collect();
+        if let Some(s) = summarize(&mut from_due) {
+            pingpong.push(row(
+                &format!(
+                    "{name}: {} @ {}/s, from when due",
+                    variants[0],
+                    get(&meta, "rate")
+                ),
+                &s,
+            ));
+        }
+        // HTTP client runs (http_bench) carry no full loop counters.
         if meta.contains_key("loop.0.spins") {
             loop_table(&meta, &variants, out, &name);
         }
+        let loops = stall_section(dir, out, &name)?;
+        let kept: Vec<&Record> = all.iter().filter(|r| r.user_ns >= t0 + skip).collect();
+        slowest_round_trips(dir, &kept, p50, &loops, out, &name)?;
         return Ok(());
     }
 
@@ -247,13 +315,15 @@ fn analyse(
         };
         let shared = shares_queue(&meta, &variants);
         summary.push(format!(
-            "| {name} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.0} | {:.0} | {:.1} | {:.1} | {} |",
+            "| {name} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.0} | {:.0} | {:.1} | {:.1} | {} |",
             variants[0],
             variants[1],
             p.n,
             us(p.user.p50),
             us(p.user.p90),
             us(p.user.p99),
+            us(p.user.p999),
+            us(p.user.max),
             p.rx.map_or_else(String::new, |s| us(s.p50)),
             p.stack.map_or_else(String::new, |s| us(s.p50)),
             p.stack.map_or_else(String::new, |s| us(s.p99)),
@@ -264,6 +334,111 @@ fn analyse(
             if shared { "yes" } else { "no" }
         ));
     }
+    stall_section(dir, out, &name)?;
+    Ok(())
+}
+
+/// A loop's stall summary and its stalls, attributed.
+type LoopStalls = (StallSummary, Vec<Attribution>);
+
+/// Stall attribution for every loop of a run (`stalls-<i>.txt`), using the
+/// kernel trace of the loop CPUs (`trace.txt`) and interrupt counts
+/// (`irq-before.txt`, `irq-after.txt`) when the run captured them.
+fn stall_section(dir: &Path, out: &mut String, name: &str) -> BoxResult<Vec<LoopStalls>> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("stalls-") && n.ends_with(".txt"))
+        })
+        .collect();
+    files.sort();
+    let traced = io_bench::record::exists_maybe_compressed(&dir.join("trace.txt"));
+    let irq = std::fs::read_to_string(dir.join("irq-before.txt"))
+        .and_then(|b| Ok((b, std::fs::read_to_string(dir.join("irq-after.txt"))?)))
+        .ok();
+    let mut loops = Vec::new();
+    for f in files {
+        let (sum, attrs) = stalls::load_loop(dir, &f)?;
+        let label = f
+            .file_stem()
+            .map(|s| s.to_string_lossy().replace("stalls-", "loop "))
+            .unwrap_or_default();
+        let title = format!(
+            "{name}, {label} on CPU {}{}",
+            sum.cpu,
+            if traced {
+                ""
+            } else {
+                " (no kernel trace: causes limited to loop work)"
+            }
+        );
+        out.push_str(&stalls::report(&title, &sum, &attrs));
+        if let (Some((before, after)), Ok(c)) = (&irq, usize::try_from(sum.cpu)) {
+            let d = stalls::interrupt_deltas(before, after, c);
+            if !d.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "Interrupts on CPU {c} during the run (`/proc/interrupts`):\n\n| interrupt | count |\n|---|---|"
+                );
+                for (k, v) in d.iter().take(12) {
+                    let _ = writeln!(out, "| {k} | {v} |");
+                }
+                let _ = writeln!(out);
+            }
+        }
+        loops.push((sum, attrs));
+    }
+    Ok(loops)
+}
+
+/// The ten slowest round trips of a ping-pong run, each matched to stalls of
+/// the client's loop and of the server (`server-*.txt`, written by
+/// `replay_server --stalls-dir`). Server stalls are matched on the wall clock
+/// with 50 µs of slack for the hosts' clock offset.
+fn slowest_round_trips(
+    dir: &Path,
+    recs: &[&Record],
+    p50: i64,
+    loops: &[LoopStalls],
+    out: &mut String,
+    name: &str,
+) -> BoxResult<()> {
+    let client: Vec<Attribution> = loops.iter().flat_map(|(_, a)| a.iter().cloned()).collect();
+    let mut server: Vec<Attribution> = Vec::new();
+    for f in stalls::server_stall_files(dir) {
+        server.extend(stalls::load_attributed(&f, &dir.join("server-trace.txt"))?.1);
+    }
+    if client.is_empty() && server.is_empty() {
+        return Ok(());
+    }
+    let mut slow: Vec<&&Record> = recs.iter().collect();
+    slow.sort_by_key(|r| std::cmp::Reverse(r.user_ns - r.src_ns));
+    let _ = writeln!(
+        out,
+        "#### Slowest round trips: {name} (median {})\n\n| # | round trip µs | over median µs | client stall µs | client cause | server stall µs | server cause | not explained by either µs | verdict |\n|---|---|---|---|---|---|---|---|---|",
+        us(p50)
+    );
+    for (i, r) in slow.iter().take(10).enumerate() {
+        let rtt = r.user_ns - r.src_ns;
+        let c = stalls::round_trip_cause(&client, &server, r.src_ns, r.user_ns, p50);
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            i + 1,
+            us(rtt),
+            us(rtt - p50),
+            us(c.client_ns),
+            c.client_cause,
+            us(c.server_ns),
+            c.server_cause,
+            us(c.unexplained_ns),
+            c.verdict
+        );
+    }
+    let _ = writeln!(out);
     Ok(())
 }
 
