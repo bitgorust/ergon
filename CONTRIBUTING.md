@@ -126,17 +126,20 @@ the benchmark is re-audited.
 
 ## Package boundaries
 
-Only `ergo-sbe` and `ergo-aeron-cluster` are publication candidates. Inspect
-their payloads before any release:
+Only `ergo-sbe`, `ergo-aeron-cluster` and `ergon-md-dpdk` are publication
+candidates. Inspect their payloads before any release:
 
 ```sh
 cargo package -p ergo-sbe --list --allow-dirty
 cargo package -p ergo-aeron-cluster --list --allow-dirty
+cargo package -p ergon-md-dpdk --list --allow-dirty
 ```
 
 Packages must exclude repository integration tests, fixtures not required at
 build time, benchmarks, Java harness code, application protocols, samples, and
-internal plans.
+internal plans. `ergon-md-dpdk` ships its native C (including the test fakes
+its own build compiles) but not its interop harness, device plugin or
+deployment assets.
 
 Publishing, tagging, and announcing a release require explicit maintainer
 authorization.

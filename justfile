@@ -10,6 +10,7 @@ import 'just/samples.just'
 import 'just/aeron.just'
 import 'just/housekeeping.just'
 import 'just/book.just'
+import 'just/dpdk.just'
 
 # Default: list available commands.
 [private]
@@ -20,7 +21,8 @@ default:
 
 # Compile product workspace + sample harnesses (no tests, no Java jars).
 build:
-    cargo build --workspace --all-features --exclude ergo-aeron-cluster-test-harness
+    cargo build --workspace --all-features --exclude ergo-aeron-cluster-test-harness --exclude ergon-md-dpdk --exclude ergon-md-dpdk-harness
+    cargo build -p ergon-md-dpdk -p ergon-md-dpdk-harness --all-targets
     cargo build -p ergo-aeron-cluster
     cd samples/exchange-example && cargo build
     cd samples/cluster-ha-orderbook && cargo build
@@ -70,8 +72,9 @@ preflight:
     cargo fmt --all --check
     cd samples/exchange-example && cargo fmt --check
     @echo "=== clippy (same workspace set as CI) ==="
-    cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster-test-harness -- -D warnings
+    cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster-test-harness --exclude ergon-md-dpdk --exclude ergon-md-dpdk-harness -- -D warnings
     cargo clippy -p ergo-aeron-cluster --all-targets -- -D warnings
+    cargo clippy -p ergon-md-dpdk -p ergon-md-dpdk-harness --all-targets -- -D warnings
     @echo "=== policy + ratchet self-tests (prove the checkers can fail) ==="
     bash scripts/tests/test-test-policy.sh
     bash scripts/tests/test-quality-ratchets.sh
@@ -109,9 +112,11 @@ preflight:
 check-local: policy
     ./scripts/check-repository-hygiene.sh
     cargo fmt --all --check
-    cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster-test-harness -- -D warnings
+    cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster-test-harness --exclude ergon-md-dpdk --exclude ergon-md-dpdk-harness -- -D warnings
     cargo clippy -p ergo-aeron-cluster --all-targets -- -D warnings
-    cargo test --workspace --all-features --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness -- --test-threads=1
+    cargo clippy -p ergon-md-dpdk -p ergon-md-dpdk-harness --all-targets -- -D warnings
+    cargo test --workspace --all-features --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness --exclude ergon-md-dpdk --exclude ergon-md-dpdk-harness -- --test-threads=1
+    cargo test -p ergon-md-dpdk -- --test-threads=1
     # runs the cluster doctests too — no separate `--doc` pass needed
     cargo test -p ergo-aeron-cluster -- --test-threads=1
     cd samples/exchange-example && cargo fmt --check
@@ -172,6 +177,8 @@ release-check: test check-coverage check-generated-rustdoc
     RUSTDOCFLAGS='-D warnings' cargo doc -p ergo-sbe --all-features --no-deps
     RUSTDOCFLAGS='-D warnings' cargo doc -p ergo-aeron-cluster --no-deps
     cargo publish -p ergo-sbe --dry-run --allow-dirty
+    RUSTDOCFLAGS='-D warnings' cargo doc -p ergon-md-dpdk --no-deps
+    cargo publish -p ergon-md-dpdk --dry-run --allow-dirty
     bash scripts/check-packaged-cluster-features.sh --list
     bash scripts/check-packaged-cluster-features.sh --unpack --package ergo-sbe
     # ergo-aeron-cluster unpack-and-build waits until ergo-sbe is on crates.io (publish step below).
@@ -268,6 +275,8 @@ _release-post:
     bash scripts/check-packaged-cluster-features.sh --unpack
     @echo "=== publish ergo-aeron-cluster ==="
     cargo publish -p ergo-aeron-cluster
+    @echo "=== publish ergon-md-dpdk ==="
+    cargo publish -p ergon-md-dpdk
     @echo "=== tag ==="
     just _tag
     @echo "=== GitHub release (with bench archives) ==="
@@ -296,15 +305,17 @@ test: policy
     @echo "=== 1/7 fmt ==="
     cargo fmt --all --check
     @echo "=== 2/7 clippy (workspace + samples) ==="
-    cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster-test-harness -- -D warnings
+    cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster-test-harness --exclude ergon-md-dpdk --exclude ergon-md-dpdk-harness -- -D warnings
     cargo clippy -p ergo-aeron-cluster --all-targets -- -D warnings
+    cargo clippy -p ergon-md-dpdk -p ergon-md-dpdk-harness --all-targets -- -D warnings
     @echo "=== 3/7 unit + integration tests ==="
     ./scripts/regenerate-golden.sh --check
     ./scripts/regenerate-sbe-tool-reference.sh --check
     ./scripts/regenerate-codegen-matrix-fixture.py --check
     cargo check --manifest-path sbe/fuzz/Cargo.toml --bins
     cargo test --manifest-path sbe/miri-fixtures/Cargo.toml
-    cargo test --workspace --all-features --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness -- --test-threads=1
+    cargo test --workspace --all-features --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness --exclude ergon-md-dpdk --exclude ergon-md-dpdk-harness -- --test-threads=1
+    cargo test -p ergon-md-dpdk -- --test-threads=1
     cargo test -p ergo-aeron-cluster -- --test-threads=1
     @echo "=== 4/7 product doctests + rustdoc (-D warnings) + docs_validation ==="
     cargo test -p ergo-sbe --doc --all-features -- --test-threads=1
@@ -331,7 +342,8 @@ test: policy
 
 # Workspace unit tests only.
 test-unit: policy
-    cargo test --workspace --all-features --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness -- --test-threads=1
+    cargo test --workspace --all-features --exclude ergo-aeron-cluster --exclude ergo-aeron-cluster-test-harness --exclude ergon-md-dpdk --exclude ergon-md-dpdk-harness -- --test-threads=1
+    cargo test -p ergon-md-dpdk -- --test-threads=1
     cargo test -p ergo-aeron-cluster -- --test-threads=1
 
 # Every test gate: standard suite + Miri UB detection + fuzz corpus replay.
@@ -392,8 +404,9 @@ fmt:
 # Auto-fix: fmt + clippy --fix (same feature split as check).
 fix:
     just fmt
-    cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster-test-harness --fix --allow-dirty --allow-staged -- -D warnings
+    cargo clippy --workspace --all-targets --all-features --exclude ergo-aeron-cluster-test-harness --exclude ergon-md-dpdk --exclude ergon-md-dpdk-harness --fix --allow-dirty --allow-staged -- -D warnings
     cargo clippy -p ergo-aeron-cluster --all-targets --fix --allow-dirty --allow-staged -- -D warnings
+    cargo clippy -p ergon-md-dpdk -p ergon-md-dpdk-harness --all-targets --fix --allow-dirty --allow-staged -- -D warnings
     cd samples/exchange-example && cargo clippy --all-targets --all-features --fix --allow-dirty --allow-staged -- -D warnings
     cd samples/cluster-ha-orderbook && cargo clippy --all-targets --fix --allow-dirty --allow-staged -- -D warnings
     cd samples/cluster-rfq && cargo clippy --all-targets --fix --allow-dirty --allow-staged -- -D warnings

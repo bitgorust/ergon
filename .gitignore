@@ -36,3 +36,7 @@ sbe/fuzz/artifacts/
 /Untitled
 /package-lock.json
 /docs/research/TODO.md
+
+# Python bytecode (md-dpdk/benches/cloud scripts).
+__pycache__/
+*.pyc
