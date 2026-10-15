@@ -163,6 +163,7 @@ jobs:
       - run: cargo test -p ergon-md-dpdk -- --test-threads=1
       - run: cargo test -p ergon-md-dpdk --features dpdk -- --test-threads=1
       - run: cargo test -p ergon-md-dpdk --features static,dpdk -- --test-threads=1
+      - run: cargo test -p ergon-md-dpdk-harness -- --test-threads=1
       - run: bash md-dpdk/deploy/aws-eks/node/test/test-bootstrap.sh
       - name: DPDK virtual-device interop (root)
         # `sudo env "PATH=$PATH"` keeps the runner's cargo on root's PATH: the

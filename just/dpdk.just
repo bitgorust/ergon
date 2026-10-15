@@ -4,11 +4,12 @@
 # on other hosts; CI runs them in the `dpdk` job. The portable half of the
 # crate (config, environment, binary selection) is in the regular recipes.
 
-# Clippy and every test of the DPDK transport against the DPDK-free fakes (Linux x86_64 + libdpdk)
+# Clippy and every test of the DPDK transport against the DPDK-free fakes, and the lab clients' tests (Linux x86_64 + libdpdk)
 check-dpdk:
     cargo clippy -p ergon-md-dpdk -p ergon-md-dpdk-harness --all-targets --features ergon-md-dpdk/dpdk,ergon-md-dpdk-harness/dpdk -- -D warnings
     cargo test -p ergon-md-dpdk --features dpdk -- --test-threads=1
     cargo test -p ergon-md-dpdk --features static,dpdk -- --test-threads=1
+    cargo test -p ergon-md-dpdk-harness -- --test-threads=1
 
 # Interop over DPDK tap devices on a Linux bridge (root, /dev/net/tun, hugepages)
 test-dpdk-vdev *args:
@@ -17,6 +18,10 @@ test-dpdk-vdev *args:
 # Node bootstrap and preflight against fake sysfs and IMDS trees
 test-dpdk-bootstrap:
     bash md-dpdk/deploy/aws-eks/node/test/test-bootstrap.sh
+
+# The cloud lab's analysis (analyse.py, spikes.py) against its fixture, and its scripts' syntax; no cloud
+test-dpdk-lab:
+    bash md-dpdk/benches/cloud/test/test-lab.sh
 
 # `check-dpdk`'s tests in Docker amd64 emulation, for macOS and arm64 hosts
 verify-dpdk-docker *args:

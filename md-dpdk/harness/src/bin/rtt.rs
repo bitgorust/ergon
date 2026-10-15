@@ -22,7 +22,8 @@
 //! every measured round trip of at least `LOAD_SPIKE_NS` (default 100000) as
 //! `stream,due_ns,latency_ns` (`due_ns`: when it was sent, from the start of the
 //! measured run, whose `CLOCK_REALTIME` the first line gives as
-//! `# start_realtime_ns=`), up to 1,000,000 of them, as `load` does.
+//! `# start_realtime_ns=`), the first 100,000 of them with `# spikes_total=`,
+//! as `load` does.
 //! With `LOOP_STALLS_DIR=<dir>`, xping and xpong also write there every stall
 //! of their own polling loop of at least `LOOP_STALL_NS` (default 20000), as
 //! `stalls-ping.csv` / `stalls-pong.csv` (`end_ns,gap_ns` from the line
@@ -33,7 +34,7 @@
 mod lab;
 
 use hdrhistogram::Histogram;
-use lab::{Clock, aeron_dir, cpu_arg, label, pin, wait_until};
+use lab::{Clock, aeron_dir, cpu_arg, label, pin, retry_closing, sub_channel, wait_until};
 use rusteron_client::*;
 use std::ffi::{CStr, CString};
 use std::hint::spin_loop;
@@ -44,7 +45,7 @@ const PING_STREAM_ID: i32 = 1002;
 const PONG_STREAM_ID: i32 = 1003;
 const MESSAGE_LENGTH: usize = 32;
 const FRAGMENT_COUNT_LIMIT: usize = 10;
-const SPIKE_CAPACITY: usize = 1_000_000;
+const SPIKE_CAPACITY: usize = 100_000;
 const STALL_CAPACITY: usize = 1_000_000;
 
 /// Gaps in the calling loop of at least a threshold, each with when it ended:
@@ -138,16 +139,21 @@ fn main() {
 
 fn run_ping(ping_channel: &CStr, pong_channel: &CStr, messages: usize, warmup: usize, cpu: Option<usize>) {
     let aeron = client();
-    let publication = aeron
-        .async_add_exclusive_publication(ping_channel, PING_STREAM_ID)
-        .unwrap()
-        .poll_blocking(Duration::from_secs(5))
-        .unwrap();
-    let subscription = aeron
-        .async_add_subscription(pong_channel, PONG_STREAM_ID, Handlers::NONE, Handlers::NONE)
-        .unwrap()
-        .poll_blocking(Duration::from_secs(5))
-        .unwrap();
+    let publication = retry_closing("publication", || {
+        aeron
+            .async_add_exclusive_publication(ping_channel, PING_STREAM_ID)
+            .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
+    });
+    let subscription = retry_closing("subscription", || {
+        aeron
+            .async_add_subscription(
+                &sub_channel(pong_channel),
+                PONG_STREAM_ID,
+                Handlers::NONE,
+                Handlers::NONE,
+            )
+            .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
+    });
     wait_until("pong", 30, || {
         publication.is_connected() && subscription.image_at_index(0).is_some()
     });
@@ -161,9 +167,24 @@ fn run_ping(ping_channel: &CStr, pong_channel: &CStr, messages: usize, warmup: u
     let budget = Duration::from_secs(std::env::var("RTT_SECONDS").map_or(20, |s| s.parse().unwrap()));
     let mut histogram = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).unwrap();
     let mut buffer = [0u8; MESSAGE_LENGTH];
+    // RTT_LOST_TIMEOUT_US: on an unreliable channel a lost ping or echo is
+    // never repaired, so after this long it is counted lost and the next sent
+    let timeout_ns: u64 =
+        std::env::var("RTT_LOST_TIMEOUT_US").map_or(0, |v| v.parse::<u64>().expect("RTT_LOST_TIMEOUT_US") * 1000);
+    let mut seq = 0_u64;
     let start = Instant::now();
     for i in 0..warmup {
-        round_trip(&clock, &publication, &image, &mut buffer, &mut None, |_| {});
+        seq += 1;
+        round_trip(
+            &clock,
+            &publication,
+            &image,
+            &mut buffer,
+            &mut None,
+            seq,
+            timeout_ns,
+            |_| {},
+        );
         if i % 64 == 0 && start.elapsed() > budget / 4 {
             break;
         }
@@ -172,17 +193,35 @@ fn run_ping(ping_channel: &CStr, pong_channel: &CStr, messages: usize, warmup: u
     let spikes_path = std::env::var("LOAD_SPIKES").ok().filter(|p| !p.is_empty());
     let spike_ns: u64 = std::env::var("LOAD_SPIKE_NS").map_or(100_000, |v| v.parse().expect("LOAD_SPIKE_NS"));
     let mut spikes: Vec<(u64, u64)> = Vec::with_capacity(if spikes_path.is_some() { SPIKE_CAPACITY } else { 0 });
+    let mut spikes_total = 0_u64;
     let start = Instant::now();
     let t0 = clock.ticks();
     let t0_realtime = realtime_ns();
     let mut stalls = Stalls::new(&clock);
+    let mut lost = 0_u64;
     for i in 0..messages {
-        round_trip(&clock, &publication, &image, &mut buffer, &mut stalls, |rtt| {
-            histogram.saturating_record(rtt);
-            if rtt >= spike_ns && spikes.len() < spikes.capacity() {
-                spikes.push((clock.ns(clock.ticks().wrapping_sub(t0)).saturating_sub(rtt), rtt));
-            }
-        });
+        seq += 1;
+        let echoed = round_trip(
+            &clock,
+            &publication,
+            &image,
+            &mut buffer,
+            &mut stalls,
+            seq,
+            timeout_ns,
+            |rtt| {
+                histogram.saturating_record(rtt);
+                if rtt >= spike_ns {
+                    spikes_total += 1;
+                    if spikes.len() < spikes.capacity() {
+                        spikes.push((clock.ns(clock.ticks().wrapping_sub(t0)).saturating_sub(rtt), rtt));
+                    }
+                }
+            },
+        );
+        if !echoed {
+            lost += 1;
+        }
         if i % 64 == 0 && start.elapsed() > budget {
             break;
         }
@@ -190,7 +229,7 @@ fn run_ping(ping_channel: &CStr, pong_channel: &CStr, messages: usize, warmup: u
 
     let q = |quantile| histogram.value_at_quantile(quantile);
     println!(
-        "rtt,{},udp,{},{},{},{},{},{},{:.0},{}",
+        "rtt,{},udp,{},{},{},{},{},{},{:.0},{},{lost}",
         label(),
         q(0.5),
         q(0.9),
@@ -211,7 +250,8 @@ fn run_ping(ping_channel: &CStr, pong_channel: &CStr, messages: usize, warmup: u
     }
     if let Some(path) = spikes_path {
         // the wall-clock time due_ns counts from, to line spikes up with traces
-        let mut rows = format!("# start_realtime_ns={t0_realtime}\nstream,due_ns,latency_ns\n");
+        let mut rows =
+            format!("# start_realtime_ns={t0_realtime}\n# spikes_total={spikes_total}\nstream,due_ns,latency_ns\n");
         for (due, latency) in &spikes {
             rows.push_str(&format!("{PING_STREAM_ID},{due},{latency}\n"));
         }
@@ -231,60 +271,80 @@ fn realtime_ns() -> u128 {
 
 /// Sends one stamped ping and polls until pong's echo of it is back.
 #[inline]
+/// One round trip of message `seq`: `true` once its echo is back, `false` if
+/// none came within `timeout_ns` (0: wait for ever, as a reliable channel
+/// repairs any loss). An echo of an earlier, timed-out message is skipped.
+#[allow(clippy::too_many_arguments)]
 fn round_trip(
     clock: &Clock,
     publication: &AeronExclusivePublication,
     image: &AeronImage,
     buffer: &mut [u8; MESSAGE_LENGTH],
     stalls: &mut Option<Stalls>,
+    seq: u64,
+    timeout_ns: u64,
     mut record: impl FnMut(u64),
-) {
+) -> bool {
     if let Some(s) = stalls.as_mut() {
         s.pass(clock.ticks());
     }
-    let position = loop {
+    buffer[8..16].copy_from_slice(&seq.to_le_bytes());
+    let started = loop {
         // stamped on each attempt, so time back-pressured is not counted
-        buffer[..8].copy_from_slice(&clock.ticks().to_le_bytes());
+        let now = clock.ticks();
+        buffer[..8].copy_from_slice(&now.to_le_bytes());
         match publication.offer(buffer) {
-            Ok(position) => break position,
+            Ok(_) => break now,
             Err(e) if e.is_retryable() => spin_loop(),
             Err(e) => panic!("offer: {e:?}"),
         }
     };
-    // pong echoes at the same length, so the echo is read once the image reaches our position
-    while image.position() < position {
+    let mut echoed = false;
+    while !echoed {
         if let Some(s) = stalls.as_mut() {
             s.pass(clock.ticks());
         }
         let fragments = image
             .poll_fn(
                 |reply, _header| {
-                    let sent = u64::from_le_bytes(reply[..8].try_into().unwrap());
-                    record(clock.ns(clock.ticks().wrapping_sub(sent)));
+                    if u64::from_le_bytes(reply[8..16].try_into().unwrap()) == seq {
+                        let sent = u64::from_le_bytes(reply[..8].try_into().unwrap());
+                        record(clock.ns(clock.ticks().wrapping_sub(sent)));
+                        echoed = true;
+                    }
                 },
                 FRAGMENT_COUNT_LIMIT,
             )
             .unwrap();
         if fragments == 0 {
             assert!(!image.is_closed(), "pong went away");
+            if timeout_ns != 0 && clock.ns(clock.ticks().wrapping_sub(started)) > timeout_ns {
+                return false;
+            }
             spin_loop();
         }
     }
+    true
 }
 
 /// Echoes every ping until the ping side's image goes away.
 fn run_pong(ping_channel: &CStr, pong_channel: &CStr, cpu: Option<usize>) {
     let aeron = client();
-    let publication = aeron
-        .async_add_exclusive_publication(pong_channel, PONG_STREAM_ID)
-        .unwrap()
-        .poll_blocking(Duration::from_secs(5))
-        .unwrap();
-    let subscription = aeron
-        .async_add_subscription(ping_channel, PING_STREAM_ID, Handlers::NONE, Handlers::NONE)
-        .unwrap()
-        .poll_blocking(Duration::from_secs(5))
-        .unwrap();
+    let publication = retry_closing("publication", || {
+        aeron
+            .async_add_exclusive_publication(pong_channel, PONG_STREAM_ID)
+            .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
+    });
+    let subscription = retry_closing("subscription", || {
+        aeron
+            .async_add_subscription(
+                &sub_channel(ping_channel),
+                PING_STREAM_ID,
+                Handlers::NONE,
+                Handlers::NONE,
+            )
+            .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
+    });
     wait_until("ping", 60, || subscription.image_at_index(0).is_some());
     let image = subscription.image_at_index(0).unwrap();
     pin(cpu);
@@ -326,11 +386,11 @@ fn echo(publication: &AeronExclusivePublication, ping: &[u8]) {
 /// Holds a subscription on `channel` that nobody publishes to, for `seconds`.
 fn run_idle(channel: &CStr, seconds: u64) {
     let aeron = client();
-    let _subscription = aeron
-        .async_add_subscription(channel, PONG_STREAM_ID + 100, Handlers::NONE, Handlers::NONE)
-        .unwrap()
-        .poll_blocking(Duration::from_secs(5))
-        .unwrap();
+    let _subscription = retry_closing("subscription", || {
+        aeron
+            .async_add_subscription(channel, PONG_STREAM_ID + 100, Handlers::NONE, Handlers::NONE)
+            .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
+    });
     eprintln!("rtt: idle subscription on {}", channel.to_string_lossy());
     std::thread::sleep(Duration::from_secs(seconds));
 }

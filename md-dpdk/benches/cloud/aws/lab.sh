@@ -25,10 +25,20 @@
 #   LAB_REPS (5) LAB_PLACEMENT (cluster)
 #   LAB_MODES ("kernel kernel-busy dpdk") LAB_STATES ("pinned isolated")
 #   LAB_LOCAL_MODES, LAB_LOAD_SIZES, LAB_LOAD_FRACTIONS, LAB_LOAD_SECONDS,
-#   LAB_LOAD_LADDER, LAB_MIX, LAB_MIX_SECONDS: as azure/lab.sh
+#   LAB_LOAD_LADDER, LAB_MIX, LAB_MIX_SECONDS, LAB_RTT_ALIGN, LAB_BASE, LAB_TPUT_FLOWS: as azure/lab.sh
+#   (LAB_TPUT_FLOWS: one UDP flow carries at most 8.0 Gbit/s of frames here, on every size
+#   measured; LAB_TPUT_FLOWS=2, where both instances have a fifth core (c7i.4xlarge and
+#   up), adds the sustained maximum over two flows at once, which shows whether two carry
+#   twice that, up to the instance's own bandwidth: 12.5 Gbit/s on c7i.4xlarge, 37.5 on
+#   c7i.metal-24xl. Unset, 0 or 1, it does not run)
 #   LAB_KEEP=1 keeps everything (delete it with LAB_DELETE=<stamp> lab.sh);
+#   LAB_MAX_HOURS (8): each instance terminates itself that long after launch,
+#   should this machine never delete it (asleep, offline), LAB_KEEP or not;
 #   LAB_REPS=0 with LAB_KEEP=1 stops after the build, for work by hand
 #   RTT_MESSAGES (300000) RTT_WARMUP (50000) TPUT_SECONDS (5)
+#   To stop a run early: kill -TERM <its pid> (the one whose parent is 1). Bash
+#   ignores SIGINT while an ssh step runs that does not die of it, so Ctrl-C can
+#   take until that step ends; TERM runs the teardown as soon as the step returns.
 set -uo pipefail
 export AWS_PAGER=""
 
@@ -65,8 +75,14 @@ load_seconds=${LAB_LOAD_SECONDS:-5}
 load_ladder=${LAB_LOAD_LADDER:-}
 mix=${LAB_MIX:-}
 mix_seconds=${LAB_MIX_SECONDS:-10}
+tput_flows=${LAB_TPUT_FLOWS:-}
 rtt_messages=${RTT_MESSAGES:-300000}
 rtt_warmup=${RTT_WARMUP:-50000}
+rtt_align=${LAB_RTT_ALIGN:-}
+base=${LAB_BASE:-}
+# the instances' own deadline (hours from launch), in case this machine never
+# gets to delete them (it slept, lost its network): see deadline-userdata.sh
+max_hours=${LAB_MAX_HOURS:-8}
 tput_seconds=${TPUT_SECONDS:-5}
 user=admin
 stamp=${LAB_DELETE:-$(date +%Y%m%d-%H%M%S)}
@@ -77,12 +93,28 @@ created=0
 
 log() { echo "[$(date +%T)] $*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
-ec2() { aws ec2 --region "$region" "$@"; }
+# One AWS CLI call at a time on this machine: `aws login` refreshes its token
+# into a shared cache, and two refreshes at once (labs, billing checks, other
+# sessions) leave it corrupt, after which every call fails, teardown included.
+# The lock is the one the other lab sessions on this machine take.
+aws_cli() {
+    perl -MFcntl=:flock -e '$^F = 255; open(my $l, ">>", shift) or die "lock: $!"; flock($l, LOCK_EX) or die "lock: $!"; exec @ARGV' \
+        "${TMPDIR:-/tmp}/ergon-lab-aws.lock" aws "$@"
+}
+ec2() { aws_cli ec2 --region "$region" "$@"; }
 tags() { echo "ResourceType=$1,Tags=[{Key=owner,Value=ergon-lab},{Key=run,Value=$stamp},{Key=Name,Value=ergon-md-dpdk-$2}]"; }
 tagged() { echo "Name=tag:run,Values=$stamp"; }
 
+# a base revision that cannot be built is found before anything is created
+# (never in the way of LAB_DELETE, which builds nothing)
+if [[ -n $base && -z ${LAB_DELETE:-} ]] && ! git -C "$repo" rev-parse --verify -q "$base^{commit}" >/dev/null; then
+    die "LAB_BASE $base: not a commit in $repo"
+fi
+if [[ -n $tput_flows && -z ${LAB_DELETE:-} && ! $tput_flows =~ ^[0-9]+$ ]]; then
+    die "LAB_TPUT_FLOWS $tput_flows: not a number of flows"
+fi
 command -v aws >/dev/null || die "aws is not on PATH"
-aws sts get-caller-identity >/dev/null 2>&1 || die "aws is not signed in (aws login)"
+aws_cli sts get-caller-identity >/dev/null 2>&1 || die "aws is not signed in (aws login)"
 mkdir -p "$out"
 
 # Delete everything tagged with this run, in dependency order, then list again
@@ -90,6 +122,22 @@ mkdir -p "$out"
 teardown_run() {
     log "deleting run $stamp in $region"
     local ids id
+    # Credentials can expire during a long run. Without them nothing below can
+    # delete or list anything, so the instances are shut down over SSH instead
+    # (instance-initiated shutdown terminates them, as the deadline unit
+    # does), and the run is reported as not verified, never as clean.
+    if ! aws_cli sts get-caller-identity --region "$region" >/dev/null 2>&1; then
+        log "WARNING: AWS credentials failed: cannot delete or verify run $stamp"
+        local host
+        for host in ${A:-} ${B:-}; do
+            [[ -n $host && $host != None ]] || continue
+            # one try: a host powering off drops the connection (on() would retry it for minutes)
+            ssh "${ssh_opts[@]}" "$user@$host" 'sudo systemctl poweroff' 2>/dev/null || true
+            log "asked $host to power off (instance-initiated shutdown terminates it)"
+        done
+        log "WARNING: refresh the credentials, then: LAB_DELETE=$stamp $0 (deletes the rest and verifies by tag)"
+        return 1
+    fi
     ids=$(ec2 describe-instances --filters "$(tagged)" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
         --query 'Reservations[].Instances[].InstanceId' --output text)
     if [[ -n $ids ]]; then
@@ -109,8 +157,9 @@ teardown_run() {
         for id in $(ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc" --query 'Subnets[].SubnetId' --output text); do
             ec2 delete-subnet --subnet-id "$id"
         done
-        for id in $(ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc" \
-            --query 'RouteTables[?!Associations[?Main]].RouteTableId' --output text); do
+        # this run's own (tagged) route table; the VPC's main one goes with the VPC
+        for id in $(ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc" "$(tagged)" \
+            --query 'RouteTables[].RouteTableId' --output text); do
             ec2 delete-route-table --route-table-id "$id"
         done
         for id in $(ec2 describe-security-groups --filters "Name=vpc-id,Values=$vpc" \
@@ -122,19 +171,28 @@ teardown_run() {
     ec2 delete-placement-group --group-name "ergon-md-dpdk-$stamp" 2>/dev/null
     ec2 delete-placement-group --group-name "ergon-md-dpdk-pt-$stamp" 2>/dev/null
     ec2 delete-key-pair --key-name "ergon-md-dpdk-$stamp" 2>/dev/null
-    # verify: nothing billable (or otherwise) left with this run's tag
-    local left
+    # verify: nothing billable (or otherwise) left with this run's tag; a
+    # failed listing is a failed verification, never an empty one
+    local left listed=0
     left=$( {
         ec2 describe-instances --filters "$(tagged)" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --query 'Reservations[].Instances[].InstanceId' --output text
-        ec2 describe-volumes --filters "$(tagged)" --query 'Volumes[].VolumeId' --output text
-        ec2 describe-network-interfaces --filters "$(tagged)" --query 'NetworkInterfaces[].NetworkInterfaceId' --output text
-        ec2 describe-addresses --filters "$(tagged)" --query 'Addresses[].AllocationId' --output text
-        ec2 describe-vpcs --filters "$(tagged)" --query 'Vpcs[].VpcId' --output text
-        ec2 describe-placement-groups --filters "$(tagged)" --query 'PlacementGroups[].GroupName' --output text
-        ec2 describe-key-pairs --filters "$(tagged)" --query 'KeyPairs[].KeyName' --output text
+            --query 'Reservations[].Instances[].InstanceId' --output text || echo LISTFAIL
+        ec2 describe-volumes --filters "$(tagged)" --query 'Volumes[].VolumeId' --output text || echo LISTFAIL
+        ec2 describe-network-interfaces --filters "$(tagged)" --query 'NetworkInterfaces[].NetworkInterfaceId' --output text || echo LISTFAIL
+        ec2 describe-addresses --filters "$(tagged)" --query 'Addresses[].AllocationId' --output text || echo LISTFAIL
+        ec2 describe-vpcs --filters "$(tagged)" --query 'Vpcs[].VpcId' --output text || echo LISTFAIL
+        ec2 describe-route-tables --filters "$(tagged)" --query 'RouteTables[].RouteTableId' --output text || echo LISTFAIL
+        ec2 describe-subnets --filters "$(tagged)" --query 'Subnets[].SubnetId' --output text || echo LISTFAIL
+        ec2 describe-security-groups --filters "$(tagged)" --query 'SecurityGroups[].GroupId' --output text || echo LISTFAIL
+        ec2 describe-internet-gateways --filters "$(tagged)" --query 'InternetGateways[].InternetGatewayId' --output text || echo LISTFAIL
+        ec2 describe-placement-groups --filters "$(tagged)" --query 'PlacementGroups[].GroupName' --output text || echo LISTFAIL
+        ec2 describe-key-pairs --filters "$(tagged)" --query 'KeyPairs[].KeyName' --output text || echo LISTFAIL
     } 2>/dev/null | tr -s ' \t\n' ' ')
-    if [[ -z ${left// /} ]]; then
+    [[ $left != *LISTFAIL* ]] && aws_cli sts get-caller-identity --region "$region" >/dev/null 2>&1 && listed=1
+    if ((!listed)); then
+        log "WARNING: could not list run $stamp's resources: NOT verified (rerun with LAB_DELETE=$stamp $0)"
+        return 1
+    elif [[ -z ${left// /} ]]; then
         log "verified: nothing tagged run=$stamp remains in $region"
     else
         log "WARNING: still present for run $stamp: $left (rerun with LAB_DELETE=$stamp $0)"
@@ -228,8 +286,35 @@ for zone in $zones; do
     ec2 associate-route-table --route-table-id "$rt" --subnet-id "$mgmt" >/dev/null
     data=$(ec2 create-subnet --vpc-id "$vpc" --cidr-block "$data_subnet" --availability-zone "$zone" \
         --tag-specifications "$(tags subnet data)" --query Subnet.SubnetId --output text) || die "data subnet"
+    # The dead-man's switch, as user data: the instance powers off at the
+    # deadline, at whichever boot reaches it (the isolated state reboots),
+    # and, launched to terminate on shutdown, is deleted with its disks and
+    # data ENIs. Only if this machine never deletes it first.
+    [[ -f $out/deadline-userdata.sh ]] || cat >"$out/deadline-userdata.sh" <<USERDATA
+#!/bin/bash
+echo $(($(date +%s) + max_hours * 3600)) >/etc/ergon-lab-deadline
+cat >/usr/local/sbin/ergon-lab-deadline <<'SCRIPT'
+#!/bin/sh
+left=\$((\$(cat /etc/ergon-lab-deadline) - \$(date +%s)))
+[ "\$left" -le 60 ] && exec /sbin/poweroff
+exec /sbin/shutdown -h "+\$((left / 60))" "ergon-lab deadline"
+SCRIPT
+chmod +x /usr/local/sbin/ergon-lab-deadline
+cat >/etc/systemd/system/ergon-lab-deadline.service <<'UNIT'
+[Unit]
+Description=ergon-lab dead-man's switch: power off (and so terminate) at the lab's deadline
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ergon-lab-deadline
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now ergon-lab-deadline.service
+USERDATA
     launch() { # type: one instance, its id
         ec2 run-instances --image-id "$ami" --instance-type "$1" --count 1 --key-name "ergon-md-dpdk-$stamp" \
+            --instance-initiated-shutdown-behavior terminate --user-data "file://$out/deadline-userdata.sh" \
             --subnet-id "$mgmt" --security-group-ids "$sg" --placement "GroupName=ergon-md-dpdk-$stamp" \
             --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=40,VolumeType=gp3,DeleteOnTermination=true}' \
             --metadata-options HttpTokens=required \

@@ -26,7 +26,30 @@
 #   LAB_REPS=0 with LAB_KEEP=1 stops after the build, for work on the VMs by hand
 #   LAB_MIX (none; e.g. "trading=orders:3001:10000:32 md:3002:200000:288:50 bulk:3003:20000:1344:10")
 #   LAB_MIX_SECONDS (10); round trips of 100 µs or more are logged with their times (spikes-*.csv)
+#   LAB_TPUT_FLOWS (none; unset, 0 and 1 run nothing of it; 2 or more, at most one flow per
+#   app CPU on each VM, so 2 where both have a fifth core): in each cross-host mode but
+#   +idle ones, after everything else, a sustained maximum over that many flows at once, at
+#   32 B and each LAB_LOAD_SIZES size. Each flow is a publication on its own channel, so its
+#   own UDP port and 5-tuple (a channel is one flow whatever its streams), each end on its
+#   own app CPU. Against one flow's maximum it shows whether a ceiling is per flow, as AWS's
+#   8 Gbit/s appears to be, or per NIC or instance; a run whose flows' measured windows
+#   overlapped less than 0.9 of the shortest is left out of it (analyse.py)
+#   LAB_MAX_HOURS (8): Azure deallocates both VMs that long after creation,
+#   should this machine never delete the group (asleep, offline)
+#   LAB_RTT_ALIGN (none; e.g. 58): start each round-trip run at that second of the
+#   minute, so every mode misses (or meets) a host event recurring once a minute alike
+#   LAB_BASE (none; a git revision of this checkout): also built on both VMs, into
+#   ~/bin-base, for modes with @BIN=bin-base: LAB_MODES="dpdk dpdk@BIN=bin-base" A/Bs
+#   that build against this one (analyse.py --ab dpdk dpdk@BIN=bin-base <results.csv>).
+#   Without it, @BIN=<dir> runs any build placed in <dir> on both VMs by hand
+#   (its media_driver, and rtt, tput and load where it has them)
+#   Every mode runs on the recommended configuration (vm.sh baseline: transparent
+#   hugepages off, and in DPDK modes the receiver's IO vectors at 16); a mode's
+#   @THP=always or @AERON_RECEIVER_IO_VECTOR_CAPACITY=4 A/Bs the earlier state
 #   RTT_MESSAGES (300000) RTT_WARMUP (50000) TPUT_SECONDS (5)
+#   To stop a run early: kill -TERM <its pid> (the one whose parent is 1). Bash
+#   ignores SIGINT while an ssh step runs that does not die of it, so Ctrl-C can
+#   take until that step ends; TERM runs the teardown as soon as the step returns.
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -67,9 +90,16 @@ load_ladder=${LAB_LOAD_LADDER:-}
 # mix_run): profiles "<profile>=<name:stream:msgs/s:size[:burst]> ...;..."
 mix=${LAB_MIX:-}
 mix_seconds=${LAB_MIX_SECONDS:-10}
+# a sustained maximum over several flows at once (lib.sh multi_flow_max): how
+# many flows; unset, 0 or 1, none
+tput_flows=${LAB_TPUT_FLOWS:-}
 read -ra states <<<"${LAB_STATES:-pinned isolated}"
 rtt_messages=${RTT_MESSAGES:-300000}
 rtt_warmup=${RTT_WARMUP:-50000}
+rtt_align=${LAB_RTT_ALIGN:-}
+base=${LAB_BASE:-}
+# both VMs deallocate themselves this long after creation (hours)
+max_hours=${LAB_MAX_HOURS:-8}
 tput_seconds=${TPUT_SECONDS:-5}
 user=azureuser
 out=$repo/target/md-dpdk-bench/$(date +%Y%m%d-%H%M%S)
@@ -82,6 +112,11 @@ die() { log "ERROR: $*"; exit 1; }
 key=
 for k in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do [[ -f $k ]] && { key=$k; break; }; done
 [[ -n $key ]] || die "no ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub"
+# a base revision that cannot be built is found before anything is created
+if [[ -n $base ]] && ! git -C "$repo" rev-parse --verify -q "$base^{commit}" >/dev/null; then
+    die "LAB_BASE $base: not a commit in $repo"
+fi
+[[ -z $tput_flows || $tput_flows =~ ^[0-9]+$ ]] || die "LAB_TPUT_FLOWS $tput_flows: not a number of flows"
 command -v az >/dev/null || die "az is not on PATH"
 az account show -o none 2>/dev/null || die "az is not logged in (az login)"
 mkdir -p "$out"
@@ -170,6 +205,14 @@ B=$(az network public-ip show -g "$group" -n b-ip --query ipAddress -o tsv)
 a_private=$(az network nic show -g "$group" -n a-mgmt --query 'ipConfigurations[0].privateIPAddress' -o tsv)
 b_private=$(az network nic show -g "$group" -n b-mgmt --query 'ipConfigurations[0].privateIPAddress' -o tsv)
 log "a=$A b=$B (private $a_private $b_private)"
+# The dead-man's switch: Azure deallocates both VMs (their compute stops
+# billing) LAB_MAX_HOURS after creation, should this machine never delete the
+# group (asleep, offline). A schedule in the group, so it goes with the group.
+off=$(date -u -v+"${max_hours}"H +%H%M 2>/dev/null || date -u -d "+${max_hours} hours" +%H%M)
+for n in a b; do
+    az vm auto-shutdown -g "$group" -n "$n" --time "$off" -o none ||
+        log "WARNING: no auto-shutdown on $n: only this machine's teardown will delete it"
+done
 
 data_subnet=10.20.1.0/24
 . "$here/../lib.sh"

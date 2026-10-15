@@ -26,14 +26,15 @@
 //! With `LOAD_SPIKES=<path>`, every round trip of at least `LOAD_SPIKE_NS`
 //! (default 100000) after warm-up is written there as
 //! `stream,due_ns,latency_ns` (`due_ns` from the start of the schedule, whose
-//! `CLOCK_REALTIME` the first line gives as `# start_realtime_ns=`), up to
-//! 1,000,000 of them, so spikes can be lined up against periodic work.
+//! `CLOCK_REALTIME` the first line gives as `# start_realtime_ns=`), the first
+//! 100,000 of them (`# spikes_total=` says how many there were: past capacity
+//! nearly every message is one), so spikes can be lined up against periodic work.
 
 #[path = "../lab.rs"]
 mod lab;
 
 use hdrhistogram::Histogram;
-use lab::{Clock, aeron_dir, cpu_arg, label, pin, wait_until};
+use lab::{Clock, aeron_dir, cpu_arg, label, pin, retry_closing, sub_channel, wait_until};
 use rusteron_client::*;
 use std::ffi::CString;
 use std::hint::spin_loop;
@@ -46,7 +47,7 @@ const PONG_STREAM_ID: i32 = 1003;
 const ECHO_OFFSET: i32 = 1000;
 const HEADER: usize = 16; // intended send tick, sequence
 const FRAGMENT_COUNT_LIMIT: usize = 64;
-const SPIKE_CAPACITY: usize = 1_000_000;
+const SPIKE_CAPACITY: usize = 100_000;
 
 fn udp(endpoint: Option<String>) -> CString {
     CString::new(format!("aeron:udp?endpoint={}", endpoint.expect("host:port"))).unwrap()
@@ -170,16 +171,21 @@ fn run(ping_channel: &CString, pong_channel: &CString, specs: Vec<Spec>, seconds
     let aeron = client();
     let mut pending = Vec::new();
     for spec in specs {
-        let publication = aeron
-            .async_add_exclusive_publication(ping_channel, spec.ping_stream)
-            .unwrap()
-            .poll_blocking(Duration::from_secs(5))
-            .unwrap();
-        let subscription = aeron
-            .async_add_subscription(pong_channel, spec.pong_stream, Handlers::NONE, Handlers::NONE)
-            .unwrap()
-            .poll_blocking(Duration::from_secs(5))
-            .unwrap();
+        let publication = retry_closing("publication", || {
+            aeron
+                .async_add_exclusive_publication(ping_channel, spec.ping_stream)
+                .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
+        });
+        let subscription = retry_closing("subscription", || {
+            aeron
+                .async_add_subscription(
+                    &sub_channel(pong_channel),
+                    spec.pong_stream,
+                    Handlers::NONE,
+                    Handlers::NONE,
+                )
+                .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
+        });
         pending.push((spec, publication, subscription));
     }
     wait_until("pong", 30, || {
@@ -271,8 +277,9 @@ fn run(ping_channel: &CString, pong_channel: &CString, specs: Vec<Spec>, seconds
                             gone = true;
                             break 'send;
                         }
-                        // messages that met back-pressure at least once
-                        if !s.stalled {
+                        // messages that met back-pressure at least once; an
+                        // admin action (once per term rotation) is not
+                        if matches!(e, AeronOfferError::BackPressured) && !s.stalled {
                             s.backpressured += 1;
                             s.stalled = true;
                         }
@@ -343,17 +350,13 @@ fn run(ping_channel: &CString, pong_channel: &CString, specs: Vec<Spec>, seconds
     }
     if let Some((path, spikes)) = spikes {
         // the wall-clock time due_ns counts from, to line spikes up with traces
-        let mut rows = format!("# start_realtime_ns={start_realtime}\nstream,due_ns,latency_ns\n");
+        let total = spikes.rows.len() as u64 + spikes.dropped;
+        let mut rows =
+            format!("# start_realtime_ns={start_realtime}\n# spikes_total={total}\nstream,due_ns,latency_ns\n");
         for (stream, due, latency) in &spikes.rows {
             rows.push_str(&format!("{stream},{due},{latency}\n"));
         }
         std::fs::write(&path, rows).unwrap_or_else(|e| panic!("LOAD_SPIKES {path}: {e}"));
-        if spikes.dropped > 0 {
-            eprintln!(
-                "load: {} spikes past the first {SPIKE_CAPACITY} not written",
-                spikes.dropped
-            );
-        }
     }
 }
 
@@ -399,16 +402,16 @@ fn echo(ping_channel: &CString, pong_channel: &CString, streams: &[i32], cpu: Op
     let aeron = client();
     let mut pairs = Vec::new();
     for &stream in streams {
-        let publication = aeron
-            .async_add_exclusive_publication(pong_channel, stream + ECHO_OFFSET)
-            .unwrap()
-            .poll_blocking(Duration::from_secs(5))
-            .unwrap();
-        let subscription = aeron
-            .async_add_subscription(ping_channel, stream, Handlers::NONE, Handlers::NONE)
-            .unwrap()
-            .poll_blocking(Duration::from_secs(5))
-            .unwrap();
+        let publication = retry_closing("publication", || {
+            aeron
+                .async_add_exclusive_publication(pong_channel, stream + ECHO_OFFSET)
+                .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
+        });
+        let subscription = retry_closing("subscription", || {
+            aeron
+                .async_add_subscription(&sub_channel(ping_channel), stream, Handlers::NONE, Handlers::NONE)
+                .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
+        });
         pairs.push((publication, subscription));
     }
     wait_until("ping", 60, || pairs.iter().all(|(_, s)| s.image_at_index(0).is_some()));

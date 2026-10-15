@@ -9,6 +9,7 @@
 //! that records loss or its repair: Aeron's NAKs, retransmits, short sends,
 //! loss gap fills, invalid packets and errors, and the DPDK transport's drop
 //! counters summed over its ports. lab.sh takes it before and after each run.
+//! `counters errors` prints the driver's distinct error log and loss report.
 
 // Only `aeron_dir` of the shared helpers is used here.
 #[allow(dead_code)]
@@ -32,10 +33,20 @@ const AERON_LOSS: [(&str, &str); 8] = [
 /// The DPDK transport's drop counters, by the name ending their label
 /// (`missed-packets` mirrors the same NIC miss as `nic-rx-missed`, so only
 /// the latter), and `rx-burst-full` and `tx-paced`, saturation signals rather
-/// than drops, reported under a `sat-` key.
-const DPDK_LOSS: [&str; 11] = [
+/// than drops, reported under a `sat-` key. `queue-drop` counts frames to one
+/// of our addresses at a port nobody listens on (answered with ICMP port
+/// unreachable, as the kernel counts UDP NoPorts): after an endpoint closes,
+/// its peer's frames in flight land there, so it is reported under `noport-`.
+/// `arp-miss` counts frames refused while a next hop's address is resolved
+/// (Aeron retries them, as short sends) or dropped once it failed.
+/// `tx-queued` counts frames a full TX ring refused and the transport queued
+/// to send first: saturation, not loss. `rx-ring-full-suspected` counts polls
+/// that drained within a burst of a full receive ring: a ring that full may
+/// have overflowed unseen (MANA), so it is reported beside the loss counters.
+const DPDK_LOSS: [&str; 14] = [
     "nobufs",
     "tx-eagain",
+    "arp-miss",
     "queue-drop",
     "checksum-failure",
     "multi-segment",
@@ -45,12 +56,18 @@ const DPDK_LOSS: [&str; 11] = [
     "peer-mtu-too-large",
     "rx-burst-full",
     "tx-paced",
+    "tx-queued",
+    "rx-ring-full-suspected",
 ];
 
 fn main() {
     let filter = std::env::args().nth(1).unwrap_or_else(|| "rusteron-dpdk".into());
     if filter == "loss" {
         loss();
+        return;
+    }
+    if filter == "errors" {
+        errors();
         return;
     }
     let context = AeronContext::new().unwrap();
@@ -64,6 +81,30 @@ fn main() {
                 println!("{value:>12} {type_id:>4} {label}");
             }
         });
+}
+
+/// The driver's distinct error log and loss report, read from its CnC file
+/// (also after the driver stopped, until the next one deletes the directory):
+/// what Aeron's `errors` counter and its NAKs were about.
+fn errors() {
+    let cnc = AeronCnc::open(&aeron_dir()).unwrap();
+    cnc.error_log_read_fn(
+        |count: i32, first_ns: i64, last_ns: i64, error: &str| {
+            println!(
+                "error count={count} first={first_ns} last={last_ns}: {}",
+                error.replace('\n', " | ")
+            );
+        },
+        0,
+    );
+    cnc.loss_reporter_read_fn(
+        |count: i64, bytes: i64, first_ns: i64, last_ns: i64, session: i32, stream: i32, channel: &str, source: &str| {
+            println!(
+                "loss count={count} bytes={bytes} first={first_ns} last={last_ns} session={session} stream={stream} channel={channel} source={source}"
+            );
+        },
+    )
+    .unwrap();
 }
 
 fn loss() {
@@ -100,10 +141,13 @@ fn loss() {
     println!("{}", line.join(";"));
 }
 
-/// `dpdk-<name>` for a drop, `sat-dpdk-<name>` for the saturation signal.
+/// `dpdk-<name>` for a drop, `sat-dpdk-<name>` for a saturation signal,
+/// `noport-dpdk-<name>` for frames to a closed port.
 fn dpdk_key(name: &str) -> String {
-    if name == "rx-burst-full" || name == "tx-paced" {
+    if name == "rx-burst-full" || name == "tx-paced" || name == "tx-queued" || name == "rx-ring-full-suspected" {
         format!("sat-dpdk-{name}")
+    } else if name == "queue-drop" {
+        format!("noport-dpdk-{name}")
     } else {
         format!("dpdk-{name}")
     }

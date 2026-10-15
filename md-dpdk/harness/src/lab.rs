@@ -32,6 +32,16 @@ pub fn aeron_dir() -> CString {
     CString::new(std::env::var("AERON_DIR").expect("AERON_DIR: the external driver's dir")).unwrap()
 }
 
+/// A subscription's channel: `channel` with `SUB_CHANNEL_PARAMS` appended when
+/// set (e.g. `reliable=false|group=false|tether=false`: no NAKs, gaps filled),
+/// for experiments on the receiving side only.
+pub fn sub_channel(channel: &std::ffi::CStr) -> CString {
+    match std::env::var("SUB_CHANNEL_PARAMS").ok().filter(|p| !p.is_empty()) {
+        Some(params) => CString::new(format!("{}|{params}", channel.to_string_lossy())).unwrap(),
+        None => channel.to_owned(),
+    }
+}
+
 /// `LABEL`, which names the run in the result line.
 pub fn label() -> String {
     std::env::var("LABEL").unwrap_or_else(|_| "-".into())
@@ -43,6 +53,24 @@ pub fn wait_until(what: &str, secs: u64, mut ready: impl FnMut() -> bool) {
     while !ready() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Retries `add` (adding a publication or subscription and waiting for it)
+/// while the driver answers that the channel's endpoint is still closing, a
+/// previous run's on the same channel ("please retry"), for up to 10 s. Any
+/// other error, or one past that, fails the client: a run that silently lost
+/// its publication would report nothing as a measurement.
+pub fn retry_closing<T, E: std::fmt::Debug>(what: &str, mut add: impl FnMut() -> Result<T, E>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match add() {
+            Ok(added) => return added,
+            Err(e) if format!("{e:?}").contains("please retry") && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("adding the {what}: {e:?}"),
+        }
     }
 }
 
