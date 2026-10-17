@@ -55,6 +55,39 @@
   - [Chained Message Decoding](./cluster/chained-decoding.md)
   - [Compatibility](./cluster/compatibility.md)
 
+# ergon-io
+
+- [Busy-Spin Network I/O](./io/overview.md)
+  - [Backends and Configuration](./io/backends.md)
+  - [WebSocket](./io/websocket.md)
+  - [HTTP client](./io/http-client.md)
+  - [Rate Limits and Errors](./io/rate-limits.md)
+  - [Kubernetes](./io/kubernetes.md)
+
+# ergon-clock
+
+- [Hardware-Counter Clock](./clock/overview.md)
+  - [UTC and Time Sync](./clock/wall-clock.md)
+
+# ergon-tune
+
+- [Host Checks](./tune/overview.md)
+
+# ergon-md-dpdk (experimental)
+
+- [DPDK Transport: Proof of Concept](./md-dpdk/overview.md)
+  - [Configuration](./md-dpdk/configuration.md)
+
+# Deployment
+
+- [Low-Latency Hosts](./deploy/overview.md)
+  - [AWS and Azure, x86 and Graviton](./deploy/hosts.md)
+  - [Kubernetes](./deploy/kubernetes.md)
+  - [Shared CPUs for Helper Threads (`k8s/nri-shared-cpus`)](./deploy/shared-cpus.md)
+  - [Latency Pods](./deploy/latency-pods.md)
+  - [Benchmarks: x86 and Graviton](./deploy/benchmarks.md)
+  - [Java for Archive and Cluster](./deploy/java.md)
+
 # Samples
 
 - [Teaching Path](./samples/overview.md)
