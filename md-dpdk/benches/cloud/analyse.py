@@ -6,7 +6,10 @@ results.csv rows (lab.sh prefixes the rep):
   <rep>,rtt,<mode>,udp,p50,p90,p99,p99.9,p99.99,max,mean,samples   (ns)
   <rep>,tput,<mode>,udp,<median msgs/s>,<min>,<max>,<received>,<lost>,<window start ns>,<window end ns>
         (the measured window on the subscriber's wall clock; older clients end at <max> or <lost>)
-  <rep>,rxhw,<mode>,<mean ns>,<max ns>,<frames>   (one per host; NIC RX timestamps only)
+  <rep>,rxhw,<mode>,<mean ns>,<max ns>,<frames>[,<min ns>,<negative>]   (one per host; NIC RX
+        timestamps only: NIC arrival to dispatch over <frames>; <negative>, frames stamped after the
+        host clock read after them, PHC/host clock skew; mean and max empty when only those came, min
+        and negative empty from a driver built before they were counted)
   <rep>,tputmax,<mode>,<size>,<median msgs/s>,<min>,<max>   (the load sweep's one-way maximum)
   <rep>,tputflows,<mode>,<size>,<flows>,<sum msgs/s>,<flow 1 median msgs/s>,...,<flow n>,<overlap>
         (several flows' sustained maxima at once; a flow without a result, and then the sum, empty;
@@ -18,6 +21,17 @@ results.csv rows (lab.sh prefixes the rep):
   <rep>,mix,<mode>,udp-<profile>/<stream>,<size>,<rate>,<burst>,... (as load: one row per stream of a mix)
   <rep>,loss,<mode>[:rtt|:<size>:<fraction>|:<size>:max|:<size>:flows<n>|:mix:<profile>],<host>,<key>=<growth>;...
         (routes-missing as found after the run; VALIDITY's counters check the run and are not loss)
+  0,netrtt,<state>,<min ns>,<avg ns>,<max ns>,<mdev ns>,<replies>/<sent>
+        (the network's own round trip, ping between the hosts' data NICs at the state's start)
+  <rep>,mtu,<mode>,<host>,<link MTU>,<Aeron MTU>   (the MTU each host's run used)
+  <rep>,aeron,<mode>[:rtt|:<size>:<fraction>|...],<host>,info-<key>=<value>;...
+        (Aeron's own telemetry over the run, as loss rows are labelled: each agent's longest duty
+        cycle in ns since its driver started, its cycles over the threshold and the threshold; the
+        sender's flow-control limits, status messages sent and received, flow control under and
+        over runs; information, never loss)
+
+Next to results.csv, each load point's histograms (histogram-<state>-<mode>-<size>-<rep>-<point>.csv,
+value_ns,count) are merged over its reps into percentiles of every sample.
 
 Next to results.csv, spikes-*.csv (stream,due_ns,latency_ns: round trips of 100 µs
 or more) are summarised: whether spikes recur at one phase of each second, the
@@ -47,7 +61,8 @@ from spikes import agent_gaps, open_spikes, spike_files
 ORDER = ["kernel", "kernel-mono", "kernel-busy", "kernel-busy-mono", "dpdk", "dpdk-mono", "dpdk+idle",
          "dpdk-spin", "dpdk-spin+idle", "dpdk-adaptive+idle", "local-kernel", "local-dpdk",
          "local-dpdk-adaptive", "local-dpdk-spin"]
-STATES = ["", "pinned", "isolated"]
+# isolated-poll: isolated, with idle CPUs polling (lib.sh run_bench)
+STATES = ["", "pinned", "isolated", "isolated-poll"]
 NAMES = {
     "kernel": "kernel UDP",
     "kernel-busy": "kernel UDP, busy polling",
@@ -65,12 +80,32 @@ NAMES = {
 }
 # a -mono mode: the transport and the clients clock with CLOCK_MONOTONIC, not TSC
 NAMES.update({f"{m}-mono": f"{n}, monotonic clock" for m, n in list(NAMES.items())})
+# <mode>@AERON_THREADING_MODE=<it>: the media driver's agents (vm.sh, host.sh threading_env)
+THREADING = {
+    "DEDICATED": "conductor, sender and receiver on a thread each",
+    "SHARED_NETWORK": "sender and receiver on one thread",
+    "SHARED": "conductor, sender and receiver on one thread",
+    # no media driver process: each client embeds the driver and runs it on its own thread
+    "INVOKER": "conductor, sender, receiver and the client on one thread",
+}
 RTT_COLUMNS = ["p50", "p90", "p99", "p99.9", "p99.99", "max"]
+
+
+def mode_name(mode):
+    """A mode as tables name it: its name, or the mode as given; a threading
+    mode override named after the rest, with Aeron's name for it."""
+    parts = mode.split("@")
+    threading = [p for p in parts[1:] if p.startswith("AERON_THREADING_MODE=")]
+    if not threading:
+        return NAMES.get(mode, mode)
+    rest = "@".join([parts[0]] + [p for p in parts[1:] if p not in threading])
+    value = threading[-1].partition("=")[2]
+    return f"{NAMES.get(rest, rest)}, {THREADING.get(value, value)} ({value})"
 
 
 def name(label):
     state, _, mode = label.rpartition(":")
-    return f"{state}, {NAMES.get(mode, mode)}" if state else NAMES.get(mode, mode)
+    return f"{state}, {mode_name(mode)}" if state else mode_name(mode)
 
 
 def cell(values, scale, digits):
@@ -143,7 +178,13 @@ def read_results(path):
         # by rep: rtt [(label, rep)], tput [(label, rep)], tputmax [(label, size, rep)],
         # tputflows [(label, size, flows, rep)], load [(label, size, point, rep)],
         # burst [(label, size, point)], loss [(loss label, rep, host)]
-        rtt_rep={}, tput_rep={}, tputmax_rep={}, tputflows_rep={}, load_rep={}, load_echo={}, burst={}, loss_rep={})
+        rtt_rep={}, tput_rep={}, tputmax_rep={}, tputflows_rep={}, load_rep={}, load_echo={}, burst={}, loss_rep={},
+        # the network's own round trip by state: [(min, avg, max) ns]
+        netrtt=defaultdict(list),
+        # Aeron's telemetry by (loss label, host): [(rep, {key: value})]
+        aeron=defaultdict(list),
+        # the media driver's start-up host checks by mode: [(rep, host, severity, what it said)]
+        hostcheck=defaultdict(list))
     with open(path, newline="") as f:
         for row in csv.reader(f):
             if len(row) < 5:
@@ -161,7 +202,8 @@ def read_results(path):
                 if len(row) >= 9:  # received and lost (by the publisher's sequence numbers)
                     r.tput_lost[mode].append((int(row[7]), int(row[8])))
             elif kind == "rxhw" and len(row) >= 6:
-                r.rxhw[mode].append((float(row[3]), float(row[4])))
+                num = lambda i: float(row[i]) if len(row) > i and row[i] != "" else None
+                r.rxhw[mode].append((num(3), num(4), num(6), num(7)))
             elif kind == "tputmax" and len(row) >= 5:
                 r.tputmax[(mode, int(row[3]))].append(float(row[4]))
                 r.tputmax_rep[(mode, int(row[3]), rep)] = float(row[4])
@@ -192,6 +234,14 @@ def read_results(path):
                 profile, _, stream = row[3].removeprefix("udp-").partition("/")
                 r.mix[(mode, profile, stream, int(row[4]), int(row[5]), int(row[6]))].append(
                     [float(v) for v in row[7:13]] + [int(row[15]), int(row[16]), int(row[17]), float(row[18])])
+            elif kind == "netrtt" and len(row) >= 6:
+                r.netrtt[mode].append(tuple(float(v) for v in row[3:6]))
+            elif kind == "hostcheck" and len(row) >= 5:
+                r.hostcheck[mode].append((rep, row[3], row[4], row[5] if len(row) > 5 else ""))
+            elif kind == "aeron" and len(row) >= 5:
+                kv = dict(x.split("=", 1) for x in row[4].split(";") if "=" in x)
+                r.aeron[(mode, row[3])].append((rep, {k.removeprefix("info-"): int(v) for k, v in kv.items()
+                                                      if k.startswith("info-") and v.lstrip("-").isdigit()}))
             elif kind == "loss" and len(row) >= 5:
                 grew = r.loss_rep.setdefault((mode, rep, row[3]), {})
                 for kv in row[4].split(";"):
@@ -220,7 +270,9 @@ SEND_CAUSES = {"dpdk-tx-eagain", "dpdk-arp-miss", "dpdk-nobufs", "kernel-udp-Snd
 # loss, irqs.sh; under DPDK, those of the IRQs the kernel keeps on the NICs):
 # vm.sh pins every IRQ there before each driver starts, so where it grows the
 # kernel placed a NIC's IRQs anew (ENA does, bringing a NIC up or resetting
-# it) and the run took interrupts off the housekeeping CPU (nic_irqs).
+# it) and the run took interrupts off the housekeeping CPU (nic_irqs). Under a
+# mode's @IRQ= vm.sh pins the NICs' queue IRQs to the CPU it chose instead,
+# and counts theirs off that CPU.
 VALIDITY = {"isolated-nic-irqs"}
 
 
@@ -247,9 +299,21 @@ def ladder_limit(r, m, size, holds, failed_word):
 
 def counts_as_loss(k, v):
     """Whether a loss row's counter growth is loss: short sends included;
-    `sat-` and `noport-` counters, VALIDITY's and SEND_CAUSES on their own
-    are not."""
-    return bool(v) and not k.startswith(("sat-", "noport-")) and k not in SEND_CAUSES and k not in VALIDITY
+    `sat-` and `noport-` counters, VALIDITY's, SEND_CAUSES on their own and
+    Aeron's telemetry (`info-`: lib.sh loss_row keeps it to aeron rows) are
+    not."""
+    return (bool(v) and not k.startswith(("sat-", "noport-", "info-")) and k not in SEND_CAUSES
+            and k not in VALIDITY)
+
+
+def loss_growth(grew):
+    """A loss row's growth with the short sends an ARP miss explains taken
+    out: a send refused while a next hop's first ARP resolution is in flight
+    is retried by Aeron, start-up rather than loss (each INVOKER client's
+    embedded driver resolves anew, so it shows at every load point)."""
+    if "short-sends" in grew and "dpdk-arp-miss" in grew:
+        grew = dict(grew, **{"short-sends": max(0, grew["short-sends"] - grew["dpdk-arp-miss"])})
+    return grew
 
 
 def rep_lost(r, m, size, point, rep):
@@ -262,7 +326,7 @@ def rep_lost(r, m, size, point, rep):
         return True
     for host in hosts:
         grew = r.loss_rep.get((f"{m}:{size}:{point}", rep, host))
-        if grew is None or any(counts_as_loss(k, v) for k, v in grew.items()):
+        if grew is None or any(counts_as_loss(k, v) for k, v in loss_growth(grew).items()):
             return True
     return False
 
@@ -277,8 +341,8 @@ def loss_by_point(r):
     cols = sorted({p[2] for p in points}, key=point_rank)
     head = {c: "bursts" if c == "burst" else (f"{int(c[1:]):,}/s" if c.startswith("r") else f"{c}%") for c in cols}
     print("\n## Loss by load point (reps that lost anything, of the reps run; NAKs sent)\n")
-    print("A rep lost something when a loss counter grew on either host (short sends included; `sat-`, `noport-`, "
-          "the run-validity counters and the send-side causes on their own aside), a message went unechoed, or a "
+    print("A rep lost something when a loss counter grew on either host (short sends included, those an ARP miss "
+          "explains aside; `sat-`, `noport-`, the run-validity counters and the send-side causes on their own aside), a message went unechoed, or a "
           "loss read failed or was not taken, as `loss-free` counts it. In brackets, the NAKs both hosts sent over "
           "those reps. Compare variants on these counts: one rare event moves the strict `loss-free` rate by whole "
           "ladder steps.\n")
@@ -349,6 +413,9 @@ def nic_irqs(r):
                else f"none of {len(runs)} runs grew.")
     if unread:
         verdict += " Not read on a host, so unknown there: " + "; ".join(unread) + "."
+    if any("@IRQ=" in label for label, _ in runs):
+        verdict += (" Under a mode's @IRQ= its data NICs' queue IRQs count on CPUs other than the one it chose (vm.sh "
+                    "pins them there; its driver log names it), and their other IRQs on CPUs other than the housekeeping one.")
     return ("Data NIC interrupts on CPUs other than the housekeeping one (`isolated-nic-irqs`: on each host, the growth "
             "over the run of the data NICs' IRQ counts, under DPDK those of the IRQs the kernel keeps on their PCI "
             "addresses, in those CPUs' columns of /proc/interrupts; a check on the run, not loss. vm.sh pins every IRQ "
@@ -385,6 +452,8 @@ def main():
         print("Round trips lost (no echo within 50 ms on an unreliable channel), per rep: "
               + ", ".join(f"{name(m)} {min(v):,}–{max(v):,} of {min(samples[m]) + min(v):,}" for m, v in lost_rtt.items()) + ".\n")
 
+    above_network(r, modes)
+
     print("## UDP throughput, 32-byte messages (M msgs/s)\n")
     def dropped(m):
         v = tput_lost.get(m)
@@ -399,7 +468,7 @@ def main():
         print("\n## Sustained one-way maximum by message size (M msgs/s)\n")
         print("`flat-out` is the most the publisher sustained with nothing held back: a ceiling, lossy when its "
               "loss counters grew. `loss-free` is the highest rate of the ladder below the first point that lost "
-              "anything in any rep: a loss counter grew on either host, short sends included; a message went unechoed; or a loss "
+              "anything in any rep: a loss counter grew on either host, short sends included (those an ARP miss explains aside); a message went unechoed; or a loss "
               "read failed or was not taken. The transport's own send-side counters (a full TX ring, an ARP miss, no mbuf, a full "
               "kernel send buffer) do not count on their own: each send they refuse is also a short send, and a full ring that "
               "queues a vector refuses nothing. Nor does `isolated-nic-irqs`, the data NICs' interrupts on CPUs other than the "
@@ -426,7 +495,10 @@ def main():
         print("\n## Round trip under open-loop load (µs, from each message's intended send time)\n")
         print("`offered` is the scheduled rate; `achieved` the rate actually offered after warm-up. "
               "Below 98% of offered (marked *), the generator or the path could not keep the schedule, "
-              "and the latencies include that queueing. `loss counters` lists every loss counter that grew "
+              "and the latencies include that queueing. `max send lag` is the longest a measured message "
+              "waited past its due time to be offered (median of the reps, range in brackets): how far the "
+              "generator itself fell behind, which is already inside the latencies beside it. "
+              "`loss counters` lists every loss counter that grew "
               "on either host (`sat-` ones are saturation, `noport-` ones frames to a port nobody listens on, "
               "such as an endpoint the previous point closed, and `isolated-nic-irqs` the data NICs' interrupts on CPUs "
               "other than the housekeeping one, a check on the run: none of them loss).\n")
@@ -438,7 +510,7 @@ def main():
             reps = load.get((m, size, frac), [])
             if not reps:
                 rows.append([name(m), f"{size} B", "burst 1000" if frac == "burst" else (f"{int(frac[1:]):,}/s" if frac.startswith("r") else f"{frac}%"), "", "",
-                             f"0 (+{load_failed[(m, size, frac)]} failed)"] + ["no echo"] * 6 + ["", "", ""])
+                             f"0 (+{load_failed[(m, size, frac)]} failed)"] + ["no echo"] * 6 + ["", "", "", ""])
                 continue
             sent = sum(r[6] for r in reps)
             received = sum(r[7] for r in reps)
@@ -453,9 +525,11 @@ def main():
                          str(len(reps)) + (f" (+{failed} failed)" if failed else "")]
                         + [cell([r[i] for r in reps], 1000, 2) for i in range(6)]
                         + [f"{received:,}/{sent:,}", f"{sum(r[8] for r in reps):,}",
+                           cell([r[11] for r in reps], 1000, 2),
                            ", ".join(f"{k} {v:,}" for k, v in sorted(bad.items())) or "none"])
         print(table(["state, transport", "size", "load", "offered", "achieved", "reps"] + RTT_COLUMNS
-                    + ["echoed", "back-pressured", "loss counters"], rows))
+                    + ["echoed", "back-pressured", "max send lag", "loss counters"], rows))
+        merged_load(r, sys.argv[1])
         loss_by_point(r)
 
     if mix:
@@ -497,11 +571,216 @@ def main():
         if note:
             print("\n" + note)
 
+    aeron_table(r)
+
+    host_checks(r)
+
     if rxhw:
         print("\n## NIC arrival to transport dispatch, receiver port (µs)\n")
-        rows = [[name(m), str(len(rxhw[m])), cell([r[0] for r in rxhw[m]], 1000, 2), cell([r[1] for r in rxhw[m]], 1000, 2)]
+        def stat(runs, i):
+            values = [r[i] for r in runs if r[i] is not None]
+            return cell(values, 1000, 2) if values else "–"
+
+        def skewed(runs):
+            counted = [r[3] for r in runs if r[3] is not None]
+            return f"{sum(counted):,.0f}" if counted else "–"
+
+        rows = [[name(m), str(len(rxhw[m])), stat(rxhw[m], 2), stat(rxhw[m], 0), stat(rxhw[m], 1), skewed(rxhw[m])]
                 for m in sorted(rxhw, key=key)]
-        print(table(["state, transport", "host-runs", "mean", "max"], rows))
+        print(table(["state, transport", "host-runs", "min", "mean", "max", "skewed frames (PHC/host clock)"], rows))
+
+
+def host_checks(r):
+    """The media driver's start-up host checks per mode and host (hostcheck
+    rows, lib.sh hostcheck_rows): each line a host's driver printed, its
+    severity, in how many of the mode's reps; warnings first."""
+    if not r.hostcheck:
+        return
+    print("\n## Media driver host checks at start-up (per mode and host)\n")
+    print("What each host's media driver said of the host as it started (its `ergon-md-dpdk warning:` and `info:` "
+          "lines: ConfiguredDriver::from_env, md-dpdk/src/checks.rs; under INVOKER each client's embedded driver's), "
+          "in how many of the mode's reps; `none`: it said nothing; `unknown`: its checks could not be read.\n")
+    rank = {"warning": 0, "info": 1, "none": 2, "unknown": 3}
+    rows = []
+    for m in sorted(r.hostcheck, key=key):
+        reps = {rep for rep, _, _, _ in r.hostcheck[m]}
+        seen = defaultdict(set)
+        for rep, host, severity, text in r.hostcheck[m]:
+            seen[(host, severity, text)].add(rep)
+        for (host, severity, text), in_reps in sorted(seen.items(), key=lambda x: (x[0][0], rank.get(x[0][1], 3), x[0][2])):
+            rows.append([name(m), host, severity, text.replace("|", "\\|"), f"{len(in_reps)} of {len(reps)}"])
+    print(table(["state, transport", "host", "severity", "finding", "reps"], rows))
+
+
+# The load client's percentiles (HdrHistogram's value_at_quantile), as the
+# load table's columns name them, then the max
+HIST_QUANTILES = (0.5, 0.9, 0.99, 0.999, 0.9999)
+
+
+def histogram_counts(path):
+    """A histogram file the clients write (value_ns,count rows, each value
+    its bucket's highest equivalent) as {value: count}; None when it is
+    missing, empty or holds no rows."""
+    try:
+        with open(path, newline="") as f:
+            rows = list(csv.reader(f))
+    except OSError:
+        return None
+    counts = {}
+    for row in rows:
+        if len(row) == 2 and row[0].isdigit() and row[1].isdigit():
+            counts[int(row[0])] = counts.get(int(row[0]), 0) + int(row[1])
+    return counts or None
+
+
+def merged_quantiles(counts):
+    """HdrHistogram's percentiles of merged counts (its value_at_quantile:
+    the first value whose running count reaches ceil(q x samples), at least
+    1) for HIST_QUANTILES, then the max; and the samples."""
+    total = sum(counts.values())
+    values = sorted(counts)
+    out = []
+    for q in HIST_QUANTILES:
+        want, running = max(1, math.ceil(q * total)), 0
+        for v in values:
+            running += counts[v]
+            if running >= want:
+                out.append(v)
+                break
+    return out + [values[-1]], total
+
+
+def merged_load(r, path):
+    """Each load point's histograms (lib.sh fetches one after every point:
+    histogram-<state>-<mode>-<size>-<rep>-<point>.csv) merged over its reps,
+    and the pooled percentiles: beside the medians of reps, a tail of every
+    sample. A rep without its histogram (missing or empty) is left out, said
+    so; nothing where no point has one (runs from before they were fetched)."""
+    dirs = run_dirs(path)
+    rows = []
+    rank = lambda p: 10**12 if p == "burst" else int(p.removeprefix("r"))
+    for m, size, point in sorted(set(r.load) | set(r.load_failed), key=lambda p: (key(p[0]), p[1], rank(p[2]))):
+        reps = sorted({k[3] for k in r.load_rep if k[:3] == (m, size, point)}, key=rep_key)
+        merged, used = {}, 0
+        for rep in reps:
+            fname = f"histogram-{file_name(m)}-{size}-{rep}-{point}.csv"
+            counts = next((c for c in (histogram_counts(os.path.join(d, fname)) for d in dirs) if c), None)
+            if counts:
+                used += 1
+                for v, c in counts.items():
+                    merged[v] = merged.get(v, 0) + c
+        if not used:
+            continue
+        values, total = merged_quantiles(merged)
+        load_name = "burst 1000" if point == "burst" else (f"{int(point[1:]):,}/s" if point.startswith("r") else f"{point}%")
+        rows.append([name(m), f"{size} B", load_name, str(used) if used == len(reps) else f"{used} of {len(reps)}",
+                     f"{total:,}"] + [f"{v / 1000:.2f}" for v in values])
+    if not rows:
+        return
+    print("\n## Round trip under open-loop load, every rep's histogram merged (µs)\n")
+    print("Each load point's reps pooled into one histogram (the load client's after its warm-up second, lib.sh "
+          "fetching it after every point) and its percentiles as HdrHistogram takes them: unlike the medians of reps "
+          "above, a tail here counts every rep's samples. A rep whose histogram is missing or empty is left out, "
+          "said so.\n")
+    print(table(["state, transport", "size", "load", "reps merged", "samples"] + RTT_COLUMNS, rows))
+
+
+# Aeron's telemetry (lib.sh's aeron rows): (key, column, how reps combine)
+AERON_COLUMNS = (("conductor-max-cycle-ns", "conductor max µs", max), ("sender-max-cycle-ns", "sender max µs", max),
+                 ("receiver-max-cycle-ns", "receiver max µs", max), ("conductor-cycles-over", "conductor over", sum),
+                 ("sender-cycles-over", "sender over", sum), ("receiver-cycles-over", "receiver over", sum),
+                 ("sender-fc-limits", "back-pressure events", sum), ("sms-sent", "status messages sent", sum),
+                 ("sms-received", "status messages received", sum), ("fc-under-runs", "flow control under runs", sum),
+                 ("fc-over-runs", "flow control over runs", sum))
+
+
+def run_of(label):
+    """A loss or aeron row's label as (<state>:<mode>, the run it covers, its
+    rank among the mode's runs)."""
+    parts = label.split(":")
+    mode, rest = ":".join(parts[:2]), parts[2:]
+    if not rest:
+        return mode, "round trip and throughput", (1,)
+    if rest == ["rtt"]:
+        return mode, "idle round trip", (0,)
+    if rest[0] == "mix":
+        return mode, f"mix {':'.join(rest[1:])}", (3, ":".join(rest[1:]))
+    if len(rest) == 2 and rest[0].isdigit():
+        size, point = int(rest[0]), rest[1]
+        if point == "max":
+            return mode, f"{size} B sustained maximum", (2, size, -2)
+        if point.startswith("flows"):
+            return mode, f"{size} B, {point.removeprefix('flows')} flows at once", (2, size, -1)
+        return mode, point_name(size, point), (2, size, point_rank(point))
+    return mode, ":".join(rest), (4, ":".join(rest))
+
+
+def duration(ns):
+    """A threshold as Aeron's labels give it, in the largest whole unit."""
+    for unit, scale in (("s", 10**9), ("ms", 10**6), ("µs", 10**3)):
+        if ns >= scale and ns % scale == 0:
+            return f"{ns // scale:,} {unit}"
+    return f"{ns:,} ns"
+
+
+def aeron_table(r):
+    """Aeron's own telemetry by mode, run and host (lib.sh's aeron rows),
+    as information: never loss."""
+    if not r.aeron:
+        return
+    rows = []
+    for (label, host), runs in sorted(r.aeron.items(), key=lambda x: (key(run_of(x[0][0])[0]), run_of(x[0][0])[2], x[0][1])):
+        mode, run, _ = run_of(label)
+        cells = []
+        for k, _, combine in AERON_COLUMNS:
+            values = [kv[k] for _, kv in runs if k in kv]
+            if not values:
+                cells.append("-")
+            elif combine is max:
+                cells.append(f"{max(values) / 1000:.1f}")
+            else:
+                cells.append(f"{sum(values):,}")
+        rows.append([name(mode), run, host, str(len({rep for rep, _ in runs}))] + cells)
+    print("\n## Aeron's agents and flow control by run (information, never loss)\n")
+    print("From Aeron's own counters on each host, read with the loss counters around every run (vm.sh loss). An "
+          "agent's longest duty cycle counts from its driver's start (one driver a mode and rep), so a run's is the "
+          "longest up to its end: the highest over reps here. Its cycles over the threshold vm.sh sets "
+          "(AERON_DRIVER_{CONDUCTOR,SENDER,RECEIVER}_CYCLE_THRESHOLD), the sender's flow-control limits "
+          "(back-pressure events), the status messages sent and received and the flow control under and over runs "
+          "are each run's growth, summed over reps. - where a host's rows lack one. None of them is loss.\n")
+    print(table(["state, transport", "run", "host", "reps"] + [c for _, c, _ in AERON_COLUMNS], rows))
+    thresholds = []
+    for agent in ("conductor", "sender", "receiver"):
+        seen = sorted({kv[f"{agent}-threshold-ns"] for runs in r.aeron.values() for _, kv in runs
+                       if f"{agent}-threshold-ns" in kv})
+        if seen:
+            thresholds.append(f"{agent} {' and '.join(duration(v) for v in seen)}")
+    if thresholds:
+        print(f"\nThresholds, from the counters' labels: {', '.join(thresholds)}.")
+
+
+def above_network(r, modes):
+    """Each cross-host mode's round trip less the network's own (netrtt: ping's
+    minimum between the hosts in that state), per rep, where a state has it:
+    what the transport and the driver add over the wire's round trip."""
+    rows = []
+    for m in modes:
+        state, _, mode = m.rpartition(":")
+        base = r.netrtt.get(state)
+        if not base or not r.rtt.get(m) or mode.startswith("local-"):
+            continue
+        low = min(b[0] for b in base)
+        net = f"{low / 1000:.2f}/{statistics.mean(b[1] for b in base) / 1000:.2f}/{max(b[2] for b in base) / 1000:.2f}"
+        reps = r.rtt[m]
+        rows.append([name(m), net, str(len(reps))] + [cell([x[i] - low for x in reps], 1000, 2) for i in (0, 2, 4, 5)])
+    if not rows:
+        return
+    print("## UDP round trip above the network's own (µs)\n")
+    print("The network's own round trip is ping's between the hosts' data NICs at the start of each state (vm.sh "
+          "base-rtt, from host a's sender to host b's receiver: min/avg/max). Each mode's round trip less that "
+          "minimum, per rep: the median across reps, the range in brackets; what the transport, the driver and the "
+          "clients add over the wire's own round trip, whatever the distance.\n")
+    print(table(["state, transport", "network min/avg/max", "reps", "p50", "p99", "p99.99", "max"], rows) + "\n")
 
 
 def one_flow(r, m, size, rep):
@@ -551,7 +830,7 @@ def flows(r):
             ratio += f", {len(ratios)} of {len(runs)} reps"
         label = f"{m}:{size}:flows{n}"
         grew = {k: v for k, v in r.loss.get(label, {}).items()
-                if v and not k.startswith(("sat-", "noport-")) and k not in VALIDITY}
+                if v and not k.startswith(("sat-", "noport-", "info-")) and k not in VALIDITY}
         lost = ", ".join(f"{k} {v:,}" for k, v in sorted(grew.items()) if k not in SEND_CAUSES) or "none"
         causes = ", ".join(f"{k} {v:,}" for k, v in sorted(grew.items()) if k in SEND_CAUSES) or "none"
         if label not in r.loss:
@@ -574,12 +853,17 @@ TRANSPORT = {"dir=tx pkts": "tx-pkts", "dir=rx pkts": "rx-pkts", "dir=tx bytes":
 def counters_snapshot(path):
     """One host's vm.sh counters (lib.sh snap), summed over its ports: the DPDK
     transport's TRANSPORT counters, or in a kernel mode the data NICs' packets
-    (nic-tx, nic-rx). A counter the snapshot lacks is absent."""
+    (nic-tx, nic-rx). A counter the snapshot lacks is absent. Under INVOKER the
+    snapshot names the embedded driver whose CnC it read ("cnc <pid>-<start>"):
+    as "_cnc"."""
     out = {}
     for line in open(path, errors="replace"):
         if line.startswith("#"):
             continue
         words = line.split()
+        if len(words) == 2 and words[0] == "cnc":
+            out["_cnc"] = words[1]
+            continue
         if words and words[0] in ("sender", "receiver"):
             for k, v in re.findall(r"(\w+): (\d+)", line):
                 if k in ("tx_packets", "rx_packets"):
@@ -659,6 +943,10 @@ def frames(r, path):
     fmt = lambda v, f: "-" if v is None else format(v, f)
     for _, _, size, rep, label, msgs, flow, s, run in sorted(runs, key=lambda x: x[:4]):
         a0, a1, b0, b1 = s["a", "before"], s["a", "after"], s["b", "before"], s["b", "after"]
+        # INVOKER: a snapshot of another embedded driver (the last client's,
+        # before this run's started) counts as zero: this one's started there
+        a0 = {} if a0 and a1 and a0.get("_cnc") != a1.get("_cnc") else a0
+        b0 = {} if b0 and b1 and b0.get("_cnc") != b1.get("_cnc") else b0
         sent = grew(a0, a1, "tx-pkts")
         sent = grew(a0, a1, "nic-tx") if sent is None else sent
         received = grew(b0, b1, "rx-pkts")
