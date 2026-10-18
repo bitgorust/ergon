@@ -52,7 +52,7 @@ Each item won an A/B and was reproduced on a second pair, unless the row says ot
 | AWS x86, c7i.4xlarge (rounds 5–7) | busy polling, 4,096-entry ring: idle p50 28.22, max 1,938 (349–4,846); 288 B at 1 M/s p50 43.74, max 599, 1 lossy rep of 5 (round 7). Not converged: moderation off with its interrupts on a core of their own is untested on x86 | 4,096 RX descriptors, receiver IO vectors 16: idle p50 21.28, max 109 (52–116); 288 B at 1 M/s p50 30.38, max 152 (139–155), no lossy rep (round 7) |
 | AWS x86 bare metal, c7i.metal-24xl (round 4) | busy polling: idle p50 33.70, max 67 (55–307); 288 B at 1 M/s p50 42.94, max 592 (114–1,150) | idle p50 28.13, max 71 (48–845); 288 B at 1 M/s p50 34.30, max 82 (77–103) |
 | Azure D16s_v6 + D8ds_v6 (rounds 4–10) | busy polling, 4,096-entry ring: idle p50 25.82, max 167 (100–1,246) (round 8); no NIC drop or NAK in round 5 | receiver IO vectors 16; the conductor's park capped at 20 µs with a ring-sized window: idle p50 23.73, max 63 (59–796) (round 8); 288 B at 1 M/s p50 72.70, max 129 (127–205) (round 5, a farther pair) |
-| Azure D8s_v6 pair, **isolated** (round 11) | busy polling: idle p50 21.15, p99.99 31.79, max 99.52 (73.86–209.41). Plain kernel UDP: idle p50 32.03, max 354.81 (272.13–2,203.65), 39 spikes of 200 µs or more and 10–40 of 100–250 µs a rep — **do not use** | **idle p50 19.90, p99.99 26.35, max 57.89 (49.47–64.22)**, **0 spikes of 200 µs or more in the whole round**, 0 of 100–250 µs in 4 of 5 reps. 32 B at 50% of flat-out: p50 26.51, max 90.50. Loss under load at 288 B is unresolved: see [round 11 loss counters](#round-11-loss-counters) |
+| Azure D8s_v6 pair, **isolated** (round 11) | busy polling: idle p50 21.15, p99.99 31.79, max 99.52 (73.86–209.41). Plain kernel UDP: idle p50 32.03, max 354.81 (272.13–2,203.65), 39 spikes of 200 µs or more and 10–40 of 100–250 µs a rep — **do not use** | **idle p50 19.90, p99.99 26.35, max 57.89 (49.47–64.22)**, **0 spikes of 200 µs or more in the whole round**, 0 of 100–250 µs in 4 of 5 reps. 32 B at 50% of flat-out: p50 26.51, max 90.50. Loss under load at 288 B is the receiver window regressed to the 2 MiB driver default, 26× the 80 KiB rounds 9–10 proved loss-free: see [round 11: the 288 B loss under load](#round-11-the-288-b-loss-under-load) |
 
 ### Every platform
 
@@ -96,7 +96,7 @@ Each item won an A/B and was reproduced on a second pair, unless the row says ot
 | --- | --- |
 | DPDK on the netvsc PMD, ports selected by MAC, `vdev_netvsc` ignored, 256 descriptors | see [what got DPDK working on Azure](#what-got-dpdk-working-on-azure) |
 | DPDK: receiver IO vectors 16 (`AERON_RECEIVER_IO_VECTOR_CAPACITY=16`) | rounds 4–5: no NAK at 288 B up to 4.5 M msgs/s; bursts' max 2,808 → 1,000 µs (round 4) |
-| DPDK: the conductor's park capped at 20 µs (`AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`) with a receiver window the ring can hold, per channel (`rcv-wnd`): 256 × the channel's smallest datagram where loss matters more than peak rate (80 KiB for 288 B messages) | rounds 9–10: with 80 KiB no lossy rep at any point (idle max 104, 95–119); with 256 KiB, sustainable 1,344 B 400 k → 600 k msgs/s. Never use the faster park without the small window: it lost more than the default (round 9). A window carries at most about window ÷ (round trip + status-message delay) |
+| DPDK: the conductor's park capped at 20 µs (`AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`) with a receiver window the ring can hold, per channel (`rcv-wnd`): 256 × the channel's smallest datagram where loss matters more than peak rate (80 KiB for 288 B messages) | rounds 9–10: with 80 KiB no lossy rep at any point (idle max 104, 95–119); with 256 KiB, sustainable 1,344 B 400 k → 600 k msgs/s. Never use the faster park without the small window: it lost more than the default (round 9). A window carries at most about window ÷ (round trip + status-message delay). Round 11 set no `rcv-wnd` and fell back to `AERON_RCV_INITIAL_WINDOW_LENGTH=2 MiB`, 26× the proven window: its 288 B loss-free rate fell to 10% of flat-out on every DPDK mode. Always name `rcv-wnd` on the subscription |
 | kernel: busy polling (`net.core.busy_read`/`busy_poll` 50) with a 4,096-entry receive ring | round 5: no NIC drop or NAK in 5 reps, where the default ring dropped at 1 M msgs/s of 288 B; idle max 166 (138–2,851) |
 
 ### Not recommended
@@ -331,26 +331,69 @@ Read before and after every run on both hosts. What they showed:
 | ENA `bw_out`/`pps_allowance_exceeded` | instance network allowance | stayed 0 at the per-flow ceiling |
 | `sw-checksum-verified` | software UDP checksum | 0 of 350,000 frames on c7i ENA: the NIC verifies every frame. MANA verified 7–10 of 56 M: same story |
 
-### Round 11 loss counters
+### Round 11: the 288 B loss under load
 
-Over the **idle** round trip alone, both hosts, all reps:
+**It is the receiver window, not the transport and not the isolation.** Round 11
+ran no `rcv-wnd` on any mode — the strings are plain `kernel`, `kernel-busy`,
+`dpdk` and `dpdk-spin`, and `rcv-wnd` appears nowhere in the run's logs. Every
+subscription therefore fell back to the driver-wide
+`AERON_RCV_INITIAL_WINDOW_LENGTH='2097152'` that `vm.sh` exports (2 MiB).
+Rounds 9–10 had already established the window that is loss-free at 288 B:
+`rcv-wnd` of 256 × the channel's smallest datagram where loss matters, **80 KiB
+for 288 B**, with the conductor's park capped at 20 µs. Round 11 ran a window
+**26 times that**, against an Azure MANA receive ring of 256 descriptors
+(`RUSTERON_DPDK_RX_DESCRIPTORS=256`). A sender allowed 2 MiB in flight on a
+256-frame ring overflows it on any receiver stall.
 
-| state, transport | grew |
-| --- | --- |
-| pinned and isolated, kernel UDP | none |
-| pinned and isolated, kernel UDP, busy polling | none |
-| pinned and isolated, DPDK, and DPDK with local sockets | `dpdk-arp-miss` 20, `short-sends` 20 |
+The loss-free rates at 288 B show it. Every DPDK configuration collapses to the
+bottom of the ladder, while kernel UDP keeps most of its ceiling:
 
-20 ARP short sends per DPDK mode are start-up ARP, not loss. Idle is clean.
+| state, transport | 288 B flat-out | loss-free | as a share of flat-out |
+| --- | --- | --- | --- |
+| pinned, kernel UDP | 2.63 M/s | 2,498,935/s | 95% |
+| pinned, kernel UDP, busy polling | 2.61 M/s | 2,087,426/s | 80% |
+| isolated, kernel UDP | 2.68 M/s | 1,341,420/s | 50% |
+| pinned, DPDK, local sockets | 3.94 M/s | 1,968,600/s | 50% |
+| pinned, DPDK | 3.94 M/s | 393,729/s | 10% |
+| isolated, DPDK, local sockets | 3.94 M/s | 393,741/s | 10% |
+| **isolated, DPDK** | 3.94 M/s | **none** | loses at the 10% step |
 
-Over the round-trip and throughput runs together the same DPDK modes also grew
-`dpdk-tx-eagain` about 40 M and `short-sends` about 40 M — those are the
-flat-out ceilings refusing frames, which is what flat-out means, not an idle
-path loss. The real recovery traffic is NAKs and retransmits:
+Two different things happen at 288 B on isolated, DPDK, and only the first is
+window overflow:
+
+| load | loss counters that grew | NAKs | reading |
+| --- | --- | --- | --- |
+| 10% (393,741/s) | `naks-received` 18, `naks-sent` 18, `retransmits-sent` 2 | 18 | real gap loss: the receiver saw a hole and asked for it back. 2 of 5 reps, one rep's max 1,464 µs against a 70–80 µs typical |
+| 80% | `sat-dpdk-tx-paced` 2,091, `short-sends` 2,091 | 0 | the send path starting to pace and refuse |
+| 95% | `dpdk-tx-eagain` 25,416,545, `short-sends` 25,270,500 | 0 | send-side collapse: the frames never reach the wire, so the receiver sees no gap and never NAKs |
+| 100% | `dpdk-tx-eagain` 65,937,115, `short-sends` 65,788,599 | 0 | the same, worse |
+
+Latency falls with it, because the open-loop generator's stamp is the *intended*
+send time: p50 20.9 µs at 80%, 233.7 µs at 95%, 2,809.9 µs at 100%. The
+queueing behind the refusals is inside those figures.
+
+The one isolation-specific effect is at the **10%** point, and it is the local-I/O
+threading mode, not the isolation:
+
+| mode, 288 B at 10% | reps lost | NAKs | max (range) |
+| --- | --- | --- | --- |
+| isolated, DPDK | 2 of 5 | 18 | 74.43 µs (71.36–**1,464.32**) |
+| isolated, DPDK, agents poll local sockets | 0 of 5 | 0 | 70.85 µs (62.98–80.96) |
+
+`dpdk` starts a `dpdk-local-io` and a `dpdk-housekeep` thread on the conductor's
+core; `dpdk-spin` (`RUSTERON_DPDK_LOCAL_IO=spin`) has the agents read the host-local
+sockets inline and starts neither. The extra threads on the housekeeping core —
+the one CPU that also takes every IRQ, under `irqaffinity=0` — cost a 1.46 ms
+stall in one rep of five. But the trade runs the other way at idle, where plain
+DPDK is tighter: idle max 57.89 µs (49.47–64.22) against spin's 67.26
+(46.81–**917.50**). Neither mode wins both, so neither is kept; the window is the
+change to make.
+
+Recovery traffic over the whole round, for reference:
 
 | state, transport | NAKs sent+received | retransmits | where |
 | --- | --- | --- | --- |
-| isolated, DPDK | 51 | 51 | scattered across the load ladder; worst 288 B at 95% and 100% |
+| isolated, DPDK | 51 | 51 | 288 B, worst at 10% and 95–100% |
 | isolated, DPDK, local sockets | 121 | 121 | 288 B at 95%: 5 of 5 reps lost (152 NAKs) |
 | isolated, kernel UDP, busy polling | 1 | 1 | 32 B at 10%: 4 of 5 reps |
 | isolated, kernel UDP | none over the pair of runs | — | but see the load table: its latency is unusable anyway |
@@ -358,6 +401,21 @@ path loss. The real recovery traffic is NAKs and retransmits:
 `isolated-nic-irqs` — the data NICs' interrupts landing on a CPU other than the
 housekeeping one — grew in **0 of 920 runs**. The IRQ pinning held every time.
 That is the check on the run, and it passed.
+
+Still open, and not measured in round 11:
+
+- The 80 KiB window was never applied here, so the rounds 9–10 result is not
+  re-confirmed on this pair. The A/B is `dpdk@SUB_PARAMS=rcv-wnd=80k` against
+  plain `dpdk`, same ladder, same reps.
+- The 2 MiB default was never A/B'd against 80 KiB on this pair either, so the
+  26× figure above is from the two rounds' settings, not a side-by-side.
+- The localhost path was skipped ("no fifth core on VM a"), so the goal's
+  "across two hosts and on localhost" is still missing one leg.
+- Agent duty cycles are the standing spike source whichever mode runs: at idle,
+  isolated DPDK's receiver reached 1,313 µs and its conductor 12,633 µs. A
+  1.3 ms receiver stall at 0.986 M frames/s is about 1,300 frames against a
+  256-descriptor ring. Until those maxima are traced to a cause, a ~1 ms
+  outlier can appear at any load, window or not.
 
 ## How to run
 
