@@ -6,7 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
+
+	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/hft"
 )
 
 // fakeNuma builds a sysfs node directory with the given node<N> directories
@@ -92,5 +95,61 @@ func TestDiscoverHostNumaIgnoresOtherNames(t *testing.T) {
 	}
 	if len(c.NodeNumaNodes) != 2 || c.NodeNumaNodes[0] != 0 || c.NodeNumaNodes[1] != 1 {
 		t.Errorf("NodeNumaNodes = %v, want [0 1]", c.NodeNumaNodes)
+	}
+}
+
+// Nothing in this tree discovers the data NIC's NUMA node, so Parse must
+// leave NicNumaNode at -1 ("unknown"). Zero would name node 0, which is a
+// real NUMA node on a multi-node machine.
+func TestParseNicNumaNodeUnknown(t *testing.T) {
+	c, err := Parse([]byte("sharedCpus: \"0,1\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.NicNumaNode != -1 {
+		t.Errorf("NicNumaNode = %d, want -1 (unknown until something records it)", c.NicNumaNode)
+	}
+	// That default is what PickMems sees: on a multi-node machine the
+	// NIC's-node ask must be refused, never answered as node 0.
+	mems, nodes, err := hft.PickMems("", []int{0, 1}, c.NicNumaNode)
+	if err == nil {
+		t.Fatalf("PickMems(%q, [0 1], %d) = %q, %q: want a refusal, not node 0", "", c.NicNumaNode, mems, nodes)
+	}
+	if !strings.Contains(err.Error(), "none recorded") {
+		t.Errorf("error %q must name that no NIC node is recorded", err)
+	}
+}
+
+// With no NIC node recorded, "" ("the NIC's node") is refused on a
+// multi-node machine: node 0 would be a guess.
+func TestNicNumaNodeUnknownRefusesOnMultiNode(t *testing.T) {
+	mems, nodes, err := hft.PickMems("", []int{0, 1}, -1)
+	if err == nil {
+		t.Fatalf("PickMems(%q, [0 1], -1) = %q, %q: want a refusal, not node 0", "", mems, nodes)
+	}
+	if !strings.Contains(err.Error(), "none recorded") {
+		t.Errorf("error %q must name that no NIC node is recorded", err)
+	}
+}
+
+// A one-node machine has one answer, so an unknown NIC node still resolves.
+func TestNicNumaNodeUnknownStillAnswersOnOneNode(t *testing.T) {
+	mems, nodes, err := hft.PickMems("", []int{0}, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mems != "0" || nodes != "0" {
+		t.Errorf("got mems=%q nodes=%q, want 0", mems, nodes)
+	}
+}
+
+// A recorded NIC node answers its own node.
+func TestNicNumaNodeKnownAnswersItsNode(t *testing.T) {
+	mems, nodes, err := hft.PickMems("", []int{0, 1}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mems != "1" || nodes != "1" {
+		t.Errorf("got mems=%q nodes=%q, want the NIC node 1", mems, nodes)
 	}
 }

@@ -166,6 +166,10 @@ func Parse(data []byte) (*Config, error) {
 		SeccompProfilePath: DefaultSeccompProfilePath,
 		CgroupRoot:         DefaultCgroupRoot,
 		DevRoot:            DefaultDevRoot,
+		// Nothing in this tree discovers the data NIC's node yet, so it
+		// starts unknown: 0 would name a real NUMA node on a multi-node
+		// machine.
+		NicNumaNode: -1,
 	}
 	if f.SharedCPUs == nil {
 		return nil, errors.New("config: sharedCpus is required")

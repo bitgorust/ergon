@@ -53,6 +53,11 @@ type Plugin struct {
 	resend    Resender
 	onSynced  func()
 	onConnect func()
+	// touched holds the containers whose state moved on after a Synchronize.
+	// Synchronize sends its re-widen updates again after ResendDelay against a
+	// copy taken at sync time; a container that was resized, stopped or removed
+	// in between must not have that copy replayed onto it.
+	touched map[string]bool
 }
 
 // New returns a plugin. siblings maps each CPU to its core's CPUs (read
@@ -66,6 +71,7 @@ func New(cfg *config.Config, siblings map[int]cpuset.Set, log *slog.Logger, m *m
 		ResendDelay: DefaultResendDelay,
 		After:       func(d time.Duration, f func()) { time.AfterFunc(d, f) },
 		table:       assign.New(cfg.Shared),
+		touched:     map[string]bool{},
 	}
 }
 
@@ -486,6 +492,7 @@ func (p *Plugin) UpdateContainer(_ context.Context, pod *api.PodSandbox, ctr *ap
 	if !ok {
 		p.metrics.Unhandled()
 		p.log.Warn("update: container was not set up by this plugin (created without it, or env set by hand); recreate it", logArgs...)
+		p.markTouched(ctr.GetId())
 		return nil, nil
 	}
 	cpu := res.GetCpu()
@@ -493,6 +500,11 @@ func (p *Plugin) UpdateContainer(_ context.Context, pod *api.PodSandbox, ctr *ap
 		p.metrics.Ineligible()
 		p.log.Warn("update: container is no longer an exclusive integer-CPU container (quota or shares); the shared CPUs are dropped",
 			append(logArgs, "cpus", cpu.GetCpus(), "quota", cpu.GetQuota().GetValue(), "shares", cpu.GetShares().GetValue())...)
+		// The reservation goes with the shared CPUs: they are shared
+		// capacity, and a later pod must not be refused capacity a dead
+		// reservation is still counting.
+		p.release(ctr.GetId())
+		p.markTouched(ctr.GetId())
 		// The kubelet is not writing a cpuset in this update: its write
 		// would leave the shared CPUs in. Shrink to the exclusive CPUs.
 		if cpu.GetCpus() == "" {
@@ -510,6 +522,10 @@ func (p *Plugin) UpdateContainer(_ context.Context, pod *api.PodSandbox, ctr *ap
 		p.metrics.Unhandled()
 		p.log.Warn("update: the container's shared CPUs are outside sharedCpus (changed since it started?); not re-widening; recreate the container",
 			append(logArgs, "container_shared", s.shared.String(), "config_shared", p.cfg.Shared.String())...)
+		// Hold what it still has, never a set outside today's sharedCpus.
+		p.holdPresent(ctr.GetId(), ctr.GetName(), pod, s,
+			ctr.GetLinux().GetResources().GetCpu().GetCpus())
+		p.markTouched(ctr.GetId())
 		return nil, nil
 	}
 	cpus := cpu.GetCpus()
@@ -519,15 +535,31 @@ func (p *Plugin) UpdateContainer(_ context.Context, pod *api.PodSandbox, ctr *ap
 	requested, err := cpuset.Parse(cpus)
 	if err != nil {
 		p.log.Error("update: bad cpuset", append(logArgs, "error", err.Error())...)
+		p.markTouched(ctr.GetId())
 		return nil, nil
 	}
+	// From here the cpuset is being decided: any later re-widen from a sync
+	// copy is stale.
+	p.markTouched(ctr.GetId())
+	// The reservation tracks what the container holds now, whatever the
+	// cpuset turn out to be.
+	p.hold(ctr.GetId(), ctr.GetName(), pod, s)
 	if s.shared.IsSubsetOf(requested) {
 		return nil, nil
 	}
-	if iso, err := cpuset.Parse(env[names.EnvIsolated]); err != nil || !requested.Difference(s.shared).Equals(iso) {
+	iso, isoErr := cpuset.Parse(env[names.EnvIsolated])
+	if isoErr != nil || !requested.Difference(s.shared).Equals(iso) {
 		p.metrics.StaleEnv()
 		p.log.Warn("update: exclusive CPUs changed; the container's CPU env is stale (use resizePolicy RestartContainer for cpu)",
 			append(logArgs, "env_isolated", env[names.EnvIsolated], "new", requested.String())...)
+		// The cpu-partition hooks carry the exclusive set as it was at
+		// create. NRI cannot re-run a createRuntime hook, so the poststop
+		// would release CPUs the container no longer owns. Say so.
+		if env[names.EnvIsolatedCgroup] != "" {
+			p.metrics.StalePartition()
+			p.log.Warn("update: exclusive CPUs changed; the cpu-partition still isolates the create-time set; recreate the container",
+				append(logArgs, "partition", env[names.EnvIsolatedCgroup], "was", env[names.EnvIsolated], "now", requested.Difference(s.shared).String())...)
+		}
 	}
 	union := requested.Union(s.shared)
 	u := &api.ContainerUpdate{}
@@ -536,6 +568,47 @@ func (p *Plugin) UpdateContainer(_ context.Context, pod *api.PodSandbox, ctr *ap
 	p.metrics.Rewidened("update")
 	p.log.Info("update", append(logArgs, "requested", requested.String(), "cpuset", union.String())...)
 	return []*api.ContainerUpdate{u}, nil
+}
+
+// markTouched records that a container's state moved on after the last
+// Synchronize, so a delayed re-widen from that sync is not replayed onto it.
+func (p *Plugin) markTouched(id string) {
+	p.mu.Lock()
+	p.touched[id] = true
+	p.mu.Unlock()
+}
+
+// hold records the container's reservation: its shared CPUs and its millicpu
+// request. It is what Synchronize rebuilds, and an update must leave the same
+// picture behind. The key matches Synchronize's and create's.
+func (p *Plugin) hold(id, name string, pod *api.PodSandbox, s setup) {
+	p.mu.Lock()
+	p.table.Hold(id, assign.Key{PodUID: pod.GetUid(), Container: name}, s.shared, s.milli)
+	p.publishTable()
+	p.mu.Unlock()
+}
+
+// holdPresent records the shared CPUs the container actually has, the way
+// Synchronize does: its recorded set clipped to what is in its cpuset now.
+// Used when that recorded set is outside today's sharedCpus — it keeps what it
+// holds and is never widened back in, but the load it does carry still counts.
+func (p *Plugin) holdPresent(id, name string, pod *api.PodSandbox, s setup, cpus string) {
+	current, err := cpuset.Parse(cpus)
+	if err != nil {
+		// Without a readable cpuset there is nothing to account for; drop
+		// the reservation rather than count CPUs the container may not have.
+		p.release(id)
+		return
+	}
+	present := s.shared.Intersection(current)
+	if present.IsEmpty() {
+		p.release(id)
+		return
+	}
+	p.mu.Lock()
+	p.table.Hold(id, assign.Key{PodUID: pod.GetUid(), Container: name}, present, s.milli)
+	p.publishTable()
+	p.mu.Unlock()
 }
 
 func live(c *api.Container) bool {
@@ -625,6 +698,9 @@ func (p *Plugin) Synchronize(_ context.Context, pods []*api.PodSandbox, ctrs []*
 
 	p.mu.Lock()
 	p.table = table
+	// This sync is the fresh picture; anything that moves on from here is
+	// newer than the updates below and must cancel its own resend.
+	p.touched = map[string]bool{}
 	p.publishTable()
 	resend, onSynced := p.resend, p.onSynced
 	p.mu.Unlock()
@@ -646,28 +722,52 @@ func (p *Plugin) Synchronize(_ context.Context, pods []*api.PodSandbox, ctrs []*
 	return updates, nil
 }
 
+// resendUpdates sends the sync-time re-widen again. The copy is from sync
+// time: a container that was resized, stopped or removed since then must not
+// have it replayed, because the copy names the CPUs as they were then and
+// could put the container on CPUs it no longer owns. containerd only logs a
+// failed update, so the ones that are still right are worth the second try.
 func (p *Plugin) resendUpdates(resend Resender, updates []*api.ContainerUpdate) {
-	failed, err := resend(updates)
+	live := make([]*api.ContainerUpdate, 0, len(updates))
+	p.mu.Lock()
+	touched := p.touched
+	p.mu.Unlock()
+	for _, u := range updates {
+		if touched[u.GetContainerId()] {
+			p.log.Info("sync resend: skipped, the container moved on",
+				"container_id", u.GetContainerId(),
+				"cpuset", u.GetLinux().GetResources().GetCpu().GetCpus())
+			continue
+		}
+		live = append(live, u)
+	}
+	if len(live) == 0 {
+		p.log.Info("sync resend", "updates", 0, "skipped", len(updates))
+		return
+	}
+	failed, err := resend(live)
 	if err != nil {
-		p.log.Error("sync resend failed", "error", err.Error(), "updates", len(updates))
+		p.log.Error("sync resend failed", "error", err.Error(), "updates", len(live))
 	}
 	for _, f := range failed {
 		p.log.Error("sync resend: update failed", "container_id", f.GetContainerId(),
 			"cpuset", f.GetLinux().GetResources().GetCpu().GetCpus())
 	}
 	if err == nil {
-		p.log.Info("sync resend", "updates", len(updates), "failed", len(failed))
+		p.log.Info("sync resend", "updates", len(live), "skipped", len(updates)-len(live), "failed", len(failed))
 	}
 }
 
 // StopContainer drops the container's load.
 func (p *Plugin) StopContainer(_ context.Context, _ *api.PodSandbox, ctr *api.Container) ([]*api.ContainerUpdate, error) {
+	p.markTouched(ctr.GetId())
 	p.release(ctr.GetId())
 	return nil, nil
 }
 
 // RemoveContainer drops the container's load.
 func (p *Plugin) RemoveContainer(_ context.Context, _ *api.PodSandbox, ctr *api.Container) error {
+	p.markTouched(ctr.GetId())
 	p.release(ctr.GetId())
 	return nil
 }

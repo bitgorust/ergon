@@ -124,6 +124,7 @@ func TestCheckCoreLayout(t *testing.T) {
 		x86[c] = New(c, c+4)
 		x86[c+4] = New(c, c+4)
 	}
+	sibs := map[int]Set{1: New(1, 5), 2: New(2, 6), 5: New(1, 5), 6: New(2, 6)}
 	cases := []struct {
 		name      string
 		exclusive Set
@@ -139,6 +140,10 @@ func TestCheckCoreLayout(t *testing.T) {
 		{"a core split the other way", New(5), New(1), x86, "split"},
 		{"no topology for an exclusive CPU", New(1, 5), New(0), map[int]Set{0: New(0)}, "thread_siblings_list"},
 		{"no topology for a shared CPU", New(1), New(0), map[int]Set{1: New(1, 5), 5: New(1, 5)}, "thread_siblings_list"},
+		// SMT siblings 1/5 and 2/6; 5 and 6 are in neither set below.
+		{"one thread of a core, its sibling unmanaged", New(1), New(2), sibs, "neither exclusive nor shared"},
+		{"whole core exclusive, the other core's sibling unmanaged", New(1, 5), New(2), sibs, ""},
+		{"whole core exclusive, nothing unmanaged", New(1, 5), New(2, 6), sibs, ""},
 	}
 	for _, c := range cases {
 		err := CheckCoreLayout(c.exclusive, c.shared, c.siblings)
@@ -166,6 +171,34 @@ func TestCheckCoreLayoutNamesTheSplitCore(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}
+	}
+}
+
+// TestCheckCoreLayoutNamesTheUnmanagedSibling: an exclusive CPU whose SMT
+// sibling is in neither set is not isolated either: the scheduler, the shared
+// pool or another pod can run on the sibling and contend on the same physical
+// core. The refusal has to name that CPU and say it is neither exclusive nor
+// shared, or an operator cannot tell which CPU to look at.
+func TestCheckCoreLayoutNamesTheUnmanagedSibling(t *testing.T) {
+	sibs := map[int]Set{1: New(1, 5), 2: New(2, 6), 5: New(1, 5), 6: New(2, 6)}
+	err := CheckCoreLayout(New(1), New(2), sibs)
+	if err == nil {
+		t.Fatal("an exclusive core with an unmanaged sibling must be refused")
+	}
+	for _, want := range []string{"1", "5", "neither exclusive nor shared", "not its own"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// TestCheckCoreLayoutLeavesSharedAlone: only exclusive cores must be clean.
+// A shared CPU is housekeeping, contention there is expected and fine, so a
+// shared core whose sibling is unmanaged must be accepted.
+func TestCheckCoreLayoutLeavesSharedAlone(t *testing.T) {
+	sibs := map[int]Set{1: New(1, 5), 2: New(2, 6), 5: New(1, 5), 6: New(2, 6)}
+	if err := CheckCoreLayout(New(1, 5), New(2), sibs); err != nil {
+		t.Errorf("a shared core with an unmanaged sibling must be allowed: %v", err)
 	}
 }
 

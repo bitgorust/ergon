@@ -20,6 +20,13 @@ found no spot capacity and tore down cleanly, so these steps come from the
 manifests and the kind e2e, not from a live EKS node. **AKS cannot run it**
 (see [Limits](#limits-and-what-is-not-verified)).
 
+This is not a new idea. CRI-O ships the same behaviour as `shared_cpuset`,
+and `kubernetes-sigs/dra-driver-cpu` has it as an open issue
+([#103](https://github.com/kubernetes-sigs/dra-driver-cpu/issues/103)) and a
+non-mergeable draft. What is here is the containerd path with no DRA feature
+gate. The full comparison is in `k8s/nri-shared-cpus/README.md`, section
+*Prior art*.
+
 ## What it gives
 
 | item | value |
@@ -37,30 +44,19 @@ the plugin still adds one whole shared CPU, and there is no hard cap.
 ### Timer slack
 
 The kernel's default timer slack is 50,000 ns. It is added to every sleep and
-to every `epoll`/`io_uring` timeout, so a 100 µs wait can take 150 µs. The
-hook sets 1 ns, the kernel's floor, on every thread the container has when it
-starts. The kernel copies the value to every thread and child the program
-makes afterwards, so the whole tree inherits it. A container that cannot have
-it does not start.
+to every `epoll`/`io_uring` timeout. The hook sets 1 ns, the kernel's floor,
+on every thread the container has when it starts; the kernel copies it to
+every thread and child after that. A container that cannot have it does not
+start. The OCI hook runs as root, so it can write
+`/proc/<tid>/timerslack_ns`; a program can always set its own slack with
+`prctl(PR_SET_TIMERSLACK)`.
 
-The hook writes `/proc/<tid>/timerslack_ns` for each thread and reads the
-result back. Access to that file is free only for a task reading or writing
-itself; any other task needs `CAP_SYS_NICE` over it and is refused with
-`EPERM`. There is no thread-group exception, so a thread reading
-`/proc/self/timerslack_ns` is reading its leader's file and hits the rule. The
-OCI hook has the capability (containerd runs hooks as root with full
-capabilities), and the plugin DaemonSet's `capabilities: drop: ["ALL"]`
-applies to the plugin process only. A program can always set its own slack
-with `prctl(PR_SET_TIMERSLACK)`, which needs no privilege.
-
-What the 1 ns slack is worth in latency is **not yet measured**. This
-environment cannot measure it: sleeps below 1 ms are quantised to about 1 ms
-here at both 50,000 ns and 1 ns slack. The mechanism is tested; the number is
-not, and is not claimed.
+What the 1 ns slack is worth in latency is **not yet measured**.
 
 ## Node setup
 
-Do this before installing the plugin. Everything here is per node.
+Do this before installing the plugin. Everything here is per node. The rest
+of the node checklist is [Latency Pods: node setup](latency-pods.md#node-setup).
 
 | setting | value |
 |---|---|
@@ -69,24 +65,6 @@ Do this before installing the plugin. Everything here is per node.
 | kernel | >= 6.2, cgroup v2. Boot line: `nohz_full`, `rcu_nocbs`, `isolcpus=managed_irq` on the exclusive CPUs, never on the shared ones. A `cpu-partition` opt-in also needs `cpuset.cpus.exclusive`: Linux 6.7, or a vendor kernel that backported that file. The plugin reads the file, not the version |
 | containerd | >= 2.2, NRI on, default validator on |
 | node label | `ergon.io/shared-cpus=true` |
-
-Check the node first. Each command must print what the comment says:
-
-```sh
-# kernel >= 6.2 (>= 6.7 for cpu-partition), cgroup v2
-uname -r
-stat -fc %T /sys/fs/cgroup                       # cgroup2fs
-find /sys/fs/cgroup -maxdepth 4 -name cpuset.cpus.exclusive | head -1
-                                               # one path = the file exists;
-                                               # empty = no cpu-partition on this node
-
-# containerd >= 2.2 with NRI
-containerd --version
-nerdctl info 2>/dev/null | grep -i nri           # or: grep -r nri /etc/containerd/
-
-# the boot line has the isolation on the exclusive CPUs only
-cat /proc/cmdline
-```
 
 **CPU split.** Pick three CPU sets on the node and write them down; every
 later step names one of them.
@@ -103,47 +81,14 @@ later step names one of them.
 nohz_full=2-5 rcu_nocbs=2-5 isolcpus=managed_irq,domain,2-5
 ```
 
-**kubelet** — `/var/lib/kubelet/config.yaml` (or the drop-in your
-distribution uses):
+**kubelet** — `reservedSystemCPUs: "0,1"` (shared + IRQ) with the policy
+above. Restart kubelet and check it took.
 
-```yaml
-cpuManagerPolicy: static
-cpuManagerPolicyOptions:
-  full-pcpus-only: "true"          # x86 only
-reservedSystemCPUs: "0,1"          # shared 0 + IRQ 1
-# cpuManagerReconcilePeriod, topologyManagerPolicy as your node needs
-```
-
-Restart kubelet after changing it, and check it took:
-
-```sh
-systemctl restart kubelet
-# must print static and your reserved list
-journalctl -u kubelet --no-pager | grep -i 'cpu manager\|reserved' | tail
-```
-
-**containerd** — the NRI plugin and the default validator must be on. The
-validator is what makes an unmet `required-plugins` annotation fail the
-create instead of starting the pod half-granted.
-
-```toml
-version = 3
-
-[plugins."io.containerd.nri.v1.nri"]
-  disable = false
-  disable_connections = false
-  socket_path = "/var/run/nri/nri.sock"
-
-[plugins."io.containerd.nri.v1.nri".default_validator]
-  enable = true
-  # leave required_plugins empty: a node-wide list would also block
-  # kube-system pods and the plugin's own pod while it is down
-```
-
-```sh
-systemctl restart containerd
-ls -l /var/run/nri/nri.sock
-```
+**containerd** — NRI on (`disable = false`) and the default validator on.
+The validator is what makes an unmet `required-plugins` annotation fail the
+create instead of starting the pod half-granted. Leave
+`required_plugins` empty: a node-wide list would also block kube-system
+pods and the plugin's own pod while it is down.
 
 ## Install on Kubernetes
 
@@ -200,47 +145,46 @@ Rules:
 
 ### 3. Build and load the image
 
-**Do not publish this to Docker Hub.** The plugin is root on the node and
+**Not released.** Nothing is on a registry yet. `k8s/nri-shared-cpus/RELEASE.md`
+is the gate: four code defects, the EKS lane and the latency benchmarks are
+open. The chart, the Dockerfile and the image workflow are ready, so the
+first push is one workflow run once that gate is clear.
+
+**Do not make this image public.** The plugin is root on the node and
 installs an executable at `/opt/ergon/bin`. A public image is a root shell on
-every node that pulls it, for whoever can push. Use one of these three.
+every node that pulls it, for whoever can push.
 
-**a. kind, or a single node** — build and load it into the node's own store:
-
-```sh
-docker build -t ergon-shared-cpus:dev .
-kind load docker-image ergon-shared-cpus:dev        # kind
-# anything else:
-docker save ergon-shared-cpus:dev | ctr -n k8s.io images import -
-```
-
-**b. A private registry, for a real multi-node cluster** — the right default
-outside a lab. Push to a registry only your nodes can read, and pin the
-digest so a re-push cannot change what runs:
-
-```sh
-docker build -t <registry>/ergon-shared-cpus:<tag> .
-docker push <registry>/ergon-shared-cpus:<tag>
-docker inspect --format='{{index .RepoDigests 0}}' <registry>/ergon-shared-cpus:<tag>
-```
-
-Then in `deploy/daemonset.yaml` set the image to that digest
-(`<registry>/ergon-shared-cpus@sha256:…`), `imagePullPolicy: IfNotPresent`,
-and give the `ergon-system` namespace an `imagePullSecret`:
-
-```sh
-kubectl -n ergon-system create secret docker-registry regcred \
-  --docker-server=<registry> --docker-username=<user> --docker-password=<token>
-kubectl -n ergon-system patch serviceaccount default \
-  -p '{"imagePullSecrets":[{"name":"regcred"}]}'
-```
-
-**c. No registry at all** — `imagePullPolicy: Never` plus a DaemonSet init
-that expects the image to already be on the node (a config-management step, or
-the AMI). Only worth it where nodes cannot reach any registry.
+- **kind or one node:** `docker build -t ergon-shared-cpus:dev .` then
+  `kind load docker-image ergon-shared-cpus:dev`
+  (or `docker save … | ctr -n k8s.io images import -`).
+- **A real cluster:** push to a private registry your nodes can read, pin
+  the DaemonSet image to the digest (`@sha256:…`), `imagePullPolicy:
+  IfNotPresent`, and give `ergon-system` an `imagePullSecret`. When it is
+  released the image is `ghcr.io/mimran1980/ergon-shared-cpus`; keep the
+  package private and pin the digest.
+- **No registry:** `imagePullPolicy: Never` and the image already on the
+  node (AMI or config management).
 
 The DaemonSet ships `image: ergon-shared-cpus:dev` with
-`imagePullPolicy: IfNotPresent`, which matches (a). Change the image field to
-match whichever you chose.
+`imagePullPolicy: IfNotPresent`. Change the image field to match.
+
+### 3b. Or install the chart
+
+`k8s/nri-shared-cpus/charts/ergon-shared-cpus` renders the same three
+manifests, with the config in `values.yaml` instead of a hand-edited
+ConfigMap. Use it when more than one cluster or node group has to agree:
+
+```sh
+helm install ergon-shared-cpus k8s/nri-shared-cpus/charts/ergon-shared-cpus \
+  --namespace ergon-system --create-namespace \
+  --set config.sharedCpus=4 \
+  --set 'config.namespaces={trading}'
+```
+
+The chart creates the namespace with the privileged Pod Security labels and
+sets `ergon.io/shared-cpus: "true"` as its node selector. Node settings
+(`reservedSystemCPUs`, `cpuManagerPolicy`, the containerd NRI validator) are
+not chart-managed; they are the node section above.
 
 ### 4. Apply the three manifests
 
@@ -250,61 +194,32 @@ kubectl apply -f deploy/namespace.yaml \
               -f deploy/daemonset.yaml
 ```
 
-The DaemonSet needs three host paths (`/var/run/nri`,
-`/var/lib/kubelet/device-plugins`, `/opt/ergon/bin`) and the namespace is
-labelled Pod Security `privileged` for that reason. The plugin is root on
-the node: anything on the NRI socket can change any container.
+The DaemonSet needs five host paths: `/var/run/nri`,
+`/var/lib/kubelet/device-plugins` and `/opt/ergon/bin` read-write, plus
+`/dev` at `/host/dev` and the host cgroup v2 tree at `/sys/fs/cgroup`, both
+read-only. The namespace is labelled Pod Security `privileged` for that
+reason. The plugin is root on the node: anything on the NRI socket can
+change any container.
 
 ### 5. Verify the plugin before any workload
 
-```sh
-# 1. the pod is Ready on every labelled node
-kubectl -n ergon-system get pods -l app=ergon-shared-cpus -o wide
-
-# 2. it registered the extended resource (a number > 0)
-kubectl get node <node> -o \
-  jsonpath='{.status.allocatable.ergon\.io/shared-millicpus}{"\n"}'
-
-# 3. it is healthy
-kubectl -n ergon-system exec ds/ergon-shared-cpus -- \
-  curl -s localhost:9466/readyz
-kubectl -n ergon-system exec ds/ergon-shared-cpus -- \
-  curl -s localhost:9466/metrics | head
-
-# 4. it logged no config error (strict YAML: a bad field stops it)
-kubectl -n ergon-system logs -l app=ergon-shared-cpus --tail=50
-```
-
-If (2) prints nothing, the device plugin did not register: check the logs in
-(4) and that `/var/lib/kubelet/device-plugins` is mounted.
+The pod is Ready on every labelled node, `allocatable` shows
+`ergon.io/shared-millicpus` greater than zero, `/readyz` is healthy, and the
+logs show no config error (strict YAML: a bad field stops it). If
+`allocatable` is empty the device plugin did not register: check the logs
+and that `/var/lib/kubelet/device-plugins` is mounted.
 
 ### 6. Run a pod and check the grants landed
 
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: trader
-  namespace: trading                       # must be in the ConfigMap's allowlist
-  annotations:
-    required-plugins.noderesource.dev: '["ergon-shared-cpus"]'
-spec:
-  nodeSelector: { ergon.io/shared-cpus: "true" }
-  containers:
-  - name: app
-    image: my-app
-    command: ["sleep", "3600"]
-    resources:
-      requests: { cpu: "2", memory: 1Gi, ergon.io/shared-millicpus: "250" }
-      limits:   { cpu: "2", memory: 1Gi, ergon.io/shared-millicpus: "250" }
-```
+Use the pod under [Pod](#pod). Inside it:
 
 ```sh
 kubectl exec trader -- sh -c 'echo isolated=$ERGON_ISOLATED_CPUS shared=$ERGON_SHARED_CPUS'
 kubectl exec trader -- cat /proc/1/status | grep Cpus_allowed_list
 ```
 
-The second must print the shared CPUs only. That is the point of the plugin.
+`Cpus_allowed_list` must print the shared CPUs only. That is the point of
+the plugin.
 
 ## Config
 
@@ -325,6 +240,7 @@ restart the DaemonSet.
 | `seccomp.ioUring` | `off` | `allow` widens the container's seccomp profile for `io_uring_*`. See [Latency Pods](latency-pods.md) |
 | `seccompProfilePath` | `/etc/ergon-shared-cpus/ergon-io-uring.json` | the shipped io_uring profile on the node, the fallback for a pod that cannot take the NRI grant |
 | `devRoot` | `/dev` | where this process sees the host's `/dev`. The DaemonSet mounts it read-only at `/host/dev` so the plugin can stat the PHC and PM QoS nodes; granted paths stay `/dev/...` |
+| `cgroupRoot` | `/sys/fs/cgroup` | the cgroup v2 mount point. The DaemonSet mounts the host tree read-only at exactly this path: it is also the node-space prefix the createRuntime hook matches against `/proc/<pid>/cgroup`, so it must stay `/sys/fs/cgroup` |
 | `schedFifo` | `off` | `off`, or `thread` (the hot thread only, never the container). Quote the value: unquoted `off` is a YAML boolean |
 | `ptp` | `off` | `off`, `auto`, or a `/dev/ptp*` path the node has. `auto` grants the NIC's PHC |
 | `hugepagesAeronDir` | unset | absolute `AERON_DIR` to export when the pod mounts a sized hugetlbfs |
@@ -540,20 +456,13 @@ kubectl exec aeron-driver -- sh -c 'ps -L -o pid,tid,psr,comm | head'
 | kubelet restart, plugin down | cpuset shrinks to the exclusive CPUs; helpers fall onto them | the plugin re-widens on return; helpers self-check meanwhile |
 | hook binary missing | the create fails | the DaemonSet installs the binary before it connects |
 
-## Security
-
-- The plugin is root on the node: anything on the NRI socket can change any
-  container.
-- It mounts `/var/run/nri`, `/var/lib/kubelet/device-plugins` and
-  `/opt/ergon/bin` (it installs the hook binary there).
-- Nothing else: no `hostPID`, no `hostNetwork`, not privileged,
-  `capabilities.drop: [ALL]`, `readOnlyRootFilesystem: true`, seccomp
-  `RuntimeDefault`, no API access.
-- Only namespaces in the allowlist may opt in. A pod author cannot fake the
-  device-plugin annotation.
-
 ## Limits and what is not verified
 
+- **The plugin is root on the node.** It mounts only `/var/run/nri`,
+  `/var/lib/kubelet/device-plugins` and `/opt/ergon/bin`: no `hostPID`, no
+  `hostNetwork`, not privileged, `capabilities.drop: [ALL]`,
+  `readOnlyRootFilesystem: true`, seccomp `RuntimeDefault`, no API access.
+  Only namespaces in the allowlist may opt in.
 - **AKS** has no supported way to enable containerd NRI plugins and no
   `reservedSystemCPUs`. Not supported.
 - **CRI-O** users use its `shared_cpuset` instead.

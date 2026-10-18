@@ -26,6 +26,15 @@ type testPluginResult struct {
 
 func testPlugin(t *testing.T, shared string, opts ...func(*config.File)) testPluginResult {
 	t.Helper()
+	return testPluginSiblings(t, shared, testSiblings(), opts...)
+}
+
+// testPluginSiblings is testPlugin on a topology of the caller's choosing.
+// The n/n+4 map in testSiblings is eight CPUs and four cores, which is not
+// always enough: a test that needs three whole exclusive cores beside two
+// shared CPUs has to bring a wider node.
+func testPluginSiblings(t *testing.T, shared string, siblings map[int]cpuset.Set, opts ...func(*config.File)) testPluginResult {
+	t.Helper()
 	text := "sharedCpus: \"" + shared + "\"\nnamespaces: [trading]\n"
 	// Options are applied to the YAML text through the File shape the config
 	// package accepts.
@@ -44,7 +53,7 @@ func testPlugin(t *testing.T, shared string, opts ...func(*config.File)) testPlu
 		t.Fatal(err)
 	}
 	m := metrics.New()
-	p := New(cfg, testSiblings(), slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})), m)
+	p := New(cfg, siblings, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})), m)
 	p.ResendDelay = 0
 	p.After = func(_ time.Duration, fn func()) { go fn() }
 	return testPluginResult{Plugin: p, m: m}
@@ -98,6 +107,45 @@ func ctr(id string, cpus string, env map[string]string, ann map[string]string) *
 			},
 		},
 	}
+}
+
+// applyAdjustment folds a create adjustment into the container the way the
+// runtime does: the env it added and the cpuset it set are the live state a
+// later UpdateContainer or Synchronize reads. A test that creates a container
+// and then updates it needs this, or the update sees the create request rather
+// than what the container became — a cpuset that was never widened and an env
+// that never gained ERGON_ISOLATED_CGROUP.
+func applyAdjustment(t *testing.T, c *api.Container, adj *api.ContainerAdjustment) {
+	t.Helper()
+	if adj == nil {
+		return
+	}
+	for _, e := range adj.GetEnv() {
+		replaced := false
+		for i, cur := range c.Env {
+			if k, _, ok := strings.Cut(cur, "="); ok && k == e.Key {
+				c.Env[i] = e.Key + "=" + e.Value
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			c.Env = append(c.Env, e.Key+"="+e.Value)
+		}
+	}
+	l := adj.GetLinux()
+	if l == nil {
+		return
+	}
+	res := l.GetResources()
+	if res == nil {
+		return
+	}
+	cpu := res.GetCpu()
+	if cpu == nil || cpu.GetCpus() == "" {
+		return
+	}
+	c.Linux.Resources.Cpu.Cpus = cpu.GetCpus()
 }
 
 func TestCreateAdjustment(t *testing.T) {
@@ -480,10 +528,18 @@ func TestRemovePodSandboxForgetsSticky(t *testing.T) {
 
 func TestBalanceOverSharedCPUs(t *testing.T) {
 	// sharedCpus "0,1", the README example: A (250) -> 0, B (250) -> 1,
-	// C (250) -> 0 (tie 250/250, lower CPU number wins). The exclusive CPUs
-	// are 2, 3 and 6: none of them shares a physical core with a shared CPU
-	// under the n/n+4 topology (4 would be the sibling of shared 0).
-	p := testPlugin(t, "0,1")
+	// C (250) -> 0 (tie 250/250, lower CPU number wins). Every exclusive
+	// container takes a whole physical core, because a core left half
+	// unmanaged is refused: under n/n+8 SMT those cores are 2,10 / 3,11 /
+	// 4,12, none of them touching the shared cores 0,8 and 1,9. The wider
+	// node is needed because the eight-CPU test topology has only two cores
+	// to spare beside two shared ones.
+	sibs := map[int]cpuset.Set{}
+	for c := 0; c < 8; c++ {
+		sibs[c] = cpuset.New(c, c+8)
+		sibs[c+8] = cpuset.New(c, c+8)
+	}
+	p := testPluginSiblings(t, "0,1", sibs)
 	mk := func(name, uid, cpus string, shares uint64) (*api.PodSandbox, *api.Container) {
 		pd := pod()
 		pd.Uid, pd.Name = uid, name
@@ -492,15 +548,15 @@ func TestBalanceOverSharedCPUs(t *testing.T) {
 		c.Linux.Resources.Cpu.Shares = &api.OptionalUInt64{Value: shares}
 		return pd, c
 	}
-	pdA, a := mk("a", "ua", "2", 1024)
+	pdA, a := mk("a", "ua", "2,10", 2048)
 	if _, _, err := p.CreateContainer(context.Background(), pdA, a); err != nil {
 		t.Fatal(err)
 	}
-	pdB, b := mk("b", "ub", "3", 1024)
+	pdB, b := mk("b", "ub", "3,11", 2048)
 	if _, _, err := p.CreateContainer(context.Background(), pdB, b); err != nil {
 		t.Fatal(err)
 	}
-	pdC, c := mk("c", "uc", "6", 1024)
+	pdC, c := mk("c", "uc", "4,12", 2048)
 	if _, _, err := p.CreateContainer(context.Background(), pdC, c); err != nil {
 		t.Fatal(err)
 	}
@@ -980,5 +1036,219 @@ func TestSeccompIOUringKeepsEveryRestriction(t *testing.T) {
 	}
 	if len(in.Syscalls) != 1 {
 		t.Errorf("the request's rules were mutated: %v", in.Syscalls)
+	}
+}
+
+// --- defect 3: UpdateContainer reconciles partition/reservation; Synchronize
+// does not replay a stale widen ---
+
+// A container that loses its exclusive integer-CPU status gives up the shared
+// CPUs. It must also give up the reservation: the millicpus it held are shared
+// capacity, and a later pod is refused capacity it should get while a dead
+// reservation still counts. Both shapes of update matter: one where the
+// kubelet writes the cpuset (then there is nothing to send back) and one where
+// it does not (then the plugin shrinks the cpuset itself).
+func TestUpdateIneligibleReleasesTheReservation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		res  *api.LinuxResources
+		want int
+	}{
+		{
+			name: "kubelet writes the cpuset",
+			res: &api.LinuxResources{Cpu: &api.LinuxCPU{
+				Cpus:   "1,5",
+				Quota:  &api.OptionalInt64{Value: 100000},
+				Shares: &api.OptionalUInt64{Value: 2048},
+			}},
+			want: 0,
+		},
+		{
+			name: "kubelet does not write the cpuset",
+			res: &api.LinuxResources{Cpu: &api.LinuxCPU{
+				Quota:  &api.OptionalInt64{Value: 100000},
+				Shares: &api.OptionalUInt64{Value: 2048},
+			}},
+			want: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testPlugin(t, "0,4")
+			c := ctr("ctr-1", "1,5", map[string]string{
+				names.EnvIsolated: "1,5",
+				names.EnvShared:   "0",
+				names.EnvMilli:    "250",
+			}, map[string]string{names.MilliAnnotation: "250"})
+			adj, _, err := p.CreateContainer(context.Background(), pod(), c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			applyAdjustment(t, c, adj)
+			if _, held := p.Table(); held != 1 {
+				t.Fatalf("held after create = %d, want 1", held)
+			}
+			updates, err := p.UpdateContainer(context.Background(), pod(), c, tc.res)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(updates) != tc.want {
+				t.Fatalf("got %d updates, want %d", len(updates), tc.want)
+			}
+			for _, u := range updates {
+				if !sameCPUs(t, u.GetLinux().GetResources().GetCpu().GetCpus(), "1,5") {
+					t.Errorf("cpuset is %q, want 1,5", u.GetLinux().GetResources().GetCpu().GetCpus())
+				}
+			}
+			if _, held := p.Table(); held != 0 {
+				t.Errorf("held after the shared CPUs were dropped = %d, want 0", held)
+			}
+			if got := p.m.Counter("ineligible"); got != 1 {
+				t.Errorf("ineligible = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// A managed update that keeps the container eligible must leave the
+// reservation matching what the container holds: same shared CPU, same
+// millicpus. It must not be dropped, and it must not be left stale.
+func TestUpdateRewidenKeepsTheReservation(t *testing.T) {
+	p := testPlugin(t, "0,4")
+	c := ctr("ctr-1", "1,5", map[string]string{
+		names.EnvIsolated: "1,5",
+		names.EnvShared:   "0",
+		names.EnvMilli:    "250",
+	}, map[string]string{names.MilliAnnotation: "250"})
+	adj, _, err := p.CreateContainer(context.Background(), pod(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyAdjustment(t, c, adj)
+	res := &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "1,5"}}
+	updates, err := p.UpdateContainer(context.Background(), pod(), c, res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 1 {
+		t.Fatalf("got %d updates, want 1", len(updates))
+	}
+	load, held := p.Table()
+	if held != 1 {
+		t.Fatalf("held after the update = %d, want 1", held)
+	}
+	if load[0] != 250 {
+		t.Errorf("load on CPU 0 is %d, want 250", load[0])
+	}
+}
+
+// The cpu-partition's createRuntime and poststop hooks carry the exclusive
+// set as it was at create. A resize makes them wrong: the poststop would
+// release CPUs the container no longer owns and miss the ones it does. NRI
+// cannot re-run a createRuntime hook, so the plugin must report it and the
+// container has to be recreated. Silently leaving it is the bug.
+func TestUpdateResizeReportsStalePartition(t *testing.T) {
+	p := testPlugin(t, "0,4")
+	c := withCgroupsPath(ctr("ctr-1", "1,5", map[string]string{
+		names.EnvIsolated: "1,5",
+		names.EnvShared:   "0",
+		names.EnvMilli:    "250",
+	}, map[string]string{
+		names.MilliAnnotation:            "250",
+		names.CpuPartitionPrefix + "app": names.CpuPartitionValue,
+	}), "kubepods/pod-1/ctr-1")
+	adj, _, err := p.CreateContainer(context.Background(), pod(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyAdjustment(t, c, adj)
+	// The kubelet resizes the exclusive set: 2 joins the core pair 1,5.
+	res := &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "1,2,5"}}
+	updates, err := p.UpdateContainer(context.Background(), pod(), c, res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 1 {
+		t.Fatalf("got %d updates, want 1", len(updates))
+	}
+	if got := p.m.Counter("stale_partition"); got != 1 {
+		t.Errorf("stale_partition = %d, want 1 (the create-time hooks still name 1,5)", got)
+	}
+}
+
+// Synchronize sends its re-widen updates again after ResendDelay because
+// containerd only logs a failed one. The copy is taken when Synchronize runs.
+// If the container moves on before the resend fires — a resize, a stop — the
+// copy is stale and must not be replayed: replaying it would put the container
+// on CPUs it no longer owns.
+func TestSynchronizeResendIsNotReplayedAfterUpdate(t *testing.T) {
+	p := testPlugin(t, "0,4")
+	c := ctr("ctr-1", "1,5", map[string]string{
+		names.EnvIsolated: "1,5",
+		names.EnvShared:   "0",
+		names.EnvMilli:    "250",
+	}, map[string]string{names.MilliAnnotation: "250"})
+	c.State = api.ContainerState_CONTAINER_RUNNING
+
+	var pending []func()
+	p.After = func(_ time.Duration, fn func()) { pending = append(pending, fn) }
+	resent := make(chan []*api.ContainerUpdate, 1)
+	p.SetResender(func(updates []*api.ContainerUpdate) ([]*api.ContainerUpdate, error) {
+		resent <- updates
+		return nil, nil
+	})
+	if _, err := p.Synchronize(context.Background(), []*api.PodSandbox{pod()}, []*api.Container{c}); err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("Synchronize queued %d resends, want 1", len(pending))
+	}
+	// The container moves on before the resend: the kubelet resizes it and the
+	// plugin widens it again from the new state.
+	res := &api.LinuxResources{Cpu: &api.LinuxCPU{Cpus: "1,2,5"}}
+	if _, err := p.UpdateContainer(context.Background(), pod(), c, res); err != nil {
+		t.Fatal(err)
+	}
+	pending[0]() // the delayed resend fires
+	select {
+	case got := <-resent:
+		t.Fatalf("the stale widen was replayed after the container moved on: %v",
+			got[0].GetLinux().GetResources().GetCpu().GetCpus())
+	default:
+	}
+}
+
+// The same rule when the container is gone: a resend naming a stopped
+// container is noise at best.
+func TestSynchronizeResendIsNotReplayedAfterStop(t *testing.T) {
+	p := testPlugin(t, "0,4")
+	c := ctr("ctr-1", "1,5", map[string]string{
+		names.EnvIsolated: "1,5",
+		names.EnvShared:   "0",
+		names.EnvMilli:    "250",
+	}, map[string]string{names.MilliAnnotation: "250"})
+	c.State = api.ContainerState_CONTAINER_RUNNING
+
+	var pending []func()
+	p.After = func(_ time.Duration, fn func()) { pending = append(pending, fn) }
+	resent := make(chan []*api.ContainerUpdate, 1)
+	p.SetResender(func(updates []*api.ContainerUpdate) ([]*api.ContainerUpdate, error) {
+		resent <- updates
+		return nil, nil
+	})
+	if _, err := p.Synchronize(context.Background(), []*api.PodSandbox{pod()}, []*api.Container{c}); err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("Synchronize queued %d resends, want 1", len(pending))
+	}
+	if _, err := p.StopContainer(context.Background(), pod(), c); err != nil {
+		t.Fatal(err)
+	}
+	pending[0]()
+	select {
+	case got := <-resent:
+		t.Fatalf("the widen was replayed for a stopped container: %v",
+			got[0].GetLinux().GetResources().GetCpu().GetCpus())
+	default:
 	}
 }

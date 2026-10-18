@@ -188,8 +188,10 @@ func TestCreateCpuPartitionInjectsHookAndEnv(t *testing.T) {
 func TestCreateCpuPartitionWithoutSharedOptIn(t *testing.T) {
 	p := testPlugin(t, "0,4")
 	// No millicpu marker: the partition grant stands alone on a Guaranteed
-	// integer-CPU container.
-	c := withCgroupsPath(ctr("ctr-1", "2,3", nil, map[string]string{
+	// integer-CPU container. The exclusive set is two whole cores (1,5 and
+	// 2,6 under n/n+4 SMT): a core whose other thread is unmanaged is refused,
+	// which is the point of the core-layout rule.
+	c := withCgroupsPath(ctr("ctr-1", "1,2,5,6", nil, map[string]string{
 		names.CpuPartitionPrefix + "app": names.CpuPartitionValue,
 	}), "kubepods/pod-1/ctr-1")
 	adj, _, err := p.CreateContainer(context.Background(), pod(), c)
@@ -212,8 +214,8 @@ func TestCreateCpuPartitionWithoutSharedOptIn(t *testing.T) {
 		t.Fatalf("hooks are %v, want one createRuntime hook", hooks)
 	}
 	args := hooks.GetCreateRuntime()[0].GetArgs()
-	if !strings.Contains(strings.Join(args, " "), "--isolated 2,3") {
-		t.Errorf("hook args %v must name the exclusive CPUs 2,3", args)
+	if !strings.Contains(strings.Join(args, " "), "--isolated 1,2,5,6") {
+		t.Errorf("hook args %v must name the exclusive CPUs 1,2,5,6", args)
 	}
 	if len(hooks.GetPoststop()) != 1 {
 		t.Fatalf("poststop hooks are %v, want one to release the partition", hooks.GetPoststop())

@@ -191,6 +191,16 @@ func Cores(s Set, siblings map[int]Set) []Set {
 // at all: the helpers still contend with the hot thread on the same core, and
 // that is the very noise a partition exists to remove.
 //
+// The same is true of a sibling in neither set. If CPU 1 is exclusive and its
+// sibling CPU 5 is neither exclusive nor shared, then CPU 5 is unmanaged: the
+// scheduler, the shared pool or any other pod can run work there and contend
+// with the hot thread on the same physical core. So an exclusive core is only
+// accepted when every thread of it is exclusive.
+//
+// Only exclusive cores are held to that. A core of shared whose sibling is in
+// neither set is fine: shared CPUs are housekeeping, and contention there is
+// expected. Do not "fix" that.
+//
 // A CPU with no thread_siblings_list is refused too. Cores would call it a
 // core of its own, which is a guess: that file is how the kernel says which
 // threads share a core, and without it the layout cannot be checked.
@@ -211,6 +221,9 @@ func CheckCoreLayout(exclusive, shared Set, siblings map[int]Set) error {
 			sib := siblings[c]
 			if both := sib.Intersection(shared); !both.IsEmpty() {
 				return fmt.Errorf("core %s is split: CPU %d is exclusive and CPU %s is shared, so the hot thread and the helpers time-share one physical core", FormatCores([]Set{sib}), c, both.List())
+			}
+			if unmanaged := sib.Difference(exclusive).Difference(shared); !unmanaged.IsEmpty() {
+				return fmt.Errorf("core %s is not its own: CPU %d is exclusive and CPU %s is neither exclusive nor shared, so anything can run on the same physical core as the hot thread", FormatCores([]Set{sib}), c, unmanaged.List())
 			}
 		}
 	}

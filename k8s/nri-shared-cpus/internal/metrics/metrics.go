@@ -24,6 +24,7 @@ type Metrics struct {
 	rewidened    map[string]uint64
 	unhandled    uint64
 	staleEnv     uint64
+	stalePart    uint64
 	ineligible   uint64
 	grants       map[string]uint64
 }
@@ -70,6 +71,11 @@ func (m *Metrics) Unhandled() { m.mu.Lock(); m.unhandled++; m.mu.Unlock() }
 // StaleEnv counts a cpuset change that made a container's env stale.
 func (m *Metrics) StaleEnv() { m.mu.Lock(); m.staleEnv++; m.mu.Unlock() }
 
+// StalePartition counts a cpuset change that made a container's cpu-partition
+// hooks name the wrong CPUs. NRI cannot re-run a createRuntime hook, so the
+// container has to be recreated.
+func (m *Metrics) StalePartition() { m.mu.Lock(); m.stalePart++; m.mu.Unlock() }
+
 // Ineligible counts a container that is no longer an exclusive integer-CPU
 // container (quota or shares) and had its shared CPUs dropped.
 func (m *Metrics) Ineligible() { m.mu.Lock(); m.ineligible++; m.mu.Unlock() }
@@ -93,6 +99,8 @@ func (m *Metrics) Counter(name string) uint64 {
 		return m.unhandled
 	case name == "stale_env":
 		return m.staleEnv
+	case name == "stale_partition":
+		return m.stalePart
 	case name == "ineligible":
 		return m.ineligible
 	case len(name) > 8 && name[:8] == "refused/":
@@ -152,6 +160,8 @@ func (m *Metrics) Write(w io.Writer) error {
 	p("# TYPE ergon_shared_cpus_unhandled_total counter\nergon_shared_cpus_unhandled_total %d\n", m.unhandled)
 	p("# HELP ergon_shared_cpus_stale_env_total Cpuset changes that left a container's CPU env stale.\n")
 	p("# TYPE ergon_shared_cpus_stale_env_total counter\nergon_shared_cpus_stale_env_total %d\n", m.staleEnv)
+	p("# HELP ergon_shared_cpus_stale_partition_total Cpuset changes that left a container's cpu-partition hooks naming the wrong CPUs.\n")
+	p("# TYPE ergon_shared_cpus_stale_partition_total counter\nergon_shared_cpus_stale_partition_total %d\n", m.stalePart)
 	p("# HELP ergon_shared_cpus_ineligible_total Containers no longer exclusive integer-CPU, shared CPUs dropped.\n")
 	p("# TYPE ergon_shared_cpus_ineligible_total counter\nergon_shared_cpus_ineligible_total %d\n", m.ineligible)
 	p("# HELP ergon_shared_cpus_grants_total Latency-pod grants given, by kind and value.\n")

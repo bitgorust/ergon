@@ -67,6 +67,9 @@ spec:
             - name: host-dev
               mountPath: /host/dev
               readOnly: true
+            - name: host-cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
       volumes:
         - name: nri
           hostPath:
@@ -90,4 +93,17 @@ spec:
         - name: host-dev
           hostPath:
             path: /dev
+            type: Directory
+        # The plugin reads the host cgroup tree. The container's own
+        # /sys/fs/cgroup is this pod's cgroup namespace root, not the node's
+        # hierarchy, so the pod cgroup's hugepage limit and the
+        # cpuset.cpus.exclusive probe cannot be read there. The host's cgroup v2
+        # is mounted read-only at /sys/fs/cgroup — the node's own path, which
+        # config.cgroupRoot names and the createRuntime hook matches against
+        # /proc/<pid>/cgroup — because the plugin never writes this tree from
+        # inside the pod: the cpu-partition writes are the ergon-cpus hook's,
+        # and runc runs that hook on the node against the node's own mount.
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
             type: Directory
