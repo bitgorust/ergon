@@ -331,3 +331,135 @@ fn set_epoll_busy_poll(ep: RawFd, cfg: &Config) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    use super::*;
+    use crate::endpoint::sealed::{Io, RouteSlot};
+
+    type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    /// A stand-in connection: a real socket and nothing else.
+    struct Stub {
+        fd: OwnedFd,
+        rx: Vec<u8>,
+        tx: Vec<u8>,
+        route: RouteSlot,
+    }
+
+    impl Stub {
+        fn socket() -> R<Self> {
+            let mut fds = [0; 2];
+            // SAFETY: two fresh descriptors are written into `fds`.
+            if unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: each entry of `fds` is a descriptor we now own.
+            let (fd, peer) =
+                unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            drop(peer);
+            Ok(Self {
+                fd,
+                rx: Vec::new(),
+                tx: Vec::new(),
+                route: RouteSlot::default(),
+            })
+        }
+    }
+
+    impl Io for Stub {
+        fn fd(&self) -> RawFd {
+            self.fd.as_raw_fd()
+        }
+        fn rx_space(&mut self) -> &mut [u8] {
+            &mut self.rx
+        }
+        fn tx_queue(&mut self) -> &mut Vec<u8> {
+            &mut self.tx
+        }
+        fn has_buffered_input(&self) -> bool {
+            false
+        }
+        fn set_route(&mut self, route: RouteSlot) {
+            self.route = route;
+        }
+        fn route_state(&self) -> &RouteSlot {
+            &self.route
+        }
+    }
+
+    fn per_queue() -> R<(Epoll, Conns<Stub>)> {
+        let mut cfg = Config::new(Backend::RecvBusy);
+        cfg.per_queue = true;
+        Ok((Epoll::new(&cfg)?, Conns::new()))
+    }
+
+    fn install(ep: &mut Epoll, conns: &mut Conns<Stub>) -> R<usize> {
+        let i = conns.reserve();
+        let stub = Stub::socket()?;
+        ep.add(stub.fd(), conns.id(i))?;
+        conns.install(i, stub);
+        Ok(i)
+    }
+
+    /// Two sockets the cache says share a queue: only the first is polled.
+    /// A slot reused for a connection on another queue must drop the previous
+    /// connection's id, or the replacement is judged to still share the old
+    /// queue, is never chosen as a representative, and its own queue is never
+    /// busy-polled.
+    #[test]
+    fn a_reused_slot_drops_the_previous_connections_queue_id() -> R {
+        let (mut ep, mut conns) = per_queue()?;
+        install(&mut ep, &mut conns)?;
+        install(&mut ep, &mut conns)?;
+        ep.napi.resize(conns.len_slots(), 0);
+        ep.napi.fill(5);
+        ep.rebind = false;
+        ep.pick_reps(&mut conns, false);
+        assert_eq!(ep.reps, [0], "{:?}", ep.reps);
+
+        // Slot 1 is reused for a connection the NIC has put on another queue.
+        ep.remove(conns.at(1).ok_or("slot 1")?.fd());
+        conns.remove(1);
+        let i = install(&mut ep, &mut conns)?;
+        assert_eq!(i, 1, "the slot is reused");
+
+        assert_eq!(ep.napi[1], 0, "the reused slot kept the old queue id");
+        assert!(ep.rebind, "the cache is not marked stale");
+        ep.pick_reps(&mut conns, ep.rebind);
+        assert!(
+            ep.reps.contains(&1),
+            "the replacement is never a polling representative: {:?}",
+            ep.reps
+        );
+        Ok(())
+    }
+
+    /// A periodic look-again has to correct an id that has gone stale (the NIC
+    /// moved a queue under a live socket), not only ids that are still unknown.
+    #[test]
+    fn a_refresh_forgets_every_cached_queue_id() -> R {
+        let (mut ep, mut conns) = per_queue()?;
+        install(&mut ep, &mut conns)?;
+        install(&mut ep, &mut conns)?;
+        ep.napi.resize(conns.len_slots(), 0);
+        ep.napi.fill(9);
+        ep.pick_reps(&mut conns, true);
+        assert!(
+            ep.napi.iter().all(|&id| id == 0),
+            "a stale id survived the refresh: {:?}",
+            ep.napi
+        );
+        Ok(())
+    }
+}

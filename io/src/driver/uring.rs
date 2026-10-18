@@ -185,10 +185,13 @@ impl Uring {
                 napi_id: 0,
             });
         }
+        // A reused slot gives back the previous connection's queue reference
+        // before the new one takes its own: dropping the id without that would
+        // leave the queue registered for a connection that is gone.
+        self.release_napi(i);
         let s = &mut self.slots[i];
         s.generation = s.generation.wrapping_add(1) & GEN_MASK;
         s.napi_known = !self.napi_static;
-        s.napi_id = 0;
         // A socket that has received nothing yet has no NAPI id: its queue is
         // registered on its first receive instead (`on_recv`).
         if self.napi_static {
