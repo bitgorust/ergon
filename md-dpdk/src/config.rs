@@ -96,10 +96,12 @@ pub struct DpdkTransportConfig {
     pub file_prefix: String,
     /// Accept DPDK virtual-device names (e.g. `net_tap0`) instead of PCI BDFs.
     ///
-    /// Test-only: the environment parser sets it only from
-    /// `RUSTERON_DPDK_TEST_VDEV=1`, so production configurations stay PCI-only. When set, the two selectors
-    /// are each validated as a canonical PCI BDF *or* a vdev name, and the
-    /// native EAL emits `--vdev=<name>` instead of `-a <bdf>`.
+    /// Test lever: the environment parser sets it only from
+    /// `RUSTERON_DPDK_TEST_VDEV=1`, so production configurations stay PCI-only.
+    /// When set, the two selectors are each validated as a canonical PCI BDF
+    /// *or* a vdev name, and the native EAL emits `--vdev=<name>` instead of
+    /// `-a <bdf>`. Not a user setting; hidden from the API.
+    #[doc(hidden)]
     pub test_vdev: bool,
     /// Hugepage mount. Must be absolute; hugetlbfs backing is verified natively
     /// at EAL initialization.

@@ -29,8 +29,8 @@ impl ConnId {
         self.idx as usize
     }
 
-    /// An id from its parts, for stand-in drivers in tests. A made-up id
-    /// never reaches a connection: the driver checks the generation.
+    /// Test lever: an id from its parts, for stand-in drivers in tests. A
+    /// made-up id never reaches a connection: the driver checks the generation.
     #[doc(hidden)]
     #[must_use]
     pub const fn from_parts(index: u32, generation: u32) -> Self {

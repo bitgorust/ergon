@@ -4,8 +4,8 @@
 #![allow(missing_docs)]
 
 use ergon_io::placement::{self, HELPER_CPUS_ENV};
-use ergon_io::tune::{CpuSet, Host};
 use ergon_io::{Backend, Config};
+use ergon_tune::{CpuSet, Host};
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 

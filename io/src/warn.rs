@@ -398,20 +398,20 @@ fn keep(line: String) {
     }
 }
 
-/// Tests: from now on, keep a copy of every line written.
+/// Test lever: from now on, keep a copy of every line written.
 #[doc(hidden)]
 pub fn keep_lines() {
     KEEP.store(true, Ordering::Relaxed);
 }
 
-/// Tests: the lines kept so far, taken.
+/// Test lever: the lines kept so far, taken.
 #[doc(hidden)]
 #[must_use]
 pub fn take_lines() -> Vec<String> {
     std::mem::take(&mut *KEPT.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
-/// Tests: forget which lines were written so far, so `once` prints them
+/// Test lever: forget which lines were written so far, so `once` prints them
 /// again. Queued ahead of any later line, so the next report is counted.
 #[doc(hidden)]
 pub fn forget_seen() {

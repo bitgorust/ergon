@@ -325,7 +325,7 @@ pub fn spawn_pinned(
 
 /// A connected socket's addressing, as the route lookup needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SocketFlow {
+pub(crate) struct SocketFlow {
     /// Local address.
     pub local: SocketAddr,
     /// Peer address.
@@ -345,7 +345,7 @@ pub struct SocketFlow {
 ///
 /// # Errors
 /// The socket has no peer (`ENOTCONN`) or is not an IP socket.
-pub fn socket_flow(fd: RawFd) -> io::Result<SocketFlow> {
+pub(crate) fn socket_flow(fd: RawFd) -> io::Result<SocketFlow> {
     // SAFETY: the caller's socket stays open for the duration of the call;
     // the borrow does not outlive it.
     let sock = unsafe { BorrowedFd::borrow_raw(fd) };
@@ -386,10 +386,15 @@ pub fn socket_flow(fd: RawFd) -> io::Result<SocketFlow> {
 /// A timeout below a microsecond waits a microsecond: a zero one would be no
 /// timeout at all.
 ///
+/// Hidden test lever: the netlink exchange is an implementation detail of
+/// [`crate::route::lookup`]; `io/tests/route.rs` uses it to stand in for the
+/// kernel.
+///
 /// # Errors
 /// The socket or a system call fails, `TimedOut` when the kernel does not
 /// answer in time, `InvalidData` when the reply does not fit `reply` or does
 /// not come from the kernel.
+#[doc(hidden)]
 pub fn rtnetlink_exchange(req: &[u8], reply: &mut [u8], timeout: Duration) -> io::Result<usize> {
     let timed_out = |e: io::Error| {
         if e.kind() == io::ErrorKind::WouldBlock {
@@ -498,7 +503,7 @@ pub fn rtnetlink_exchange(req: &[u8], reply: &mut [u8], timeout: Duration) -> io
 
 /// The name of interface `index`, if it exists.
 #[must_use]
-pub fn if_name(index: u32) -> Option<String> {
+pub(crate) fn if_name(index: u32) -> Option<String> {
     let mut buf = [0u8; libc::IF_NAMESIZE];
     // SAFETY: `buf` holds IF_NAMESIZE bytes, as if_indextoname requires.
     let p = unsafe { libc::if_indextoname(index, buf.as_mut_ptr().cast()) };

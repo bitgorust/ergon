@@ -13,11 +13,11 @@ use std::path::PathBuf;
 use ergon_io::checks::{self, DevChecks, DevContext, LoopCpu};
 use ergon_io::placement::{Allowed, CpuError, Why};
 use ergon_io::route::{self, Flow};
-use ergon_io::tune::{
+use ergon_io::{Backend, Config, ConnId};
+use ergon_tune::{
     CheckId, Coalesce, CpuSet, Ethtool, EthtoolCache, EthtoolError, Finding, Host, HostCheckPolicy,
     HotSet, Rings, Role, SILENCE, Status,
 };
-use ergon_io::{Backend, Config, ConnId};
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -861,7 +861,7 @@ fn a_device_not_visible_here_is_one_unknown_line() -> R {
 fn ok_findings_print_nothing_and_unknown_ones_are_information() {
     let ok = Finding {
         id: CheckId::T1,
-        severity: ergon_io::tune::Severity::Warn,
+        severity: ergon_tune::Severity::Warn,
         status: Status::Ok,
         message: "fine".to_owned(),
         evidence: "",

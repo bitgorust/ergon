@@ -40,7 +40,7 @@ fn backend(b: Backend) -> R {
     // lifecycle runs on any pod (the refusal without this is reconnect.rs's
     // `no_cpu_for_the_connect_helper_gives_up_at_once`). On a pod with a
     // second CPU the fallback is off: the run exercises the helper path.
-    let one_cpu = ergon_io::placement::process_cpus(&ergon_io::tune::Host::system())
+    let one_cpu = ergon_io::placement::process_cpus(&ergon_tune::Host::system())
         .0
         .len()
         <= 1;

@@ -2,8 +2,8 @@
 //!
 //! - [`WsDial`] sets it up without blocking: TCP, TLS, then the upgrade.
 //!   [`WsOptions`] holds its limits and timers.
-//! - [`WsConn`] parses server frames in place in the receive buffer (see
-//!   [`crate::stream`]): a payload is a slice of the bytes the kernel wrote.
+//! - [`WsConn`] parses server frames in place in the receive buffer: a
+//!   payload is a slice of the bytes the kernel wrote.
 //! - Close handshake both ways ([`WsConn::close`]; a server Close is answered
 //!   with its code). On a quiet connection, Pings and a Pong timeout; an idle
 //!   timeout. The timers run on the driver's deadline check (every 250 µs),

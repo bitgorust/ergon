@@ -276,7 +276,7 @@ impl Clock {
                 Phase::Running,
             );
             if a.action == Action::Held {
-                utc.rejected_in_a_row = utc.discipline.counters().consecutive_rejects;
+                utc.rejected_in_a_row = utc.discipline.consecutive_rejects();
             } else {
                 utc.last_good = now_ticks;
                 utc.rejected_in_a_row = 0;

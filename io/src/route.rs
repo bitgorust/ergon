@@ -143,20 +143,31 @@ const RTA_DPORT: u16 = 29;
 const RTA_NH_ID: u16 = 30;
 
 /// `RTAX_LOCK`: the bit mask of locked metrics (bit `n` locks metric `n`).
+///
+/// Hidden test lever: the netlink metric ABI. A caller reads the named
+/// accessors on [`Route`] and [`Metrics`] instead.
+#[doc(hidden)]
 pub const RTAX_LOCK: u16 = 1;
 /// `RTAX_MTU`.
+#[doc(hidden)]
 pub const RTAX_MTU: u16 = 2;
 /// `RTAX_RTT`, in units of 1/8 ms.
+#[doc(hidden)]
 pub const RTAX_RTT: u16 = 4;
 /// `RTAX_RTTVAR`, in units of 1/4 ms.
+#[doc(hidden)]
 pub const RTAX_RTTVAR: u16 = 5;
 /// `RTAX_FEATURES`.
+#[doc(hidden)]
 pub const RTAX_FEATURES: u16 = 12;
 /// `RTAX_RTO_MIN`: the route's minimum retransmission timeout, milliseconds.
+#[doc(hidden)]
 pub const RTAX_RTO_MIN: u16 = 13;
 /// `RTAX_QUICKACK`: non-zero when the route disables delayed ACKs.
+#[doc(hidden)]
 pub const RTAX_QUICKACK: u16 = 15;
 /// `RTAX_CC_ALGO`: the congestion control algorithm (a name).
+#[doc(hidden)]
 pub const RTAX_CC_ALGO: u16 = 16;
 const RTAX_MAX: u16 = 17;
 const RTAX_FEATURE_ECN: u32 = 1;
@@ -194,6 +205,9 @@ const RT_SCOPE_LINK: u8 = 253;
 
 /// Largest request [`encode_request`] builds: header, route message,
 /// IPv6 destination and source, interface, mark, protocol and both ports.
+///
+/// Hidden test lever: see [`encode_request`].
+#[doc(hidden)]
 pub const REQUEST_MAX: usize = NLMSG_HDRLEN + RTMSG_LEN + 2 * 20 + 5 * 8;
 
 /// What to do when a connection's route does not disable delayed ACKs.
@@ -368,7 +382,7 @@ impl fmt::Display for RouteError {
 impl std::error::Error for RouteError {}
 
 /// How long the netlink exchange may take, in milliseconds.
-pub const LOOKUP_TIMEOUT_MS: u32 = 100;
+pub(crate) const LOOKUP_TIMEOUT_MS: u32 = 100;
 
 /// A route's metrics (`RTA_METRICS`), as the kernel reports them: a metric
 /// set to 0 is not reported, so 0 and absent are the same.
@@ -381,6 +395,10 @@ pub struct Metrics {
 impl Metrics {
     /// Metric `rtax` (an `RTAX_*` number), if the route sets it. The
     /// congestion control algorithm is a name: see [`Metrics::cc_algo`].
+    ///
+    /// Hidden test lever: raw netlink metric numbers. Prefer [`Route::quickack`],
+    /// [`Route::rto_min_ms`] and [`Metrics::cc_algo`].
+    #[doc(hidden)]
     #[must_use]
     pub fn get(&self, rtax: u16) -> Option<u32> {
         let i = usize::from(rtax).checked_sub(1)?;
@@ -388,6 +406,9 @@ impl Metrics {
     }
 
     /// Whether metric `rtax` is locked (`ip route ... mtu lock 1400`).
+    ///
+    /// Hidden test lever: see [`Metrics::get`].
+    #[doc(hidden)]
     #[must_use]
     pub fn locked(&self, rtax: u16) -> bool {
         self.get(RTAX_LOCK)
@@ -827,6 +848,10 @@ enum WarnKey {
 /// The routes and failures already warned about, so [`QuickAckCheck::Warn`]
 /// reports each once. The driver and the libcurl client share one per
 /// process; tests make their own.
+///
+/// Hidden test lever: a test injects its own warn state through
+/// [`check_with`].
+#[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct Warned(Mutex<Vec<WarnKey>>);
 
@@ -862,6 +887,10 @@ pub(crate) static WARNED: Warned = Warned::new();
 /// (`RTA_OIF`) and mark (`RTA_MARK`) when set, then TCP and both ports
 /// (`RTA_IP_PROTO`, `RTA_SPORT`, `RTA_DPORT`) for policy rules that match
 /// them.
+///
+/// Hidden test lever: the netlink request codec is an implementation detail
+/// of [`lookup`]; `io/tests/route.rs` drives it against a stand-in peer.
+#[doc(hidden)]
 #[must_use]
 pub fn encode_request(flow: &Flow, seq: u32, out: &mut [u8; REQUEST_MAX]) -> usize {
     let (family, bits, dst) = ip_parts(flow.peer.ip());
@@ -983,11 +1012,14 @@ fn u32_of(b: &[u8]) -> Result<u32, RouteError> {
 /// Parses the kernel's answer to the request numbered `seq`: the route, or
 /// the kernel's error.
 ///
+/// Hidden test lever: see [`encode_request`].
+///
 /// # Errors
 /// [`RouteError::Kernel`] when the kernel refused the lookup (no route),
 /// [`RouteError::Malformed`] for anything that is not a complete, consistent
 /// answer to `seq`. Every length is checked; nothing in the reply can make
 /// this read out of bounds or panic.
+#[doc(hidden)]
 pub fn decode_reply(reply: &[u8], seq: u32) -> Result<Route, RouteError> {
     let malformed = RouteError::Malformed;
     let len = ne_u32(reply, 0).ok_or(RouteError::Malformed("shorter than a netlink header"))?;
@@ -1157,6 +1189,9 @@ static LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// How many route lookups (netlink exchanges, see [`lookup`]) this process
 /// has made. The check makes one per connection it sets up and none per
 /// request or poll; this lets a test or a health check confirm it.
+///
+/// Hidden test lever: a lookup counter for tests and health checks.
+#[doc(hidden)]
 #[must_use]
 pub fn lookups() -> u64 {
     LOOKUPS.load(std::sync::atomic::Ordering::Relaxed)
@@ -1170,6 +1205,9 @@ thread_local! {
 /// How many route lookups the calling thread has made: a test (or a
 /// health check) can confirm with it that a polling thread makes none under
 /// [`QuickAckCheck::Warn`].
+///
+/// Hidden test lever: see [`lookups`].
+#[doc(hidden)]
 #[must_use]
 pub fn lookups_here() -> u64 {
     LOOKUPS_HERE.with(std::cell::Cell::get)
@@ -1178,7 +1216,7 @@ pub fn lookups_here() -> u64 {
 /// Asks the kernel which route `flow` uses.
 ///
 /// On Linux: one request and one reply on a fresh `NETLINK_ROUTE` socket,
-/// waiting at most [`LOOKUP_TIMEOUT_MS`]; the interface name is filled in
+/// waiting at most 100 ms; the interface name is filled in
 /// from its index. Elsewhere: [`RouteError::Unsupported`].
 ///
 /// # Errors
@@ -1232,6 +1270,10 @@ pub fn lookup(flow: &Flow) -> Result<Route, RouteError> {
 /// Under [`QuickAckCheck::Require`] only: the route has no quickack and is
 /// not local ([`QuickAckError::Missing`]), or it could not be read
 /// ([`QuickAckError::Lookup`]).
+///
+/// Hidden test lever: the `lookup` and `warned` parameters exist so a test
+/// can inject a stand-in peer and its own warn state. Use [`check_socket`].
+#[doc(hidden)]
 pub fn check_with(
     policy: QuickAckCheck,
     flow: Result<Flow, RouteError>,

@@ -37,7 +37,7 @@ pub struct StreamStats {
 }
 
 /// A connected TLS stream with its receive buffer and send queue.
-pub(crate) struct TlsStream {
+pub struct TlsStream {
     sock: TcpStream,
     buf: Box<[u8]>,
     head: usize,

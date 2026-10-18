@@ -294,6 +294,7 @@ struct Run {
     disc: Discipline,
     sampler: Sampler,
     cap_ppm: u32,
+    sane_ppm: u32,
     start_tick: u64,
     started: bool,
     seen: Vec<Seen>,
@@ -342,6 +343,7 @@ impl Run {
             disc,
             sampler,
             cap_ppm: cfg.cap_ppm,
+            sane_ppm: cfg.sane_ppm,
             started: false,
             seen: Vec::new(),
             between: Vec::new(),
@@ -457,7 +459,6 @@ impl Run {
     fn check_factor(&self, a: &Adjustment) {
         let m0 = self.disc.nominal_mult();
         let lim = u64::try_from(u128::from(m0) * u128::from(self.cap_ppm) / 1_000_000).unwrap_or(0);
-        assert_eq!(self.disc.mult_limit(), lim, "the limit is floor(m0 * cap)");
         let mult = a.clock.params().mult;
         assert!(
             mult >= m0 - lim && mult <= m0 + lim,
@@ -466,7 +467,7 @@ impl Run {
         let cap = i64::from(self.cap_ppm) * 1_000_000;
         assert!(a.rate_ppt.abs() <= cap, "rate {} over the cap", a.rate_ppt);
         // P9: no slope over the sanity limit is ever a rate
-        let sane = i64::from(self.disc.config().sane_ppm) * 1_000_000;
+        let sane = i64::from(self.sane_ppm) * 1_000_000;
         assert!(
             a.freq_ppt.abs() <= sane,
             "frequency {} over the sanity limit",
@@ -478,6 +479,33 @@ impl Run {
         if a.action != Action::Held && a.rate_ppt == -cap {
             assert_eq!(mult, m0 - lim, "at the cap, exactly the limit");
         }
+    }
+
+    /// ρ̂ as the last update reported it: the controller's estimate.
+    fn freq_ppt(&self) -> i64 {
+        self.seen.last().map_or(0, |s| s.adjustment.freq_ppt)
+    }
+
+    /// How many updates carried `flag`.
+    fn flagged(&self, flag: u32) -> u64 {
+        u64::try_from(
+            self.seen
+                .iter()
+                .filter(|s| s.adjustment.flags & flag != 0)
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    /// Samples the controller held (rejected).
+    fn rejects(&self) -> u64 {
+        u64::try_from(
+            self.seen
+                .iter()
+                .filter(|s| s.adjustment.action == Action::Held)
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
     }
 
     /// Steps applied after the start update.
@@ -681,7 +709,6 @@ fn hand_over(run: &mut Run, rng: &mut Rng, fallback: bool) -> Res {
         anchored.to_ns(install) - old.to_ns(install) <= old.ticks_to_ns(install - new_ticks) + 2,
         "a hand-over runs ahead by at most its bracket"
     );
-    assert_eq!(run.disc.freq_ppt(), 0, "the slope state is reset");
     assert_eq!(
         run.disc.nominal_mult(),
         new.params().mult,
@@ -942,7 +969,7 @@ fn a_wall_step_is_slewed_and_never_spoils_the_frequency() -> Res {
         for r in [&mut control, &mut run] {
             r.host.linux = linux;
         }
-        let before = run.disc.freq_ppt();
+        let before = run.freq_ppt();
         let at = run.host.tick + 1;
         run.host.wall.step(at, delta);
         let a = run.second()?;
@@ -1058,7 +1085,10 @@ fn the_start_steps_forward_once_and_never_back() -> Res {
                 "seed {seed}: one step only"
             );
         }
-        assert_eq!(run.disc.counters().steps, u64::from(first.residual_ns > 0));
+        assert_eq!(
+            run.flagged(flags::STEPPED),
+            u64::from(first.residual_ns > 0)
+        );
     }
     Ok(())
 }
@@ -1086,7 +1116,7 @@ fn a_glitched_step_probe_changes_nothing() -> Res {
         );
         assert_eq!(a.wall_step_ns, 0, "seed {seed}: not a step");
         assert_eq!(a.clock, b.clock, "seed {seed}: the same clock installed");
-        assert_eq!(glitched.disc.counters().d_glitches, 1);
+        assert_eq!(glitched.flagged(flags::D_GLITCH), 1);
         for _ in 0..5 {
             let (a, b) = (glitched.second()?, clean.second()?);
             assert_eq!(a.clock, b.clock, "seed {seed}: the same clocks after it");
@@ -1132,7 +1162,7 @@ fn a_glitched_first_probe_is_outvoted() -> Res {
     run.host.glitch = 0;
     run.seconds(4)?;
     assert_eq!(
-        run.disc.counters().d_glitches,
+        run.flagged(flags::D_GLITCH),
         2,
         "outvoted at the second disagreement"
     );
@@ -1152,26 +1182,20 @@ fn a_glitched_first_probe_is_outvoted() -> Res {
 /// P8: a sample taken across interrupts (every bracket wide) is rejected:
 /// the clock is re-anchored at the frequency estimate alone, the phase
 /// term dropped, with no step, and the estimate kept; the next accepted
-/// sample's slope spans both intervals. Five seconds without an accepted
-/// sample is holdover.
+/// sample's slope spans both intervals.
 #[test]
 fn a_wide_sample_is_held_at_the_frequency_estimate() -> Res {
     for seed in 0..200_u64 {
         let rho = -10_134_000;
         let mut run = settled(rho, 1.0, 10, seed)?;
-        let before = run.disc.freq_ppt();
+        let before = run.freq_ppt();
         let old = run.clock;
         run.host.storm = 20_000;
         let held = run.second()?;
         assert_eq!(held.action, Action::Held, "seed {seed}");
         assert_ne!(held.flags & flags::REJECTED, 0);
-        assert_eq!(
-            held.flags & flags::HOLDOVER,
-            0,
-            "one reject is not holdover"
-        );
-        assert_eq!(run.disc.freq_ppt(), before, "the estimate is kept");
-        assert_eq!(run.disc.counters().rejects, 1);
+        assert_eq!(held.freq_ppt, before, "the estimate is kept");
+        assert_eq!(run.rejects(), 1);
         let m0 = i128::from(run.disc.nominal_mult());
         let want = m0 + (m0 * i128::from(before) + PPT / 2 * i128::from(before.signum())) / PPT;
         assert_eq!(
@@ -1189,18 +1213,7 @@ fn a_wide_sample_is_held_at_the_frequency_estimate() -> Res {
             "seed {seed}: {}",
             next.freq_ppt
         );
-        assert_eq!(run.disc.counters().consecutive_rejects, 0);
-        // holdover once nothing was accepted for 5 s
-        run.host.storm = 20_000;
-        let flagged: Vec<bool> = (0..7)
-            .map(|_| run.second().map(|a| a.flags & flags::HOLDOVER != 0))
-            .collect::<Result<_, _>>()?;
-        assert_eq!(
-            flagged,
-            [false, false, false, false, true, true, true],
-            "seed {seed}"
-        );
-        run.host.storm = 0;
+        assert_eq!(run.disc.consecutive_rejects(), 0);
     }
     Ok(())
 }
@@ -1366,9 +1379,10 @@ fn scenario_chrony_slew_of_533_ppm_is_followed_at_the_cap() -> Res {
         true,
     )?;
     assert!(
-        run.disc.counters().slew_limited_s >= 50,
-        "the cap bound: {:?}",
-        run.disc.counters()
+        run.flagged(flags::SLEW_LIMITED) >= 50,
+        "the cap bound: {} of {}",
+        run.flagged(flags::SLEW_LIMITED),
+        run.reanchors
     );
     Ok(())
 }
@@ -1411,7 +1425,7 @@ fn scenario_timesyncd_boot_slew_of_3546_ppm() -> Res {
         true,
     )?;
     assert!(
-        run.disc.counters().fast_slews >= 9,
+        run.flagged(flags::FAST_SLEW_OR_JUMP) >= 9,
         "over the sanity limit: never a rate"
     );
     Ok(())
@@ -1510,7 +1524,7 @@ fn scenario_rate_step_of_50_ppm_with_three_rejects() -> Res {
         },
         true,
     )?;
-    assert_eq!(run.disc.counters().rejects, 3);
+    assert_eq!(run.rejects(), 3);
     Ok(())
 }
 
@@ -1576,7 +1590,7 @@ fn scenario_wall_step_of_five_milliseconds_is_slewed_at_the_cap() -> Res {
         true,
     )?;
     assert_eq!(run.running_steps(), 0);
-    assert_eq!(run.disc.counters().wall_steps, 1);
+    assert_eq!(run.flagged(flags::WALL_STEP), 1);
     Ok(())
 }
 
@@ -1683,7 +1697,7 @@ fn scenario_step_of_five_milliseconds_without_a_step_probe() -> Res {
         false,
     )?;
     assert_eq!(
-        run.disc.counters().wall_steps,
+        run.flagged(flags::WALL_STEP),
         1,
         "inferred from the innovation"
     );
@@ -1777,8 +1791,8 @@ fn scenario_a_glitched_step_probe_is_ignored() -> Res {
     )?;
     eprintln!("scenario probe glitch: peak {peak} ns (spec 100)");
     assert!(peak <= 120, "{peak}");
-    assert!(run.disc.counters().d_glitches >= 1);
-    assert_eq!(run.disc.counters().wall_steps, 0);
+    assert!(run.flagged(flags::D_GLITCH) >= 1);
+    assert_eq!(run.flagged(flags::WALL_STEP), 0);
     Ok(())
 }
 
@@ -1803,7 +1817,7 @@ fn scenario_a_glitch_then_a_real_step() -> Res {
         },
         true,
     )?;
-    assert_eq!(run.disc.counters().wall_steps, 1, "the step recognised");
+    assert_eq!(run.flagged(flags::WALL_STEP), 1, "the step recognised");
     Ok(())
 }
 
@@ -1827,7 +1841,7 @@ fn scenario_counter_jump() -> Res {
         },
         true,
     )?;
-    assert_eq!(run.disc.counters().fast_slews, 1, "flagged once");
-    assert_eq!(run.disc.counters().wall_steps, 0, "not a wall step");
+    assert_eq!(run.flagged(flags::FAST_SLEW_OR_JUMP), 1, "flagged once");
+    assert_eq!(run.flagged(flags::WALL_STEP), 0, "not a wall step");
     Ok(())
 }

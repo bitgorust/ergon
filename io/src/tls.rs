@@ -29,21 +29,25 @@ use rustls::{ClientConfig, ConnectionTrafficSecrets, RootCertStore};
 use crate::error::{Error, Result};
 
 /// TLS record header length.
+///
+/// Hidden test lever: `io/benches` counts record headers with it. The record
+/// layer itself is not part of the API.
+#[doc(hidden)]
 pub const HEADER_LEN: usize = 5;
 /// AEAD tag length for every TLS 1.3 suite.
-pub const TAG_LEN: usize = 16;
+pub(crate) const TAG_LEN: usize = 16;
 /// Largest TLS 1.3 record on the wire: 2^14 plaintext + content type + padding + tag.
-pub const MAX_RECORD: usize = HEADER_LEN + (1 << 14) + 256;
+pub(crate) const MAX_RECORD: usize = HEADER_LEN + (1 << 14) + 256;
 
 /// Largest post-handshake handshake message this layer will reassemble. A
 /// `NewSessionTicket` is far smaller; the bound stops a peer from making us
 /// buffer without limit.
-pub const MAX_HS_MSG: usize = 1 << 18;
+pub(crate) const MAX_HS_MSG: usize = 1 << 18;
 
 const CT_ALERT: u8 = 21;
 const CT_HANDSHAKE: u8 = 22;
 /// Application-data content type.
-pub const CT_APPDATA: u8 = 23;
+pub(crate) const CT_APPDATA: u8 = 23;
 const HS_NEW_SESSION_TICKET: u8 = 4;
 const HS_KEY_UPDATE: u8 = 24;
 
@@ -274,6 +278,10 @@ impl Direction {
 }
 
 /// Result of opening one record in place.
+///
+/// Hidden test lever: the post-handshake record layer is not part of the API;
+/// `io/tests/tls_records.rs` and `io/benches` drive it directly.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opened {
     /// Application data at `record[HEADER_LEN..HEADER_LEN + len]`.
@@ -289,6 +297,11 @@ pub enum Opened {
 /// reassembly across records, dispatch — and the cipher suite's
 /// confidentiality limit is this type's, because the kernel API leaves those
 /// to the caller.
+///
+/// Hidden test lever: a post-handshake record layer is an implementation
+/// detail of [`crate::WsConn`] and [`crate::HttpConn`]. `io/tests/tls_records.rs`
+/// and `io/benches` exercise it directly.
+#[doc(hidden)]
 pub struct RecordLayer {
     rx: Direction,
     tx: Direction,
@@ -641,8 +654,11 @@ impl RecordLayer {
 /// Runs the TLS 1.3 handshake over a blocking stream and returns the record layer
 /// plus any bytes already read that belong to records after the handshake.
 ///
+/// Hidden test lever: see [`RecordLayer`].
+///
 /// # Errors
 /// I/O failure, a TLS error, or a peer that closes during the handshake.
+#[doc(hidden)]
 pub fn handshake<S: Read + Write>(
     stream: &mut S,
     config: Arc<ClientConfig>,
@@ -656,8 +672,11 @@ pub fn handshake<S: Read + Write>(
 /// Like [`handshake`] but returns the raw traffic secrets, so callers (the TLS
 /// micro-benchmark) can drive a different AEAD implementation.
 ///
+/// Hidden test lever: see [`RecordLayer`].
+///
 /// # Errors
 /// I/O failure, a TLS error, or a peer that closes during the handshake.
+#[doc(hidden)]
 pub fn handshake_raw<S: Read + Write>(
     stream: &mut S,
     config: Arc<ClientConfig>,
@@ -674,7 +693,7 @@ pub fn handshake_raw<S: Read + Write>(
 
 /// A client handshake advanced without blocking: [`TlsHandshake::step`] reads
 /// and writes what the socket accepts and returns at the first `WouldBlock`.
-pub struct TlsHandshake {
+pub(crate) struct TlsHandshake {
     conn: UnbufferedClientConnection,
     inc: Vec<u8>,
     inc_len: usize,

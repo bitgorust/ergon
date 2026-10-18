@@ -62,6 +62,10 @@ impl DnsConfig {
 }
 
 /// Name servers from `resolv.conf` text (IPv4 only).
+///
+/// Hidden test lever: [`DnsConfig::system`] parses the system files; a caller
+/// builds [`DnsConfig`] from its fields.
+#[doc(hidden)]
 #[must_use]
 pub fn parse_resolv_conf(text: &str) -> Vec<SocketAddr> {
     text.lines()
@@ -77,6 +81,9 @@ pub fn parse_resolv_conf(text: &str) -> Vec<SocketAddr> {
 }
 
 /// IPv4 entries from `/etc/hosts` text (first address wins per name).
+///
+/// Hidden test lever: see [`parse_resolv_conf`].
+#[doc(hidden)]
 #[must_use]
 pub fn parse_hosts(text: &str) -> HashMap<String, Ipv4Addr> {
     let mut m = HashMap::new();
@@ -326,8 +333,12 @@ fn random_u16() -> Result<u16> {
 
 /// Encodes a recursive A query for `host`.
 ///
+/// Hidden test lever: the wire codec is an implementation detail of
+/// [`Resolver`]; `io/tests/dns.rs` drives it directly.
+///
 /// # Errors
 /// The name is empty, too long, or has an empty or over-long label.
+#[doc(hidden)]
 pub fn encode_query(host: &str, id: u16) -> Result<Vec<u8>> {
     let host = host.trim_end_matches('.');
     if host.is_empty() || host.len() > MAX_NAME {
@@ -353,9 +364,12 @@ pub fn encode_query(host: &str, id: u16) -> Result<Vec<u8>> {
 /// Parses an answer to query `id`: `Ok(None)` if it is not an answer to it,
 /// otherwise the A records and the smallest TTL.
 ///
+/// Hidden test lever: see [`encode_query`].
+///
 /// # Errors
 /// The server reported an error, the answer was truncated or malformed, or it
 /// held no A record.
+#[doc(hidden)]
 pub fn parse_answer(msg: &[u8], id: u16) -> Result<Option<(Vec<Ipv4Addr>, u32)>> {
     let bad = || Error::Dns("malformed answer".into());
     let u16_at = |i: usize| -> Result<u16> {

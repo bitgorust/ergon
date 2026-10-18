@@ -87,23 +87,16 @@ const FLOOR_SAMPLES: usize = 64;
 /// No slope over an interval shorter than this, ns: two brackets' noise
 /// over less than 10 ms is a rate error of several ppm.
 const MIN_SLOPE_NS: i128 = 10_000_000;
-/// No accepted sample for this long, ns: [`flags::HOLDOVER`].
-const HOLDOVER_NS: i128 = 5_000_000_000;
 /// A residual over this, ns: [`flags::CONVERGING`].
 const CONVERGING_NS: i64 = 10_000;
 /// Where `CLOCK_REALTIME - CLOCK_MONOTONIC` is not available, an
 /// innovation this large, ns, is taken for a wall-clock step.
 const INFERRED_STEP_NS: i128 = 1_000_000;
 
-/// The bits of [`Adjustment::flags`]. Two of them,
-/// [`LEAP_PENDING`](crate::advanced::discipline::flags::LEAP_PENDING) and
-/// [`UNSYNCHRONISED`](crate::advanced::discipline::flags::UNSYNCHRONISED), are the
-/// caller's to set from `adjtimex`.
+/// The bits of [`Adjustment::flags`]: what the controller decided.
 pub mod flags {
     /// The sample was rejected (its bracket too wide): held at ρ̂.
     pub const REJECTED: u32 = 1 << 0;
-    /// No accepted sample for 5 s.
-    pub const HOLDOVER: u32 = 1 << 1;
     /// The rate cap bound: the clock follows the wall clock at the cap.
     pub const SLEW_LIMITED: u32 = 1 << 2;
     /// The residual was over 10 µs.
@@ -114,10 +107,6 @@ pub mod flags {
     pub const STEPPED: u32 = 1 << 5;
     /// The start update ([`Phase::Start`](super::Phase::Start)).
     pub const START: u32 = 1 << 6;
-    /// `adjtimex` says a leap second is pending (set by the caller).
-    pub const LEAP_PENDING: u32 = 1 << 7;
-    /// `adjtimex` says the wall clock is unsynchronised (set by the caller).
-    pub const UNSYNCHRONISED: u32 = 1 << 8;
     /// The wall clock moved faster than the sanity limit against the counter.
     ///
     /// With no step seen ([`sane_ppm`](super::DisciplineConfig::sane_ppm)):
@@ -164,7 +153,7 @@ pub struct DisciplineConfig {
     /// the band (a wall-clock step) the controller runs as without one,
     /// and the band returns once the residual is within a quarter of it
     /// (hysteresis: noise near the edge never flips the factor). Rejected
-    /// samples and snapshots inside the band also keep the factor m₀.
+    /// samples inside the band also keep the factor m₀.
     pub unit_rate_within_ns: Option<u64>,
 }
 
@@ -270,25 +259,6 @@ pub struct Adjustment {
     pub flags: u32,
 }
 
-/// Running totals since the discipline was made.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Counters {
-    /// Samples rejected.
-    pub rejects: u64,
-    /// Samples rejected since the last accepted one.
-    pub consecutive_rejects: u64,
-    /// Wall-clock steps seen.
-    pub wall_steps: u64,
-    /// Forward steps applied to the clock.
-    pub steps: u64,
-    /// Step probes ignored as glitches.
-    pub d_glitches: u64,
-    /// Updates (one a second) at which the rate cap bound.
-    pub slew_limited_s: u64,
-    /// Slopes over the sanity limit ([`flags::FAST_SLEW_OR_JUMP`]).
-    pub fast_slews: u64,
-}
-
 /// The discipline of one clock: its owner's state, a plain value.
 ///
 /// Made from the calibration's clock ([`new`](Self::new)), it keeps the
@@ -318,12 +288,11 @@ pub struct Discipline {
     /// or none yet).
     errors: [u32; FLOOR_SAMPLES],
     next: usize,
-    /// The last accepted sample's ticks (the calibration's anchor before
-    /// the first): for the holdover flag.
-    last_accepted: u64,
     /// The wall offset after the last accepted sample, ns.
     wall_offset: i64,
-    counters: Counters,
+    /// Samples rejected since the last accepted one: the owner's health
+    /// check reports it.
+    consecutive_rejects: u64,
     /// Inside the dead band ([`DisciplineConfig::unit_rate_within_ns`]):
     /// the applied rate is 0.
     in_band: bool,
@@ -356,17 +325,10 @@ impl Discipline {
             d_candidate: None,
             errors: [u32::MAX; FLOOR_SAMPLES],
             next: 0,
-            last_accepted: p.base_ticks,
             wall_offset: 0,
-            counters: Counters::default(),
+            consecutive_rejects: 0,
             in_band: cfg.unit_rate_within_ns.is_some(),
         })
-    }
-
-    /// The configuration.
-    #[must_use]
-    pub const fn config(&self) -> &DisciplineConfig {
-        &self.cfg
     }
 
     /// The calibrated factor m₀, ns per tick, 32.32: durations measured in
@@ -376,28 +338,11 @@ impl Discipline {
         self.m0
     }
 
-    /// The factor's limit about m₀: ⌊m₀·cap⌋.
+    /// Samples rejected since the last accepted one: the owner's health
+    /// check reports it.
     #[must_use]
-    pub const fn mult_limit(&self) -> u64 {
-        self.lim
-    }
-
-    /// ρ̂: the wall clock's rate against the calibrated rate, ppt.
-    #[must_use]
-    pub const fn freq_ppt(&self) -> i64 {
-        self.rho_hat
-    }
-
-    /// The wall clock less the clock after the last accepted update, ns.
-    #[must_use]
-    pub const fn wall_offset_ns(&self) -> i64 {
-        self.wall_offset
-    }
-
-    /// The running totals.
-    #[must_use]
-    pub const fn counters(&self) -> Counters {
-        self.counters
+    pub const fn consecutive_rejects(&self) -> u64 {
+        self.consecutive_rejects
     }
 
     /// One update from a sample taken by `sampler` from `src`, with the
@@ -452,7 +397,7 @@ impl Discipline {
             return self.hold(clock, sample, at_ticks, theta);
         }
         self.remember_error(clamp_u32(sample.error_ns));
-        self.counters.consecutive_rejects = 0;
+        self.consecutive_rejects = 0;
         let mut flags = if phase == Phase::Start {
             flags::START
         } else {
@@ -479,7 +424,6 @@ impl Discipline {
             }
             WallStep::Step(delta) => {
                 flags |= flags::WALL_STEP;
-                self.counters.wall_steps += 1;
                 delta
             }
         };
@@ -495,7 +439,6 @@ impl Discipline {
                 self.rho_hat = saturate(rho);
             } else {
                 flags |= flags::FAST_SLEW_OR_JUMP;
-                self.counters.fast_slews += 1;
             }
         }
         self.prev = Some((sample.mid_ticks, sample.wall_ns));
@@ -515,14 +458,12 @@ impl Discipline {
         let rate = wanted.clamp(-cap, cap);
         if rate != wanted {
             flags |= flags::SLEW_LIMITED;
-            self.counters.slew_limited_s += 1;
         }
         let mult = self.mult_at(rate);
         let step_ns = u64::try_from(step).unwrap_or(u64::MAX);
         let retuned = clock.retuned(at_ticks, mult, step_ns);
         let action = if step > 0 && retuned.is_some() {
             flags |= flags::STEPPED;
-            self.counters.steps += 1;
             Action::Stepped { ns: step_ns }
         } else {
             Action::Slewed
@@ -537,7 +478,6 @@ impl Discipline {
         if residual.abs() > CONVERGING_NS {
             flags |= flags::CONVERGING;
         }
-        self.last_accepted = sample.mid_ticks;
         Adjustment {
             clock: retuned.unwrap_or(*clock),
             action,
@@ -554,13 +494,9 @@ impl Discipline {
     /// A rejected sample: re-anchored at ρ̂ alone (the phase term dropped:
     /// it is never applied twice), the state kept.
     fn hold(&mut self, clock: &Clock, sample: &Sample, at_ticks: u64, theta: i128) -> Adjustment {
-        self.counters.rejects += 1;
-        self.counters.consecutive_rejects += 1;
+        self.consecutive_rejects += 1;
         self.remember_error(u32::MAX);
         let mut flags = flags::REJECTED;
-        if self.elapsed(self.last_accepted, at_ticks) >= HOLDOVER_NS {
-            flags |= flags::HOLDOVER;
-        }
         if self.wall_offset.abs() > CONVERGING_NS {
             flags |= flags::CONVERGING;
         }
@@ -615,7 +551,6 @@ impl Discipline {
         // not confirmed: keep the trusted probe, unless this one agrees
         // with the last unconfirmed one (then the trusted one was the
         // glitch, or a step went unconfirmed: either way D is here now)
-        self.counters.d_glitches += 1;
         if let Some((c, cw)) = self.d_candidate
             && (i128::from(d) - i128::from(c)).unsigned_abs()
                 <= (4 * (u128::from(w) + u128::from(cw))).max(1_000)
@@ -626,18 +561,6 @@ impl Discipline {
             self.d_candidate = Some((d, w));
         }
         WallStep::Glitch
-    }
-
-    /// The clock at ρ̂ alone, re-anchored at `at_ticks` with no phase term
-    /// and no step: what may be handed to code that will not follow the
-    /// owner (a snapshot for a benchmark, another process, C code). It
-    /// drifts from the disciplined clock at the wall clock's rate change
-    /// since, never at a slew's.
-    #[must_use]
-    pub fn snapshot(&self, clock: &Clock, at_ticks: u64) -> Clock {
-        clock
-            .retuned(at_ticks, self.mult_at(self.held_rate()), 0)
-            .unwrap_or(*clock)
     }
 
     /// The rate with no phase term, ppt: 0 inside the dead band, else ρ̂
@@ -704,7 +627,6 @@ impl Discipline {
         self.rho_hat = 0;
         self.errors = [u32::MAX; FLOOR_SAMPLES];
         self.next = 0;
-        self.last_accepted = new_ticks;
         Ok(anchored)
     }
 
@@ -922,14 +844,11 @@ mod tests {
                 assert_eq!(a.clock.to_ns(at), c.to_ns(at) + ns);
                 assert_eq!(a.wall_offset_ns, theta - ns.cast_signed());
                 assert_ne!(a.flags & flags::STEPPED, 0);
-                assert_eq!(d.counters().steps, 1);
             } else {
                 assert_eq!(a.action, Action::Slewed, "{phase:?} {theta}");
                 assert_eq!(a.clock.to_ns(at), c.to_ns(at));
                 assert_eq!(a.wall_offset_ns, theta);
-                assert_eq!(d.counters().steps, 0);
             }
-            assert_eq!(d.wall_offset_ns(), a.wall_offset_ns);
             assert_eq!(
                 a.rate_ppt,
                 (500 * a.wall_offset_ns).clamp(-500_000_000, 500_000_000),
@@ -952,7 +871,6 @@ mod tests {
             let lim = u64::try_from(u128::from(M0) * u128::from(cap) / 1_000_000)?;
             for theta in [10_000_000, -10_000_000] {
                 let (c, mut d) = discipline(cfg)?;
-                assert_eq!(d.mult_limit(), lim);
                 let a = d.update_at(
                     &c,
                     &sample(5_000_000, theta, 30, None),
@@ -975,14 +893,13 @@ mod tests {
                 5_000_100,
             );
             assert_eq!(a.flags & flags::SLEW_LIMITED, 0, "{theta} ns at cap {cap}");
-            assert_eq!(d.counters().slew_limited_s, 0);
         }
         Ok(())
     }
 
     /// A sample whose error bound is over twice the floor plus 250 ns is
     /// rejected; at the limit it is accepted. A rejected sample is held at
-    /// ρ̂ (no phase term) and changes nothing but the counters.
+    /// ρ̂ (no phase term) and changes nothing but the reject count.
     #[test]
     fn the_reject_limit_is_twice_the_floor_and_250_ns() -> Res {
         let (mut c, mut d) = discipline(DisciplineConfig::default())?;
@@ -994,8 +911,7 @@ mod tests {
         );
         assert_eq!(first.action, Action::Slewed);
         c = first.clock;
-        let rho = d.freq_ppt();
-        assert_eq!(rho, 300_000, "300 ns over the second");
+        assert_eq!(first.freq_ppt, 300_000, "300 ns over the second");
         let at_limit = d.update_at(
             &c,
             &sample(2_000_000_000, 600, 450, None),
@@ -1004,7 +920,7 @@ mod tests {
         );
         assert_eq!(at_limit.action, Action::Slewed, "2 x 100 + 250 is accepted");
         c = at_limit.clock;
-        let rho = d.freq_ppt();
+        let rho = at_limit.freq_ppt;
         let before = d.clone();
         let over = d.update_at(
             &c,
@@ -1014,7 +930,7 @@ mod tests {
         );
         assert_eq!(over.action, Action::Held, "451 is rejected");
         assert_eq!(over.flags & flags::REJECTED, flags::REJECTED);
-        assert_eq!(d.freq_ppt(), rho);
+        assert_eq!(over.freq_ppt, rho, "the estimate is kept");
         assert_eq!(
             (d.prev, d.d_prev, d.wall_offset),
             (before.prev, before.d_prev, before.wall_offset)
@@ -1031,39 +947,7 @@ mod tests {
             over.wall_offset_ns, at_limit.wall_offset_ns,
             "the last accepted offset"
         );
-        assert_eq!(d.counters().rejects, 1);
-        assert_eq!(d.counters().consecutive_rejects, 1);
-        Ok(())
-    }
-
-    /// Holdover once nothing has been accepted for 5 s, to the tick.
-    #[test]
-    fn holdover_after_five_seconds_without_a_sample() -> Res {
-        let (c, mut d) = discipline(DisciplineConfig::default())?;
-        let a = d.update_at(
-            &c,
-            &sample(1_000_000_000, 0, 30, None),
-            Phase::Running,
-            1_000_000_000,
-        );
-        let c = a.clock;
-        let early = d.update_at(
-            &c,
-            &sample(5_999_999_000, 0, 1_000, None),
-            Phase::Running,
-            5_999_999_999,
-        );
-        assert_eq!(
-            early.flags & (flags::REJECTED | flags::HOLDOVER),
-            flags::REJECTED
-        );
-        let late = d.update_at(
-            &c,
-            &sample(6_000_000_000, 0, 1_000, None),
-            Phase::Running,
-            6_000_000_000,
-        );
-        assert_eq!(late.flags & flags::HOLDOVER, flags::HOLDOVER);
+        assert_eq!(d.consecutive_rejects(), 1);
         Ok(())
     }
 
@@ -1167,32 +1051,6 @@ mod tests {
             assert_eq!(b.wall_step_ns, step, "{off}");
             assert_eq!(b.freq_ppt, if step == 0 { off * 1_000 } else { 0 });
         }
-        Ok(())
-    }
-
-    /// A snapshot runs at ρ̂ from where the clock reads, with no phase term.
-    #[test]
-    fn a_snapshot_runs_at_the_frequency_estimate() -> Res {
-        let (c, mut d) = discipline(DisciplineConfig::default())?;
-        let a = d.update_at(
-            &c,
-            &sample(1_000_000_000, 2_000, 30, None),
-            Phase::Running,
-            1_000_000_000,
-        );
-        assert_eq!(d.freq_ppt(), 2_000_000);
-        assert_ne!(
-            a.rate_ppt,
-            d.freq_ppt(),
-            "the slewing clock has a phase term"
-        );
-        let snap = d.snapshot(&a.clock, 1_500_000_000);
-        assert_eq!(snap.to_ns(1_500_000_000), a.clock.to_ns(1_500_000_000));
-        let m0 = i128::from(M0);
-        assert_eq!(
-            i128::from(snap.params().mult),
-            m0 + (m0 * 2_000_000 + PPT / 2) / PPT
-        );
         Ok(())
     }
 
@@ -1449,7 +1307,7 @@ mod tests {
 
     /// The Linux fallback in UTC with a 1 µs dead band: its factor stays
     /// exactly one (its read an add) while the residual is bracket noise,
-    /// rejected samples and snapshots included; a 50 ms wall step takes it
+    /// rejected samples included; a 50 ms wall step takes it
     /// out (slewing at the cap) until the residual is within 250 ns, then
     /// it stays; noise around 900 ns inside the band never flips it.
     #[test]
@@ -1483,7 +1341,6 @@ mod tests {
             assert_eq!(a.clock.params().mult, 1 << 32, "update {k}: θ {theta}");
             c = a.clock;
         }
-        assert_eq!(d.snapshot(&c, tick + 200).params().mult, 1 << 32);
         // a 50 ms wall step (the probe moves with it)
         let step = 50_000_000;
         let mut back = None;

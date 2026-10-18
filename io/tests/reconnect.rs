@@ -352,7 +352,7 @@ impl Connector<u32> for OneCpuPod {
         Err(ergon_io::placement::CpuError::NoSpareCpu {
             helper: ergon_io::placement::HelperThread::Dial,
             polling: Some(0),
-            allowed: ergon_io::tune::CpuSet::of([0]),
+            allowed: ergon_tune::CpuSet::of([0]),
         }
         .into())
     }
