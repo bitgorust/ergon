@@ -332,6 +332,34 @@ got = (analyse.loss_free(r, "isolated:z", 288), analyse.keeps_up(r, "isolated:z"
 assert got == ("750,000/s", "250,000/s", "500,000/s"), got
 PY
 
+# the work behind the percentiles: scheduled (what the run owed), late (the
+# sends that found the following slot already due) and censored (the round
+# trips at the histogram's bound), counted with sent and received. A row from
+# before they were counted still parses, and is reported without them rather
+# than as a zero that would read as measured
+python3 - "$cloud" "$tmp/work.csv" <<'PY' && pass "load rows carry scheduled, late and censored" || fail "load rows carry scheduled, late and censored"
+import subprocess, sys
+cloud, path = sys.argv[1], sys.argv[2]
+# one point with the three counts, one point from before they were counted
+new = ("1,load,isolated:dpdk,udp-r250000,288,250000,1,28000,30000,33000,38000,42000,60000,28500,"
+       "1250000,1500000,1500000,0,250000,9000,1500000,12,3\n")
+old = ("2,load,isolated:dpdk,udp-r500000,288,500000,1,28000,30000,33000,38000,42000,60000,28500,"
+       "1250000,1500000,1500000,0,500000,9000\n")
+open(path, "w").writelines([new, old])
+sys.path.insert(0, cloud)
+import analyse
+r = analyse.read_results(path)
+both = r.load[("isolated:dpdk", 288, "r250000")]
+was = r.load[("isolated:dpdk", 288, "r500000")]
+assert len(both) == 1 and both[0][12:] == [1500000, 12, 3], both
+assert len(was) == 1 and was[0][12:] == [None, None, None], was
+out = subprocess.run([sys.executable, f"{cloud}/analyse.py", path], capture_output=True, text=True)
+assert out.returncode == 0, out.stderr
+rows = [ln for ln in out.stdout.splitlines() if "250,000/s" in ln or "500,000/s" in ln]
+assert any("1,500,000/1,500,000/1,500,000" in ln and "late 12, censored 3" in ln for ln in rows), rows
+assert any("1,500,000/1,500,000" in ln and "late 12" not in ln for ln in rows), rows
+PY
+
 # isolated-nic-irqs, the data NICs' interrupts on CPUs other than the
 # housekeeping one: a check on the run, never loss, in every mode. A kernel
 # mode and a DPDK one, one rep each of the round trip, throughput, two load
@@ -551,18 +579,26 @@ on() {
     *" rtt idle "*) echo "idle subscription" ;;
     *" tput x"[ps]"ub "*:227[0-9][0-9]" "*)
         # a subscriber lasts until its publisher has sent a while, a publisher its seconds
-        local role=${cmd#* tput x} ep=${cmd#* tput x?ub } port window
+        local role=${cmd#* tput x} ep=${cmd#* tput x?ub } port window got
         role=${role%% *} ep=${ep%% *} port=${ep##*:}
         echo "$role-start $port" >>"$out/flow-order"
         command sleep "$([[ $role == sub ]] && echo 0.8 || echo 0.3)"
         echo "$role-end $port" >>"$out/flow-order"
+        # the window and the messages it carried. The row's msgs/s is tput's
+        # median of its one-second samples; multi_flow_max reports the mean
+        # over the window (got / (end - start)), which is what a concurrent
+        # sum can add. At 22701 and 22703 the mean is deliberately below the
+        # median, so a sum of medians and a sum of means differ
         case $port in
-        22701) window=,$((S + 20000000)),$((S + 5030000000)) ;;
-        22703) window=,$((S + 897200000)),$((S + 5697200000)) ;;
-        22707) window= ;;
-        *) window=,$S,$((S + 5000000000)) ;;
+        22700) window=,$S,$((S + 5000000000)) got=113500000 ;;            # mean 22700000
+        22701) window=,$((S + 20000000)),$((S + 5030000000)) got=110220000 ;; # mean 22000000
+        22702) window=,$S,$((S + 5000000000)) got=100000000 ;;            # mean 20000000
+        22703) window=,$((S + 897200000)),$((S + 5697200000)) got=101280000 ;; # mean 21100000
+        22704) window=,$S,$((S + 5000000000)) got=113520000 ;;            # mean 22704000
+        22706) window=,$S,$((S + 5000000000)) got=113530000 ;;            # mean 22706000
+        22707) window= got=106000000 ;;                                   # no window: no mean
         esac
-        [[ $role == sub && $port != 22705 ]] && echo "tput,$(label "$cmd"),udp,${port}000,1,2,3,0$window"
+        [[ $role == sub && $port != 22705 ]] && echo "tput,$(label "$cmd"),udp,${port}000,1,2,$got,0$window"
         ;;
     *" tput xsub "*)
         local ep=${cmd#* tput xsub }
@@ -591,10 +627,10 @@ remote_state isolated
 SH
 bash "$tmp/dry.sh" "$cloud" "$dry" 2 </dev/null 2>"$dry/stderr" || fail "lib.sh dry run exited $?"
 S=1792032877000000000
-expect_rows='1,tputflows,isolated:dpdk,32,2,45401000,22700000,22701000,0.996
-1,tputflows,isolated:dpdk,288,2,45405000,22702000,22703000,0.854
+expect_rows='1,tputflows,isolated:dpdk,32,2,44700000,22700000,22000000,0.996
+1,tputflows,isolated:dpdk,288,2,41100000,20000000,21100000,0.854
 1,tputflows,isolated:dpdk,1344,2,,22704000,,
-1,tputflows,isolated:dpdk,64,2,45413000,22706000,22707000,'
+1,tputflows,isolated:dpdk,64,2,,22706000,22707000,'
 expect_loss=$(for size in 32 288 1344 64; do for node in a b; do
     echo "1,loss,isolated:dpdk:$size:flows2,$node,naks-sent=0;short-sends=0"
 done; done)
@@ -662,7 +698,10 @@ checks = [
     (r.tputmax_rep.get(("isolated:dpdk", 288, 1)), 20125000.0),
     ("load xping 10.30.1.7:22200 10.30.1.5:22201 10062500 1 288 2" in calls, True),
     ([(rep, total, overlap) for rep, total, _, overlap in r.tputflows.get(("isolated:dpdk", 32, 2), [])],
-     [(1, 45401000.0, 0.996)]),
+     [(1, 44700000.0, 0.996)]),
+    # each flow's mean over its own window, not its median (22700000 and
+    # 22701000): a sum of medians is not what the flows carried at once
+    (r.tputflows.get(("isolated:dpdk", 32, 2), [])[0][2], [22700000.0, 22000000.0]),
     (dict(r.tputflows_apart), {("isolated:dpdk", 288, 2): [(1, 0.854)], ("isolated:dpdk", 64, 2): [(1, None)]}),
     (dict(r.tputflows_failed), {("isolated:dpdk", 1344, 2): 1}),
 ]

@@ -922,11 +922,14 @@ flow_count() {
 # a while, raising the sum), so each subscriber reports its measured window on
 # the wall clock (tput's last two fields): all on VM b, one clock. With
 # the counters on both hosts just before and after (frames per message), and
-# the loss counters on both. Result rows: each flow's median msgs/s and their
-# sum (a flow without a result left empty, and the sum too), then the flows'
-# overlap, the span every flow's window shares over the shortest window,
-# truncated to the thousandth so a run never reads as better overlapped than it
-# was (empty when a flow reported no window; analyse.py counts a run from 0.9):
+# the loss counters on both. Result rows: each flow's mean msgs/s over its own
+# measured window (received / window) and their sum, which is the concurrent
+# aggregate -- a median of one-second samples is a typical second, and a sum of
+# those is not what the flows carried at once (a flow without a result, or
+# without a window, leaves the sum empty), then the flows' overlap, the span
+# every flow's window shares over the shortest window, truncated to the
+# thousandth so a run never reads as better overlapped than it was (empty when
+# a flow reported no window; analyse.py counts a run from 0.9):
 # <rep>,tputflows,<label>,<size>,<flows>,<sum>,<flow 1>,...,<flow n>,<overlap>
 multi_flow_max() {
     local state=$1 rep=$2 mode=$3 label=$4 far_ip=$5 near=($6) far=($7)
@@ -957,21 +960,33 @@ multi_flow_max() {
         loss_row "$rep" "$label:$size:flows$n" b "$before_b" "$(on "$B" "$vm loss" 2>/dev/null)"
         sum=0 each= latest= earliest= shortest= windows=1
         for i in $(seq "$n"); do
-            flow= start= end=
-            read -r flow start end < <(awk -F, '$1 == "tput" {printf "%d %s %s\n", $4, $9, $10; exit}' "$out/flows-$tag-$i.csv")
-            if [[ -z $flow ]]; then
+            # $4 is tput's median of its one-second samples; the rate this row
+            # reports is the mean over the flow's own measured window
+            # (received / window), which is what a concurrent sum can add.
+            median= received= start= end= flow=
+            read -r median received start end < <(awk -F, '$1 == "tput" {printf "%s %s %s %s\n", $4, $7, $9, $10; exit}' "$out/flows-$tag-$i.csv")
+            if [[ -z $median ]]; then
                 log "WARNING: $label $size B, $n flows at once: no result from flow $i ($out/flowsub-$tag-$i.log)"
                 sum= windows=
-            elif [[ ! $start =~ ^[0-9]+$ || ! $end =~ ^[0-9]+$ ]] || ((end <= start)); then
-                log "WARNING: $label $size B, $n flows at once: no measured window from flow $i (a tput client older than the window): overlap unknown"
-                windows=
+            elif [[ ! $start =~ ^[0-9]+$ || ! $end =~ ^[0-9]+$ ]] || ((end <= start)) ||
+                ! [[ $received =~ ^[0-9]+$ ]]; then
+                # Without a window there is no mean, and a sum of medians is
+                # not the aggregate: the sum is left empty rather than wrong.
+                log "WARNING: $label $size B, $n flows at once: no measured window from flow $i (a tput client older than the window): sum and overlap unknown"
+                sum= windows=
             else
+                # python3: exact integer arithmetic. bash's 64-bit multiply
+                # overflows on a long high-rate run, and awk's `r * 1e9` is a
+                # double -- exact only to 2^53, so it truncates a rate like
+                # 22000000 to 21999999
+                flow=$(python3 -c 'import sys; r, s, e = map(int, sys.argv[1:]); print(r * 10**9 // (e - s))' \
+                    "$received" "$start" "$end")
                 if [[ -z $latest ]] || ((start > latest)); then latest=$start; fi
                 if [[ -z $earliest ]] || ((end < earliest)); then earliest=$end; fi
                 if [[ -z $shortest ]] || ((end - start < shortest)); then shortest=$((end - start)); fi
             fi
-            [[ -n $sum ]] && sum=$((sum + flow))
-            each+=,$flow
+            [[ -n $sum && -n $flow ]] && sum=$((sum + flow))
+            each+=,${flow:-$median}
         done
         overlap=
         if [[ -n $windows ]]; then

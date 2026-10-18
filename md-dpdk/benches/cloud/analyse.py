@@ -13,13 +13,18 @@ results.csv rows (lab.sh prefixes the rep):
         burst's first is measured before its own dispatch; mean and max empty when only those came,
         min and negative empty from a driver built before they were counted)
   <rep>,tputmax,<mode>,<size>,<median msgs/s>,<min>,<max>   (the load sweep's one-way maximum)
-  <rep>,tputflows,<mode>,<size>,<flows>,<sum msgs/s>,<flow 1 median msgs/s>,...,<flow n>,<overlap>
-        (several flows' sustained maxima at once; a flow without a result, and then the sum, empty;
+  <rep>,tputflows,<mode>,<size>,<flows>,<sum msgs/s>,<flow 1 msgs/s>,...,<flow n>,<overlap>
+        (several flows' sustained maxima at once; each flow's mean over its own measured window,
+        and the sum of those -- the concurrent aggregate, not a sum of per-flow medians; a flow
+        without a result, or without a window, leaves the sum empty;
         overlap: the span every flow's measured window shares over the shortest window, truncated to
         the thousandth, empty when a flow reported no window and absent in rows from before it. A run
         counts from MIN_OVERLAP; one below it, or with it unknown, is left out and reported)
   <rep>,load,<mode>,udp-<fraction|burst>,<size>,<rate>,<burst>,p50,...,max,mean,samples,sent,received,
-        backpressured,achieved msgs/s,max send lag ns
+        backpressured,achieved msgs/s,max send lag ns[,scheduled,late,censored]
+        (scheduled is what the run owed, late the sends that found the following slot already due,
+        censored the round trips at the histogram's bound whose true value is only known to be at
+        least that; all three absent in rows from before they were counted)
   <rep>,mix,<mode>,udp-<profile>/<stream>,<size>,<rate>,<burst>,... (as load: one row per stream of a mix)
   <rep>,loss,<mode>[:rtt|:<size>:<fraction>|:<size>:max|:<size>:flows<n>|:mix:<profile>],<host>,<key>=<growth>;...
         (routes-missing as found after the run; VALIDITY's counters check the run and are not loss)
@@ -166,6 +171,29 @@ def overlap_name(overlap):
     return "unknown" if overlap is None else f"{overlap:.3f}"
 
 
+def work_of(row):
+    """A load or mix row's scheduled, late and censored counts -- the work
+    behind its percentiles -- always three, `None` each when the row is from
+    before they were counted: there is nothing to report, which is not a
+    measured zero."""
+    return [int(v) for v in row[20:23]] if len(row) >= 23 else [None, None, None]
+
+
+def work_columns(reps):
+    """A point's `echoed` and `late, censored` cells: completed, issued and
+    scheduled together, and how often the run fell more than one slot behind
+    plus how many round trips the histogram's bound censored. A rep that
+    predates the three counts has none to add, so the point is reported
+    without them rather than as a zero that would read as measured."""
+    sent = sum(r[6] for r in reps)
+    received = sum(r[7] for r in reps)
+    if any(r[-3] is None for r in reps):
+        return f"{received:,}/{sent:,}", "—"
+    scheduled, late, censored = (sum(r[i] for r in reps) for i in (-3, -2, -1))
+    work = f"late {late:,}, censored {censored:,}" if late or censored else "none"
+    return f"{received:,}/{sent:,}/{scheduled:,}", work
+
+
 def read_results(path):
     """Every row of results.csv, by mode, and by mode and rep (the A/B's and
     the frames table's)."""
@@ -212,12 +240,15 @@ def read_results(path):
             elif kind == "tputflows" and len(row) >= 7:
                 size, n = int(row[3]), int(row[4])
                 flows = row[6:6 + n]
-                if len(flows) != n or not row[5] or not all(flows):  # a flow without a result
+                if len(flows) != n or not all(flows):  # a flow without a result
                     r.tputflows_failed[(mode, size, n)] += 1
                     continue
-                # the flows' overlap; a row from before it was recorded has none
+                # the flows' overlap; a row from before it was recorded has none.
+                # An empty sum goes the same way: a flow reported no window, so
+                # there is no mean to add and no aggregate to report (lib.sh
+                # leaves the sum empty rather than summing medians)
                 overlap = overlap_of(row[6 + n] if len(row) > 6 + n else "")
-                if overlap is None or overlap < MIN_OVERLAP:
+                if not row[5] or overlap is None or overlap < MIN_OVERLAP:
                     r.tputflows_apart[(mode, size, n)].append((rep, overlap))
                     continue
                 r.tputflows[(mode, size, n)].append((rep, float(row[5]), [float(v) for v in flows], overlap))
@@ -228,14 +259,16 @@ def read_results(path):
                     r.load_failed[point] += 1
                     continue
                 r.load[point].append([float(v) for v in row[7:13]]
-                                     + [int(row[15]), int(row[16]), int(row[17]), int(row[5]), float(row[18]), int(row[19])])
+                                     + [int(row[15]), int(row[16]), int(row[17]), int(row[5]), float(row[18]), int(row[19])]
+                                     + work_of(row))
                 r.load_rep[point + (rep,)] = [float(v) for v in row[7:13]]
                 r.load_echo[point + (rep,)] = (int(row[15]), int(row[16]))  # sent, received
                 r.burst[point] = int(row[6])
             elif kind == "mix" and len(row) >= 20 and int(row[14]) > 0:
                 profile, _, stream = row[3].removeprefix("udp-").partition("/")
                 r.mix[(mode, profile, stream, int(row[4]), int(row[5]), int(row[6]))].append(
-                    [float(v) for v in row[7:13]] + [int(row[15]), int(row[16]), int(row[17]), float(row[18])])
+                    [float(v) for v in row[7:13]] + [int(row[15]), int(row[16]), int(row[17]), float(row[18])]
+                    + work_of(row))
             elif kind == "netrtt" and len(row) >= 6:
                 r.netrtt[mode].append(tuple(float(v) for v in row[3:6]))
             elif kind == "hostcheck" and len(row) >= 5:
@@ -497,7 +530,11 @@ def main():
         print("\n## Round trip under open-loop load (µs, from each message's intended send time)\n")
         print("`offered` is the scheduled rate; `achieved` the rate actually offered after warm-up. "
               "Below 98% of offered (marked *), the generator or the path could not keep the schedule, "
-              "and the latencies include that queueing. `max send lag` is the longest a measured message "
+              "and the latencies include that queueing. `echoed` is completed/issued/scheduled; "
+              "`late, censored` is how often the run fell more than one slot behind, and how many round "
+              "trips the histogram's bound censored (a max at the bound beside a censored count is a floor, "
+              "not the slowest round trip). Both are absent (`—`) at a point whose reps predate them. "
+              "`max send lag` is the longest a measured message "
               "waited past its due time to be offered (median of the reps, range in brackets): how far the "
               "generator itself fell behind, which is already inside the latencies beside it. "
               "`loss counters` lists every loss counter that grew "
@@ -512,10 +549,9 @@ def main():
             reps = load.get((m, size, frac), [])
             if not reps:
                 rows.append([name(m), f"{size} B", "burst 1000" if frac == "burst" else (f"{int(frac[1:]):,}/s" if frac.startswith("r") else f"{frac}%"), "", "",
-                             f"0 (+{load_failed[(m, size, frac)]} failed)"] + ["no echo"] * 6 + ["", "", "", ""])
+                             f"0 (+{load_failed[(m, size, frac)]} failed)"] + ["no echo"] * 6 + ["", "", "", "", ""])
                 continue
-            sent = sum(r[6] for r in reps)
-            received = sum(r[7] for r in reps)
+            echoed, work = work_columns(reps)
             lost = loss.get(f"{m}:{size}:{frac}", {})
             bad = {k: v for k, v in lost.items() if v}
             load_name = "burst 1000" if frac == "burst" else (f"{int(frac[1:]):,}/s" if frac.startswith("r") else f"{frac}%")
@@ -526,29 +562,32 @@ def main():
             rows.append([name(m), f"{size} B", load_name, f"{offered:,.0f}", f"{achieved:,.0f}{limited}",
                          str(len(reps)) + (f" (+{failed} failed)" if failed else "")]
                         + [cell([r[i] for r in reps], 1000, 2) for i in range(6)]
-                        + [f"{received:,}/{sent:,}", f"{sum(r[8] for r in reps):,}",
+                        + [echoed, work, f"{sum(r[8] for r in reps):,}",
                            cell([r[11] for r in reps], 1000, 2),
                            ", ".join(f"{k} {v:,}" for k, v in sorted(bad.items())) or "none"])
         print(table(["state, transport", "size", "load", "offered", "achieved", "reps"] + RTT_COLUMNS
-                    + ["echoed", "back-pressured", "max send lag", "loss counters"], rows))
+                    + ["echoed", "late, censored", "back-pressured", "max send lag", "loss counters"], rows))
         merged_load(r, sys.argv[1])
         loss_by_point(r)
 
     if mix:
         print("\n## Mixed streams at once, open loop (µs, from each message's intended send time)\n")
         print("Every stream of a profile runs at the same time on one pair of channels, each on its own "
-              "schedule; one row per stream. `achieved` below 98% of `offered` is marked *.\n")
+              "schedule; one row per stream. `achieved` below 98% of `offered` is marked *. "
+              "`echoed` is completed/issued/scheduled and `late, censored` as in the load table, "
+              "each stream's own schedule.\n")
         rows = []
         for (m, profile, stream, size, rate, burst), reps in sorted(mix.items(), key=lambda x: (key(x[0][0]), x[0][1], x[0][2])):
             achieved = statistics.median(r[9] for r in reps)
             lost = {k: v for k, v in loss.get(f"{m}:mix:{profile}", {}).items() if v}
+            echoed, work = work_columns(reps)
             rows.append([name(m), profile, stream, f"{size} B", f"{rate:,}" + (f" ×{burst}" if burst > 1 else ""),
                          f"{achieved:,.0f}" + ("*" if achieved < 0.98 * rate else ""), str(len(reps))]
                         + [cell([r[i] for r in reps], 1000, 2) for i in range(6)]
-                        + [f"{sum(r[7] for r in reps):,}/{sum(r[6] for r in reps):,}",
+                        + [echoed, work,
                            ", ".join(f"{k} {v:,}" for k, v in sorted(lost.items())) or "none"])
         print(table(["state, transport", "profile", "stream", "size", "offered/s", "achieved", "reps"] + RTT_COLUMNS
-                    + ["echoed", "loss counters (profile)"], rows))
+                    + ["echoed", "late, censored", "loss counters (profile)"], rows))
 
     spikes(os.path.dirname(os.path.abspath(sys.argv[1])))
 
@@ -809,7 +848,8 @@ def flows(r):
           f"in brackets. A run whose overlap is below {MIN_OVERLAP}, or unknown (a client that reports no window, or "
           "a row from before the overlap was recorded), counts in none of `aggregate`, `per flow` and `× one flow`: "
           "`left out` counts it, each one's overlap in brackets. `aggregate` sums the flows' "
-          "medians and `per flow` is each flow's median. `× one flow` is the aggregate over the same mode's one-flow "
+          "means over their own measured windows -- the rate the flows carried at once, which a sum of per-flow "
+          "medians is not -- and `per flow` is each flow's mean. `× one flow` is the aggregate over the same mode's one-flow "
           "sustained maximum at that size in the same rep (at 32 B, the flat-out throughput run): the median of those "
           "ratios, their range in brackets, and how many reps paired where not all did. Near 1, every flow shares "
           "one ceiling (the NIC's or the instance's, or the drivers' threads'); near the number of flows, the ceiling "
