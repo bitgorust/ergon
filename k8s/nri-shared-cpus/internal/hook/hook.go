@@ -2,9 +2,10 @@
 
 // Package hook implements the OCI createRuntime hook that starts a container
 // on its shared CPUs and, when asked, puts its exclusive CPUs in an isolated
-// cpuset partition. The hook runs on the node, after the cgroup cpuset is
-// written and before the user program starts. Every thread the program later
-// creates inherits the mask.
+// cpuset partition, and the poststop hook that takes the partition back down.
+// The createRuntime hook runs on the node, after the cgroup cpuset is written
+// and before the user program starts. Every thread the program later creates
+// inherits the mask.
 //
 // The isolated child is a threaded cpuset partition, so both kinds of move
 // work: a whole process through cgroup.procs, and one thread of a
@@ -52,26 +53,35 @@ type State struct {
 	ID string `json:"id"`
 }
 
-// PartitionRequest is the isolated child cgroup the hook sets up. The child
-// holds only Exclusive, and the kernel keeps everything else load-balanced.
+// PartitionRequest is the isolated child cgroup the hook sets up or takes
+// down. The child holds only Exclusive, and the kernel keeps everything else
+// load-balanced.
 type PartitionRequest struct {
 	// Exclusive is the CPU list the child holds.
 	Exclusive cpuset.Set
-	// Child is the absolute path of the child cgroup to create.
+	// Child is the absolute path of the child cgroup to create, or, when
+	// Release is set, to take away again.
 	Child string
+	// Release tears the child and its ancestor reservations down instead of
+	// building them. The poststop hook runs it after the container's
+	// processes are gone, so it needs no pid.
+	Release bool
 }
 
 // ParseArgs reads the hook's command line: --shared S starts the container on
-// the shared CPUs, and --isolated E --partition-child PATH builds the isolated
-// child cgroup. At least one of the two must be present. The exclusive CPUs
-// must not overlap the shared ones: an isolated shared CPU would take load
-// balancing away from the helpers.
+// the shared CPUs, --isolated E --partition-child PATH builds the isolated
+// child cgroup, and --isolated E --release-child PATH takes it back down. At
+// least one of the three must be present. The exclusive CPUs must not overlap
+// the shared ones: an isolated shared CPU would take load balancing away from
+// the helpers.
 func ParseArgs(args []string) (shared cpuset.Set, part *PartitionRequest, err error) {
 	var sharedText, isolatedText, child string
+	release := false
+	sawChild := ""
 	for i := 0; i < len(args); i++ {
 		flag := args[i]
 		switch flag {
-		case "--shared", "--isolated", "--partition-child":
+		case "--shared", "--isolated", "--partition-child", "--release-child":
 		default:
 			return shared, nil, fmt.Errorf("hook: unknown argument %q", flag)
 		}
@@ -85,8 +95,13 @@ func ParseArgs(args []string) (shared cpuset.Set, part *PartitionRequest, err er
 			sharedText = value
 		case "--isolated":
 			isolatedText = value
-		case "--partition-child":
+		case "--partition-child", "--release-child":
+			if sawChild != "" && sawChild != flag {
+				return shared, nil, fmt.Errorf("hook: %s and %s are two different hooks", sawChild, flag)
+			}
+			sawChild = flag
 			child = value
+			release = flag == "--release-child"
 		}
 	}
 	if sharedText == "" && isolatedText == "" {
@@ -100,10 +115,13 @@ func ParseArgs(args []string) (shared cpuset.Set, part *PartitionRequest, err er
 	}
 	if isolatedText != "" || child != "" {
 		if isolatedText == "" || child == "" {
-			return shared, nil, fmt.Errorf("hook: --isolated and --partition-child go together")
+			return shared, nil, fmt.Errorf("hook: --isolated and --partition-child (or --release-child) go together")
+		}
+		if release && sharedText != "" {
+			return shared, nil, fmt.Errorf("hook: --release-child does not start a container: drop --shared")
 		}
 		if !filepath.IsAbs(child) || filepath.Clean(child) != child {
-			return shared, nil, fmt.Errorf("hook: --partition-child %q must be a clean absolute path", child)
+			return shared, nil, fmt.Errorf("hook: the child %q must be a clean absolute path", child)
 		}
 		excl, err := cpuset.Parse(isolatedText)
 		if err != nil {
@@ -115,7 +133,7 @@ func ParseArgs(args []string) (shared cpuset.Set, part *PartitionRequest, err er
 		if both := excl.Intersection(shared); !both.IsEmpty() {
 			return shared, nil, fmt.Errorf("hook: CPU %s is both exclusive and shared; an isolated partition must not hold shared CPUs", both)
 		}
-		part = &PartitionRequest{Exclusive: excl, Child: child}
+		part = &PartitionRequest{Exclusive: excl, Child: child, Release: release}
 	}
 	return shared, part, nil
 }
@@ -158,6 +176,21 @@ func Run(stdin io.Reader, stderr io.Writer, shared cpuset.Set, part *PartitionRe
 	var st State
 	if err := json.Unmarshal(data, &st); err != nil {
 		return fmt.Errorf("hook: state does not parse: %w", err)
+	}
+	// A release runs at poststop, after the container's processes are gone:
+	// it needs the child path and the exclusive list from the command line,
+	// not a live pid.
+	if part != nil && part.Release {
+		root, err := cgroupRootOf()
+		if err != nil {
+			return err
+		}
+		if err := ReleasePartition(root, part.Child, part.Exclusive); err != nil {
+			return err
+		}
+		fmt.Fprintf(stderr, "ergon-cpus hook: container %s released %s (was %s)\n",
+			st.ID, part.Child, part.Exclusive.List())
+		return nil
 	}
 	if st.Pid <= 0 {
 		return fmt.Errorf("hook: state has no pid")
@@ -395,6 +428,125 @@ func writeCPUSet(path string, set cpuset.Set) error {
 	return nil
 }
 
+// ReleasePartition takes the isolated child cgroup and its ancestor
+// reservations away. It is the poststop half of a partition's life: without
+// it the create's WriteExclusiveAdd union stays in every ancestor's
+// cpuset.cpus.exclusive for a partition that no longer exists, and the next
+// container that wants those CPUs is refused with EINVAL.
+//
+// A CPU is taken back from an ancestor only when no remaining isolated
+// partition under that ancestor still holds it: two containers share
+// kubepods.slice, and giving a shared level back a CPU the other one is
+// running on would silently break its isolation. The exclusive list comes in
+// on the command line rather than from the child's cpuset.cpus, so the
+// reservation is still released when the runtime has already torn the cgroup
+// down. Under the same lock as ApplyPartition, so a concurrent create cannot
+// lose its union to this subtract.
+func ReleasePartition(root, child string, exclusive cpuset.Set) error {
+	if root == "" || !filepath.IsAbs(root) {
+		return fmt.Errorf("hook: release: the cgroup root %q is not absolute", root)
+	}
+	if child == "" || !filepath.IsAbs(child) || filepath.Clean(child) != child {
+		return fmt.Errorf("hook: release: the child %q must be a clean absolute path", child)
+	}
+	if exclusive.IsEmpty() {
+		return fmt.Errorf("hook: release: the exclusive CPU list is empty")
+	}
+	if !strings.HasPrefix(child, filepath.Clean(root)+"/") {
+		return fmt.Errorf("hook: release: the child %s is not under the cgroup root %s", child, root)
+	}
+	dir := filepath.Dir(child)
+	unlock, err := lockPartition()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	others, err := otherPartitions(root, dir, child)
+	if err != nil {
+		return err
+	}
+	for _, ancestor := range cpuset.Ancestors(root, dir) {
+		path := filepath.Join(ancestor, "cpuset.cpus.exclusive")
+		if _, err := os.Stat(path); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				// Nothing was ever reserved at this level (the cgroup root
+				// has no such file); there is nothing to take back.
+				continue
+			}
+			return fmt.Errorf("hook: release: %s: %w", path, err)
+		}
+		still := cpuset.Set{}
+		for _, o := range others {
+			if o.path == ancestor || strings.HasPrefix(o.path, ancestor+"/") {
+				still = still.Union(o.cpus)
+			}
+		}
+		if err := subtractFrom(path, exclusive.Difference(still)); err != nil {
+			return err
+		}
+	}
+	return removeChild(child)
+}
+
+// otherPartition is one isolated partition root that is not the child being
+// released.
+type otherPartition struct {
+	path string
+	cpus cpuset.Set
+}
+
+// otherPartitions walks the tree from the outermost ancestor of dir and
+// collects every isolated partition root outside child's subtree. Those are
+// the reservations an ancestor's cpuset.cpus.exclusive still has to hold once
+// child is gone.
+func otherPartitions(root, dir, child string) ([]otherPartition, error) {
+	anc := cpuset.Ancestors(root, dir)
+	if len(anc) == 0 {
+		return nil, nil
+	}
+	var out []otherPartition
+	err := filepath.WalkDir(anc[0], func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			// A cgroup can vanish under a walk as containers come and go;
+			// anything unreadable is simply not counted as a live partition.
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if path == child {
+			return filepath.SkipDir
+		}
+		if path != anc[0] {
+			data, err := os.ReadFile(filepath.Join(path, "cpuset.cpus.partition"))
+			if err != nil {
+				return nil
+			}
+			if strings.TrimSpace(string(data)) != "isolated" {
+				return nil
+			}
+			cpus, err := os.ReadFile(filepath.Join(path, "cpuset.cpus"))
+			if err != nil {
+				return fmt.Errorf("hook: release: read %s/cpuset.cpus: %w", path, err)
+			}
+			set, err := cpuset.Parse(strings.TrimSpace(string(cpus)))
+			if err != nil {
+				return fmt.Errorf("hook: release: parse %q in %s/cpuset.cpus: %w", cpus, path, err)
+			}
+			out = append(out, otherPartition{path: path, cpus: set})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("hook: release: walk %s: %w", anc[0], err)
+	}
+	return out, nil
+}
+
 // removeChild takes a half-made partition child away. A cgroup2 directory is
 // removed with rmdir and only when it holds no task and no child cgroup: the
 // kernel owns the pseudo-files and unlinking one fails, so os.Remove is the
@@ -614,8 +766,16 @@ func cgroupOf(pid int) (string, error) {
 	return "", fmt.Errorf("hook: /proc/%d/cgroup has no cgroup v2 entry", pid)
 }
 
+// CgroupRoot is the cgroup v2 mount point. Empty means "find it in
+// /proc/self/mountinfo", which is what a node does. Tests point it at a
+// fixture tree, the same way they point PartitionLockPath at a scratch file.
+var CgroupRoot = ""
+
 // cgroupRootOf finds the cgroup v2 mount point.
 func cgroupRootOf() (string, error) {
+	if CgroupRoot != "" {
+		return CgroupRoot, nil
+	}
 	data, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
 		return "", fmt.Errorf("hook: read /proc/self/mountinfo: %w", err)

@@ -283,5 +283,18 @@ func Hook(path string, shared cpuset.Set, part *hft.PartitionGrant) *api.Hook {
 	}
 }
 
+// ReleaseHook is the poststop hook. It takes the isolated child cgroup and
+// its ancestor reservations back down once the container's processes are
+// gone. NRI delivers poststop outside the plugin's request handlers, where
+// the filesystem work cannot eat into the plugin's request timeout.
+func ReleaseHook(path string, part *hft.PartitionGrant) *api.Hook {
+	args := []string{path, "hook", "--isolated", part.Exclusive, "--release-child", part.Child}
+	return &api.Hook{
+		Path:    path,
+		Args:    args,
+		Timeout: &api.OptionalInt{Value: HookTimeoutSeconds},
+	}
+}
+
 // key names a container across restarts.
 func key(r Request) assign.Key { return assign.Key{PodUID: r.PodUID, Container: r.Container} }

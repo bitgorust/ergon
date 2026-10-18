@@ -145,7 +145,7 @@ func PartitionPlan(cgroupRoot, containerCgroup string, exclusive, shared Set) (*
 	// from the partition the first pod is already running in. The child is
 	// this container's alone, so it is written outright. Concurrent hooks
 	// update the shared levels under one lock in ApplyPartition.
-	for _, ancestor := range ancestors(root, dir) {
+	for _, ancestor := range Ancestors(root, dir) {
 		plan.Writes = append(plan.Writes, Write{
 			Kind:  WriteExclusiveAdd,
 			Path:  filepath.Join(ancestor, "cpuset.cpus.exclusive"),
@@ -168,10 +168,10 @@ func PartitionPlan(cgroupRoot, containerCgroup string, exclusive, shared Set) (*
 	return plan, nil
 }
 
-// ancestors returns every directory between cgroupRoot (exclusive) and dir
+// Ancestors returns every directory between cgroupRoot (exclusive) and dir
 // (inclusive), outermost first. That is the path a remote partition's
 // cpuset.cpus.exclusive has to be written down.
-func ancestors(root, dir string) []string {
+func Ancestors(root, dir string) []string {
 	var out []string
 	for cur := dir; cur != root; cur = filepath.Dir(cur) {
 		out = append(out, cur)

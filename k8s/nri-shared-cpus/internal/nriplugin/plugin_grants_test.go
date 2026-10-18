@@ -173,6 +173,16 @@ func TestCreateCpuPartitionInjectsHookAndEnv(t *testing.T) {
 	if !strings.Contains(joined, "--partition-child "+want) {
 		t.Errorf("hook args %v must carry --partition-child %s", args, want)
 	}
+	// A partition also needs its poststop: the create's ancestor reservations
+	// have to come back down, or the next container that wants those CPUs is
+	// refused and the isolation of a sibling can be broken by a late release.
+	if len(hooks.GetPoststop()) != 1 {
+		t.Fatalf("poststop hooks are %v, want one to release the partition", hooks.GetPoststop())
+	}
+	release := strings.Join(hooks.GetPoststop()[0].GetArgs(), " ")
+	if !strings.Contains(release, "--isolated 1,5") || !strings.Contains(release, "--release-child "+want) {
+		t.Errorf("poststop args %v must release %s with --isolated 1,5", hooks.GetPoststop()[0].GetArgs(), want)
+	}
 }
 
 func TestCreateCpuPartitionWithoutSharedOptIn(t *testing.T) {
@@ -204,6 +214,12 @@ func TestCreateCpuPartitionWithoutSharedOptIn(t *testing.T) {
 	args := hooks.GetCreateRuntime()[0].GetArgs()
 	if !strings.Contains(strings.Join(args, " "), "--isolated 2,3") {
 		t.Errorf("hook args %v must name the exclusive CPUs 2,3", args)
+	}
+	if len(hooks.GetPoststop()) != 1 {
+		t.Fatalf("poststop hooks are %v, want one to release the partition", hooks.GetPoststop())
+	}
+	if !strings.Contains(strings.Join(hooks.GetPoststop()[0].GetArgs(), " "), "--release-child") {
+		t.Errorf("poststop args %v must carry --release-child", hooks.GetPoststop()[0].GetArgs())
 	}
 }
 

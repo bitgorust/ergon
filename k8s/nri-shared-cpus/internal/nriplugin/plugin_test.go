@@ -140,6 +140,10 @@ func TestCreateAdjustment(t *testing.T) {
 	if len(h.GetArgs()) != 4 || h.GetArgs()[2] != "--shared" || h.GetArgs()[3] != env[names.EnvShared] {
 		t.Errorf("hook args are %v, want hook --shared <S>", h.GetArgs())
 	}
+	// Shared-only: there is no isolated child to take back down.
+	if got := hooks.GetPoststop(); len(got) != 0 {
+		t.Errorf("poststop hooks are %v, want none without a partition", got)
+	}
 }
 
 func TestCreateAdjustmentNoHookOnOptOut(t *testing.T) {

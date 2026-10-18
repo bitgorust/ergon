@@ -4,6 +4,8 @@
 // app images carry as an entrypoint.
 //
 //	ergon-cpus hook --shared S          the OCI createRuntime hook
+//	ergon-cpus hook --isolated E --partition-child P   build the isolated child
+//	ergon-cpus hook --isolated E --release-child P     take it down (poststop)
 //	ergon-cpus [--env NAME=SPEC]... [--affinity shared|keep] [--fifo PRIO] -- cmd [args...]
 //	ergon-cpus show                     print the container's CPU plan
 //
@@ -68,8 +70,10 @@ func run(args, env []string, stdin *os.File, stdout, stderr *os.File) int {
 func usage(w *os.File) {
 	fmt.Fprint(w, `ergon-cpus: pin by index, run helpers on the shared CPUs
 
-  ergon-cpus hook --shared S     OCI createRuntime hook (on the node)
-  ergon-cpus show                print the container's CPU plan as JSON
+  ergon-cpus hook --shared S                    OCI createRuntime hook (on the node)
+  ergon-cpus hook --isolated E --partition-child P   build the isolated child cgroup
+  ergon-cpus hook --isolated E --release-child P     take it back down (poststop)
+  ergon-cpus show                               print the container's CPU plan as JSON
   ergon-cpus [--env NAME=SPEC]... [--affinity shared|keep] [--fifo PRIO] -- cmd [args...]
 
 SPEC values for --env:

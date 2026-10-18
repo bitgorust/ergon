@@ -288,14 +288,20 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr *ap
 	// The hook starts the container on the shared CPUs (d.Hook) and builds the
 	// isolated child cgroup (cpu-partition). Either one alone is enough to
 	// inject it: a partition is never skipped because the affinity was left
-	// alone.
+	// alone. A partition also gets a poststop hook: the create's ancestor
+	// reservations must come back down when the container goes, or the next
+	// one that wants those CPUs is refused.
 	needHook := d.Hook || (d.Grants != nil && d.Grants.CpuPartition)
 	if needHook {
 		var part *hft.PartitionGrant
 		if d.Grants != nil {
 			part = d.Grants.Partition
 		}
-		adj.AddHooks(&api.Hooks{CreateRuntime: []*api.Hook{Hook(p.cfg.HookPath, shared, part)}})
+		hooks := &api.Hooks{CreateRuntime: []*api.Hook{Hook(p.cfg.HookPath, shared, part)}}
+		if part != nil {
+			hooks.Poststop = []*api.Hook{ReleaseHook(p.cfg.HookPath, part)}
+		}
+		adj.AddHooks(hooks)
 	}
 	p.log.Info("create", append(logArgs, "exclusive", d.Exclusive.String(), "shared", shared.String(),
 		"millicpus", d.Milli, "source", d.Source, "hook", needHook)...)
