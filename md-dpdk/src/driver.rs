@@ -18,11 +18,18 @@
 //! }
 //! ```
 
+// The free of the native runtime is the crate's one unsafe operation
+// (`ffi.rs`). This module promises it at the two places that know every driver
+// is gone: wrapping the transport in `ConfiguredDriver::from_env`, which runs
+// before any driver exists, and dropping that wrapper once
+// `EnvMediaDriver` has closed its driver. See `CloseOnDrop`.
+#![allow(unsafe_code)]
+
 use crate::checks::{
     HostCheckPolicy, HostReport, Inputs, OFF_NOTE, RecheckThread, data_nics_from_env, host_report, start_rechecks,
 };
 use crate::error::DpdkError;
-use crate::ffi::{DpdkTransport, lock_memory_from_env, pin_agents_to_configured_cpus};
+use crate::ffi::{CloseOnDrop, DpdkTransport, lock_memory_from_env, pin_agents_to_configured_cpus};
 use ergon_tune::{EthtoolCache, Host};
 use rusteron_media_driver::bindings::aeron_threading_mode_t;
 use rusteron_media_driver::{AeronDriver, AeronDriverContext};
@@ -47,10 +54,10 @@ const RECEIVER_IO_VECTOR_CAPACITY_ENV: &str = "AERON_RECEIVER_IO_VECTOR_CAPACITY
 /// receiver IO vector capacity is 16 unless `AERON_RECEIVER_IO_VECTOR_CAPACITY`
 /// says otherwise. The host checks ([`crate::checks`]) then run, as
 /// `RUSTERON_MEDIA_DRIVER_HOST_CHECK` says.
-#[must_use = "the transport it may hold is closed when it drops"]
+#[must_use = "the transport it may hold is freed when it drops: start it, or keep it alive for as long as a driver it started can run"]
 pub struct ConfiguredDriver {
     context: AeronDriverContext,
-    transport: Option<DpdkTransport>,
+    transport: Option<CloseOnDrop>,
     report: Option<HostReport>,
     rechecks: Option<RecheckThread>,
 }
@@ -90,6 +97,11 @@ impl ConfiguredDriver {
         // AERON_*_CPU_AFFINITY applied as aeronmd applies them, in every transport mode.
         pin_agents_to_configured_cpus(&context)?;
         let transport = crate::configure_media_transport_from_env(&context)?;
+        // Free the runtime on any error below, and when this drops: nothing has
+        // been started from `context`, so nothing can be calling the bindings.
+        // SAFETY: no driver exists yet; `start` moves the wrapper out before one
+        // is created, so it only ever drops while the context is driver-free.
+        let transport = transport.map(|t| unsafe { CloseOnDrop::wrap(t) });
         if transport.is_some() && std::env::var_os(RECEIVER_IO_VECTOR_CAPACITY_ENV).is_none() {
             context
                 .set_receiver_io_vector_capacity(DPDK_RECEIVER_IO_VECTOR_CAPACITY)
@@ -102,7 +114,8 @@ impl ConfiguredDriver {
                 (None, None)
             }
             HostCheckPolicy::Warn | HostCheckPolicy::Require => {
-                let (report, rechecks) = run_host_checks(&context, transport.as_ref(), data_nics, policy)?;
+                let (report, rechecks) =
+                    run_host_checks(&context, transport.as_ref().and_then(CloseOnDrop::get), data_nics, policy)?;
                 (Some(report), rechecks)
             }
         };
@@ -164,10 +177,12 @@ impl ConfiguredDriver {
         Ok(EnvMediaDriver {
             driver,
             context,
-            transport,
             memory_locked,
             report,
             rechecks,
+            // Last field: the free runs after the driver above has closed and
+            // joined its agents.
+            transport,
         })
     }
 }
@@ -217,11 +232,13 @@ pub struct EnvMediaDriver {
     // Dropped in this order: the transport must outlive every agent using it.
     driver: AeronDriver,
     context: AeronDriverContext,
-    transport: Option<DpdkTransport>,
     memory_locked: bool,
     report: Option<HostReport>,
     // md's re-check thread, stopped and joined as the driver drops.
     rechecks: Option<RecheckThread>,
+    // Last, so the free runs only once the driver above has closed and joined
+    // every agent that could call the bindings.
+    transport: Option<CloseOnDrop>,
 }
 
 impl EnvMediaDriver {
@@ -312,6 +329,11 @@ impl EnvMediaDriver {
                 } = self;
                 std::mem::forget(driver);
                 std::mem::forget(context);
+                // Frees the native runtime. Sound here because every agent of a
+                // SHARED or INVOKER driver under the manual main loop runs on
+                // this thread, `self` is consumed so no further `do_work` can
+                // be called, and the modes that would still have an agent
+                // thread of their own are refused above.
                 drop(transport);
                 drop(rechecks);
                 Ok(())

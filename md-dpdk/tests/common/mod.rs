@@ -475,6 +475,23 @@ pub fn test_clock() -> ergon_clock::advanced::Clock {
         .clock
 }
 
+/// Free a transport a test installed. Dropping does not free — the Aeron
+/// context's bindings point into the native runtime — so a test that wants
+/// teardown has to close. No test starts a driver from its context, so nothing
+/// can call those bindings afterwards.
+pub fn teardown(transport: ergon_md_dpdk::DpdkTransport) {
+    // SAFETY: these tests never start a driver from the context they install
+    // into, so no agent can call the bindings after this.
+    unsafe { transport.close() }.unwrap_or_else(|e| panic!("close the test transport: {e}"));
+}
+
+/// Free whatever an install produced, keeping the install's own error.
+pub fn teardown_result(result: Result<ergon_md_dpdk::DpdkTransport, ergon_md_dpdk::DpdkError>) {
+    if let Ok(transport) = result {
+        teardown(transport);
+    }
+}
+
 /// A counter clock made from parameters (another calibration's, as
 /// ergon-clock lets a process share one), wherever this process can read the
 /// counter: the transport's counter path is exercised even on a host whose

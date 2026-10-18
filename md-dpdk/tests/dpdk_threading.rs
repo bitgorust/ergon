@@ -125,8 +125,9 @@ fn bare_context(mode: aeron_threading_mode_t) -> AeronDriverContext {
 fn install(ctx: &AeronDriverContext) -> Result<(), DpdkError> {
     let env = TestEnv::new();
     env.eal_skip();
-    // the native transport closes, as the transport drops, before the env resets
-    let result = DpdkTransport::install(ctx, &canonical()).map(drop);
+    // Dropping does not free the native runtime, so close it here: no driver
+    // is started from this context.
+    let result = DpdkTransport::install(ctx, &canonical()).map(teardown);
     drop(env);
     result
 }
@@ -482,7 +483,7 @@ fn install_with_housekeeping<T>(
     unsafe { rusteron_dpdk_test_set_housekeeping_thread(1) };
     let installed = DpdkTransport::install(ctx, &canonical());
     let seen = check(&installed);
-    drop(installed);
+    teardown_result(installed);
     drop(env);
     seen
 }
@@ -546,7 +547,7 @@ fn a_shared_mode_spinning_on_the_eal_main_lcores_core_is_refused() {
             let env = TestEnv::new();
             env.eal_skip();
             unsafe { rusteron_dpdk_fake_set_eal_main_cpu(cpu) };
-            let installed = DpdkTransport::install(&ctx, &canonical()).map(drop);
+            let installed = DpdkTransport::install(&ctx, &canonical()).map(teardown);
             drop(env);
             installed
         };
@@ -604,7 +605,7 @@ fn a_dedicated_agent_spinning_on_the_eal_main_lcores_core_is_refused() {
         let env = TestEnv::new();
         env.eal_skip();
         unsafe { rusteron_dpdk_fake_set_eal_main_cpu(cpu as c_int) };
-        let installed = DpdkTransport::install(&ctx, &canonical()).map(drop);
+        let installed = DpdkTransport::install(&ctx, &canonical()).map(teardown);
         drop(env);
         installed
     };

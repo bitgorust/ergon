@@ -13,18 +13,20 @@ use std::ffi::CStr;
 #[cfg(feature = "dpdk")]
 use std::os::raw::{c_char, c_int, c_void};
 
-/// Owning handle to the native DPDK transport installed into an
-/// [`AeronDriverContext`].
+/// Handle to the native DPDK transport installed into an [`AeronDriverContext`].
 ///
-/// Cloning shares the same native instance; the native runtime (EAL, both
-/// ports, mempools) is closed exactly once, when the last clone is dropped.
+/// Cloning shares the same native instance. Dropping is safe and leaks: the
+/// bindings installed into the context point into that runtime, and rusteron
+/// 0.2.11's context cannot hold this handle, so Rust cannot see that a driver
+/// may still be calling them. A leaked runtime cannot corrupt a running
+/// driver, which is why the free is not on `Drop`.
 ///
-/// The bindings installed into the context point into that runtime, and
-/// rusteron 0.2.11's context cannot hold a Rust dependency for it, so the
-/// caller owns its lifetime: keep a clone alive until every driver started
-/// from the context has stopped.
+/// The only way to free the native runtime is [`close`](Self::close), which is
+/// `unsafe` and only sound once every driver started from the context has
+/// stopped. For a media driver that is the end of the process, so in practice
+/// the handle is held for the process lifetime and never closed.
 #[derive(Clone, Debug)]
-#[must_use = "dropping the transport while a driver uses it is a use-after-free in the driver's agents"]
+#[must_use = "keep the transport alive for as long as any driver started from the context can run; only close() frees the native runtime"]
 pub struct DpdkTransport {
     // Read only in the `dpdk` install path.
     #[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
@@ -85,7 +87,15 @@ impl DpdkTransport {
                 test_vdev: config.test_vdev,
                 clock,
             };
-            transport.inner.install(context)?;
+            if let Err(err) = transport.inner.install(context) {
+                // Created in this call and never installed, so no driver can be
+                // holding the bindings. Free it: dropping would leak the runtime
+                // and the two threads its create started, which would keep
+                // running and block every later install.
+                // SAFETY: the install failed, so nothing points into the runtime.
+                let _ = unsafe { transport.close() };
+                return Err(err);
+            }
             Ok(transport)
         }
         #[cfg(not(feature = "dpdk"))]
@@ -101,6 +111,40 @@ impl DpdkTransport {
     #[must_use]
     pub const fn clock(&self) -> ergon_clock::advanced::Clock {
         self.clock
+    }
+
+    /// Free the native runtime: the EAL, both ports and their mempools.
+    ///
+    /// Dropping does not do this — see the type. Nothing is freed while other
+    /// handles to the same native instance are alive; that returns
+    /// [`DpdkError::StillHeld`] and the runtime stays up for them.
+    ///
+    /// # Errors
+    ///
+    /// [`DpdkError::StillHeld`] when other handles are alive, and
+    /// [`DpdkError::FeatureDisabled`] without the `dpdk` feature (nothing was
+    /// ever created).
+    ///
+    /// # Safety
+    ///
+    /// Every driver started from the [`AeronDriverContext`] passed to
+    /// [`install`](Self::install) must have stopped. Until then its sender and
+    /// receiver agents still call the bindings installed into that context,
+    /// and those bindings point into this runtime. Freeing it under them is a
+    /// use-after-free in the driver's agents.
+    pub unsafe fn close(self) -> Result<(), DpdkError> {
+        #[cfg(feature = "dpdk")]
+        {
+            let Self { inner, .. } = self;
+            let native = Arc::try_unwrap(inner).map_err(|_| DpdkError::StillHeld)?;
+            native.destroy();
+            Ok(())
+        }
+        #[cfg(not(feature = "dpdk"))]
+        {
+            let _ = self;
+            Err(DpdkError::FeatureDisabled)
+        }
     }
 
     /// The sender's and the receiver's PCI addresses (or vdev names), and
@@ -122,6 +166,51 @@ impl DpdkTransport {
         #[cfg(not(feature = "dpdk"))]
         {
             None
+        }
+    }
+}
+
+/// A [`DpdkTransport`] that frees the native runtime when it drops.
+///
+/// Dropping a bare [`DpdkTransport`] only leaks, which is the safe default when
+/// Rust cannot see that a driver may still be calling the installed bindings.
+/// This wrapper is for the owner that already knows every driver has stopped
+/// and would otherwise have to call [`DpdkTransport::close`] by hand. It is the
+/// last field of [`EnvMediaDriver`](crate::EnvMediaDriver), so it drops after
+/// the driver has closed and joined its agent threads.
+#[must_use = "dropping it frees the native runtime"]
+pub struct CloseOnDrop(Option<DpdkTransport>);
+
+impl CloseOnDrop {
+    /// Take on the free of `transport`.
+    ///
+    /// # Safety
+    ///
+    /// The contract of [`DpdkTransport::close`]: every driver started from the
+    /// [`AeronDriverContext`] passed to [`DpdkTransport::install`] must have
+    /// stopped by the time this wrapper drops.
+    pub const unsafe fn wrap(transport: DpdkTransport) -> Self {
+        Self(Some(transport))
+    }
+
+    /// Whether a transport is held (whether the native runtime is installed).
+    #[must_use]
+    pub const fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// The transport it will free.
+    #[must_use]
+    pub const fn get(&self) -> Option<&DpdkTransport> {
+        self.0.as_ref()
+    }
+}
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        if let Some(transport) = self.0.take() {
+            // SAFETY: promised by `wrap`.
+            let _ = unsafe { transport.close() };
         }
     }
 }
@@ -162,10 +251,16 @@ unsafe impl Send for NativeTransport {}
 unsafe impl Sync for NativeTransport {}
 
 #[cfg(feature = "dpdk")]
-impl Drop for NativeTransport {
-    fn drop(&mut self) {
+impl NativeTransport {
+    /// Free the native runtime. Only [`DpdkTransport::close`] calls this, on
+    /// the last handle, after its `unsafe` contract has been promised.
+    ///
+    /// There is deliberately no `Drop` here: dropping a handle must not free
+    /// the runtime the Aeron context's bindings point into.
+    fn destroy(self) {
         if !self.ptr.is_null() {
-            // SAFETY: the last owner closes the pointer exactly once.
+            // SAFETY: the caller is DpdkTransport::close, which is unsafe and
+            // whose contract is that no driver can still call these bindings.
             unsafe { rusteron_dpdk_transport_close(self.ptr) };
         }
     }

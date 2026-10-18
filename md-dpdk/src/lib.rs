@@ -39,8 +39,8 @@
 //!     let driver = AeronDriver::new(&context)?;
 //!     driver.start(true)?;
 //!     // ... run the driver ...
-//!     drop(driver);
-//!     drop(transport); // only after the driver is gone
+//!     drop(driver);    // stop the driver first
+//!     drop(transport); // safe: dropping leaks; close() is what frees
 //!     Ok(())
 //! }
 //! ```
@@ -49,10 +49,15 @@
 //!
 //! ## Lifetime
 //!
-//! The returned [`DpdkTransport`] owns the native DPDK runtime that the
-//! installed bindings point into. Keep it alive until every driver started from
-//! the context has stopped: dropping it while a driver still runs is a
-//! use-after-free in the driver's sender and receiver agents.
+//! The returned [`DpdkTransport`] is the handle to the native DPDK runtime
+//! that the installed bindings point into. Dropping it is safe and leaks: a
+//! leaked runtime cannot corrupt a running driver, and rusteron's context
+//! cannot hold the handle for us. To free the runtime, call
+//! [`DpdkTransport::close`], which is `unsafe` and only sound once every
+//! driver started from the context has stopped — until then its sender and
+//! receiver agents still call those bindings. A media driver runs until its
+//! process exits, so in practice the handle is held for the process lifetime
+//! and never closed.
 //!
 //! ## Environment
 //!

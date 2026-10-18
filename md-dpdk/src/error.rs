@@ -15,6 +15,10 @@ pub enum DpdkError {
     UnsupportedPlatform,
     /// An EAL/DPDK transport already exists in this process.
     AlreadyInitialized,
+    /// [`DpdkTransport::close`](crate::DpdkTransport::close) was called while
+    /// other handles to the same native instance were still alive, so nothing
+    /// was freed. Close the last handle instead.
+    StillHeld,
     /// A required environment variable is absent.
     MissingEnvironment(String),
     /// A selector or environment value cannot be parsed.
@@ -45,6 +49,10 @@ impl fmt::Display for DpdkError {
             Self::AlreadyInitialized => write!(
                 f,
                 "a DPDK EAL/transport is already initialized in this process; DPDK permits only one"
+            ),
+            Self::StillHeld => write!(
+                f,
+                "other handles to the native DPDK transport are still alive, so nothing was freed; close the last handle instead"
             ),
             Self::MissingEnvironment(var) => write!(f, "missing required environment variable {var}"),
             Self::InvalidEnvironment(msg) => write!(f, "invalid environment value: {msg}"),

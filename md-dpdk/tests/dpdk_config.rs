@@ -882,7 +882,7 @@ fn install_succeeds_on_configured_context() {
     env.eal_skip();
     let ctx = configured_context();
     let guard = DpdkTransport::install(&ctx, &canonical()).unwrap();
-    drop(guard); // the last owner: closes the native transport
+    common::teardown(guard);
 }
 
 /// The install calibrates the transport's clock with ergon-clock (once a
@@ -936,7 +936,7 @@ fn install_hands_the_native_transport_ergon_clocks_calibration() {
             native + 1_000 >= before && native <= after + 1_000,
             "{value:?}: native {native} outside {before}..{after}"
         );
-        drop(guard);
+        common::teardown(guard);
     }
     let env = TestEnv::new();
     env.eal_skip();
@@ -967,7 +967,7 @@ fn install_hands_an_unset_receive_ring_to_the_nics_default() {
         let want = format!("rx {port} (q=0 desc=2048)");
         assert!(log.iter().any(|l| l.contains(&want)), "{want}: {log:?}");
     }
-    drop(guard);
+    common::teardown(guard);
 }
 
 #[cfg(feature = "dpdk")]
@@ -985,7 +985,7 @@ fn install_rejects_misconfigured_context() {
 #[cfg(feature = "dpdk")]
 #[serial]
 #[test]
-fn native_transport_closes_only_when_the_last_clone_drops() {
+fn the_native_transport_is_freed_only_by_close_on_the_last_handle() {
     let env = TestEnv::new();
     env.eal_skip();
     let ctx = configured_context();
@@ -993,13 +993,52 @@ fn native_transport_closes_only_when_the_last_clone_drops() {
     let clone = guard.clone();
     let closed = |env: &TestEnv| (0..env.log_count()).any(|i| env.log_at(i).starts_with("close "));
 
-    // rusteron 0.2.11's context cannot hold the transport, so the caller's
-    // clones own it: dropping one of two must leave the native ports open.
+    // Dropping never frees: the bindings in the context point into the native
+    // runtime and a driver may still be calling them. Dropping is safe and
+    // leaks, so safe code cannot produce the use-after-free.
     drop(guard);
-    assert!(!closed(&env), "native transport closed while a clone was alive");
+    assert!(!closed(&env), "native transport freed by Drop");
 
-    drop(clone);
-    assert!(closed(&env), "native transport not closed after the last clone dropped");
+    // The free is close, on the last handle. A close with another handle
+    // still alive must refuse rather than free under it.
+    assert!(
+        matches!(unsafe { clone.clone().close() }, Err(DpdkError::StillHeld)),
+        "close with another handle alive must refuse"
+    );
+    assert!(!closed(&env), "native transport freed while another handle was alive");
+
+    // SAFETY: no driver was started from the context, so nothing can call the
+    // bindings after this.
+    unsafe { clone.close() }.unwrap();
+    assert!(closed(&env), "native transport not freed by close on the last handle");
+}
+
+/// Dropping the handle is safe and leaks. That is the contract: the free is
+/// `unsafe`, so a use-after-free is not reachable from safe code. The leak is
+/// visible as the runtime still being up after every handle is gone.
+#[cfg(feature = "dpdk")]
+#[serial]
+#[test]
+fn dropping_the_handle_leaks_rather_than_freeing_the_native_runtime() {
+    let env = TestEnv::new();
+    env.eal_skip();
+    let ctx = configured_context();
+    let closed = |env: &TestEnv| (0..env.log_count()).any(|i| env.log_at(i).starts_with("close "));
+    {
+        let _guard = DpdkTransport::install(&ctx, &canonical()).unwrap();
+    }
+    assert!(
+        !closed(&env),
+        "Drop freed the native runtime the context's bindings point into"
+    );
+    // The runtime is still up, so a second install in this process is refused
+    // rather than racing a half-freed one. TestEnv::new() resets the singleton,
+    // which is why the other tests are unaffected.
+    let err = DpdkTransport::install(&ctx, &canonical()).unwrap_err();
+    assert!(
+        matches!(err, DpdkError::AlreadyInitialized | DpdkError::Native(_)),
+        "a leaked runtime must make the next install fail closed, got {err:?}"
+    );
 }
 
 /// Aeron's C driver only parses `AERON_{SENDER,RECEIVER,CONDUCTOR}_CPU_AFFINITY`;
