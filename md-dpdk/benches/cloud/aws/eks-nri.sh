@@ -1356,11 +1356,19 @@ wait_pods_ready() { # <ns>
 # on the CPU it was given. The CPUs come from the grant, never a literal.
 rep_cmd() { # <mode> <which> <ping_ep> <pong_ep>
     local mode=$1 which=$2 ping_ep=$3 pong_ep=$4 pre="" client="" envs=""
+    # A control mode (M0/M1/M3/M4/M5) is measured in the container cgroup on
+    # purpose: it asked for no cpu-partition.ergon.io, so there is no
+    # ERGON_ISOLATED_CGROUP and no isolated child to enter. Requiring one
+    # here made every control rep exit before it measured anything.
+    local want_partition=0
     case $mode in
     # prelock --mlock asks the target to mlockall, which the plugin's
     # RLIMIT_MEMLOCK grant (rlimits.ergon.io/app: "memlock") makes possible
     # in an unprivileged pod. prelock does not itself lock any pages.
     M1 | M6) pre="prelock --mlock --" ;;
+    esac
+    case $mode in
+    M2 | M6) want_partition=1 ;;
     esac
     if [[ $which == a ]]; then
         client="rtt xping $ping_ep $pong_ep $rtt_messages $rtt_warmup"
@@ -1373,15 +1381,34 @@ rep_cmd() { # <mode> <which> <ping_ep> <pong_ep>
     fi
     local cmd="$client"
     [[ -n $pre ]] && cmd="$pre $client"
+    # The partition block is emitted only for a mode that asked for one: a
+    # control mode's script has no isolated child to find, no move and no
+    # membership proof. The block is single-quoted so its `$`s reach the pod.
+    local partition_enter="" partition_prove="" partition_note="no partition (control mode)"
+    if [[ $want_partition == 1 ]]; then
+        partition_note="partition isolated"
+        partition_enter='child=${ERGON_ISOLATED_CGROUP:-}
+if [ -n "$child" ] && [ ! -d "$child" ]; then
+    child=/sys/fs/cgroup/$(basename "$child")
+fi
+[ -d "$child" ] || { echo "rep: this mode asked for a partition but no isolated cgroup is under ERGON_ISOLATED_CGROUP" >&2; exit 1; }
+[ "$(cat "$child/cpuset.cpus.partition" 2>/dev/null)" = isolated ] ||
+    { echo "rep: $child/cpuset.cpus.partition is not isolated" >&2; exit 1; }
+# The whole process group goes into the partition before anything starts.
+echo $$ >"$child/cgroup.procs" || { echo "rep: cannot move $$ into $child" >&2; exit 1; }'
+        partition_prove='grep -q "^$app$" "$child/cgroup.threads" 2>/dev/null ||
+    { echo "rep: pid $app is not in $child" >&2; kill $app $gap 2>/dev/null || true; exit 1; }'
+    fi
     cat <<EOF
 $envs
 set -eu
 mkdir -p "\${AERON_DIR:-/data/aeron}"
 rm -f /data/gapspin-$which.log /data/load-spikes.csv /data/stalls-ping.csv /data/stalls-pong.csv /data/rtt-histogram.csv
 
-# The exclusive CPUs the plugin granted this pod.
+# The exclusive CPUs the plugin granted this pod. Every mode gets these from
+# ergon-shared-cpus; only the partition annotation adds an isolated child.
 iso=\${ERGON_ISOLATED_CPUS:-}
-[ -n "\$iso" ] || { echo "rep: ERGON_ISOLATED_CPUS is empty: no partition grant" >&2; exit 1; }
+[ -n "\$iso" ] || { echo "rep: ERGON_ISOLATED_CPUS is empty: no exclusive-CPU grant" >&2; exit 1; }
 expand() { echo "\$1" | tr ',' '\n' | while read -r r; do case \$r in *-*) seq "\${r%%-*}" "\${r##*-}";; *) echo "\$r";; esac; done; }
 set -- \$(expand "\$iso")
 [ \$# -ge 1 ] || { echo "rep: ERGON_ISOLATED_CPUS=\$iso names no CPU" >&2; exit 1; }
@@ -1390,16 +1417,7 @@ cpu_gap=\${2:-\$1}
 
 # The isolated child. The env carries the node's path; inside the pod's own
 # cgroup namespace the child is a directory of the namespace root.
-child=\${ERGON_ISOLATED_CGROUP:-}
-if [ -n "\$child" ] && [ ! -d "\$child" ]; then
-    child=/sys/fs/cgroup/\$(basename "\$child")
-fi
-[ -d "\$child" ] || { echo "rep: no isolated cgroup under ERGON_ISOLATED_CGROUP" >&2; exit 1; }
-[ "\$(cat "\$child/cpuset.cpus.partition" 2>/dev/null)" = isolated ] ||
-    { echo "rep: \$child/cpuset.cpus.partition is not isolated" >&2; exit 1; }
-
-# The whole process group goes into the partition before anything starts.
-echo \$\$ >"\$child/cgroup.procs" || { echo "rep: cannot move \$\$ into \$child" >&2; exit 1; }
+$partition_enter
 
 gapspin \$cpu_gap 50 > /data/gapspin-$which.log 2>&1 &
 gap=\$!
@@ -1408,14 +1426,13 @@ app=\$!
 
 # Prove it before any number counts.
 sleep 0.2
-grep -q "^\$app\$" "\$child/cgroup.threads" 2>/dev/null ||
-    { echo "rep: pid \$app is not in \$child" >&2; kill \$app \$gap 2>/dev/null || true; exit 1; }
+$partition_prove
 mask=\$(taskset -pc \$app 2>/dev/null | sed 's/.*: //')
 case ",\$iso," in
 *,\$cpu_client,*) ;;
 *) echo "rep: cpu \$cpu_client is not in ERGON_ISOLATED_CPUS=\$iso" >&2; kill \$app \$gap 2>/dev/null || true; exit 1 ;;
 esac
-echo "rep: $which pid \$app in \$child on cpu \$cpu_client (affinity \$mask); gapspin \$gap on \$cpu_gap; partition isolated" >&2
+echo "rep: $which pid \$app on cpu \$cpu_client (affinity \$mask); gapspin \$gap on \$cpu_gap; $partition_note" >&2
 wait \$app
 EOF
 }

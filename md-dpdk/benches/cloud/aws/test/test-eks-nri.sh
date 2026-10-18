@@ -289,7 +289,7 @@ else
 fi
 if grep -q 'cgroup.procs' "$script" &&
     grep -q 'cgroup.threads' "$script" &&
-    grep -qF 'pid \$app is not in' "$script"; then
+    grep -qF 'pid $app is not in' "$script"; then
     ok "partition: the measured task is moved into the isolated child and proved there"
 else
     bad "partition: the measured task is not moved into the isolated child, or not proved"
@@ -311,6 +311,38 @@ if grep -q 'export RTT_HISTOGRAM=' "$script" &&
     ok "env: the client's environment is exported, not prefixed to one command"
 else
     bad "env: the client's RTT_HISTOGRAM/LOAD_SPIKES are not exported (they would not reach rtt)"
+fi
+
+# ---- 14. a control mode does not require the partition it never asked for ----
+# Only M2/M6 carry cpu-partition.ergon.io, so only they have an isolated
+# child. rep_cmd's in-pod script used to demand one for every mode, so every
+# control rep exited before it measured anything and the lab died at M0.
+# Generate the two scripts and read what they ask for.
+rep_fn=$tmp/rep_cmd.sh
+sed -n '/^rep_cmd()/,/^}/p' "$script" >"$rep_fn"
+gen_rep() { # <mode> -> the in-pod script on stdout
+    bash -c 'source "$1"; rtt_messages=1000 rtt_warmup=10; rep_cmd "$2" a 10.0.0.1:1 10.0.0.2:1' \
+        _ "$rep_fn" "$1"
+}
+gen_rep M0 >"$tmp/rep-m0.sh"
+gen_rep M2 >"$tmp/rep-m2.sh"
+if grep -q 'cgroup.procs' "$tmp/rep-m0.sh"; then
+    bad "rep_cmd M0: a control mode writes cgroup.procs (it was never granted a partition)"
+else
+    ok "rep_cmd M0: a control mode stays in the container cgroup"
+fi
+if grep -q 'cgroup.procs' "$tmp/rep-m2.sh" &&
+    grep -q 'cgroup.threads' "$tmp/rep-m2.sh" &&
+    grep -q 'partition isolated' "$tmp/rep-m2.sh"; then
+    ok "rep_cmd M2: the partition mode still moves in and proves it"
+else
+    bad "rep_cmd M2: the partition mode lost its move or its proof"
+fi
+if grep -q 'no partition (control mode)' "$tmp/rep-m0.sh" &&
+    ! grep -q 'ERGON_ISOLATED_CGROUP' "$tmp/rep-m0.sh"; then
+    ok "rep_cmd: a control mode's script names its mode and never looks for a child"
+else
+    bad "rep_cmd: a control mode's script still looks for an isolated child"
 fi
 
 echo
