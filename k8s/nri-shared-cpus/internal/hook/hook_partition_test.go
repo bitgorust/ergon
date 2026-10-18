@@ -350,6 +350,125 @@ func TestApplyPartitionFailsWhenTheAncestorFileIsMissing(t *testing.T) {
 	}
 }
 
+// TestApplyPartitionRollsBackTheAncestorsOnAFailedPlan is the P2 regression:
+// a half-applied plan must leave no cpuset.cpus.exclusive claim behind. Those
+// claims are the kernel's exclusivity currency: while podB.slice still lists
+// 2,3, a later container that wants 2,3 is rejected with EINVAL even though
+// nothing is using them.
+func TestApplyPartitionRollsBackTheAncestorsOnAFailedPlan(t *testing.T) {
+	useTempLock(t)
+	root := t.TempDir()
+	// Pod A is already running a partition on 1,5.
+	podA := writeTree(t, root, "kubepods/podA.slice/cri-a.scope")
+	writeTree(t, root, "kubepods")
+	planA, err := cpuset.PartitionPlan(root, podA, cpuset.New(1, 5), cpuset.New(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyPartition(planA); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pod B's create fails partway: its own cpuset.cpus.exclusive is missing,
+	// so the innermost WriteExclusiveAdd fails after kubepods and podB.slice
+	// have already reserved 2,3.
+	podB := writeTree(t, root, "kubepods/podB.slice/cri-b.scope")
+	if err := os.Remove(filepath.Join(podB, "cpuset.cpus.exclusive")); err != nil {
+		t.Fatal(err)
+	}
+	planB, err := cpuset.PartitionPlan(root, podB, cpuset.New(2, 3), cpuset.New(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyPartition(planB); err == nil {
+		t.Fatal("a plan that cannot finish must fail the create")
+	}
+
+	// Every ancestor is back to what it held before pod B: the shared
+	// kubepods keeps pod A's 1,5, and podB.slice holds nothing.
+	for _, tc := range []struct{ dir, want string }{
+		{filepath.Join(root, "kubepods"), "1,5"},
+		{filepath.Join(root, "kubepods", "podB.slice"), ""},
+	} {
+		got, err := os.ReadFile(filepath.Join(tc.dir, "cpuset.cpus.exclusive"))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.dir, err)
+		}
+		if have := strings.TrimSpace(string(got)); have != tc.want {
+			t.Errorf("%s/cpuset.cpus.exclusive = %q, want %q", tc.dir, have, tc.want)
+		}
+	}
+	// The half-made child is gone, so it cannot hold the CPUs either.
+	if _, err := os.Stat(planB.Child); !os.IsNotExist(err) {
+		t.Errorf("the half-made child %s must be removed, stat err = %v", planB.Child, err)
+	}
+	// Pod A is untouched by pod B's failed create.
+	got, err := os.ReadFile(filepath.Join(podA, "cpuset.cpus.exclusive"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != "1,5" {
+		t.Errorf("pod A's cpuset.cpus.exclusive = %q, want 1,5", got)
+	}
+	got, err = os.ReadFile(filepath.Join(planA.Child, "cpuset.cpus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != "1,5" {
+		t.Errorf("pod A's child cpuset.cpus = %q, want 1,5", got)
+	}
+}
+
+// TestApplyPartitionRollsBackOnlyWhatItAdded: re-running a plan that is
+// already in place must not drop the reservation the first run made. The
+// rollback undoes this run's delta, not the whole set.
+func TestApplyPartitionRollsBackOnlyWhatItAdded(t *testing.T) {
+	useTempLock(t)
+	root := t.TempDir()
+	podA := writeTree(t, root, "kubepods/podA.slice/cri-a.scope")
+	writeTree(t, root, "kubepods")
+	planA, err := cpuset.PartitionPlan(root, podA, cpuset.New(1, 5), cpuset.New(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyPartition(planA); err != nil {
+		t.Fatal(err)
+	}
+	// Re-run the same plan, but make the last write impossible: a directory
+	// where cpuset.cpus.partition should be. The kernel would refuse the
+	// write; so does the fixture. The first run left the real file there, so
+	// it has to come out before the directory can take its place.
+	block := filepath.Join(planA.Child, "cpuset.cpus.partition")
+	if err := os.Remove(block); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(block, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyPartition(planA); err == nil {
+		t.Fatal("a re-run whose last write cannot land must fail")
+	}
+	// The child the first run made is still there: this run did not create
+	// it, so its rollback must not remove it.
+	if _, err := os.Stat(planA.Child); err != nil {
+		t.Errorf("the child %s must survive a failed re-run, stat err = %v", planA.Child, err)
+	}
+
+	// The reservation the first run made is still there.
+	for _, tc := range []struct{ dir, want string }{
+		{filepath.Join(root, "kubepods"), "1,5"},
+		{podA, "1,5"},
+	} {
+		got, err := os.ReadFile(filepath.Join(tc.dir, "cpuset.cpus.exclusive"))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.dir, err)
+		}
+		if have := strings.TrimSpace(string(got)); have != tc.want {
+			t.Errorf("%s/cpuset.cpus.exclusive = %q, want %q", tc.dir, have, tc.want)
+		}
+	}
+}
+
 func TestVerifyPartition(t *testing.T) {
 	dir := t.TempDir()
 	if err := verifyPartition(dir); err == nil {

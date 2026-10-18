@@ -245,45 +245,187 @@ var PartitionLockPath = "/run/ergon-shared-cpus.partition.lock"
 // container's CPUs. A write the kernel refuses, or one that does not read
 // back as written, is a failure: a container must not start claiming an
 // isolation it does not have.
+//
+// A plan that fails partway is undone before returning. The ancestors'
+// cpuset.cpus.exclusive is the kernel's exclusivity currency: a CPU left
+// reserved there for a partition that never started still counts as claimed
+// by a sibling, and the next container that wants it is rejected with EINVAL.
+// The undo takes back only what this call added — a re-run of a plan that is
+// already in place adds nothing, so it takes nothing back — and removes the
+// child only when this call created it. cgroup.subtree_control is left alone:
+// enabling cpuset is idempotent and another child may need it.
 func ApplyPartition(plan *cpuset.Plan) error {
 	unlock, err := lockPartition()
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	_, statErr := os.Stat(plan.Child)
+	weCreatedChild := statErr != nil
+	var reserved []reserve
+	fail := func(cause error) error {
+		if err := undoReserves(reserved); err != nil {
+			return fmt.Errorf("%w (and undoing the reservation left by the failed plan: %v)", cause, err)
+		}
+		if weCreatedChild {
+			if err := removeChild(plan.Child); err != nil {
+				return fmt.Errorf("%w (and removing the half-made child %s: %v)", cause, plan.Child, err)
+			}
+		}
+		return cause
+	}
 	for _, w := range plan.Writes {
 		switch w.Kind {
 		case cpuset.WriteMkdir:
 			if err := os.MkdirAll(w.Path, 0o755); err != nil {
-				return fmt.Errorf("hook: create %s: %w", w.Path, err)
+				return fail(fmt.Errorf("hook: create %s: %w", w.Path, err))
 			}
 		case cpuset.WriteExclusiveAdd:
-			value, err := unionInto(w.Path, w.Value)
+			value, added, err := unionInto(w.Path, w.Value)
 			if err != nil {
-				return fmt.Errorf("hook: reserve %s in %s: %w", w.Value, w.Path, err)
+				return fail(fmt.Errorf("hook: reserve %s in %s: %w", w.Value, w.Path, err))
+			}
+			// Record before the write, not after: a write that lands and
+			// then fails its read-back has still changed the file, and the
+			// undo takes back only CPUs that are there anyway.
+			if !added.IsEmpty() {
+				reserved = append(reserved, reserve{path: w.Path, cpus: added})
 			}
 			if err := writeCPUList(w.Path, value); err != nil {
-				return err
+				return fail(err)
 			}
 		case cpuset.WriteCpus, cpuset.WriteExclusive:
 			if err := writeCPUList(w.Path, w.Value); err != nil {
-				return err
+				return fail(err)
 			}
 		case cpuset.WriteSubtreeControl:
 			if err := enableController(w.Path, w.Value); err != nil {
-				return fmt.Errorf("hook: enable %s in %s: %w", w.Value, w.Path, err)
+				return fail(fmt.Errorf("hook: enable %s in %s: %w", w.Value, w.Path, err))
 			}
 		case cpuset.WriteCgroupType:
 			if err := writeCgroupType(w.Path, w.Value); err != nil {
-				return err
+				return fail(err)
 			}
 		default:
 			if err := writeAndVerify(w.Path, w.Value); err != nil {
-				return err
+				return fail(err)
 			}
 		}
 	}
-	return verifyPartition(plan.Child)
+	if err := verifyPartition(plan.Child); err != nil {
+		return fail(err)
+	}
+	return nil
+}
+
+// reserve is one ancestor reservation this call added, so that a failed plan
+// can take it back. The CPUs are the delta this call unioned in, not the whole
+// file: a re-run of a plan that is already in place adds nothing and must not
+// take back the reservation the first run made.
+type reserve struct {
+	path string
+	cpus cpuset.Set
+}
+
+// undoReserves takes back the ancestor reservations of a failed plan, last
+// first. A reservation that is already gone is not an error: the rollback is
+// best-effort cleanup, and its own failure is reported separately by the
+// caller so the create's cause is never hidden.
+func undoReserves(reserved []reserve) error {
+	var problems []string
+	for i := len(reserved) - 1; i >= 0; i-- {
+		r := reserved[i]
+		if err := subtractFrom(r.path, r.cpus); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
+	if len(problems) > 0 {
+		return errors.New(strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// subtractFrom drops cpus from the CPU list at path. Unlike unionInto, an
+// empty result is written back as an empty file: a reservation of nothing is
+// the state a real cpuset.cpus.exclusive shows when nothing is reserved.
+func subtractFrom(path string, cpus cpuset.Set) error {
+	current, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	base := cpuset.Set{}
+	if text := strings.TrimSpace(string(current)); text != "" {
+		base, err = cpuset.Parse(text)
+		if err != nil {
+			return fmt.Errorf("parse the reservation %q in %s: %w", current, path, err)
+		}
+	}
+	return writeCPUSet(path, base.Difference(cpus))
+}
+
+// writeCPUSet writes a CPU set and reads it back. It is writeCPUList for the
+// case where the set may be empty, which a rollback can produce and which
+// cpuset.Parse rejects as "empty list".
+func writeCPUSet(path string, set cpuset.Set) error {
+	value := ""
+	if !set.IsEmpty() {
+		value = set.List()
+	}
+	if err := os.WriteFile(path, []byte(value+"\n"), 0o644); err != nil {
+		return fmt.Errorf("hook: write %s=%q: %w", path, value, err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("hook: read back %s: %w", path, err)
+	}
+	text := strings.TrimSpace(string(got))
+	if text == "" {
+		if !set.IsEmpty() {
+			return fmt.Errorf("hook: %s is empty after writing %s", path, set.List())
+		}
+		return nil
+	}
+	have, err := cpuset.Parse(text)
+	if err != nil {
+		return fmt.Errorf("hook: %s does not read back as a CPU list (%q): %w", path, got, err)
+	}
+	if !have.Equals(set) {
+		return fmt.Errorf("hook: %s is %s after writing %s", path, have.List(), set.List())
+	}
+	return nil
+}
+
+// removeChild takes a half-made partition child away. A cgroup2 directory is
+// removed with rmdir and only when it holds no task and no child cgroup: the
+// kernel owns the pseudo-files and unlinking one fails, so os.Remove is the
+// whole story on a real cgroup. The unit fixture is ordinary files, which
+// rmdir refuses while they are there, so those are taken out first and rmdir
+// is tried again. Anything that is not an ordinary file — a cgroup
+// pseudo-file, or a nested cgroup — is left for rmdir.
+func removeChild(child string) error {
+	if err := os.Remove(child); err == nil || errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	entries, err := os.ReadDir(child)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		if err := os.Remove(filepath.Join(child, e.Name())); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(child); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // lockPartition takes the exclusive partition lock for the duration of a
@@ -304,28 +446,31 @@ func lockPartition() (func(), error) {
 }
 
 // unionInto reads the CPU list already reserved at path and returns it with
-// add's CPUs merged in. An empty file is "nothing reserved yet", which is what
-// a real cpuset.cpus.exclusive shows on a cgroup holding no exclusive CPUs. A
-// missing or unreadable file is an error, not an empty reservation: guessing
-// there would either drop another partition's CPUs or hide a path that does
-// not exist.
-func unionInto(path, add string) (string, error) {
+// add's CPUs merged in, plus the CPUs that were not already there. The delta
+// is what a failed plan has to take back: subtracting all of add would drop a
+// reservation a previous run of the same plan made and is still using.
+// An empty file is "nothing reserved yet", which is what a real
+// cpuset.cpus.exclusive shows on a cgroup holding no exclusive CPUs. A missing
+// or unreadable file is an error, not an empty reservation: guessing there
+// would either drop another partition's CPUs or hide a path that does not
+// exist.
+func unionInto(path, add string) (string, cpuset.Set, error) {
 	current, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return "", cpuset.Set{}, err
 	}
 	base := cpuset.Set{}
 	if text := strings.TrimSpace(string(current)); text != "" {
 		base, err = cpuset.Parse(text)
 		if err != nil {
-			return "", fmt.Errorf("parse the existing reservation %q: %w", current, err)
+			return "", cpuset.Set{}, fmt.Errorf("parse the existing reservation %q: %w", current, err)
 		}
 	}
 	more, err := cpuset.Parse(add)
 	if err != nil {
-		return "", err
+		return "", cpuset.Set{}, err
 	}
-	return base.Union(more).List(), nil
+	return base.Union(more).List(), more.Difference(base), nil
 }
 
 // writeCPUList writes a CPU list and reads it back as a set. A write the kernel
