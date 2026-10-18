@@ -283,8 +283,55 @@ fn k4_warns_when_there_is_one_cpu_and_no_helpers_named() -> R {
 
 #[test]
 fn k4_is_ok_with_a_second_cpu() -> R {
+    // 2 and 6 are SMT siblings, the book's `x86 with SMT, cpu: 2` row: the
+    // spare is the loop's other hyperthread, so the message has to say the
+    // helpers share that core rather than claim a whole core of their own.
     let f = pod_at("k4-two", QOS_BURSTABLE, Some("2,6"))?;
     let v = k8s_checks(&f.host(), &hot(), &needs());
+    let k4 = by_id(&v, CheckId::K4)?;
+    assert_eq!(k4.status, Status::Ok, "{v:#?}");
+    let m = &k4.message;
+    assert!(m.contains("for helpers"), "{m}");
+    assert!(m.contains("SMT sibling"), "{m}");
+    Ok(())
+}
+
+#[test]
+fn k4_names_a_spare_on_another_core() -> R {
+    // 2 and 3 are different cores (2's sibling is 6, 3's is 7), so the
+    // helpers get a core of their own.
+    let f = pod_at("k4-cores", QOS_BURSTABLE, Some("2,3"))?;
+    let v = k8s_checks(&f.host(), &hot(), &needs());
+    let k4 = by_id(&v, CheckId::K4)?;
+    assert_eq!(k4.status, Status::Ok, "{v:#?}");
+    let m = &k4.message;
+    assert!(m.contains("for helpers"), "{m}");
+    assert!(!m.contains("SMT sibling"), "{m}");
+    Ok(())
+}
+
+#[test]
+fn k4_warns_when_every_cpu_holds_a_spinning_role() -> R {
+    // Two CPUs, but both busy-spin: a sender on 6 as well as the loop on 2.
+    // The helpers have nowhere to go, and counting the CPUs is not enough.
+    let f = pod_at("k4-full", QOS_BURSTABLE, Some("2,6"))?;
+    let hot = HotSet::new().with(2, Role::Loop).with(6, Role::Sender);
+    let v = k8s_checks(&f.host(), &hot, &needs());
+    let k4 = by_id(&v, CheckId::K4)?;
+    assert!(k4.is_warning(), "{v:#?}");
+    let m = &k4.message;
+    assert!(m.contains("sender"), "{m}");
+    assert!(m.contains("ERGON_SHARED_CPUS or ERGON_HELPER_CPUS"), "{m}");
+    assert!(m.contains("Fix (pod spec):"), "{m}");
+    Ok(())
+}
+
+#[test]
+fn k4_accepts_a_cpu_that_only_runs_non_spinning_roles() -> R {
+    // The conductor does not busy-spin, so CPU 6 is still free for helpers.
+    let f = pod_at("k4-conductor", QOS_BURSTABLE, Some("2,6"))?;
+    let hot = HotSet::new().with(2, Role::Loop).with(6, Role::Conductor);
+    let v = k8s_checks(&f.host(), &hot, &needs());
     let k4 = by_id(&v, CheckId::K4)?;
     assert_eq!(k4.status, Status::Ok, "{v:#?}");
     assert!(k4.message.contains("for helpers"), "{}", k4.message);

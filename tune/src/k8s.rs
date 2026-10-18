@@ -105,7 +105,7 @@ pub fn k8s_checks(host: &Host, cpus: &HotSet, needs: &Needs) -> Vec<Finding> {
         t9_cpu_quota(host),
         t7_sched_policy(host, needs.thread, needs.role),
         k3_smt_sibling(host, cpus, cg.as_ref().ok()),
-        k4_helpers(host, cg.as_ref().ok()),
+        k4_helpers(host, cpus, cg.as_ref().ok()),
         k5_capabilities(host, needs),
         k6_pressure(host, cg.as_ref().ok()),
         k7_numa(host, cg.as_ref().ok(), needs.nic.as_ref()),
@@ -418,7 +418,13 @@ fn named_helpers(host: &Host) -> bool {
 }
 
 /// K4: the pod has a CPU for helpers.
-fn k4_helpers(host: &Host, cg: Option<&CpuCgroup>) -> Finding {
+///
+/// A CPU counts only when no busy-spinning role is pinned to it: two CPUs
+/// that both spin leave the helpers nowhere to go, whatever the cpuset's
+/// size. A spare that is a busy CPU's SMT sibling still counts — the book's
+/// `x86 with SMT, cpu: 2` layout puts the helpers there — and the message
+/// says so, because those helpers take that core's execution units.
+fn k4_helpers(host: &Host, cpus: &HotSet, cg: Option<&CpuCgroup>) -> Finding {
     let id = CheckId::K4;
     let sev = Severity::Warn;
     let set = match pod_cpuset(host, cg) {
@@ -433,31 +439,89 @@ fn k4_helpers(host: &Host, cg: Option<&CpuCgroup>) -> Finding {
             );
         }
     };
-    if set.len() > 1 || named_helpers(host) {
-        return Finding::ok(
+    let spinning = cpus.spinning();
+    let spare: CpuSet = set.iter().filter(|c| !spinning.contains(*c)).collect();
+    if spare.is_empty() {
+        if named_helpers(host) {
+            return Finding::ok(
+                id,
+                sev,
+                K_EVIDENCE,
+                "every CPU in this pod's cpuset holds a busy-spinning role, and helper CPUs are \
+                 named (ERGON_SHARED_CPUS or ERGON_HELPER_CPUS)"
+                    .to_owned(),
+            );
+        }
+        return Finding::found(
             id,
             sev,
             K_EVIDENCE,
-            if set.len() > 1 {
+            if set.len() == 1 {
                 format!(
-                    "{} CPUs in this pod's cpuset: one is for helpers",
-                    set.len()
+                    "this pod has one CPU ({set}) and names no helper CPUs: the helpers share the \
+                     loop's CPU and take its time. Fix (pod spec): ask for one more CPU (cpu: 2), \
+                     or run the shared-CPU plugin and set ERGON_SHARED_CPUS or ERGON_HELPER_CPUS"
                 )
             } else {
-                "one CPU in this pod's cpuset, and helper CPUs are named (ERGON_SHARED_CPUS or \
-                 ERGON_HELPER_CPUS)"
-                    .to_owned()
+                format!(
+                    "every CPU in this pod's cpuset ({}) holds a busy-spinning role: the helpers \
+                     share one of those CPUs and take its time. Fix (pod spec): ask for one more \
+                     CPU (cpu: {}), or run the shared-CPU plugin and set ERGON_SHARED_CPUS or \
+                     ERGON_HELPER_CPUS",
+                    cpus.describe_all(&set),
+                    set.len() + 1
+                )
             },
         );
     }
-    Finding::found(
+    // Of the spares, which are a busy CPU's other hyperthread: a real CPU for
+    // the helpers, but on the loop's core.
+    let mut sibling: Vec<u32> = Vec::new();
+    let mut own_core: Vec<u32> = Vec::new();
+    let mut unproven: Vec<u32> = Vec::new();
+    for c in spare.iter() {
+        let path = format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list");
+        match host.read_cpu_list(&path) {
+            Ok(s) if s.iter().any(|x| x != c && spinning.contains(x)) => sibling.push(c),
+            Ok(_) => own_core.push(c),
+            // A missing thread_siblings_list is not "a core of its own".
+            Err(_) => unproven.push(c),
+        }
+    }
+    // The helpers get a core of their own when any spare is; otherwise the
+    // spares are the busy CPUs' other hyperthreads (or the topology is
+    // missing), and the message has to say which.
+    let shared = own_core.is_empty() && !sibling.is_empty();
+    let free = if !own_core.is_empty() {
+        own_core
+    } else if !sibling.is_empty() {
+        sibling
+    } else {
+        unproven
+    };
+    let note = if shared {
+        ", and it is a busy CPU's SMT sibling: the helpers share that core's execution units"
+    } else {
+        ""
+    };
+    let names = free
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (cpu, is) = if free.len() == 1 {
+        ("CPU", "is")
+    } else {
+        ("CPUs", "are")
+    };
+    Finding::ok(
         id,
         sev,
         K_EVIDENCE,
         format!(
-            "this pod has one CPU ({set}) and names no helper CPUs: the helpers share the loop's \
-             CPU and take its time. Fix (pod spec): ask for one more CPU (cpu: 2), or run the \
-             shared-CPU plugin and set ERGON_SHARED_CPUS or ERGON_HELPER_CPUS"
+            "{} CPUs in this pod's cpuset: {cpu} {names} {is} free of busy-spinning roles: one is \
+             for helpers{note}",
+            set.len()
         ),
     )
 }
