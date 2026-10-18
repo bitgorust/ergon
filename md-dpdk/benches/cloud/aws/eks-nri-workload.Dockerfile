@@ -15,8 +15,9 @@
 # still packages openjdk-17 (trixie dropped it). Bookworm's own cmake is
 # 3.25.1 and Aeron's CMakeLists requires 3.30 or higher, so cmake comes from
 # cmake.org's official binary. The runtime image matches the build's glibc
-# (rtt is dynamically linked). The pods run `prelock -- rtt ...` and kubectl
-# exec runs `counters` and the probes.
+# (rtt is dynamically linked). The pods run `prelock --mlock -- rtt ...` (on
+# the modes with the RLIMIT_MEMLOCK grant) and kubectl exec runs `counters`
+# and the probes.
 
 FROM rust:1.99.0-slim-bookworm AS build
 ARG CMAKE_VERSION=3.31.6

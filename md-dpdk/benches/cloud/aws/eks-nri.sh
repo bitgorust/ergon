@@ -924,6 +924,10 @@ sed -i.bak "s|PROBE_IMAGE|$registry/$N/workload:$tag|" "$out/k8s/probe.yaml" && 
 
 # The shared-cpus plugin: the repo's manifests, its config rewritten for this
 # node group (shared CPU 0, the lab namespaces only, annotation opt-in).
+# devRoot and seccomp are part of that rewrite: the DaemonSet mounts the
+# host's /dev read-only at /host/dev, so the default /dev would have the
+# plugin look at its own /dev for the PHC and cpu_dma_latency; and the
+# io-uring widening defaults to off, which refuses the M3/M6 annotations.
 mkdir -p "$out/k8s/plugin"
 cp "$plugin_src/deploy/namespace.yaml" "$plugin_src/deploy/daemonset.yaml" "$out/k8s/plugin/" 2>/dev/null
 cat >"$out/k8s/plugin/configmap.yaml" <<YAML
@@ -941,6 +945,9 @@ data:
     hookPath: /opt/ergon/bin/ergon-cpus
     annotationOptIn: true
     metricsAddress: ":9466"
+    devRoot: /host/dev
+    seccomp:
+      ioUring: allow
 YAML
 cat >"$out/k8s/plugin/kustomization.yaml" <<YAML
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -1024,10 +1031,14 @@ YAML
 k apply -f "$out/k8s/admission.yaml" >"$out/apply.log" 2>&1 || { cat "$out/apply.log" >&2; die "kubectl apply admission"; }
 k apply -k "$out/k8s/plugin" >>"$out/apply.log" 2>&1 || { cat "$out/apply.log" >&2; die "kubectl apply -k plugin"; }
 k apply -f "$out/k8s/probe.yaml" >>"$out/apply.log" 2>&1 || { cat "$out/apply.log" >&2; die "kubectl apply probe"; }
-for ds in ergon-shared-cpus ergon-lab-probe; do
-    kubectl rollout status "ds/$ds" -n default --timeout=10m >>"$out/apply.log" 2>&1 ||
-        kubectl rollout status "ds/$ds" --timeout=10m >>"$out/apply.log" 2>&1 ||
-        die "daemonset $ds did not roll out (logs follow in $out/logs)"
+# Each DaemonSet in the namespace it is deployed in: the shared-cpus plugin
+# ships in ergon-system (deploy/daemonset.yaml), the probe in default. A wait
+# on the wrong namespace finds nothing and the run dies before it measures.
+for ds_ns in "ergon-shared-cpus ergon-system" "ergon-lab-probe default"; do
+    ds=${ds_ns%% *}
+    ns=${ds_ns##* }
+    kubectl rollout status "ds/$ds" -n "$ns" --timeout=10m >>"$out/apply.log" 2>&1 ||
+        die "daemonset $ds in $ns did not roll out (logs follow in $out/logs)"
 done
 k get ds -A >>"$out/apply.log" 2>&1
 
@@ -1094,6 +1105,8 @@ done
 make_pod() {
     local mode=$1 which=$2 ping_ep=$3 pong_ep=$4
     local name=ergon-lab-$which-$mode ns=ergon-hft
+    local node=$node_a
+    [[ $which == b ]] && node=$node_b
     local ann_hugepages="" ann_partition="" ann_seccomp="" ann_devices="" ann_rlimits=""
     local huge="" aeron_dir=/data/aeron page_size=""
     [[ $mode == M5 ]] && ns=ergon-hft-probe
@@ -1144,10 +1157,12 @@ PYAML
     fi
     # The pod's command is a sleep: the script starts each rep's xpong and
     # xping inside it with kubectl exec (like the DPDK lab's driver pod), so
-    # the files the clients write stay readable while the pod lives. The
-    # measured thread is pinned by rtt's own cpu argument (isolated CPU 2);
-    # an exec'd process starts on the container's whole cpuset, which is why
-    # the pin is explicit and never left to the runtime.
+    # the files the clients write stay readable while the pod lives. Each
+    # role is bound to the node whose IP becomes its endpoint: a generic
+    # nodeSelector lets the two land anywhere, and swapped roles point the
+    # RTT at the wrong process. The measured thread is moved into the
+    # isolated partition and pinned by rep_cmd; an exec'd process starts on
+    # the container's whole cpuset, which is why both are explicit.
     cat <<YAML
 apiVersion: v1
 kind: Pod
@@ -1166,6 +1181,7 @@ spec:
   hostNetwork: true
   nodeSelector:
     ergon.io/shared-cpus: "true"
+    kubernetes.io/hostname: "$node"
   tolerations:
     - operator: Exists
   terminationGracePeriodSeconds: 1
@@ -1332,31 +1348,95 @@ wait_pods_ready() { # <ns>
     return 1
 }
 
-# The rep's command inside the pod: the gap spinner on the second isolated
-# CPU (to attribute every max), then the measured client pinned to the first.
+# The rep's command inside the pod: the gap spinner on the second granted
+# exclusive CPU (to attribute every max), then the measured client on the
+# first. Both are moved into the isolated partition first — a task left
+# outside it cannot execute on those CPUs at all — and the rep refuses to
+# produce numbers unless the measured task is shown to be in the child and
+# on the CPU it was given. The CPUs come from the grant, never a literal.
 rep_cmd() { # <mode> <which> <ping_ep> <pong_ep>
-    local mode=$1 which=$2 ping_ep=$3 pong_ep=$4 pre="" client=""
+    local mode=$1 which=$2 ping_ep=$3 pong_ep=$4 pre="" client="" envs=""
     case $mode in
-    M1 | M6) pre="prelock --mlock -- " ;; # MEMLOCK grant; mlock the hugepages
+    # prelock --mlock asks the target to mlockall, which the plugin's
+    # RLIMIT_MEMLOCK grant (rlimits.ergon.io/app: "memlock") makes possible
+    # in an unprivileged pod. prelock does not itself lock any pages.
+    M1 | M6) pre="prelock --mlock --" ;;
     esac
     if [[ $which == a ]]; then
-        client="rtt xping $ping_ep $pong_ep $rtt_messages $rtt_warmup 2"
+        client="rtt xping $ping_ep $pong_ep $rtt_messages $rtt_warmup"
+        # These have to be exported, not prefixed to one command: the old
+        # `VAR=... mkdir; ...; rtt` spelling set them for mkdir alone, so
+        # the histogram and spike files were never written.
+        envs="export RTT_HISTOGRAM=/data/rtt-histogram.csv LOAD_SPIKES=/data/load-spikes.csv LOAD_SPIKE_NS=100000 LOOP_STALLS_DIR=/data"
     else
-        client="rtt xpong $ping_ep $pong_ep 2"
+        client="rtt xpong $ping_ep $pong_ep"
     fi
-    # mkdir -p AERON_DIR: on the hugepage modes it is /dev/hugepages/aeron
-    # inside the plugin's sized hugetlbfs mount.
-    echo "mkdir -p \"\${AERON_DIR:-/data/aeron}\"; rm -f /data/gapspin-$which.log /data/load-spikes.csv /data/stalls-ping.csv /data/stalls-pong.csv /data/rtt-histogram.csv; gapspin 3 50 > /data/gapspin-$which.log 2>&1 & exec $pre$client"
+    local cmd="$client"
+    [[ -n $pre ]] && cmd="$pre $client"
+    cat <<EOF
+$envs
+set -eu
+mkdir -p "\${AERON_DIR:-/data/aeron}"
+rm -f /data/gapspin-$which.log /data/load-spikes.csv /data/stalls-ping.csv /data/stalls-pong.csv /data/rtt-histogram.csv
+
+# The exclusive CPUs the plugin granted this pod.
+iso=\${ERGON_ISOLATED_CPUS:-}
+[ -n "\$iso" ] || { echo "rep: ERGON_ISOLATED_CPUS is empty: no partition grant" >&2; exit 1; }
+expand() { echo "\$1" | tr ',' '\n' | while read -r r; do case \$r in *-*) seq "\${r%%-*}" "\${r##*-}";; *) echo "\$r";; esac; done; }
+set -- \$(expand "\$iso")
+[ \$# -ge 1 ] || { echo "rep: ERGON_ISOLATED_CPUS=\$iso names no CPU" >&2; exit 1; }
+cpu_client=\$1
+cpu_gap=\${2:-\$1}
+
+# The isolated child. The env carries the node's path; inside the pod's own
+# cgroup namespace the child is a directory of the namespace root.
+child=\${ERGON_ISOLATED_CGROUP:-}
+if [ -n "\$child" ] && [ ! -d "\$child" ]; then
+    child=/sys/fs/cgroup/\$(basename "\$child")
+fi
+[ -d "\$child" ] || { echo "rep: no isolated cgroup under ERGON_ISOLATED_CGROUP" >&2; exit 1; }
+[ "\$(cat "\$child/cpuset.cpus.partition" 2>/dev/null)" = isolated ] ||
+    { echo "rep: \$child/cpuset.cpus.partition is not isolated" >&2; exit 1; }
+
+# The whole process group goes into the partition before anything starts.
+echo \$\$ >"\$child/cgroup.procs" || { echo "rep: cannot move \$\$ into \$child" >&2; exit 1; }
+
+gapspin \$cpu_gap 50 > /data/gapspin-$which.log 2>&1 &
+gap=\$!
+$cmd \$cpu_client &
+app=\$!
+
+# Prove it before any number counts.
+sleep 0.2
+grep -q "^\$app\$" "\$child/cgroup.threads" 2>/dev/null ||
+    { echo "rep: pid \$app is not in \$child" >&2; kill \$app \$gap 2>/dev/null || true; exit 1; }
+mask=\$(taskset -pc \$app 2>/dev/null | sed 's/.*: //')
+case ",\$iso," in
+*,\$cpu_client,*) ;;
+*) echo "rep: cpu \$cpu_client is not in ERGON_ISOLATED_CPUS=\$iso" >&2; kill \$app \$gap 2>/dev/null || true; exit 1 ;;
+esac
+echo "rep: $which pid \$app in \$child on cpu \$cpu_client (affinity \$mask); gapspin \$gap on \$cpu_gap; partition isolated" >&2
+wait \$app
+EOF
 }
 
 # What each extension actually granted, read back from inside the pods
-# (the plan's functional checks). Recorded per mode; never a silent skip.
-functional_check() { # <mode> <ns>
+# (the plan's functional checks). Recorded per mode, and a mode whose grant
+# cannot be read back is not measured: an extension that did not fire is a
+# diagnostic, never a performance comparison. Returns 0 only when every
+# grant that mode asked for is present in both pods.
+functional_check() { # <mode> <ns> -> 0 when every promised grant is there
     local mode=$1 ns=$2 pod out=$out/functional-$mode.txt
+    local ok=0 missing=""
     : >"$out"
     for which in a b; do
         pod=$(pod_of "$which" "$ns")
-        [[ -n $pod ]] || { echo "$which: no pod" >>"$out"; continue; }
+        if [[ -z $pod ]]; then
+            echo "$which: no pod" >>"$out"
+            ok=1
+            missing="$missing $which:no-pod"
+            continue
+        fi
         {
             echo "== $which $pod"
             kx -n "$ns" "$pod" -- sh -c '
@@ -1368,7 +1448,19 @@ functional_check() { # <mode> <ns>
                 echo "ERGON_ISOLATED_CGROUP=${ERGON_ISOLATED_CGROUP:-}"
                 echo "ERGON_PTP_DEVICE=${ERGON_PTP_DEVICE:-}"
                 echo "== findmnt hugepages"; findmnt /dev/hugepages 2>&1 || true
-                echo "== partition"; if [ -n "${ERGON_ISOLATED_CGROUP:-}" ]; then cat "$ERGON_ISOLATED_CGROUP/cpuset.cpus.partition" 2>&1; else echo "(no ERGON_ISOLATED_CGROUP)"; fi
+                echo "== partition"
+                child=${ERGON_ISOLATED_CGROUP:-}
+                if [ -n "$child" ] && [ ! -d "$child" ]; then
+                    child=/sys/fs/cgroup/$(basename "$child")
+                fi
+                echo "child=$child"
+                if [ -n "$child" ] && [ -d "$child" ]; then
+                    cat "$child/cpuset.cpus.partition" 2>&1 || true
+                    echo "== child cpus"; cat "$child/cpuset.cpus" 2>&1 || true
+                    echo "== child type"; cat "$child/cgroup.type" 2>&1 || true
+                else
+                    echo "(no isolated child)"
+                fi
                 echo "== parent cpuset"; cat /sys/fs/cgroup/cpuset.cpus 2>&1 || true
                 echo "== ptp"; ls -l /dev/ptp* 2>&1 || true
                 echo "== io_uring"; io_uring_probe 2>&1 || true
@@ -1377,7 +1469,54 @@ functional_check() { # <mode> <ns>
         } >>"$out"
     done
     log "functional $mode: $out"
-    grep -E 'findmnt|pagesize|size=|partition|ERGON_|ptp|io_uring|Seccomp|isolated' "$out" | sed 's/^/    /' >&2 || true
+    grep -E 'findmnt|pagesize|size=|partition|child|ERGON_|ptp|io_uring|Seccomp|isolated' "$out" | sed 's/^/    /' >&2 || true
+
+    # Enforce: the read-back has to show what this mode asked for.
+    local want=""
+    case $mode in
+    M1 | M6) want="hugepages" ;;
+    esac
+    case $mode in
+    M2 | M6) want="$want partition" ;;
+    esac
+    case $mode in
+    M3 | M6) want="$want io_uring" ;;
+    esac
+    case $mode in
+    M4 | M6) want="$want ptp" ;;
+    esac
+    local w
+    for w in $want; do
+        case $w in
+        hugepages)
+            if ! grep -q 'ERGON_HUGEPAGES_DIR=/dev/hugepages' "$out" ||
+                ! grep -q 'size=' "$out"; then
+                missing="$missing hugepages"
+            fi
+            ;;
+        partition)
+            if ! grep -q '^isolated$' "$out" || ! grep -q 'ERGON_ISOLATED_CPUS=.' "$out"; then
+                missing="$missing partition"
+            fi
+            ;;
+        io_uring)
+            if ! grep -q 'io_uring_setup fd=' "$out"; then
+                missing="$missing io_uring"
+            fi
+            ;;
+        ptp)
+            if ! grep -q 'ERGON_PTP_DEVICE=/dev/ptp\|/dev/ptp[0-9]' "$out"; then
+                missing="$missing ptp"
+            fi
+            ;;
+        esac
+    done
+    if [[ -n $missing ]]; then
+        log "functional $mode: missing$missing"
+        echo "functional $mode: missing$missing" >>"$out"
+        return 1
+    fi
+    return 0
 }
 
 : >"$results"
@@ -1402,20 +1541,42 @@ for mode in $modes; do
             k delete pod -n "$ns" -l 'app in (ergon-lab-a,ergon-lab-b)' --ignore-not-found >/dev/null 2>&1
             break
         fi
-        functional_check "$mode" "$ns"
+        # The endpoints are the named nodes' IPs, so each role has to be on
+        # its own node. Spreading alone does not say which pod runs where.
+        for which in a b; do
+            want=$node_a
+            [[ $which == b ]] && want=$node_b
+            got=$(k get pod -n "$ns" "ergon-lab-$which-$mode" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+            if [[ $got != "$want" ]]; then
+                echo "mode $mode rep $rep: pod $which on '$got', not '$want': the endpoints name the wrong process" >>"$out/skipped.txt"
+                die "$mode rep $rep: role $which is on '$got', not '$want' (see $out/skipped.txt)"
+            fi
+        done
+        # The grants have to be readable before the numbers count. An
+        # extension that did not fire is a diagnostic, never a comparison.
+        if ! functional_check "$mode" "$ns"; then
+            echo "mode $mode: not measured (a grant is missing; see functional-$mode.txt)" >>"$out/skipped.txt"
+            log "WARNING: $mode rep $rep: a grant is missing (functional-$mode.txt). Skipping the rest of $mode."
+            k delete pod -n "$ns" -l 'app in (ergon-lab-a,ergon-lab-b)' --ignore-not-found >/dev/null 2>&1
+            break
+        fi
         loss_a_before=$(loss_now a "$ns")
         loss_b_before=$(loss_now b "$ns")
         vm_before=$(vmstat_now a "$ns")
         # xpong on b first, then xping on a; the rtt line is xping's stdout.
-        # Each client's measured thread is pinned by rtt's own cpu argument
-        # (isolated CPU 2); gapspin takes CPU 3.
+        # rep_cmd moves each measured task into the isolated partition and
+        # pins it to a granted CPU; it prints nothing to stdout but the
+        # client's own line, and nothing at all if the proof fails.
         kx -n "$ns" "ergon-lab-b-$mode" -- sh -c "$(rep_cmd "$mode" b "$ping_ep" "$pong_ep")" \
             >"$out/$run-pong.log" 2>&1 &
         pong_bg=$!
         sleep 3
-        kx -n "$ns" "ergon-lab-a-$mode" -- sh -c \
-            "RTT_HISTOGRAM=/data/rtt-histogram.csv LOAD_SPIKES=/data/load-spikes.csv LOAD_SPIKE_NS=100000 LOOP_STALLS_DIR=/data $(rep_cmd "$mode" a "$ping_ep" "$pong_ep")" \
+        kx -n "$ns" "ergon-lab-a-$mode" -- sh -c "$(rep_cmd "$mode" a "$ping_ep" "$pong_ep")" \
             2>"$out/$run-ping-err.log" | sed "s/^/$rep,/" | tee -a "$results" >&2
+        ping_rc=${PIPESTATUS[0]}
+        if ((ping_rc != 0)); then
+            die "$mode rep $rep: the measured client did not prove its placement (rc $ping_rc; $out/$run-ping-err.log)"
+        fi
         kx -n "$ns" "ergon-lab-b-$mode" -- pkill -f '[r]tt xpong' >/dev/null 2>&1 || true
         wait "$pong_bg" 2>/dev/null
         # what the clients wrote, while the pods still live

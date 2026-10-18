@@ -262,6 +262,57 @@ else
     bad "admission gate: admission_check is not a gate (a wasted run would pass)"
 fi
 
+# ---- 13. the lab proves what it measures ------------------------------------
+# Source-level guarantees for the defects a live run would only show as
+# numbers that mean nothing: the plugin waited for in the wrong namespace,
+# a config that silently disables two extensions, roles that can land on
+# either node, a measured task outside its isolated partition, and a CPU
+# number that does not come from the grant.
+if grep -q 'ergon-shared-cpus ergon-system' "$script" &&
+    grep -q 'ergon-lab-probe default' "$script" &&
+    grep -q 'rollout status "ds/$ds" -n "$ns"' "$script"; then
+    ok "ds namespace: each DaemonSet is waited for in the namespace it is deployed in"
+else
+    bad "ds namespace: the rollout wait does not pair each DaemonSet with its own namespace"
+fi
+if grep -q 'devRoot: /host/dev' "$script" &&
+    grep -q 'ioUring: allow' "$script"; then
+    ok "plugin config: devRoot and seccomp.ioUring are set (PHC discovery and M3/M6)"
+else
+    bad "plugin config: devRoot and/or seccomp.ioUring are missing from the generated ConfigMap"
+fi
+if grep -q 'kubernetes.io/hostname' "$script" &&
+    grep -q "role \$which is on" "$script"; then
+    ok "placement: each role is bound to its named node and a mismatch fails the run"
+else
+    bad "placement: roles are not bound to the nodes whose IPs become the endpoints"
+fi
+if grep -q 'cgroup.procs' "$script" &&
+    grep -q 'cgroup.threads' "$script" &&
+    grep -qF 'pid \$app is not in' "$script"; then
+    ok "partition: the measured task is moved into the isolated child and proved there"
+else
+    bad "partition: the measured task is not moved into the isolated child, or not proved"
+fi
+if grep -qF 'ERGON_ISOLATED_CPUS=\$iso names no CPU' "$script" &&
+    grep -qF 'cpu \$cpu_client is not in ERGON_ISOLATED_CPUS' "$script"; then
+    ok "cpus: the measured CPU comes from the grant, and is checked against it"
+else
+    bad "cpus: the rep does not read ERGON_ISOLATED_CPUS (a literal CPU number can leave the partition)"
+fi
+if grep -q 'if ! functional_check' "$script" &&
+    grep -q 'not measured (a grant is missing' "$script"; then
+    ok "grant gate: a mode whose grant cannot be read back is not measured"
+else
+    bad "grant gate: functional_check does not gate the measurement"
+fi
+if grep -q 'export RTT_HISTOGRAM=' "$script" &&
+    ! grep -Eq 'LOAD_SPIKES=[^ ]+ mkdir' "$script"; then
+    ok "env: the client's environment is exported, not prefixed to one command"
+else
+    bad "env: the client's RTT_HISTOGRAM/LOAD_SPIKES are not exported (they would not reach rtt)"
+fi
+
 echo
 echo "passed $pass, failed $fail"
 if ((fail)); then
