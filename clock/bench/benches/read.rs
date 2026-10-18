@@ -4,6 +4,9 @@
 //! conversions alone. Criterion reports a mean and its interval, not a
 //! maximum: the maxima, deltas, skew and drift are clockbench's.
 //!
+//! A run that cannot calibrate exits 2 rather than succeeding with no
+//! measurements: automation must not read a missing benchmark as a good one.
+//!
 //! `cargo bench -p ergon-clock-bench --bench read` (pin it on Linux:
 //! `taskset -c 2 cargo bench ...`).
 #![allow(missing_docs)]
@@ -46,8 +49,11 @@ fn reads(c: &mut Criterion) {
     let clocks = match Clocks::new() {
         Ok(clocks) => clocks,
         Err(e) => {
+            // A run that printed a failure and returned would exit 0 with no
+            // measurements, and automation would read that as a good bench.
+            // Setup failures exit 2, as clockbench does.
             eprintln!("clock bench: cannot calibrate: {e}");
-            return;
+            std::process::exit(2);
         }
     };
     eprintln!("clock bench: {}", clocks.ergon_report);

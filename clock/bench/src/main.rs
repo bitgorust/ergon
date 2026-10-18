@@ -1135,11 +1135,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let _ = writeln!(
         t,
-        "\n{:<32} {:>9} {:>8} {:>8} | {:>8} {:>8} {:>9} {:>11} {:>5} {:>5} | {:>6} {:>8}",
-        "read (ns)",
+        "\n{:<32} {:>9} {:>8} {:>9} | {:>8} {:>8} {:>9} {:>11} {:>5} {:>5} | {:>6} {:>8}",
+        "read (ns, batch mean)",
         "median",
         "p99",
-        "max",
+        "max batch",
         "resol",
         "p50",
         "p99.99",
@@ -1156,7 +1156,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         let _ = write!(
             t,
-            "{:<32} {:>9.2} {:>8.2} {:>8.2} |",
+            "{:<32} {:>9.2} {:>8.2} {:>9.2} |",
             r.spec.name, c.median_ns, c.p99_ns, c.max_ns
         );
         match &r.deltas {
@@ -1196,13 +1196,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let _ = writeln!(
         t,
-        "\n{:<32} {:>9} {:>8} {:>8}",
-        "conversion alone (ns)", "median", "p99", "max"
+        "\n{:<32} {:>9} {:>8} {:>9}",
+        "conversion (ns, batch mean)", "median", "p99", "max batch"
     );
     for (spec, c) in &converts {
         let _ = writeln!(
             t,
-            "{:<32} {:>9.2} {:>8.2} {:>8.2}",
+            "{:<32} {:>9.2} {:>8.2} {:>9.2}",
             spec.name, c.median_ns, c.p99_ns, c.max_ns
         );
     }
