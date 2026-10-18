@@ -40,6 +40,16 @@ fn ok() -> Finding {
     }
 }
 
+fn unknown(id: CheckId) -> Finding {
+    Finding {
+        id,
+        severity: Severity::Warn,
+        status: Status::Unknown("no such file".to_owned()),
+        message: "cannot tell".to_owned(),
+        evidence: "somewhere",
+    }
+}
+
 #[test]
 fn the_policy_parses_off_on_warn_and_require() -> R {
     assert_eq!(
@@ -160,7 +170,10 @@ fn require_refuses_to_start_on_a_warning() -> R {
         }
     );
     assert!(text.contains("ERGON_HOST_CHECKS=require"), "{text}");
-    assert!(text.contains("2 host check warning(s) (T1)"), "{text}");
+    assert!(
+        text.contains("2 host check(s) warned or could not be proven (T1)"),
+        "{text}"
+    );
     assert!(
         text.contains("ERGON_HOST_CHECKS=off to start anyway"),
         "{text}"
@@ -191,4 +204,52 @@ fn warn_line_is_none_for_everything_but_a_warning() {
     assert!(warn_line("ergon-io", &warn()).is_some());
     assert!(warn_line("ergon-io", &info()).is_none());
     assert!(warn_line("ergon-io", &ok()).is_none());
+}
+
+/// `require` is a readiness gate, not a blanket refusal. An unknown of a
+/// check that must prove a property of this pod stops the start: unproven is
+/// not "fine". An unknown of a check whose subsystem the node may not have
+/// does not: that host is a real host, and refusing there would stop every
+/// start on it.
+#[test]
+fn require_refuses_on_an_unproven_proof_but_not_on_a_missing_subsystem() -> R {
+    assert!(
+        CheckId::K2.unknown_stops_require(),
+        "K2 proves this pod owns its CPUs"
+    );
+    assert!(
+        !CheckId::K6.unknown_stops_require(),
+        "K6 reads PSI, which a kernel may not have"
+    );
+    // The proof: refused, and the ids are named.
+    let findings = vec![ok(), unknown(CheckId::K2)];
+    let e = HostCheckPolicy::Require
+        .refusal(&findings)
+        .ok_or("an unproven K2 must stop a require start")?;
+    assert_eq!(
+        e,
+        HostCheckError::Warnings {
+            count: 1,
+            ids: "K2".to_owned(),
+        },
+        "{e}"
+    );
+    // The missing subsystem: reported, not refused.
+    let findings = vec![ok(), unknown(CheckId::K6), unknown(CheckId::K7)];
+    assert_eq!(
+        HostCheckPolicy::Require.refusal(&findings),
+        None,
+        "a host with no PSI and no NIC node is a real host"
+    );
+    // And the unknowns still print.
+    let lines = HostCheckPolicy::Require.lines("ergon-io", &findings);
+    assert!(
+        lines.iter().any(|l| l.contains("K6 unknown:")),
+        "{lines:#?}"
+    );
+    // Off and on never refuse, whatever the findings are.
+    let findings = vec![warn(), unknown(CheckId::K2)];
+    assert_eq!(HostCheckPolicy::Off.refusal(&findings), None);
+    assert_eq!(HostCheckPolicy::On.refusal(&findings), None);
+    Ok(())
 }

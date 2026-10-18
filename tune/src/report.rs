@@ -4,6 +4,15 @@
 //! only says how they are reported: `off` drops the warning lines, `on`
 //! (the default) prints them, `require` makes a failing check an error at
 //! start. Every warning line that is printed ends with how to silence it.
+//!
+//! `require` is a readiness gate, not a blanket refusal. It refuses on a
+//! **warning** (a check fired) and on an **unproven** check whose job is to
+//! prove a property of this pod or process
+//! ([`CheckId::unknown_stops_require`](crate::CheckId::unknown_stops_require)):
+//! starting on an unproven isolation claim is the false pass the check
+//! exists to stop. An unknown of a check whose subsystem the node may not
+//! have — PSI, a NUMA node, a NIC knob — is printed and allowed through,
+//! because refusing there would stop every start on such a host.
 
 use std::fmt;
 
@@ -24,7 +33,9 @@ pub enum HostCheckPolicy {
     /// Print the warning lines (the default).
     #[default]
     On,
-    /// Print them, and make a warning an error at start.
+    /// Print them, and make a warning an error at start. An **unproven** check
+    /// is an error too, but only where the check must prove something: see
+    /// [`CheckId::unknown_stops_require`](crate::CheckId::unknown_stops_require).
     Require,
 }
 
@@ -39,9 +50,10 @@ pub enum HostCheckError {
         /// The value it is set to.
         value: String,
     },
-    /// [`HostCheckPolicy::Require`] and a check warned: the start must fail.
+    /// [`HostCheckPolicy::Require`] and a check warned, or could not prove a
+    /// property that check must prove: the start must fail.
     Warnings {
-        /// How many findings warned.
+        /// How many findings warned or were left unproven.
         count: usize,
         /// Their check ids, joined with `, `.
         ids: String,
@@ -54,12 +66,14 @@ impl fmt::Display for HostCheckError {
             Self::Invalid { variable, value } => write!(
                 f,
                 "{variable}={value}: set {variable} to off, on or require (off prints no host-check \
-                 warning line; require refuses to start on a warning)"
+                 warning line; require refuses to start on a warning, or on a check that could not \
+                 be proven)"
             ),
             Self::Warnings { count, ids } => write!(
                 f,
-                "{HOST_CHECKS_ENV}=require and {count} host check warning(s) ({ids}), printed \
-                 above: fix them, or set {HOST_CHECKS_ENV}=off to start anyway"
+                "{HOST_CHECKS_ENV}=require and {count} host check(s) warned or could not be \
+                 proven ({ids}), printed above: fix them, or set {HOST_CHECKS_ENV}=off to start \
+                 anyway"
             ),
         }
     }
@@ -169,7 +183,10 @@ impl HostCheckPolicy {
     }
 
     /// Under [`Self::Require`], the error a start must fail with when any
-    /// finding is a warning.
+    /// finding is a warning, or is an unknown of a check that must be proven
+    /// ([`CheckId::unknown_stops_require`](crate::CheckId::unknown_stops_require)).
+    /// An unknown of a check whose subsystem the node may not have is
+    /// reported and allowed through: that is a real host, not a gap.
     #[must_use]
     pub fn refusal(&self, findings: &[Finding]) -> Option<HostCheckError> {
         if *self != Self::Require {
@@ -177,7 +194,10 @@ impl HostCheckPolicy {
         }
         let mut ids: Vec<&str> = Vec::new();
         let mut count = 0;
-        for f in findings.iter().filter(|f| f.is_warning()) {
+        for f in findings
+            .iter()
+            .filter(|f| f.is_warning() || (f.is_unknown() && f.id.unknown_stops_require()))
+        {
             count += 1;
             let id = f.id.as_str();
             if !ids.contains(&id) {

@@ -48,7 +48,16 @@ gives `isolcpus=nohz,domain,managed_irq,2 nohz_full=2 rcu_nocbs=2 irqaffinity=0-
 |---|---|
 | `on` (default; `warn` is the same) | checks run and the warning lines print |
 | `off` | no warning line prints; the results are still returned, and info lines still print |
-| `require` | a warning is an error at start |
+| `require` | a warning is an error at start, and so is a check that could not prove a property it must prove (see below) |
+
+`require` is a readiness gate, not a blanket refusal. It refuses on a warning
+(a check fired) and on an **unproven** check whose job is to prove a property
+of this pod or process: its CPUs are its own, they are isolated, there is no
+CPU quota, its helpers have a core. Starting on an unproven claim is the false
+pass those checks exist to stop. An unknown of a check whose subsystem the
+node may not have — PSI and `memory.high`, a NUMA node, a NIC knob, THP — is
+printed and allowed through: that is a real host, and refusing there would
+stop every start on it. Which is which is `CheckId::unknown_stops_require`.
 
 Every printed warning line ends with `(ERGON_HOST_CHECKS=off silences host-check
 warnings)`. The media driver takes `RUSTERON_MEDIA_DRIVER_HOST_CHECK` as its

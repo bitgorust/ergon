@@ -161,9 +161,9 @@ Their findings cite Aeron's, the kernel's or the vendor's documentation.
 
 | component | checks | when | switch |
 |---|---|---|---|
-| ergon-io's `Driver` (`Component::Io`) | T1 and T8 on the loop's CPU (and `sqpoll_cpu`); T7 on the calling thread; T9, T10; T3 as info; K1–K7 inside a pod | `Driver::new`; read them back with `Driver::host_report()` | `ERGON_HOST_CHECKS`: `on` (default), `off` (no warning line; the results stay) or `require` (a warning stops the start) |
+| ergon-io's `Driver` (`Component::Io`) | T1 and T8 on the loop's CPU (and `sqpoll_cpu`); T7 on the calling thread; T9, T10; T3 as info; K1–K7 inside a pod | `Driver::new`; read them back with `Driver::host_report()` | `ERGON_HOST_CHECKS`: `on` (default), `off` (no warning line; the results stay) or `require` (a warning, or an unproven proof check, stops the start) |
 | ergon-io's `Driver` | T2, N1, N2 (interrupt-driven backends only), N3 on each connection's egress NIC | after the first route lookup to it; again after a NIC reset | `quickack_check=off` skips them |
-| the ergon-md-dpdk media driver (`Component::Md`) | T1, T3, T4, T5, T7, T8, T9, T10; T2 and T6 on the data NICs; on the socket transport also N1, N2, and N4 with busy polling | before the driver starts; N1 and T2 again after a NIC reset, on its `md-host-checks` thread | `ERGON_HOST_CHECKS`, alias `RUSTERON_MEDIA_DRIVER_HOST_CHECK`: `on`/`warn` (default), `off` (no check runs at all) or `require` (any warning stops the start) |
+| the ergon-md-dpdk media driver (`Component::Md`) | T1, T3, T4, T5, T7, T8, T9, T10; T2 and T6 on the data NICs; on the socket transport also N1, N2, and N4 with busy polling | before the driver starts; N1 and T2 again after a NIC reset, on its `md-host-checks` thread | `ERGON_HOST_CHECKS`, alias `RUSTERON_MEDIA_DRIVER_HOST_CHECK`: `on`/`warn` (default), `off` (no check runs at all) or `require` (any warning or unproven proof stops the start) |
 | your own busy loop (`Component::Rt`) | T1, T3, T4 (the directory it connects to), T5, T7, T8, T9, T10; K1–K7 inside a pod; on a kernel NIC also T2, N1, N2, N3; `ThrottleWatch` | before the loop; the NIC checks again when the NIC's `carrier_changes` moves; `ThrottleWatch::check` every few seconds from housekeeping | do not call them |
 | [ergon-clock](../clock/overview.md)'s `calibrate` | the clock source and `CLOCK_REALTIME`'s keeping (`Report::warnings`) | at calibration | `ERGON_HOST_CHECKS`: `off` or `0` silences the print (a typo leaves it on) |
 
@@ -171,6 +171,16 @@ Every printed warning line ends with `(ERGON_HOST_CHECKS=off silences host-check
 warnings)`. The K checks run only inside a pod (the `kubepods` cgroup path, the
 service-account mount, or `KUBERNETES_SERVICE_HOST`) and each says whether its
 fix is in the pod spec or on the node.
+
+`require` is a readiness gate, not a blanket refusal. It refuses on a warning
+(a check fired) and on a check that could not **prove** a property of this pod
+or process — its CPUs are its own, they are isolated, there is no CPU quota,
+its helpers have a core — because starting on an unproven claim is the false
+pass those checks exist to stop. An unknown of a check whose subsystem the
+node may not have (PSI and `memory.high`, a NUMA node, a NIC knob, THP) is
+printed and allowed through: that is a real host, and refusing there would
+stop every start on it. Which checks are which is
+`CheckId::unknown_stops_require`.
 
 - **ergon-io** needs the loop's CPU: pin the thread that calls `Driver::new`
   to one CPU, or set `loop_cpu`. Otherwise it skips T1, T8 and T2, and says so.

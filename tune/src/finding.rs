@@ -96,6 +96,58 @@ impl CheckId {
             Self::M4 => "M4",
         }
     }
+
+    /// Whether an unknown result of this check stops a
+    /// [`HostCheckPolicy::Require`](crate::HostCheckPolicy::Require) start.
+    ///
+    /// A check that proves a property of this pod or process — its CPUs are
+    /// its own, they are isolated, there is no CPU quota, its helpers have a
+    /// core — **blocks** when it cannot be answered: `require` must not start
+    /// on an unproven property, and the file is one this node always has.
+    /// Unproven is not "fine".
+    ///
+    /// A check of a subsystem the node may not have — PSI and `memory.high`,
+    /// a NUMA node, a NIC knob, THP — does **not** block: that is a real
+    /// host, and refusing to start there is not a readiness gate but a
+    /// refusal to run at all.
+    ///
+    /// The match is exhaustive on purpose: a new check has to be classified
+    /// here, and until it is, the build says so.
+    #[must_use]
+    pub const fn unknown_stops_require(self) -> bool {
+        match self {
+            // Proof about this pod or process. The evidence is node state
+            // this deployment provides, and a host that can run a busy loop
+            // always has the file.
+            Self::T1
+            | Self::T2
+            | Self::T7
+            | Self::T8
+            | Self::T9
+            | Self::T10
+            | Self::K1
+            | Self::K2
+            | Self::K3
+            | Self::K4
+            | Self::K5
+            | Self::M1
+            | Self::M2
+            | Self::M3 => true,
+            // A subsystem the node may not have. Absent evidence is not a
+            // gap in the proof; it is a host without that subsystem.
+            Self::T3
+            | Self::T4
+            | Self::T5
+            | Self::T6
+            | Self::K6
+            | Self::K7
+            | Self::N1
+            | Self::N2
+            | Self::N3
+            | Self::N4
+            | Self::M4 => false,
+        }
+    }
 }
 
 impl fmt::Display for CheckId {
@@ -134,7 +186,9 @@ pub enum Status {
     /// Nothing to report, or the check does not apply here (the message
     /// says which).
     Ok,
-    /// The data could not be read (the reason): never a warning.
+    /// The data could not be read (the reason): never a warning. It stops a
+    /// `require` start only where the check must prove something —
+    /// [`CheckId::unknown_stops_require`].
     Unknown(String),
 }
 
