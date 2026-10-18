@@ -291,9 +291,9 @@ impl App for PingPong {
         else {
             return Err(Error::Closed);
         };
-        // Past its slot, not merely at it: the schedule never slips, so a send
-        // after a stall is late by however far behind the run is.
-        if self.interval_ns != 0 && self.next_send != 0 && now > self.next_send {
+        // Late when the next slot is already due; see [`Work::is_late`].
+        if self.next_send != 0 && crate::stats::Work::is_late(now, self.next_send, self.interval_ns)
+        {
             self.late += 1;
         }
         driver

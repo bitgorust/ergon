@@ -126,8 +126,9 @@ fn main() -> ExitCode {
              The percentiles are over `completed` alone, and the tables drop the warm-up, so `n` is smaller \
              still. `censored` is the issued work they leave out: no reply came back before the run ended, \
              or the reply was discarded because the record vector was full. `scheduled − issued` is work \
-             the schedule called for that never went out, and `late` is the part that went out after its \
-             slot. A WebSocket or HTTP client's send queue grows instead of refusing, and a send failure \
+             the schedule called for that never went out, and `late` is the part issued when the next slot \
+             was already due, so the run owed more than one. A WebSocket or HTTP client's send queue grows \
+             instead of refusing, and a send failure \
              fails the run, so `rejected` is 0 on every run that reported. `not yet measured` is a count \
              the path does not produce, never a zero. On a receive-only run the send-side counts are the \
              sender's.\n\n\

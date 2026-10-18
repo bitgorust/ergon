@@ -68,6 +68,24 @@ fn an_unpaced_run_has_no_schedule_beyond_its_replies() {
 }
 
 #[test]
+fn a_send_is_late_only_when_the_run_owed_the_next_slot_too() {
+    // On time: past its own slot by the loop's detection latency, but the next
+    // slot is not yet due. Counting these would report `late` as `issued`.
+    assert!(!Work::is_late(T0 + 200, T0, SEC / 10));
+    assert!(!Work::is_late(T0 + SEC / 10 - 1, T0, SEC / 10));
+    // The boundary: the next slot is due exactly now.
+    assert!(Work::is_late(T0 + SEC / 10, T0, SEC / 10));
+    // A catch-up send after a stall, and one further behind again.
+    assert!(Work::is_late(T0 + SEC / 10 + 1, T0, SEC / 10));
+    assert!(Work::is_late(T0 + SEC, T0, SEC / 10));
+    // An unpaced run has no slots, so nothing is late.
+    assert!(!Work::is_late(T0 + SEC, T0, 0));
+    // A stall that never caught up: every one of its sends is late.
+    let stalled = Work::paced(T0 + SEC, T0, SEC / 1000, 10, 10, 10);
+    assert_eq!(stalled.late, Some(10));
+}
+
+#[test]
 fn a_receive_only_run_reports_the_send_side_as_not_yet_measured() {
     let w = Work::received(6, 2);
     assert_eq!((w.completed, w.censored), (Some(6), Some(2)));

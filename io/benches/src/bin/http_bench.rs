@@ -250,11 +250,11 @@ mod imp {
 
         /// Records one send: `slot` is [`wait_slot`]'s return (0 when unpaced),
         /// `mono` when the send was attempted, `sent` its wall-clock time.
-        fn sent(&mut self, slot: i64, mono: i64, sent: i64) {
+        fn sent(&mut self, slot: i64, mono: i64, sent: i64, interval_ns: i64) {
             if slot == 0 {
                 return;
             }
-            if mono > slot {
+            if io_bench::stats::Work::is_late(mono, slot, interval_ns) {
                 self.late += 1;
             }
             if self.first_due_ns == 0 {
@@ -386,7 +386,7 @@ mod imp {
             let mono = monotonic_ns();
             h.sent_ns = realtime_ns();
             h.due_ns = due(slot, mono, h.sent_ns);
-            pace.sent(slot, mono, h.sent_ns);
+            pace.sent(slot, mono, h.sent_ns, interval);
             let mut c = d.get_mut(id).ok_or("connection closed")?;
             c.request(method, &plan.path, &[], body.as_bytes())?;
             d.flush()?;
@@ -542,7 +542,7 @@ mod imp {
             let mono = monotonic_ns();
             h.sent_ns = realtime_ns();
             h.due_ns = due(slot, mono, h.sent_ns);
-            pace.sent(slot, mono, h.sent_ns);
+            pace.sent(slot, mono, h.sent_ns, interval);
             c.request(method, &plan.path, &[], body.as_bytes())?;
             while !h.done {
                 stalls.tick(h.seq - 1);
@@ -745,7 +745,7 @@ mod imp {
                 }
                 let t_mono = monotonic_ns();
                 let sent = realtime_ns();
-                pace.sent(due_slot, t_mono, sent);
+                pace.sent(due_slot, t_mono, sent, interval);
                 let handle = multi.add2(e)?;
                 let result = loop {
                     stalls.tick(seq - 1);
@@ -853,7 +853,7 @@ mod imp {
                     seq += 1;
                     let t_mono = monotonic_ns();
                     let sent = realtime_ns();
-                    pace.sent(due_slot, t_mono, sent);
+                    pace.sent(due_slot, t_mono, sent, interval);
                     let req = if plan.live {
                         client.get(&url)
                     } else {

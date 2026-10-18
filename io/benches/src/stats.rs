@@ -107,7 +107,11 @@ pub struct Work {
     /// Sends with a recorded sample: the percentile's `n` before a warm-up is
     /// dropped.
     pub completed: Option<u64>,
-    /// Sends that went out after their slot on the schedule.
+    /// Sends that went out when the next slot on the schedule was already due,
+    /// so the run owed more than one when it issued them. Not merely past
+    /// their own slot: on a nanosecond clock every send is past its slot by
+    /// the loop's detection latency, and that count would be [`Work::issued`]
+    /// itself. The size of the slip is the run's max lag.
     pub late: Option<u64>,
     /// Send attempts the transport refused. On a WebSocket or HTTP client the
     /// send queue grows instead of refusing, and a send failure fails the run,
@@ -178,6 +182,17 @@ impl Work {
             u64::try_from(1 + span / interval_ns).unwrap_or(0)
         };
         Self::round_trip(scheduled, issued, completed, late, censored)
+    }
+
+    /// Whether a send issued at `now` for a slot at `due` counts as
+    /// [`Work::late`]: the next slot (`due + interval_ns`) is already due, so
+    /// the run owed more than one when it issued this. A send merely past its
+    /// own slot is not late — on a nanosecond clock every send is, by the
+    /// loop's detection latency, and that count would be [`Work::issued`]
+    /// itself. `interval_ns` 0 is an unpaced run, which has no slots.
+    #[must_use]
+    pub const fn is_late(now: i64, due: i64, interval_ns: i64) -> bool {
+        interval_ns != 0 && now >= due + interval_ns
     }
 
     /// A receive-only run: what arrived and what produced no sample. The

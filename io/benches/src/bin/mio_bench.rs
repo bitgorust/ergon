@@ -449,7 +449,7 @@ fn pingpong(a: &Args) -> BoxResult<()> {
             let now = realtime_ns();
             if interval == 0 || now >= next_send {
                 // Past its slot, not merely at it: the schedule never slips.
-                if interval != 0 && next_send != 0 && now > next_send {
+                if next_send != 0 && io_bench::stats::Work::is_late(now, next_send, interval) {
                     late += 1;
                 }
                 seq += 1;
