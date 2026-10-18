@@ -339,22 +339,24 @@ static uint16_t rusteron_dpdk_port_tx_burst(
 }
 
 /* The decode of those verdicts is pure and lives in rusteron_dpdk_packet.c so
- * the test archive can exercise it; only the shift positions come from DPDK.
- * Assert here that the positions rusteron_dpdk_packet.h hardcodes still match
- * the DPDK this is compiled against. */
-_Static_assert(RUSTERON_DPDK_CKSUM_IP_SHIFT == 5, "RTE_MBUF_F_RX_IP_CKSUM_BAD moved");
-_Static_assert(RUSTERON_DPDK_CKSUM_L4_SHIFT == 7, "RTE_MBUF_F_RX_L4_CKSUM_BAD moved");
+ * the test archive can exercise it; only the bit masks come from DPDK. Assert
+ * here that they still have the shape the decode relies on: BAD and GOOD are
+ * one bit each and NONE is both. The positions themselves are free to move —
+ * DPDK 23.11 put the IP pair at bits 4 and 7 and the L4 pair at 3 and 8,
+ * where older releases had two adjacent pairs at 5/6 and 7/8. */
 _Static_assert(
-    (1ULL << RUSTERON_DPDK_CKSUM_IP_SHIFT) == RTE_MBUF_F_RX_IP_CKSUM_BAD &&
-        (1ULL << (RUSTERON_DPDK_CKSUM_IP_SHIFT + 1)) == RTE_MBUF_F_RX_IP_CKSUM_GOOD &&
-        (1ULL << RUSTERON_DPDK_CKSUM_L4_SHIFT) == RTE_MBUF_F_RX_L4_CKSUM_BAD &&
-        (1ULL << (RUSTERON_DPDK_CKSUM_L4_SHIFT + 1)) == RTE_MBUF_F_RX_L4_CKSUM_GOOD,
-    "the DPDK checksum verdicts are no longer two-bit enums at bits 5 and 7");
+    0 == (RTE_MBUF_F_RX_IP_CKSUM_BAD & RTE_MBUF_F_RX_IP_CKSUM_GOOD) &&
+        RTE_MBUF_F_RX_IP_CKSUM_NONE == (RTE_MBUF_F_RX_IP_CKSUM_BAD | RTE_MBUF_F_RX_IP_CKSUM_GOOD) &&
+        0 == (RTE_MBUF_F_RX_L4_CKSUM_BAD & RTE_MBUF_F_RX_L4_CKSUM_GOOD) &&
+        RTE_MBUF_F_RX_L4_CKSUM_NONE == (RTE_MBUF_F_RX_L4_CKSUM_BAD | RTE_MBUF_F_RX_L4_CKSUM_GOOD),
+    "the DPDK checksum verdicts are no longer a BAD bit, a GOOD bit and NONE as both");
 
 /* Map the DPDK RX offload verdicts onto the view flags (plan §7.6). */
 static uint32_t rusteron_dpdk_port_rx_ol_flags(const struct rte_mbuf *mbuf)
 {
-    return rusteron_dpdk_rx_ol_flags_from_dpdk(mbuf->ol_flags);
+    return rusteron_dpdk_rx_ol_flags_from_dpdk(
+        mbuf->ol_flags, RTE_MBUF_F_RX_IP_CKSUM_BAD, RTE_MBUF_F_RX_IP_CKSUM_GOOD, RTE_MBUF_F_RX_IP_CKSUM_NONE,
+        RTE_MBUF_F_RX_L4_CKSUM_BAD, RTE_MBUF_F_RX_L4_CKSUM_GOOD, RTE_MBUF_F_RX_L4_CKSUM_NONE);
 }
 
 static uint16_t rusteron_dpdk_port_rx_burst(

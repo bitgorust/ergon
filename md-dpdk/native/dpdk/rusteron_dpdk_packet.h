@@ -74,13 +74,6 @@ extern "C" {
 #define RUSTERON_DPDK_CKSUM_GOOD 2u
 #define RUSTERON_DPDK_CKSUM_NONE 3u
 
-/* Bit positions of those two verdicts in a DPDK ol_flags word
- * (rte_mbuf_core.h: RTE_MBUF_F_RX_IP_CKSUM_BAD at bit 5, GOOD at bit 6,
- * RTE_MBUF_F_RX_L4_CKSUM_BAD at bit 7, GOOD at bit 8). Port ops assert these
- * still match the DPDK headers they compile against. */
-#define RUSTERON_DPDK_CKSUM_IP_SHIFT 5u
-#define RUSTERON_DPDK_CKSUM_L4_SHIFT 7u
-
 /* Map one DPDK checksum verdict onto the (good_bit | bad_bit) view flags.
  * UNKNOWN maps to 0, which makes the transport software-verify; NONE maps to
  * good_bit alone, which trusts the verified integrity and skips the software
@@ -99,9 +92,20 @@ static inline uint32_t rusteron_dpdk_cksum_view(unsigned status, uint32_t good_b
     }
 }
 
-/* Decode a DPDK ol_flags word onto the RX verdict view flags: the two two-bit
- * verdicts at the shifts above, each mapped by rusteron_dpdk_cksum_view. */
-uint32_t rusteron_dpdk_rx_ol_flags_from_dpdk(uint64_t ol);
+/* Decode a DPDK ol_flags word onto the RX verdict view flags.
+ *
+ * The two verdicts' bit masks come from rte_mbuf_core.h as arguments, not as
+ * a hardcoded shift: their positions moved between DPDK releases (23.11 has
+ * the IP pair at bits 4 and 7 and the L4 pair at 3 and 8, where older
+ * releases had two adjacent pairs at 5/6 and 7/8). Reading them as adjacent
+ * bits on 23.11 puts the IP GOOD bit in the L4 half, where it counts as BAD
+ * and the frame is dropped.
+ *
+ * For each verdict pass RTE_MBUF_F_RX_{IP,L4}_CKSUM_{BAD,GOOD,NONE}. NONE is
+ * BAD|GOOD and is also the mask of the pair. */
+uint32_t rusteron_dpdk_rx_ol_flags_from_dpdk(
+    uint64_t ol, uint64_t ip_bad, uint64_t ip_good, uint64_t ip_none, uint64_t l4_bad, uint64_t l4_good,
+    uint64_t l4_none);
 
 /*
  * Opaque-to-the-encoder mbuf view. The port ops fill `opaque`/`data`/`capacity`

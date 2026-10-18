@@ -40,7 +40,15 @@ use rusteron_media_driver::bindings::*;
 unsafe extern "C" {
     fn rusteron_dpdk_transport_bindings() -> *mut aeron_udp_channel_transport_bindings_stct;
     fn rusteron_dpdk_fake_rx_queued(port_id: u16) -> c_int;
-    fn rusteron_dpdk_rx_ol_flags_from_dpdk(ol: u64) -> u32;
+    fn rusteron_dpdk_rx_ol_flags_from_dpdk(
+        ol: u64,
+        ip_bad: u64,
+        ip_good: u64,
+        ip_none: u64,
+        l4_bad: u64,
+        l4_good: u64,
+        l4_none: u64,
+    ) -> u32;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,8 +393,12 @@ const RECEIVER_IP: [u8; 4] = [10, 0, 1, 1];
 const PEER_IP: [u8; 4] = [10, 0, 1, 5];
 const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x50];
 
-const RX_GOOD: u32 = 0b11; // IPV4_CKSUM_GOOD | UDP_CKSUM_GOOD
-const RX_IPV4_BAD: u32 = 0b100; // IPV4_CKSUM_BAD
+// The RX verdict view flags (rusteron_dpdk_packet.h).
+const RX_IPV4_GOOD: u32 = 0b0001;
+const RX_UDP_GOOD: u32 = 0b0010;
+const RX_GOOD: u32 = RX_IPV4_GOOD | RX_UDP_GOOD;
+const RX_IPV4_BAD: u32 = 0b0100;
+const RX_UDP_BAD: u32 = 0b1000;
 
 fn ones_sum(words: &[u16]) -> u32 {
     let mut sum: u32 = 0;
@@ -849,7 +861,6 @@ fn udp_checksum_ffff_is_valid() {
 #[test]
 #[serial]
 fn zero_udp_checksum_accepted_despite_a_nic_bad_verdict() {
-    const RX_UDP_BAD: u32 = 0b1000;
     let (mut p, mut h) = reject_setup();
     let mut frame = frame_to_receiver(60000, b"nocsum");
     frame[40] = 0;
@@ -1045,10 +1056,51 @@ fn reject_nic_bad_checksum() {
     assert_reject(&mut h, &mut p, &frame, RX_IPV4_BAD, 1, |s| s.checksum);
 }
 
+/// One DPDK RX checksum verdict's bit masks (rte_mbuf_core.h). BAD and GOOD
+/// are one bit each and NONE is both; the two bits are not adjacent in every
+/// DPDK release, so the decode takes the masks rather than a shift.
+#[derive(Clone, Copy)]
+struct Masks {
+    bad: u64,
+    good: u64,
+    none: u64,
+}
+
+impl Masks {
+    const fn new(bad: u32, good: u32) -> Self {
+        Self {
+            bad: 1 << bad,
+            good: 1 << good,
+            none: (1 << bad) | (1 << good),
+        }
+    }
+    fn encode(self, verdict: u64) -> u64 {
+        match verdict {
+            0 => 0,
+            1 => self.bad,
+            2 => self.good,
+            3 => self.none,
+            _ => panic!("verdict {verdict} is out of range"),
+        }
+    }
+}
+
+fn decode(ol: u64, ip: Masks, l4: Masks) -> u32 {
+    unsafe {
+        rusteron_dpdk_rx_ol_flags_from_dpdk(ol, ip.bad, ip.good, ip.none, l4.bad, l4.good, l4.none)
+    }
+}
+
 /// DPDK encodes each RX checksum verdict as a two-bit enum, and NONE carries
 /// both the GOOD and the BAD bit (rte_mbuf_core.h). Decoding the bits
 /// independently classifies a NONE packet as both good and bad, and the BAD
 /// half drops it. Decode the enum instead.
+///
+/// The masks are arguments because their positions moved between DPDK
+/// releases: DPDK 23.11 has IP at bits 4 and 7 and L4 at bits 3 and 8, where
+/// older releases had two adjacent pairs at 5/6 and 7/8. A shift-based decode
+/// reads the wrong bits on 23.11 and classifies every packet whose IP
+/// checksum is GOOD as an L4 checksum error.
 #[test]
 #[serial]
 fn a_none_checksum_verdict_is_verified_good_never_bad() {
@@ -1056,37 +1108,50 @@ fn a_none_checksum_verdict_is_verified_good_never_bad() {
     const BAD: u64 = 1;
     const GOOD: u64 = 2;
     const NONE: u64 = 3;
-    const IP_SHIFT: u32 = 5;
-    const L4_SHIFT: u32 = 7;
 
-    // (ip verdict, l4 verdict) -> expected view flags.
     // View bits: IPV4_GOOD 0b0001, UDP_GOOD 0b0010, IPV4_BAD 0b0100, UDP_BAD 0b1000.
     let cases = [
         (UNKNOWN, UNKNOWN, 0b0000),
         (GOOD, UNKNOWN, 0b0001),
         (BAD, UNKNOWN, 0b0100),
-        (NONE, UNKNOWN, 0b0001), // NONE is verified good: the old decode made it 0b0101
+        (NONE, UNKNOWN, 0b0001), // NONE is verified good: bit-wise reads made it 0b0101
         (UNKNOWN, GOOD, 0b0010),
         (UNKNOWN, BAD, 0b1000),
-        (UNKNOWN, NONE, 0b0010), // NONE is verified good: the old decode made it 0b1010
+        (UNKNOWN, NONE, 0b0010), // NONE is verified good: bit-wise reads made it 0b1010
         (NONE, NONE, 0b0011),
         (BAD, BAD, 0b1100),
         (GOOD, GOOD, 0b0011),
     ];
-    for (ip, l4, want) in cases {
-        let ol = (ip << IP_SHIFT) | (l4 << L4_SHIFT);
-        let got = unsafe { rusteron_dpdk_rx_ol_flags_from_dpdk(ol) };
-        assert_eq!(got, want, "ol_flags {ol:#x} (ip {ip} l4 {l4})");
+    // Both a current DPDK layout and the older adjacent one: the decode must
+    // not care where the bits are.
+    let layouts = [
+        ("dpdk 23.11", Masks::new(4, 7), Masks::new(3, 8)),
+        ("older dpdk", Masks::new(5, 6), Masks::new(7, 8)),
+    ];
+    for (name, ip, l4) in layouts {
+        for (ipv, l4v, want) in cases {
+            let ol = ip.encode(ipv) | l4.encode(l4v);
+            assert_eq!(decode(ol, ip, l4), want, "{name}: ol_flags {ol:#x} (ip {ipv} l4 {l4v})");
+        }
+        // A verified NONE packet must never come out with a BAD half: that
+        // half is what the classifier drops on.
+        for (label, one) in [("ip", ip), ("l4", l4)] {
+            let got = decode(one.encode(NONE), ip, l4);
+            assert_eq!(got & (RX_IPV4_BAD | RX_UDP_BAD), 0, "{name} {label}: {got:#x}");
+        }
+        // UNKNOWN is the only verdict that sends a checksum to software
+        // verify: it alone leaves its GOOD bit clear.
+        assert_eq!(decode(0, ip, l4), 0, "{name}");
     }
-    // A verified NONE packet must never come out with a BAD half: that half is
-    // what the classifier drops on.
-    for shift in [IP_SHIFT, L4_SHIFT] {
-        let got = unsafe { rusteron_dpdk_rx_ol_flags_from_dpdk(NONE << shift) };
-        assert_eq!(got & (RX_IPV4_BAD | RX_UDP_BAD), 0, "shift {shift}: {got:#x}");
-    }
-    // UNKNOWN is the only verdict that sends a checksum to software verify:
-    // it alone leaves its GOOD bit clear.
-    assert_eq!(unsafe { rusteron_dpdk_rx_ol_flags_from_dpdk(UNKNOWN) }, 0);
+
+    // DPDK 23.11 specifically: a packet whose IP checksum is verified good is
+    // not an L4 checksum error. Reading the verdict as adjacent bits puts the
+    // IP GOOD bit in the L4 half, where it counts as BAD and the frame is
+    // dropped.
+    let ip = Masks::new(4, 7);
+    let l4 = Masks::new(3, 8);
+    assert_eq!(decode(ip.good, ip, l4), RX_IPV4_GOOD, "IP GOOD alone");
+    assert_eq!(decode(l4.good, ip, l4), RX_UDP_GOOD, "L4 GOOD alone");
 }
 
 #[test]

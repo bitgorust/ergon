@@ -568,14 +568,37 @@ rusteron_dpdk_rx_result_t rusteron_dpdk_packet_classify_rx(
     return RUSTERON_DPDK_RX_RESULT_OK;
 }
 
-/* Decode a DPDK ol_flags word onto the RX verdict view flags. See the enum
- * note in rusteron_dpdk_packet.h: each verdict is a two-bit enum and NONE
- * carries both the GOOD and the BAD bit, so the word is decoded by shifting
- * and masking, never by testing the individual bits. */
-uint32_t rusteron_dpdk_rx_ol_flags_from_dpdk(uint64_t ol)
+/* Decode one DPDK RX checksum verdict out of an ol_flags word. See the enum
+ * note in rusteron_dpdk_packet.h: the verdict is a two-bit enum and NONE
+ * carries both the GOOD and the BAD bit, so the masks are compared against
+ * the whole field, never tested as individual bits. */
+static unsigned rusteron_dpdk_cksum_decode(uint64_t ol, uint64_t bad, uint64_t good, uint64_t none)
 {
-    const unsigned ip = (unsigned)((ol >> RUSTERON_DPDK_CKSUM_IP_SHIFT) & 3u);
-    const unsigned l4 = (unsigned)((ol >> RUSTERON_DPDK_CKSUM_L4_SHIFT) & 3u);
+    const uint64_t bits = ol & none;
+    if (0 != none && bits == none)
+    {
+        return RUSTERON_DPDK_CKSUM_NONE;
+    }
+    if (bits == bad)
+    {
+        return RUSTERON_DPDK_CKSUM_BAD;
+    }
+    if (bits == good)
+    {
+        return RUSTERON_DPDK_CKSUM_GOOD;
+    }
+    return RUSTERON_DPDK_CKSUM_UNKNOWN;
+}
+
+/* Decode a DPDK ol_flags word onto the RX verdict view flags. The masks come
+ * from rte_mbuf_core.h as arguments: their positions moved between DPDK
+ * releases, so a hardcoded shift reads the wrong bits on some of them. */
+uint32_t rusteron_dpdk_rx_ol_flags_from_dpdk(
+    uint64_t ol, uint64_t ip_bad, uint64_t ip_good, uint64_t ip_none, uint64_t l4_bad, uint64_t l4_good,
+    uint64_t l4_none)
+{
+    const unsigned ip = rusteron_dpdk_cksum_decode(ol, ip_bad, ip_good, ip_none);
+    const unsigned l4 = rusteron_dpdk_cksum_decode(ol, l4_bad, l4_good, l4_none);
     uint32_t flags = rusteron_dpdk_cksum_view(
         ip, RUSTERON_DPDK_MBUF_F_RX_IPV4_CKSUM_GOOD, RUSTERON_DPDK_MBUF_F_RX_IPV4_CKSUM_BAD);
     flags |= rusteron_dpdk_cksum_view(
