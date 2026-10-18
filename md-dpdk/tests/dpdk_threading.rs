@@ -246,6 +246,28 @@ fn shared_modes_refuse_a_pacing_wait() {
     }
 }
 
+/// Re-offering a refused tail spins until a deadline, which would stall the
+/// receive half of a shared loop just as a pacing wait does: in the shared
+/// modes RUSTERON_DPDK_TX_RETRY_US may only be 0 (or unset), while DEDICATED
+/// keeps any value.
+#[test]
+#[serial]
+fn shared_modes_refuse_a_tx_retry_wait() {
+    for mode in [DEDICATED, SHARED_NETWORK, SHARED, INVOKER] {
+        for (value, ok) in [("", true), ("0", true), ("1000", mode == DEDICATED)] {
+            let _retry = EnvGuard::set("RUSTERON_DPDK_TX_RETRY_US", value);
+            match install(&ready_context(mode)) {
+                Ok(_) => assert!(ok, "{} with {value:?} accepted", name(mode)),
+                Err(e) => {
+                    assert!(!ok, "{} with {value:?}: {e}", name(mode));
+                    assert!(matches!(e, DpdkError::InvalidConfiguration(_)), "{e:?}");
+                    assert!(e.to_string().contains("RUSTERON_DPDK_TX_RETRY_US"), "{e}");
+                }
+            }
+        }
+    }
+}
+
 /// The native install keeps a shared loop from waiting out a pacing debt:
 /// unset, the wait is 0 there (DEDICATED keeps its 20 µs), and a non-zero one
 /// fails the install.

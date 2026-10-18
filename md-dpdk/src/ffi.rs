@@ -469,7 +469,9 @@ fn last_error() -> String {
 ///   `aeron_driver_main_idle_strategy` applies to it, must busy-spin.
 ///
 /// In the three shared modes one thread also receives, so a send never waits
-/// out a pacing debt there: `RUSTERON_DPDK_TX_PACE_SPIN_US` must be 0 or unset.
+/// there: neither out a pacing debt (`RUSTERON_DPDK_TX_PACE_SPIN_US`) nor to
+/// re-offer a refused tail (`RUSTERON_DPDK_TX_RETRY_US`). Both must be 0 or
+/// unset.
 #[cfg(feature = "dpdk")]
 fn validate_context(context: &AeronDriverContext, config: &DpdkTransportConfig) -> Result<(), DpdkError> {
     use rusteron_media_driver::bindings::aeron_threading_mode_t;
@@ -562,7 +564,7 @@ fn validate_context(context: &AeronDriverContext, config: &DpdkTransportConfig) 
 /// One agent of a shared threading mode (`mode`) carries the network work: it
 /// must have a CPU (`cpu`: its variable and value) and an idle strategy
 /// (`stored`, or the variable `idle_var` names) that busy-spins, and no send
-/// may wait out a pacing debt on it.
+/// may wait on it — neither out a pacing debt nor to re-offer a refused tail.
 #[cfg(feature = "dpdk")]
 fn validate_shared_agent(
     mode: &str,
@@ -584,15 +586,29 @@ fn validate_shared_agent(
             "aeron context threading mode {mode}: {agent} must busy-spin ({idle_var} `spin` or `noop`, not {idle})"
         )));
     }
-    match std::env::var(PACE_SPIN_ENV).as_deref().map(str::trim) {
-        Ok(spin) if !spin.is_empty() && spin.bytes().any(|b| b != b'0') && spin.parse::<u64>().is_ok() => {
-            Err(DpdkError::InvalidConfiguration(format!(
-                "aeron context threading mode {mode}: {PACE_SPIN_ENV}={spin} would stall the receive half of \
-                 {agent} while a send waits out a pacing debt: it must be 0 or unset"
-            )))
-        }
-        _ => Ok(()),
+    if asks_for_a_wait(PACE_SPIN_ENV) {
+        return Err(DpdkError::InvalidConfiguration(format!(
+            "aeron context threading mode {mode}: {PACE_SPIN_ENV} would stall the receive half of {agent} while \
+             a send waits out a pacing debt: it must be 0 or unset"
+        )));
     }
+    if asks_for_a_wait(TX_RETRY_ENV) {
+        return Err(DpdkError::InvalidConfiguration(format!(
+            "aeron context threading mode {mode}: {TX_RETRY_ENV} would stall the receive half of {agent} while \
+             a send spins re-offering a refused tail: it must be 0 or unset"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `var` asks for a non-zero wait in microseconds. Empty, or all
+/// zeros, is no wait at all and is accepted in every mode.
+#[cfg(feature = "dpdk")]
+fn asks_for_a_wait(var: &str) -> bool {
+    std::env::var(var)
+        .as_deref()
+        .map(str::trim)
+        .is_ok_and(|value| !value.is_empty() && value.bytes().any(|b| b != b'0') && value.parse::<u64>().is_ok())
 }
 
 /// Outside SHARED and INVOKER (where the one agent does the conductor's work
@@ -619,6 +635,11 @@ fn validate_off_the_conductor(mode: &str, agents: &[(&str, &str, i32)], conducto
 /// How long a send may wait out a pacing debt (read natively; checked here).
 #[cfg(feature = "dpdk")]
 const PACE_SPIN_ENV: &str = "RUSTERON_DPDK_TX_PACE_SPIN_US";
+
+/// How long a send may spin re-offering a refused tail (read natively;
+/// checked here).
+#[cfg(feature = "dpdk")]
+const TX_RETRY_ENV: &str = "RUSTERON_DPDK_TX_RETRY_US";
 
 /// DEDICATED: the sender and the receiver, each busy-spinning on its own CPU.
 #[cfg(feature = "dpdk")]

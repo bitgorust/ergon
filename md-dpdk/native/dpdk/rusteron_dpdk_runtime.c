@@ -2380,6 +2380,15 @@ int rusteron_dpdk_runtime_agents_known(
             return -1;
         }
         native->tx_pace_spin_ns = 0;
+        /* Re-offering a refused tail spins to a deadline the same way. */
+        if (0 != native->tx_retry_ns)
+        {
+            rusteron_dpdk_set_error(
+                "RUSTERON_DPDK_TX_RETRY_US must be 0 or unset under AERON_THREADING_MODE SHARED_NETWORK, "
+                "SHARED or INVOKER: a send spinning to re-offer a refused tail would stall the receive half of "
+                "its agent");
+            return -1;
+        }
     }
     native->threading_mode = threading_mode;
     /* The context may still name its `backoff` default when the environment
