@@ -155,6 +155,24 @@ pub struct CounterClock {
     ordered: OrderedRead,
 }
 
+/// Counts begin reads in this crate's tests. Both reads report "now" and
+/// differ only in ordering, so no assertion on their values can show which
+/// one a caller reached; this can. Not compiled into the library.
+#[cfg(test)]
+mod begin_reads {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn tick() {
+        COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn get() -> u64 {
+        COUNT.load(Ordering::Relaxed)
+    }
+}
+
 impl OrderedRead {
     /// The read itself. Crate-private: a variant names an instruction a CPU
     /// may lack, so only detection (calibration, `from_params`) picks one.
@@ -177,6 +195,8 @@ impl OrderedRead {
     /// same read as [`read`](Self::read).
     #[inline]
     pub(crate) fn read_begin(self) -> u64 {
+        #[cfg(test)]
+        begin_reads::tick();
         #[cfg(target_arch = "x86_64")]
         {
             let _ = self;
@@ -868,6 +888,12 @@ impl TimeSource for Clock {
     fn now_ns_ordered(&self) -> u64 {
         Self::now_ns_ordered(self)
     }
+    // Without this a generic caller gets the trait's default, which is
+    // `now_ns_ordered`, and so never reaches the counter clock's begin read.
+    #[inline]
+    fn now_ns_begin(&self) -> u64 {
+        Self::now_ns_begin(self)
+    }
     #[inline]
     fn resolution_ns(&self) -> u64 {
         match self {
@@ -1033,6 +1059,71 @@ mod tests {
             assert!(clock.retuned(5_000, 0, 0).is_none());
             assert!(clock.retuned(5_000, 1 << 63, 0).is_none());
         }
+        Ok(())
+    }
+
+    /// A generic `TimeSource` caller reaches the same three reads as a
+    /// concrete one. Without the override on `impl TimeSource for Clock` the
+    /// begin read silently becomes the ordered one for every generic caller,
+    /// and the measured region can start before its timestamp completes.
+    ///
+    /// Both reads report "now" and differ only in ordering (and on Arm they
+    /// are the same instruction), so the test pins *which read ran*, through
+    /// [`begin_reads`], and not how the two values compare: consecutive
+    /// reads are never equal, and no value shows a fence.
+    #[test]
+    fn a_generic_caller_sees_the_same_reads_as_a_concrete_one() -> Result<(), Error> {
+        let scale = Scale::from_hz(2_400_000_000, 1_000, 1_760_000_000_000_000_000)
+            .ok_or(Error::InvalidParams("rate"))?;
+        // the read this CPU implements: `Cntvctss` traps where ECV is absent,
+        // and a test must not fault on the hardware it runs on
+        let clock = Clock::Counter(CounterClock::new(
+            scale,
+            Domain::Realtime,
+            crate::detect::this_cpu_ordered_read(),
+        ));
+
+        // the generic path takes the begin read, and only for `now_ns_begin`
+        let before = begin_reads::get();
+        let generic: fn(&Clock) -> u64 = TimeSource::now_ns_begin;
+        let b = generic(&clock);
+        assert_eq!(begin_reads::get(), before + 1, "the begin read is taken");
+        assert!(b > 0, "the time is read");
+
+        let before = begin_reads::get();
+        let o = TimeSource::now_ns_ordered(&clock);
+        let n = TimeSource::now_ns(&clock);
+        assert_eq!(
+            begin_reads::get(),
+            before,
+            "the other two take no begin read"
+        );
+        assert!(o > 0 && n > 0, "the times are read");
+
+        // the concrete path is the same read, one each
+        let before = begin_reads::get();
+        let _ = clock.now_ns_begin();
+        assert_eq!(begin_reads::get(), before + 1, "the inherent method agrees");
+        // through a reference, which forwards every method
+        let before = begin_reads::get();
+        let _ = TimeSource::now_ns_begin(&&clock);
+        assert_eq!(begin_reads::get(), before + 1, "through a reference");
+
+        // a bracket taken generically does not run backwards
+        let (start, end) = (
+            TimeSource::now_ns_begin(&clock),
+            TimeSource::now_ns_ordered(&clock),
+        );
+        assert!(end >= start || start - end < 1_000_000_000, "{start} {end}");
+
+        // the fallback's begin read is its only read, so the override is
+        // indistinguishable there; a generic caller still gets a bracket
+        let fallback = Clock::Monotonic(MonotonicClock::unretuned(77, Domain::Realtime, 41));
+        let (start, end) = (
+            TimeSource::now_ns_begin(&fallback),
+            TimeSource::now_ns_ordered(&fallback),
+        );
+        assert!(end >= start || start - end < 1_000_000_000, "{start} {end}");
         Ok(())
     }
 
