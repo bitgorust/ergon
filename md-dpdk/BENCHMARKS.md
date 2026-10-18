@@ -98,6 +98,7 @@ Each item won an A/B and was reproduced on a second pair, unless the row says ot
 | DPDK: receiver IO vectors 16 (`AERON_RECEIVER_IO_VECTOR_CAPACITY=16`) | rounds 4–5: no NAK at 288 B up to 4.5 M msgs/s; bursts' max 2,808 → 1,000 µs (round 4) |
 | DPDK: the conductor's park capped at 20 µs (`AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`) with a receiver window the ring can hold, per channel (`rcv-wnd`): 256 × the channel's smallest datagram where loss matters more than peak rate (80 KiB for 288 B messages) | rounds 9–10: with 80 KiB no lossy rep at any point (idle max 104, 95–119); with 256 KiB, sustainable 1,344 B 400 k → 600 k msgs/s. Never use the faster park without the small window: it lost more than the default (round 9). A window carries at most about window ÷ (round trip + status-message delay). Round 11 set no `rcv-wnd` and fell back to `AERON_RCV_INITIAL_WINDOW_LENGTH=2 MiB`, 26× the proven window: its 288 B loss-free rate fell to 10% of flat-out on every DPDK mode. Always name `rcv-wnd` on the subscription |
 | kernel: busy polling (`net.core.busy_read`/`busy_poll` 50) with a 4,096-entry receive ring | round 5: no NIC drop or NAK in 5 reps, where the default ring dropped at 1 M msgs/s of 288 B; idle max 166 (138–2,851) |
+| Never set `AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD` to the conductor's max park | Aeron's duty-cycle counter times `do_work` entries, so it includes the park. At 1 ms against `backoff`'s 1 ms park the counter fires on every idle park and its max is a `nanosleep` oversleep, not work. Round 11: see [what the agents' duty cycles actually measured](#round-11-what-the-agents-duty-cycles-actually-measured) |
 
 ### Not recommended
 
@@ -402,8 +403,86 @@ Recovery traffic over the whole round, for reference:
 housekeeping one — grew in **0 of 920 runs**. The IRQ pinning held every time.
 That is the check on the run, and it passed.
 
+### Round 11: what the agents' duty cycles actually measured
+
+Aeron's `*-max-cycle-ns` is **not** time spent working. It is the interval
+between two entries to `do_work`
+(`aeron/aeron-driver/src/main/c/aeron_duty_cycle_tracker.h:50`), so it includes
+whatever the agent's idle strategy did in between. The counter label says
+"max cycle time doing its work in ns"; for an agent that parks, that label is
+wrong. Round 11's three agents therefore need reading separately.
+
+| agent | idle strategy | does its counter include a park? | threshold |
+| --- | --- | --- | --- |
+| conductor | `backoff` (Aeron's default: `aeron_driver_context.c:1143`) | **yes**, up to 1 ms (`aeron_agent.h:46`) | 1 ms — the park itself |
+| sender | `noop` (busy-spin, `host.sh:172`) | no | 50 µs |
+| receiver | `noop` (busy-spin, `host.sh:173`) | no | 50 µs |
+
+Highest duty cycle and total over-threshold cycles in each mode, over all five
+reps and every read point (the max is cumulative from the driver's start, so
+this is the worst each agent ever got):
+
+| mode | cond max µs, a / b | send max µs, a / b | recv max µs, a / b | recv over-threshold, a / b |
+| --- | --- | --- | --- | --- |
+| isolated, DPDK | 16,982 / 11,700 | 638 / 1,398 | 1,585 / 1,834 | 1,015 / **834,623** |
+| isolated, DPDK, local sockets | 13,717 / 12,933 | 667 / 644 | 1,934 / 1,696 | 1,827 / **847,327** |
+| pinned, DPDK | 9,307 / 8,997 | 617 / 1,748 | 890 / 594 | 245 / **872,033** |
+| pinned, DPDK, local sockets | 11,070 / 9,469 | 864 / 1,914 | 664 / 1,131 | 247 / **846,016** |
+| isolated, kernel UDP | 25,073 / 40,040 | 1,586 / 629 | **3,578** / 2,502 | 292 / 231 |
+| isolated, kernel UDP, busy polling | 34,545 / 24,332 | 1,868 / 678 | 2,457 / **2,698** | 6,822 / 5,027 |
+
+**The conductor's maxima are its idle-strategy park, not stalls.** The default
+`backoff` parks for up to 1 ms, and `vm.sh common_env` sets
+`AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='1ms'` — the same number — so every park
+at full length counts as an overrun. The evidence is that the overrun count is
+nearly load-independent (about 5,800 per run at 10%, 50% and 100% of flat-out
+alike, and 4,175 during the idle round trip), that it happens in **every** mode
+including kernel UDP, and that it is worst where nothing on the data path is
+happening: 40 ms on `isolated, kernel UDP`. Work does not behave like that. A
+1 ms `clock_nanosleep` oversleeping fortyfold is a guest vCPU preemption. The
+conductor sits on the housekeeping CPU and is not on the data path, so none of
+these figures put a message at risk. They are the lab measuring a park as work.
+
+**The sender is quiet.** 594–1,914 µs, at most 521 over-threshold cycles in any
+mode's whole round. Not a spike source.
+
+**The receiver is the spike source, and it is worse on kernel UDP than on
+DPDK.** It busy-spins, so nothing parked is inside its counter. Its worst
+maxima are 3.6 ms on `isolated, kernel UDP` at 32 B — the highest message rate
+of the ladder — against 1.9 ms on DPDK. A 3.6 ms stall at 32 B's 3.5 M msgs/s
+is on the order of twelve thousand messages.
+
+Separately, host b's DPDK receiver runs **about 850,000 cycles over 50 µs** in
+a round in every DPDK mode, where host a's runs about a thousand. The two hosts
+are the same size, image and layout. Host b's receiver is continuously a little
+slow; host a's is usually fast with rarer longer stalls. Kernel UDP does not
+show the split (231–6,822 on both). That is a DPDK-receiver problem specific to
+one host, and it is not measured to a cause.
+
+The local-I/O threading mode is **not** what causes any of this. Both DPDK
+modes show the same host-b receiver over-count (834,623 for `dpdk`, 847,327
+for `dpdk-spin`) and comparable maxima. The extra threads only cost the 288 B
+at 10% point, as set out above.
+
+Whether the receiver's ~1.5–1.9 ms DPDK maxima are the same events as the 288 B
+gap loss (18 NAKs at 10%, one round-trip max of 1,464 µs against a 70–80 µs
+typical) is **not separated**: the receiver's max is cumulative and carries no
+timestamp, so a max recorded at one load point cannot be pinned to the loss at
+another. They are the same order of magnitude. The window finding above stands
+on its own either way — the window decides how much a stall may cost.
+
 Still open, and not measured in round 11:
 
+- Why host b's DPDK receiver runs 850,000 over-50 µs cycles a round and host
+  a's runs a thousand. Same size, image and layout. Not measured to a cause.
+- Whether the receiver's long maxima are work or descheduling. 1344 B carries
+  1.0 message per frame against 288 B's 4.0, so a full 16-vector poll is *less*
+  work at 1344 B, yet the maxima grow with size — which points at descheduling.
+  Not separated. The counter carries no timestamp and no cycle index.
+- The lab sets the conductor's threshold equal to the default park, so the
+  conductor's duty-cycle counter cannot mean anything as shipped. Either cap
+  the park (rounds 9–10 used `AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`)
+  or raise the threshold above it.
 - The 80 KiB window was never applied here, so the rounds 9–10 result is not
   re-confirmed on this pair. The A/B is `dpdk@SUB_PARAMS=rcv-wnd=80k` against
   plain `dpdk`, same ladder, same reps.
@@ -411,11 +490,6 @@ Still open, and not measured in round 11:
   26× figure above is from the two rounds' settings, not a side-by-side.
 - The localhost path was skipped ("no fifth core on VM a"), so the goal's
   "across two hosts and on localhost" is still missing one leg.
-- Agent duty cycles are the standing spike source whichever mode runs: at idle,
-  isolated DPDK's receiver reached 1,313 µs and its conductor 12,633 µs. A
-  1.3 ms receiver stall at 0.986 M frames/s is about 1,300 frames against a
-  256-descriptor ring. Until those maxima are traced to a cause, a ~1 ms
-  outlier can appear at any load, window or not.
 
 ## How to run
 
