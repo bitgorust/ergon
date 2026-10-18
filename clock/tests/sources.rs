@@ -8,7 +8,7 @@ use ergon_clock::advanced::{
     Clock, CounterClock, MonotonicClock, PARAMS_VERSION, Params, Policy, SteppedClock, Trust,
     WallOffset, calibrate, monotonic_ns, realtime_ns,
 };
-use ergon_clock::{Config, Domain, Error, ManualClock, TimeSource};
+use ergon_clock::{Config, Domain, Error, ManualClock, TimeSource, elapsed_ns};
 use std::mem::{align_of, offset_of, size_of};
 
 type R = Result<(), Box<dyn std::error::Error>>;
@@ -17,9 +17,9 @@ type R = Result<(), Box<dyn std::error::Error>>;
 /// What a component written against the trait sees: the elapsed time of a
 /// piece of work, statically dispatched.
 fn timed<C: TimeSource>(clock: &C, work: impl FnOnce()) -> u64 {
-    let start = clock.now_ns();
+    let start = clock.now_ns_begin();
     work();
-    clock.since_ns(start)
+    elapsed_ns(start, clock.now_ns_ordered())
 }
 
 /// A manual clock reads what it was set to, and is advanced by hand: a

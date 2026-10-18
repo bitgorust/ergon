@@ -23,6 +23,9 @@ counter read and one multiply per read.
   10.92–15.16 ns (slowest batch 16.13) on c7i.2xlarge, c8g.xlarge and
   c9g.2xlarge (runs `aws-20261016-231320`, `aws-20261016-223331`,
   `aws-20261016-223251`), against 21.29–31.69 ns (33.35) for `Instant::now`.
+- **`now_ns_begin`**: the start of a measurement. Ordered after earlier work
+  and before the region's work can start (`rdtscp; lfence`; on Arm the same
+  ordered read, which already fences both ways).
 - **`now_ns_ordered`**: the same read, taken only after all earlier work
   has finished (`rdtscp`; on Arm `isb` then the read, or `CNTVCTSS_EL0`).
 - **`update`**: called from the loop's idle time. Once a second it keeps
@@ -46,13 +49,25 @@ counter read and one multiply per read.
 
 | read | for |
 |---|---|
-| `now_ns` | event stamps, deadlines, ages, the start of a measurement |
+| `now_ns` | event stamps, deadlines, ages. Never a measurement: the read may be taken before earlier work finishes |
+| `now_ns_begin` | the start of a measurement: earlier work is finished, and the region's work cannot start before the stamp |
 | `now_ns_ordered` | the end of a measurement; stamps that must never be earlier than another thread's (a follower can still be about 1 ns early at an update) |
 
-`now_ns` may be read before earlier work finishes, so a measurement that
-ends with it comes out too short. Neither read stops the compiler moving
-work that touches no memory: pass the work's input and result through
-`std::hint::black_box`.
+A measurement brackets its work with `now_ns_begin` and `now_ns_ordered`.
+`now_ns` at either end is wrong: taken before earlier work finishes the
+interval comes out too long, and with the region's work started before it,
+too short.
+
+`std::hint::black_box` is not a CPU fence. It stops the compiler deleting
+the work; it does not order the stamp. Use it on the work's input and result
+as well, and take the order from the read.
+
+A stamp says when the instruction read the counter, and nothing more. It does
+not say that a store has reached memory or that a packet has left the NIC: a
+store can sit in the store buffer, and a packet can sit in the TX ring, long
+after the stamp. Measure those ends on their own — read the store back, or
+use the NIC's own transmit timestamp and the peer's receive stamp — and never
+treat a local stamp as proof of wire time.
 
 ## Guarantees and limits
 
@@ -103,9 +118,9 @@ fn main() -> Result<(), ergon_clock::Error> {
     let stamp = clock.now_ns();
     let age = clock.since_ns(stamp);
 
-    // A measurement: its end is the ordered read, taken after every earlier
-    // instruction has finished.
-    let start = clock.now_ns();
+    // A measurement: begin and end are the ordered reads, so the region's
+    // work sits inside the bracket and nothing before or after it does.
+    let start = clock.now_ns_begin();
     let took = elapsed_ns(start, clock.now_ns_ordered());
 
     // From the loop's idle time: real work at most once a second.

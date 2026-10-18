@@ -70,10 +70,10 @@ pub fn calibrate(config: &Config) -> Result<Clock, Error> {
 /// calibration), kept by the thread that calls [`update`](Self::update).
 ///
 /// Reads are [`now_ns`](Self::now_ns) (unordered: event stamps, deadlines,
-/// ages, the start of a measurement) and
-/// [`now_ns_ordered`](Self::now_ns_ordered) (the end of a measurement, and
-/// stamps that must never be earlier than another thread's). Each is one
-/// counter read and one multiply: the owner's state is never touched.
+/// ages), [`now_ns_begin`](Self::now_ns_begin) (a measurement's start) and
+/// [`now_ns_ordered`](Self::now_ns_ordered) (its end, and stamps that must
+/// never be earlier than another thread's). Each is one counter read and one
+/// multiply: the owner's state is never touched.
 ///
 /// In UTC ([`Domain::Realtime`], the default) the owner calls
 /// [`update`](Self::update) from its loop's idle time, about once a second
@@ -199,8 +199,8 @@ impl Clock {
     }
 
     /// The time now, ns, unordered: the read may be taken before earlier
-    /// work finishes. For event stamps, deadlines, ages and the start of a
-    /// measurement.
+    /// work finishes. For event stamps, deadlines and ages. Never the start
+    /// of a measurement: use [`now_ns_begin`](Self::now_ns_begin).
     #[inline]
     #[must_use]
     pub fn now_ns(&self) -> u64 {
@@ -214,6 +214,21 @@ impl Clock {
     #[must_use]
     pub fn now_ns_ordered(&self) -> u64 {
         self.segment.now_ns_ordered()
+    }
+
+    /// The time now, ns, for the start of a measurement: ordered after
+    /// earlier work and before the region's work can start
+    /// ([`TimeSource::now_ns_begin`](crate::TimeSource::now_ns_begin)). The
+    /// end is [`now_ns_ordered`](Self::now_ns_ordered).
+    ///
+    /// This stops the CPU, not the compiler only: `std::hint::black_box` is
+    /// not a fence and does not order a stamp. It does not say that a store
+    /// has reached memory or that a packet is on the wire — see the crate
+    /// README's measurement section.
+    #[inline]
+    #[must_use]
+    pub fn now_ns_begin(&self) -> u64 {
+        self.segment.now_ns_begin()
     }
 
     /// Nanoseconds since `start_ns`, never negative.
@@ -354,6 +369,10 @@ impl TimeSource for Clock {
     #[inline]
     fn now_ns_ordered(&self) -> u64 {
         self.segment.now_ns_ordered()
+    }
+    #[inline]
+    fn now_ns_begin(&self) -> u64 {
+        self.segment.now_ns_begin()
     }
     #[inline]
     fn resolution_ns(&self) -> u64 {
@@ -502,6 +521,20 @@ impl Follower {
         )
     }
 
+    /// The time now, ns, for the start of a measurement ([`Clock::now_ns_begin`]).
+    #[inline]
+    #[must_use]
+    pub fn now_ns_begin(&self) -> u64 {
+        self.follow();
+        self.counter.get().map_or_else(
+            || self.fallback_ns(arch::clock_ns_unchecked(wall::MONOTONIC)),
+            |ordered| {
+                let ticks = ordered.read_begin();
+                self.ns_at(ticks)
+            },
+        )
+    }
+
     /// Nanoseconds since `start_ns`, never negative.
     #[inline]
     #[must_use]
@@ -518,6 +551,10 @@ impl TimeSource for Follower {
     #[inline]
     fn now_ns_ordered(&self) -> u64 {
         Self::now_ns_ordered(self)
+    }
+    #[inline]
+    fn now_ns_begin(&self) -> u64 {
+        Self::now_ns_begin(self)
     }
     #[inline]
     fn resolution_ns(&self) -> u64 {

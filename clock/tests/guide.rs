@@ -15,7 +15,9 @@ type R = Result<(), Box<dyn std::error::Error>>;
 // ANCHOR: busy_loop
 /// A busy-spin loop: calibrate once at start-up, stamp each event with
 /// `now_ns`, time its handling up to `now_ns_ordered` and keep the slowest,
-/// and keep the clock on UTC from idle time.
+/// and keep the clock on UTC from idle time. The event's stamp starts this
+/// one because the question is how long from arrival to done; a measurement
+/// of the work alone starts at `now_ns_begin`.
 #[test]
 fn a_busy_spin_loop() -> R {
     let mut clock = calibrate(&Config::default())?; // start-up only: 40-70 ms, plus up to 50 ms for the time-sync probe
@@ -58,12 +60,13 @@ fn handle(event: u64) -> u64 {
 
 // ANCHOR: ordered_read
 /// The end of a measurement must be ordered: 16 loads that miss the
-/// caches, each waiting for the one before.
+/// caches, each waiting for the one before. The begin too: an unordered
+/// read lets the work start before the stamp and shortens the interval.
 #[test]
 fn the_end_of_a_measurement_is_ordered() -> R {
     let clock = calibrate(&Config::default())?;
     let ring = ring(1 << 23); // 32 MB of slots in one random cycle
-    let start_ns = clock.now_ns();
+    let start_ns = clock.now_ns_begin();
     let slot = black_box(chase(&ring, black_box(start_ns))); // 16 cache misses
     let early_ns = elapsed_ns(start_ns, clock.now_ns()); // may run before they finish
     let full_ns = elapsed_ns(start_ns, clock.now_ns_ordered()); // waits for them
@@ -153,7 +156,7 @@ fn stamp_events_with_now_ns() -> R {
 fn time_a_short_section() -> R {
     let clock = calibrate(&Config::default())?;
     let raw = advanced::segment(&clock); // the fixed segment: raw ticks
-    let start = raw.ticks_ordered(); // waits for the work before it
+    let start = raw.ticks_begin(); // waits for the work before it, and holds the work behind it
     let sum: u64 = (0..1_000_u64).map(black_box).sum(); // the work
     let end = raw.ticks_ordered(); // waits for the work to finish
     let took_ns = raw.ticks_to_ns(end.saturating_sub(start));
@@ -161,12 +164,13 @@ fn time_a_short_section() -> R {
     Ok(())
 }
 
-/// A long section (well over a microsecond): a plain start is fine, but
-/// the end must still be ordered.
+/// A long section (well over a microsecond): both ends are still the
+/// ordered reads. The begin's ordering costs a few nanoseconds and is not
+/// the measurement here, but dropping it is still wrong.
 #[test]
 fn time_a_long_section() -> R {
     let clock = calibrate(&Config::default())?;
-    let start_ns = clock.now_ns();
+    let start_ns = clock.now_ns_begin();
     std::thread::sleep(Duration::from_millis(1)); // the work
     let took_ns = elapsed_ns(start_ns, clock.now_ns_ordered());
     assert!(took_ns >= 990_000, "{took_ns} ns");

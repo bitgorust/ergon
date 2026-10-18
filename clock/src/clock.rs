@@ -73,7 +73,8 @@ impl Domain {
 /// for the clock it is given, so a read is never a dynamic call.
 pub trait TimeSource {
     /// The time now, ns, unordered: the read may be taken before earlier
-    /// instructions finish (event time, pacing, freshness).
+    /// instructions finish (event time, pacing, freshness). Never a
+    /// measurement's begin.
     fn now_ns(&self) -> u64;
 
     /// The time now, ns, ordered: taken after every earlier instruction
@@ -82,6 +83,15 @@ pub trait TimeSource {
     #[inline]
     fn now_ns_ordered(&self) -> u64 {
         self.now_ns()
+    }
+
+    /// The time now, ns, for a measurement bracket's begin: ordered after
+    /// earlier work and before the region's work can start. Defaults to
+    /// [`now_ns_ordered`](Self::now_ns_ordered), which is what a source with
+    /// no separate begin gives; the calibrated clocks override it.
+    #[inline]
+    fn now_ns_begin(&self) -> u64 {
+        self.now_ns_ordered()
     }
 
     /// Nanoseconds since `start_ns`, never negative: a start a little
@@ -106,6 +116,9 @@ impl<T: TimeSource + ?Sized> TimeSource for &T {
     #[inline]
     fn now_ns_ordered(&self) -> u64 {
         (**self).now_ns_ordered()
+    }
+    fn now_ns_begin(&self) -> u64 {
+        (**self).now_ns_begin()
     }
     #[inline]
     fn since_ns(&self, start_ns: u64) -> u64 {
@@ -155,6 +168,23 @@ impl OrderedRead {
         let _ = self;
         arch::ticks_ordered()
     }
+
+    /// The read for a measurement's begin: ordered after earlier work and
+    /// before later work can start. On x86 `rdtscp` alone does not stop the
+    /// region's first instructions from issuing before it, so this is
+    /// `rdtscp; lfence`. On Arm the ordered read already fences both ways
+    /// (`isb; mrs`, and `CNTVCTSS_EL0` is self-synchronised), so it is the
+    /// same read as [`read`](Self::read).
+    #[inline]
+    pub(crate) fn read_begin(self) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let _ = self;
+            return arch::ticks_ordered_fenced();
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        self.read()
+    }
 }
 
 impl CounterClock {
@@ -176,25 +206,47 @@ impl CounterClock {
 
     /// The counter, ordered (`rdtscp`; `mrs cntvctss_el0` where the CPU has
     /// `FEAT_ECV`, else `isb; mrs cntvct_el0`), and a compiler barrier: a
-    /// measurement bracket's read.
+    /// measurement bracket's end.
     #[inline]
     #[must_use]
     pub fn ticks_ordered(&self) -> u64 {
         self.ordered.read()
     }
 
+    /// The counter for a measurement bracket's begin: ordered after earlier
+    /// work and before the region's work can start
+    /// ([`OrderedRead::read_begin`]).
+    #[inline]
+    #[must_use]
+    pub fn ticks_begin(&self) -> u64 {
+        self.ordered.read_begin()
+    }
+
     /// The time now, ns, in the clock's domain, from an unordered read.
+    ///
+    /// Event stamps, deadlines and ages. Never the start of a measurement:
+    /// the read may be taken before earlier work finishes, which makes the
+    /// interval too long, and the region's work may start before it, which
+    /// makes it too short.
     #[inline]
     #[must_use]
     pub fn now_ns(&self) -> u64 {
         self.scale.to_ns(arch::ticks())
     }
 
-    /// The time now, ns, from an ordered read.
+    /// The time now, ns, from an ordered read: a measurement bracket's end.
     #[inline]
     #[must_use]
     pub fn now_ns_ordered(&self) -> u64 {
         self.scale.to_ns(self.ordered.read())
+    }
+
+    /// The time now, ns, for a measurement bracket's begin
+    /// ([`ticks_begin`](Self::ticks_begin)).
+    #[inline]
+    #[must_use]
+    pub fn now_ns_begin(&self) -> u64 {
+        self.scale.to_ns(self.ordered.read_begin())
     }
 
     /// The time, ns, at counter value `ticks`.
@@ -334,6 +386,10 @@ impl TimeSource for CounterClock {
     #[inline]
     fn now_ns_ordered(&self) -> u64 {
         Self::now_ns_ordered(self)
+    }
+    #[inline]
+    fn now_ns_begin(&self) -> u64 {
+        Self::now_ns_begin(self)
     }
     #[inline]
     fn resolution_ns(&self) -> u64 {
@@ -649,6 +705,27 @@ impl Clock {
         match self {
             Self::Counter(c) => c.now_ns_ordered(),
             Self::Monotonic(m) => m.now_ns(),
+        }
+    }
+
+    /// The time now, ns, for a measurement bracket's begin. The monotonic
+    /// fallback's read is a vDSO call, which orders both ways already.
+    #[inline]
+    #[must_use]
+    pub fn now_ns_begin(&self) -> u64 {
+        match self {
+            Self::Counter(c) => c.now_ns_begin(),
+            Self::Monotonic(m) => m.now_ns(),
+        }
+    }
+
+    /// Raw ticks for a measurement bracket's begin.
+    #[inline]
+    #[must_use]
+    pub fn ticks_begin(&self) -> u64 {
+        match self {
+            Self::Counter(c) => c.ticks_begin(),
+            Self::Monotonic(m) => m.ticks(),
         }
     }
 

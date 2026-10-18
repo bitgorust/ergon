@@ -90,12 +90,15 @@ A CPU starts an instruction once its inputs are ready. A counter read has
 no inputs and no memory dependency, so `now_ns` may run before the work
 above it has finished. `now_ns_ordered` waits for every earlier
 instruction: `rdtscp` on x86; on Arm `isb` then the read, or
-`CNTVCTSS_EL0` where the CPU has it (Graviton5).
+`CNTVCTSS_EL0` where the CPU has it (Graviton5). `now_ns_begin` is the
+read for a measurement's start: ordered after earlier work and, on x86,
+fenced so the region's work cannot start before it (`rdtscp; lfence`).
 
-An unordered read is fine at the *start* of a measurement: the work comes
-after it and is bracketed by the end read.
+An unordered read is **not** fine at the start of a measurement. The
+region's work can begin before the stamp is taken, so the interval comes
+out too short.
 
-**Without it** a measurement's end is read early:
+**Without an ordered end** a measurement's end is read early:
 
 - A crate test times 16 cache-missing loads: about 1.9 µs on an M1 Pro
   (release build). The unordered end read measured 0 (median of 1,000
@@ -117,13 +120,21 @@ is the same on x86 (LLVM treats `rdtsc` as touching memory), not on Arm
 touches no memory can still move either way: a compiled probe moved pure
 arithmetic out from between two ordered reads. Pass the work's input
 through `std::hint::black_box` after the start read, and its result before
-the end read, as above.
+the end read, as above. `black_box` is not a CPU fence: it stops the
+compiler, and the read's own ordering is what stops the CPU.
+
+A stamp is when the instruction read the counter. It is not proof that a
+store has reached memory or that a packet has left the NIC: a store can
+sit in the store buffer, and a packet can sit in the TX ring, long after
+the stamp. Measure those ends on their own — read the store back, or use
+the NIC's transmit timestamp and the peer's receive stamp.
 
 ## Which read when
 
 | read | for |
 |---|---|
-| `now_ns` | event stamps, deadlines, ages, the start of a measurement |
+| `now_ns` | event stamps, deadlines, ages. Never a measurement |
+| `now_ns_begin` | the start of a measurement |
 | `now_ns_ordered` | the end of a measurement; stamps that must never be earlier than another thread's (a follower can still be about 1 ns early at an update) |
 
 - **Unordered, like `now_ns`:** quanta's reads, and minstant's
@@ -134,8 +145,10 @@ the end read, as above.
 
 ## A low-latency loop
 
-Calibrate once; stamp each event with `now_ns`; time its work up to
-`now_ns_ordered`; keep the slowest; `update` when idle — idle meaning
+Calibrate once; stamp each event with `now_ns`; time its handling up to
+`now_ns_ordered` and keep the slowest (the event's stamp starts this one,
+because the question is how long from arrival to done; a measurement of the
+work alone starts at `now_ns_begin`); `update` when idle — idle meaning
 between two pieces of work, even in a loop that never sleeps:
 
 ```rust,ignore
