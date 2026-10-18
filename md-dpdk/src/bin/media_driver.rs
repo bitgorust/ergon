@@ -41,8 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // default socket driver.
     let configured = ConfiguredDriver::from_env(AeronDriverContext::new()?)?;
     println!("transport backend: {}", configured.backend());
-    println!("aeron dir: {}", configured.context().get_dir());
-    configured.context().print_configuration();
+    println!("aeron dir: {}", configured.dir());
+    configured.print_configuration();
 
     // RUSTERON_MEDIA_DRIVER_MLOCKALL=1 (in `start`, before the driver is
     // created): every mapping faulted in by mmap, so the agents never

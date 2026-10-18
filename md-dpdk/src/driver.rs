@@ -57,6 +57,10 @@ const RECEIVER_IO_VECTOR_CAPACITY_ENV: &str = "AERON_RECEIVER_IO_VECTOR_CAPACITY
 #[must_use = "the transport it may hold is freed when it drops: start it, or keep it alive for as long as a driver it started can run"]
 pub struct ConfiguredDriver {
     context: AeronDriverContext,
+    // The threading mode at configuration time. The only one `start` can
+    // start, and the only one `abandon` may trust: a later read of the
+    // context is not what the driver was built with.
+    threading: aeron_threading_mode_t,
     transport: Option<CloseOnDrop>,
     report: Option<HostReport>,
     rechecks: Option<RecheckThread>,
@@ -124,6 +128,7 @@ impl ConfiguredDriver {
             }
         };
         Ok(Self {
+            threading: context.get_threading_mode(),
             context,
             transport,
             report,
@@ -144,10 +149,31 @@ impl ConfiguredDriver {
         self.rechecks.is_some()
     }
 
-    /// The configured context.
+    /// The Aeron directory the driver will run in.
+    ///
+    /// (The context itself is kept private: safe code must not be able to
+    /// start a second driver from a context whose transport this value owns,
+    /// and then drop this value out from under it.)
     #[must_use]
-    pub const fn context(&self) -> &AeronDriverContext {
-        &self.context
+    pub fn dir(&self) -> &str {
+        self.context.get_dir()
+    }
+
+    /// Aeron's configuration for this driver, one setting per line on stdout.
+    pub fn print_configuration(&self) {
+        self.context.print_configuration();
+    }
+
+    /// The threading mode the driver will start with.
+    #[must_use]
+    pub const fn threading_mode(&self) -> aeron_threading_mode_t {
+        self.threading
+    }
+
+    /// The conductor's configured CPU affinity (`AERON_CONDUCTOR_CPU_AFFINITY`), or -1.
+    #[must_use]
+    pub fn conductor_cpu_affinity(&self) -> i32 {
+        self.context.get_conductor_cpu_affinity()
     }
 
     /// `dpdk-ena` when the DPDK transport is installed, else `socket`.
@@ -171,6 +197,7 @@ impl ConfiguredDriver {
     pub fn start(self) -> Result<EnvMediaDriver, DpdkError> {
         let Self {
             context,
+            threading,
             transport,
             report,
             rechecks,
@@ -180,6 +207,7 @@ impl ConfiguredDriver {
         driver.start(true).map_err(|e| aeron_error("aeron_driver_start", &e))?;
         Ok(EnvMediaDriver {
             driver,
+            threading,
             context,
             memory_locked,
             report,
@@ -235,6 +263,10 @@ fn run_host_checks(
 pub struct EnvMediaDriver {
     // Dropped in this order: the transport must outlive every agent using it.
     driver: AeronDriver,
+    // The threading mode the driver was started with. The only one `abandon`
+    // may trust: a later read of the context is not what the driver was built
+    // with.
+    threading: aeron_threading_mode_t,
     context: AeronDriverContext,
     memory_locked: bool,
     report: Option<HostReport>,
@@ -265,10 +297,31 @@ impl EnvMediaDriver {
         self.driver.main_idle_strategy(work_count);
     }
 
-    /// The driver's context.
+    /// The Aeron directory the driver is running in.
+    ///
+    /// (The context itself is kept private, for the same reason as on
+    /// [`ConfiguredDriver`]: safe code must not be able to start a second
+    /// driver from a context whose transport this value owns.)
     #[must_use]
-    pub const fn context(&self) -> &AeronDriverContext {
-        &self.context
+    pub fn dir(&self) -> &str {
+        self.context.get_dir()
+    }
+
+    /// Aeron's configuration for this driver, one setting per line on stdout.
+    pub fn print_configuration(&self) {
+        self.context.print_configuration();
+    }
+
+    /// The threading mode the driver was started with.
+    #[must_use]
+    pub const fn threading_mode(&self) -> aeron_threading_mode_t {
+        self.threading
+    }
+
+    /// The conductor's configured CPU affinity (`AERON_CONDUCTOR_CPU_AFFINITY`), or -1.
+    #[must_use]
+    pub fn conductor_cpu_affinity(&self) -> i32 {
+        self.context.get_conductor_cpu_affinity()
     }
 
     /// `dpdk-ena` when the DPDK transport is installed, else `socket`.
@@ -320,7 +373,10 @@ impl EnvMediaDriver {
     /// [`DpdkError::InvalidConfiguration`] under `DEDICATED` or
     /// `SHARED_NETWORK`, after closing the driver as dropping it would.
     pub fn abandon(self) -> Result<(), DpdkError> {
-        let mode = self.context.get_threading_mode();
+        // The mode the driver was started with, not a later read of the
+        // context: the context is interior-mutable and a later read is not
+        // what this driver was built with.
+        let mode = self.threading;
         match mode {
             aeron_threading_mode_t::AERON_THREADING_MODE_SHARED
             | aeron_threading_mode_t::AERON_THREADING_MODE_INVOKER => {

@@ -287,13 +287,13 @@ impl Lab {
             }
             Ok("invoker") => {
                 let driver = embed(cpu).unwrap_or_else(|e| panic!("HARNESS_DRIVER=invoker: {e}"));
-                let dir = driver.context().get_dir().to_string();
+                let dir = driver.dir().to_string();
                 let aeron = client(&dir.clone().into_c_string(), true);
-                // what the driver runs with, read back from its context
-                let conductor = driver.context().get_conductor_cpu_affinity();
+                // what the driver runs with, as it was started
+                let conductor = driver.conductor_cpu_affinity();
                 eprintln!(
                     "harness driver: embedded threading={} transport={} cpu={} dir={dir}",
-                    threading_mode_name(driver.context().get_threading_mode()),
+                    threading_mode_name(driver.threading_mode()),
                     driver.backend(),
                     if conductor < 0 {
                         "-".to_string()
