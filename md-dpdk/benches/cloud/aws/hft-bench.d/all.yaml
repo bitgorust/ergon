@@ -29,6 +29,10 @@ spec:
       env:
         - name: HFT_OUT
           value: /out
+        # This mode asked for cpu-partition.ergon.io: a missing partition
+        # grant is a failure, not a control run.
+        - name: HFT_REQUIRE_PARTITION
+          value: "1"
         - name: AERON_DIR
           value: /dev/hugepages/aeron
         - name: HARNESS_DRIVER
@@ -77,6 +81,10 @@ spec:
       env:
         - name: HFT_OUT
           value: /out
+        # This mode asked for cpu-partition.ergon.io: a missing partition
+        # grant is a failure, not a control run.
+        - name: HFT_REQUIRE_PARTITION
+          value: "1"
         - name: AERON_DIR
           value: /dev/hugepages/aeron
         - name: HARNESS_DRIVER

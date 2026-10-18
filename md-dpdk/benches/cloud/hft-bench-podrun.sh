@@ -15,9 +15,14 @@
 # ERGON_SHARED_CPUS.
 #
 # When the plugin set ERGON_ISOLATED_CGROUP (cpu-partition.ergon.io), the
-# measuring thread is first moved into that child cgroup and only then pinned
+# measuring process is first moved into that child cgroup and only then pinned
 # to the exclusive CPU -- the kernel rejects a partition write if a thread
-# outside the child holds an exclusive CPU, so move-then-pin is the order.
+# outside the child holds an exclusive CPU, so move-then-pin is the order. The
+# move is proved before any number counts, and a run that cannot show its
+# measuring task inside an isolated partition exits rather than measure
+# outside it. A mode that asked for a partition (HFT_REQUIRE_PARTITION=1)
+# exits when the grant is missing; a mode that did not asks for none and says
+# so in meta.txt.
 #
 # When the plugin set ERGON_HUGEPAGES_DIR (hugepages.ergon.io), AERON_DIR is
 # $ERGON_HUGEPAGES_DIR/aeron and AERON_FILE_PAGE_SIZE is $ERGON_HUGEPAGE_SIZE,
@@ -36,6 +41,101 @@
 # Nothing here adds capabilities; rlimits ride along from the NRI plugin.
 set -uo pipefail
 
+log() { echo "[hft-bench-podrun ${role:-lib} $(date +%T)] $*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+# ---------------------------------------------------------------- cgroup
+# Sourced by test/test-hft-bench-podrun.sh (HFT_PODRUN_LIB=1) against a fake
+# tree: these three are the whole placement contract, and they are tested
+# behaviourally rather than by grepping this file.
+cgroup_root=${HFT_CGROUP_ROOT:-/sys/fs/cgroup}
+
+# ERGON_ISOLATED_CGROUP is the node's path (nriplugin.partitionChild). Inside
+# the pod's own cgroup namespace the child is a directory of the namespace
+# root, so a path that is not a directory is retried under the cgroup root by
+# name. Prints the resolved child, fails when there is none.
+resolve_child() {
+    local p=${ERGON_ISOLATED_CGROUP:-} alt
+    [[ -n $p ]] || return 1
+    if [[ -d $p ]]; then
+        printf '%s\n' "$p"
+        return 0
+    fi
+    alt=$cgroup_root/$(basename "$p")
+    if [[ -d $alt ]]; then
+        printf '%s\n' "$alt"
+        return 0
+    fi
+    return 1
+}
+
+# cpu_in_mask <cpu> <taskset mask>: the mask is a comma list of numbers and
+# ranges ("2", "2,3", "0-3,8-11"), the way taskset -pc prints it.
+cpu_in_mask() {
+    local cpu=$1 mask=$2 r
+    local IFS=,
+    for r in $mask; do
+        if [[ $r == *-* ]]; then
+            ((cpu >= ${r%%-*} && cpu <= ${r##*-})) && return 0
+        elif [[ $r == "$cpu" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# enter_partition: move this process into the isolated child and require the
+# child to read back as an isolated partition. Prints the child path. With no
+# grant at all it prints nothing and returns 0 -- unless HFT_REQUIRE_PARTITION
+# is set, which is how a mode that asked for cpu-partition.ergon.io says a
+# missing grant is a failure rather than a control run.
+enter_partition() {
+    local child part
+    if [[ -z ${ERGON_ISOLATED_CGROUP:-} ]]; then
+        if [[ ${HFT_REQUIRE_PARTITION:-} == 1 ]]; then
+            die "HFT_REQUIRE_PARTITION=1 but ERGON_ISOLATED_CGROUP is unset: no partition grant"
+        fi
+        echo "partition=none child=none" >>"${out:?}/meta.txt"
+        log "no cpu-partition grant: the measuring task stays in the container cgroup"
+        return 0
+    fi
+    child=$(resolve_child) ||
+        die "no isolated cgroup under ERGON_ISOLATED_CGROUP=$ERGON_ISOLATED_CGROUP (tried it and $cgroup_root/$(basename "${ERGON_ISOLATED_CGROUP}"))"
+    [[ -w $child/cgroup.procs ]] || die "$child/cgroup.procs is not writable"
+    echo $$ >"$child/cgroup.procs" 2>/dev/null || die "cannot move $$ into $child"
+    part=$(cat "$child/cpuset.cpus.partition" 2>/dev/null || echo unknown)
+    echo "partition=$part child=$child" >>"${out:?}/meta.txt"
+    [[ $part == isolated ]] || die "$child/cpuset.cpus.partition is '$part', expected 'isolated'"
+    printf '%s\n' "$child"
+}
+
+# prove_placed <pid> <cpu> [child]: the measuring task is in the isolated
+# child and on the CPU the grant named, before any number counts. cgroup.procs
+# is write-only in a threaded child (names.go), so membership is read from
+# cgroup.threads. Affinity is set inside rtt after it parses its arguments, so
+# it is retried briefly rather than sampled once.
+prove_placed() {
+    local pid=$1 cpu=$2 child=${3:-} mask= i
+    if [[ -n $child ]]; then
+        grep -qx "$pid" "$child/cgroup.threads" 2>/dev/null ||
+            die "pid $pid is not in $child (cgroup.threads: $(tr '\n' ' ' <"$child/cgroup.threads" 2>/dev/null))"
+    fi
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        mask=$(taskset -pc "$pid" 2>/dev/null | sed 's/.*: //') ||
+            die "cannot read the affinity of pid $pid"
+        if cpu_in_mask "$cpu" "$mask"; then
+            log "placed: pid $pid on cpu $cpu${child:+ in $child} (affinity $mask)"
+            return 0
+        fi
+        sleep 0.2
+    done
+    die "pid $pid is not on CPU $cpu (affinity $mask)"
+}
+
+if [[ ${HFT_PODRUN_LIB:-} == 1 ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 role=${1:?hft-bench-podrun.sh: ping|pong <ping ep> <pong ep> [messages] [warmup]}
 case $role in
 ping | pong) ;;
@@ -50,9 +150,6 @@ messages=${4:-${RTT_MESSAGES:-300000}}
 warmup=${5:-${RTT_WARMUP:-50000}}
 out=${HFT_OUT:-/out}
 mkdir -p "$out"
-
-log() { echo "[hft-bench-podrun $role $(date +%T)] $*" >&2; }
-die() { log "ERROR: $*"; exit 1; }
 
 # The measuring CPU: the first isolated CPU the plugin named. The gap spinner
 # takes the second. Never a shared CPU: the loop is the hot path.
@@ -96,20 +193,9 @@ export RTT_SECONDS=${RTT_SECONDS:-60}
 vmstat_line() { awk '/^pgfault |^pgmajfault /{printf "%s %s\n", $1, $2}' /proc/vmstat; }
 
 # Move-then-pin: into the isolated child cgroup first, then onto the CPU. The
-# partition write (done by the hook) already named this cgroup; a thread that
-# is not in it cannot hold an exclusive CPU of a valid isolated partition.
-if [[ -n ${ERGON_ISOLATED_CGROUP:-} ]]; then
-    if [[ -w $ERGON_ISOLATED_CGROUP/cgroup.procs ]]; then
-        echo $$ >"$ERGON_ISOLATED_CGROUP/cgroup.procs" 2>/dev/null ||
-            log "WARN: could not move pid $$ into $ERGON_ISOLATED_CGROUP"
-        part=$(cat "$ERGON_ISOLATED_CGROUP/cgroup.cpuset.cpus.partition" 2>/dev/null ||
-            cat "$ERGON_ISOLATED_CGROUP/cpuset.cpus.partition" 2>/dev/null || echo unknown)
-        echo "partition=$part" >>"$out/meta.txt"
-        [[ $part == isolated ]] || log "WARN: partition reads '$part', expected 'isolated'"
-    else
-        log "WARN: $ERGON_ISOLATED_CGROUP/cgroup.procs not writable"
-    fi
-fi
+# hook created the partition but moved no tasks; a thread outside the child
+# cannot hold an exclusive CPU of a valid isolated partition. Fails closed.
+child=$(enter_partition)
 
 gapspin_bg=
 cleanup() {
@@ -132,14 +218,18 @@ log "rtt on CPU $meas_cpu, $messages messages after $warmup warmup, AERON_DIR=$A
 rc=0
 case $role in
 ping)
-    rtt xping "$ping_ep" "$pong_ep" "$messages" "$warmup" "$meas_cpu" >"$out/rtt-line.txt" 2>>"$out/rtt-stderr.log" || rc=$?
+    rtt xping "$ping_ep" "$pong_ep" "$messages" "$warmup" "$meas_cpu" >"$out/rtt-line.txt" 2>>"$out/rtt-stderr.log" &
+    app=$!
+    prove_placed "$app" "$meas_cpu" "$child"
+    wait "$app" || rc=$?
     ;;
 pong)
     # xpong stops on SIGTERM (the lab script sends it after xping prints)
     rtt xpong "$ping_ep" "$pong_ep" "$meas_cpu" >"$out/rtt-pong.log" 2>>"$out/rtt-stderr.log" &
-    pong_bg=$!
-    echo "$pong_bg" >"$out/pong.pid"
-    wait "$pong_bg" || rc=$?
+    app=$!
+    echo "$app" >"$out/pong.pid"
+    prove_placed "$app" "$meas_cpu" "$child"
+    wait "$app" || rc=$?
     ;;
 esac
 after=$(vmstat_line)
