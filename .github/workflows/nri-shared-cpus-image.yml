@@ -4,13 +4,9 @@
 #
 # The module is still under test (see k8s/nri-shared-cpus/RELEASE.md). This
 # workflow exists so the multi-arch build and the chart can be proven without
-# touching a registry:
-#
-#   default run  -> build both platforms, upload an OCI tarball artifact,
-#                   lint and template the chart. Nothing is pushed.
-#   publish run  -> the same build, then push to GHCR. Gated behind the
-#                   `publish` input, which must be typed as `publish` to
-#                   take effect. Do not run it until RELEASE.md is signed off.
+# touching a registry: it builds both platforms, uploads an OCI tarball
+# artifact, and lints and templates the chart. Nothing is pushed. The push is
+# nri-shared-cpus-publish.yml, a separate dispatch that has to be asked for.
 #
 # Triggers on workflow_dispatch only. Never on push or pull_request.
 
@@ -23,10 +19,6 @@ on:
         description: "Image tag (also used as appVersion for the chart)"
         required: true
         default: "0.1.0-dev"
-      publish:
-        description: 'Type "publish" to push to GHCR. Anything else builds only.'
-        required: true
-        default: "build-only"
 
 permissions:
   contents: read
@@ -136,57 +128,3 @@ jobs:
           path: /tmp/image-${{ strategy.job-index }}.tar
           retention-days: 7
 
-  # Only reachable by typing "publish" in the dispatch input. This is the
-  # single step that writes to a registry. It must not run until
-  # k8s/nri-shared-cpus/RELEASE.md is signed off.
-  publish:
-    name: push to GHCR (gated)
-    needs: [checks, chart]
-    if: github.event.inputs.publish == 'publish'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-qemu-action@v3
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Push multi-arch image
-        uses: docker/build-push-action@v6
-        with:
-          context: k8s/nri-shared-cpus
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ github.event.inputs.tag }}
-            ${{ env.IMAGE_NAME }}:latest
-          build-args: |
-            VERSION=${{ github.event.inputs.tag }}
-            GIT_DESCRIBE=${{ github.sha }}
-          cache-from: type=gha
-          provenance: true
-          sbom: true
-
-      - name: Package the chart
-        run: |
-          helm package k8s/nri-shared-cpus/charts/ergon-shared-cpus \
-            --version "${{ github.event.inputs.tag }}" \
-            --app-version "${{ github.event.inputs.tag }}" \
-            --destination /tmp/chart
-
-      - name: Push the chart to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
-            --username "${{ github.actor }}" --password-stdin
-          helm push /tmp/chart/*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
