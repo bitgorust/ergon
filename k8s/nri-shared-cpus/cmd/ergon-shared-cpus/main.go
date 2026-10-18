@@ -91,7 +91,20 @@ func run(configPath string, log *slog.Logger) error {
 	}
 	pinSelfToShared(cfg, log)
 
-	siblings, err := cpuset.ReadSiblings("/sys", cfg.Shared)
+	// The topology covers every online CPU, not just the shared ones: the
+	// plugin groups a container's exclusive CPUs by core too, and a map built
+	// from shared alone has no entry for any of them. Cores then calls each
+	// exclusive CPU a physical core of its own, so two threads of one core
+	// look like two cores and an app can put two "separate" hot cores on one.
+	onlineData, err := os.ReadFile("/sys/devices/system/cpu/online")
+	if err != nil {
+		return fmt.Errorf("core topology: %w", err)
+	}
+	online, err := cpuset.Parse(strings.TrimSpace(string(onlineData)))
+	if err != nil {
+		return fmt.Errorf("core topology: /sys/devices/system/cpu/online %q: %w", onlineData, err)
+	}
+	siblings, err := cpuset.ReadSiblings("/sys", online)
 	if err != nil {
 		return fmt.Errorf("core topology: %w", err)
 	}

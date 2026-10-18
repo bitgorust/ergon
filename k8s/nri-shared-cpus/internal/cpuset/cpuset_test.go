@@ -114,6 +114,61 @@ func TestCores(t *testing.T) {
 	}
 }
 
+// TestCheckCoreLayout: an exclusive CPU whose SMT sibling is shared is not
+// isolated, and a CPU with no topology cannot be checked at all. Both must be
+// refused; Cores would guess "a core of its own" for the second and silently
+// accept the first.
+func TestCheckCoreLayout(t *testing.T) {
+	x86 := map[int]Set{}
+	for c := 0; c < 4; c++ {
+		x86[c] = New(c, c+4)
+		x86[c+4] = New(c, c+4)
+	}
+	cases := []struct {
+		name      string
+		exclusive Set
+		shared    Set
+		siblings  map[int]Set
+		want      string
+	}{
+		{"whole cores, shared elsewhere", New(1, 5), New(0, 4), x86, ""},
+		{"two cores", New(1, 2, 5, 6), New(0, 4), x86, ""},
+		{"graviton: no SMT at all", New(2, 3), New(0), map[int]Set{0: New(0), 2: New(2), 3: New(3)}, ""},
+		{"nothing to keep", Set{}, New(0, 4), x86, ""},
+		{"one thread of a core, its sibling shared", New(1), New(5), x86, "split"},
+		{"a core split the other way", New(5), New(1), x86, "split"},
+		{"no topology for an exclusive CPU", New(1, 5), New(0), map[int]Set{0: New(0)}, "thread_siblings_list"},
+		{"no topology for a shared CPU", New(1), New(0), map[int]Set{1: New(1, 5), 5: New(1, 5)}, "thread_siblings_list"},
+	}
+	for _, c := range cases {
+		err := CheckCoreLayout(c.exclusive, c.shared, c.siblings)
+		if c.want == "" {
+			if err != nil {
+				t.Errorf("%s: err = %v, want nil", c.name, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want %q", c.name, err, c.want)
+		}
+	}
+}
+
+// TestCheckCoreLayoutNamesTheSplitCore: the refusal has to say which core and
+// which CPUs, or an operator cannot pick another CPU without guessing.
+func TestCheckCoreLayoutNamesTheSplitCore(t *testing.T) {
+	x86 := map[int]Set{1: New(1, 5), 5: New(1, 5)}
+	err := CheckCoreLayout(New(1), New(5), x86)
+	if err == nil {
+		t.Fatal("a split core must be refused")
+	}
+	for _, want := range []string{"1,5", "1", "5"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
 func TestParseCores(t *testing.T) {
 	cores, err := ParseCores("1,5;2,6")
 	if err != nil {

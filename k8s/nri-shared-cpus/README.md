@@ -195,6 +195,8 @@ Then run a pod with the example above and check
 | kubelet restart, plugin down | cpuset shrinks to the exclusive CPUs; helpers fall onto them; `Synchronize` re-widens on return |
 | kernel < 6.2 or cgroup v1 | the plugin exits with one clear line |
 | kernel has no `cpuset.cpus.exclusive` | shared-only pods work; every `cpu-partition` opt-in is refused and the pod stays out of the partition (6.7 or a vendor backport of that file) |
+| one physical core is split between the exclusive and the shared CPUs | the container is refused, naming the core: on SMT the hot thread and the helpers would share one core, which is the noise this removes |
+| a CPU has no `thread_siblings_list` | the container is refused: without it the plugin cannot tell which CPUs share a core and will not guess |
 
 ## Limits
 

@@ -254,6 +254,20 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr *ap
 	if d == nil {
 		return nil, nil, nil
 	}
+	// The exclusive CPUs have to be able to keep their own physical cores.
+	// On SMT a core split between exclusive and shared runs the hot thread and
+	// the helpers on the same execution units, which is the contention a
+	// partition exists to remove. This is checked here rather than in Admit:
+	// Admit is the policy over the request, and this is the request against
+	// the node's topology. A container with no exclusive CPUs has nothing to
+	// keep, so it is left alone.
+	if !d.Exclusive.IsEmpty() {
+		if err := cpuset.CheckCoreLayout(d.Exclusive, p.cfg.Shared, p.siblings); err != nil {
+			p.metrics.Refused("core-layout")
+			p.log.Warn("create refused", append(logArgs, "reason", "core-layout", "error", err.Error())...)
+			return nil, nil, refuse(8, "core-layout", "%v", err)
+		}
+	}
 	for _, w := range d.Warnings {
 		p.log.Warn("create warning", append(logArgs, "warning", w)...)
 	}

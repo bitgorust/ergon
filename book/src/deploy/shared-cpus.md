@@ -400,7 +400,17 @@ Rules:
 - never a spinner or SQPOLL on a shared CPU. ergon-io keeps this: with no
   `sqpoll_cpu`, `uring-sqpoll` takes a CPU of the pod's own outside
   `ERGON_HELPER_CPUS` and refuses (`Error::Cpu`) when there is none
-  ([io: Kubernetes](../io/kubernetes.md#shared-cpus-from-the-node)).
+  ([io: Kubernetes](../io/kubernetes.md#shared-cpus-from-the-node));
+- two indices are two physical cores only when they are two groups in
+  `ERGON_ISOLATED_CORES`. On SMT, `1,5` is one core and its two threads
+  share every execution unit: two "hot cores" there is one hot core.
+
+A core is never split between the exclusive and the shared CPUs. On SMT
+the hot thread and the helpers would time-share one physical core, which
+is the contention this whole setup exists to remove. The plugin refuses
+such a container rather than start it claiming an isolation it does not
+have. On x86 keep SMT off, or use `full-pcpus-only` and put whole cores
+in `reservedSystemCPUs`.
 
 ## Worked example: an Aeron media driver
 

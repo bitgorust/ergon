@@ -44,10 +44,24 @@ func testPlugin(t *testing.T, shared string, opts ...func(*config.File)) testPlu
 		t.Fatal(err)
 	}
 	m := metrics.New()
-	p := New(cfg, map[int]cpuset.Set{}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})), m)
+	p := New(cfg, testSiblings(), slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})), m)
 	p.ResendDelay = 0
 	p.After = func(_ time.Duration, fn func()) { go fn() }
 	return testPluginResult{Plugin: p, m: m}
+}
+
+// testSiblings is the node's core topology for the tests: x86 with the two
+// threads of a core at n and n+4, the shape the cpuset tests use. So 1 and 5
+// are one physical core and 0 and 4 are another. A real node has
+// thread_siblings_list for every online CPU; an empty map is not a node, it is
+// a topology the plugin must refuse to guess from.
+func testSiblings() map[int]cpuset.Set {
+	out := map[int]cpuset.Set{}
+	for c := 0; c < 4; c++ {
+		out[c] = cpuset.New(c, c+4)
+		out[c+4] = cpuset.New(c, c+4)
+	}
+	return out
 }
 
 func pod() *api.PodSandbox {
@@ -143,6 +157,64 @@ func TestCreateAdjustment(t *testing.T) {
 	// Shared-only: there is no isolated child to take back down.
 	if got := hooks.GetPoststop(); len(got) != 0 {
 		t.Errorf("poststop hooks are %v, want none without a partition", got)
+	}
+}
+
+// TestCreateGroupsSMTSiblingsIntoOneCore is the regression for the topology
+// map being built from the shared CPUs alone. E is disjoint from S, so that
+// map had no entry for any exclusive CPU and Cores called each of them a
+// physical core of its own: two threads of one core were published as two
+// cores, and an app placing two "separate" hot cores from
+// ERGON_ISOLATED_CORES put both on the same execution units.
+func TestCreateGroupsSMTSiblingsIntoOneCore(t *testing.T) {
+	p := testPlugin(t, "0")
+	c := ctr("ctr-1", "1,5", nil, map[string]string{names.MilliAnnotation: "250"})
+	adj, _, err := p.CreateContainer(context.Background(), pod(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{}
+	for _, e := range adj.GetEnv() {
+		env[e.Key] = e.Value
+	}
+	if env[names.EnvIsolatedCores] != "1,5" {
+		t.Errorf("%s = %q, want 1,5: 1 and 5 are the two threads of one core", names.EnvIsolatedCores, env[names.EnvIsolatedCores])
+	}
+}
+
+// TestCreateRefusesACoreSplitAcrossExclusiveAndShared: an exclusive CPU whose
+// SMT sibling is shared is not isolated. The hot thread and the helpers still
+// time-share one physical core, which is the contention the partition exists
+// to remove. Refuse it; a container must never start claiming an isolation it
+// does not have.
+func TestCreateRefusesACoreSplitAcrossExclusiveAndShared(t *testing.T) {
+	p := testPlugin(t, "5")
+	// 1 and 5 are the two threads of one core. The container keeps 1 and 2;
+	// 5 is in the shared pool, so core 1,5 is split between them.
+	c := ctr("ctr-1", "1,2", nil, map[string]string{names.MilliAnnotation: "250"})
+	_, _, err := p.CreateContainer(context.Background(), pod(), c)
+	if err == nil {
+		t.Fatal("a core split between exclusive 1 and shared 5 must be refused")
+	}
+	if !strings.Contains(err.Error(), "core") || !strings.Contains(err.Error(), "1,5") {
+		t.Errorf("refusal %q must name the split core", err)
+	}
+}
+
+// TestCreateRefusesAnIncompleteTopology: without thread_siblings_list the core
+// of a CPU is unknown, so the split check cannot run. Cores would guess "a
+// core of its own", which is exactly the guess that published two siblings as
+// two cores. Refuse rather than guess.
+func TestCreateRefusesAnIncompleteTopology(t *testing.T) {
+	p := testPlugin(t, "0")
+	p.siblings = map[int]cpuset.Set{}
+	c := ctr("ctr-1", "1,5", nil, map[string]string{names.MilliAnnotation: "250"})
+	_, _, err := p.CreateContainer(context.Background(), pod(), c)
+	if err == nil {
+		t.Fatal("a container with no core topology must be refused")
+	}
+	if !strings.Contains(err.Error(), "thread_siblings_list") {
+		t.Errorf("refusal %q must name the missing file", err)
 	}
 }
 
@@ -408,7 +480,9 @@ func TestRemovePodSandboxForgetsSticky(t *testing.T) {
 
 func TestBalanceOverSharedCPUs(t *testing.T) {
 	// sharedCpus "0,1", the README example: A (250) -> 0, B (250) -> 1,
-	// C (250) -> 0 (tie 250/250, lower CPU number wins).
+	// C (250) -> 0 (tie 250/250, lower CPU number wins). The exclusive CPUs
+	// are 2, 3 and 6: none of them shares a physical core with a shared CPU
+	// under the n/n+4 topology (4 would be the sibling of shared 0).
 	p := testPlugin(t, "0,1")
 	mk := func(name, uid, cpus string, shares uint64) (*api.PodSandbox, *api.Container) {
 		pd := pod()
@@ -426,7 +500,7 @@ func TestBalanceOverSharedCPUs(t *testing.T) {
 	if _, _, err := p.CreateContainer(context.Background(), pdB, b); err != nil {
 		t.Fatal(err)
 	}
-	pdC, c := mk("c", "uc", "4", 1024)
+	pdC, c := mk("c", "uc", "6", 1024)
 	if _, _, err := p.CreateContainer(context.Background(), pdC, c); err != nil {
 		t.Fatal(err)
 	}

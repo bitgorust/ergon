@@ -185,6 +185,38 @@ func Cores(s Set, siblings map[int]Set) []Set {
 	return cores
 }
 
+// CheckCoreLayout reports whether exclusive can be given its own physical
+// cores alongside shared. On SMT the two threads of one core share every
+// execution unit, so an exclusive CPU whose sibling is shared is not isolated
+// at all: the helpers still contend with the hot thread on the same core, and
+// that is the very noise a partition exists to remove.
+//
+// A CPU with no thread_siblings_list is refused too. Cores would call it a
+// core of its own, which is a guess: that file is how the kernel says which
+// threads share a core, and without it the layout cannot be checked.
+//
+// siblings maps a CPU to every CPU of its core. Build it with ReadSiblings
+// over all the CPUs under consideration — exclusive and shared both. A map
+// built from shared alone leaves every exclusive CPU unlisted, and Cores then
+// calls each of them a separate physical core even when two of them are the
+// two threads of one.
+func CheckCoreLayout(exclusive, shared Set, siblings map[int]Set) error {
+	for _, c := range exclusive.Union(shared).Slice() {
+		if _, ok := siblings[c]; !ok {
+			return fmt.Errorf("cpu %d has no thread_siblings_list, so its core cannot be found: the topology is incomplete", c)
+		}
+	}
+	for _, core := range Cores(exclusive, siblings) {
+		for _, c := range core.Slice() {
+			sib := siblings[c]
+			if both := sib.Intersection(shared); !both.IsEmpty() {
+				return fmt.Errorf("core %s is split: CPU %d is exclusive and CPU %s is shared, so the hot thread and the helpers time-share one physical core", FormatCores([]Set{sib}), c, both.List())
+			}
+		}
+	}
+	return nil
+}
+
 // FormatCores writes core groups as "1,5;2,6": groups by ';', CPUs by ','.
 func FormatCores(cores []Set) string {
 	parts := make([]string, len(cores))
