@@ -171,6 +171,29 @@ else
 fi
 chmod u+w "$pod_child/cgroup.procs"
 
+# The child is set for the caller as well as printed: prove_placed needs the
+# path, and a run that failed to enter must not reach it with an empty one.
+export ERGON_ISOLATED_CGROUP=$pod_child
+new_child "$pod_child" isolated 1
+child=unset
+enter_partition >/dev/null
+if [[ $child == "$pod_child" ]]; then
+    ok "enter_partition sets child for the calling shell"
+else
+    bad "enter_partition left child=[$child]; the runner would skip the membership proof"
+fi
+
+# The runner must call it in the current shell. `child=$(enter_partition)`
+# runs it in a subshell, whose `die` exits only that subshell: the run then
+# measures outside the partition and `prove_placed` skips its one cgroup
+# check, because the check is on `child` being non-empty. Comment lines are
+# ignored: the warning above says the same words.
+if grep -nE '\$\(enter_partition' "$script" | grep -vE '^[0-9]+:[[:space:]]*#' >/dev/null; then
+    bad "the runner captures enter_partition in a command substitution (die is swallowed)"
+else
+    ok "the runner calls enter_partition in the current shell"
+fi
+
 # ---- prove_placed ---------------------------------------------------------
 pid=$$
 echo "$pid" >"$pod_child/cgroup.threads"

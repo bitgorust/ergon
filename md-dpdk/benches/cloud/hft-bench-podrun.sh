@@ -85,12 +85,20 @@ cpu_in_mask() {
 }
 
 # enter_partition: move this process into the isolated child and require the
-# child to read back as an isolated partition. Prints the child path. With no
-# grant at all it prints nothing and returns 0 -- unless HFT_REQUIRE_PARTITION
-# is set, which is how a mode that asked for cpu-partition.ergon.io says a
-# missing grant is a failure rather than a control run.
+# child to read back as an isolated partition. Sets `child` to the path and
+# prints it. With no grant at all `child` is empty and it returns 0 -- unless
+# HFT_REQUIRE_PARTITION is set, which is how a mode that asked for
+# cpu-partition.ergon.io says a missing grant is a failure rather than a
+# control run.
+#
+# Call it in the current shell, never as `child=$(enter_partition)`. A command
+# substitution runs the function in a subshell, so `die`'s `exit 1` stops only
+# that subshell: the runner goes on with `child=""`, and `prove_placed` then
+# skips the cgroup-membership proof and the run measures outside the
+# partition.
 enter_partition() {
-    local child part
+    local part
+    child=
     if [[ -z ${ERGON_ISOLATED_CGROUP:-} ]]; then
         if [[ ${HFT_REQUIRE_PARTITION:-} == 1 ]]; then
             die "HFT_REQUIRE_PARTITION=1 but ERGON_ISOLATED_CGROUP is unset: no partition grant"
@@ -194,8 +202,11 @@ vmstat_line() { awk '/^pgfault |^pgmajfault /{printf "%s %s\n", $1, $2}' /proc/v
 
 # Move-then-pin: into the isolated child cgroup first, then onto the CPU. The
 # hook created the partition but moved no tasks; a thread outside the child
-# cannot hold an exclusive CPU of a valid isolated partition. Fails closed.
-child=$(enter_partition)
+# cannot hold an exclusive CPU of a valid isolated partition. Fails closed:
+# `enter_partition` is called in the current shell so a missing or unusable
+# child stops this script (see the comment on the function).
+child=
+enter_partition >/dev/null
 
 gapspin_bg=
 cleanup() {
