@@ -207,7 +207,16 @@ fn connect(a: &Args, conns: usize) -> BoxResult<(Poll, Vec<Conn>)> {
     connect_paths(a, &paths)
 }
 
-fn meta(mode: &str, duration_s: i64, extra: &str, spins: u64, reads: u64, polls: u64, elapsed_s: i64, end_reason: &str) -> String {
+fn meta(
+    mode: &str,
+    duration_s: i64,
+    extra: &str,
+    spins: u64,
+    reads: u64,
+    polls: u64,
+    elapsed_s: i64,
+    end_reason: &str,
+) -> String {
     let mut m = String::new();
     let _ = writeln!(m, "mode={mode}");
     // The planned run length and how long the run actually lasted. A run whose
@@ -303,8 +312,8 @@ fn lab(a: &Args) -> BoxResult<()> {
                 // successful one whose samples sit beside full-duration runs.
                 let reason = end_reason(monotonic_ns(), end)?;
                 return finish_lab(
-                    &out, duration_s, &records, &stalls, spins, reads, polls, dropped,
-                    start, reason,
+                    &out, duration_s, &records, &stalls, spins, reads, polls, dropped, start,
+                    reason,
                 );
             }
         }
@@ -330,10 +339,13 @@ fn finish_lab(
 ) -> BoxResult<()> {
     stalls.write(&out.join("stalls-0.txt"))?;
     write_records(&out.join("records.bin"), records)?;
-    let extra = format!(
+    // Beside the percentiles: what arrived and what produced no sample. A
+    // receive-only run does not see the sender's schedule.
+    let mut extra = format!(
         "loop.0.messages={}\nloop.0.dropped={dropped}\n",
         records.len()
     );
+    io_bench::stats::Work::received(records.len() as u64, dropped).write_meta(&mut extra);
     std::fs::write(
         out.join("meta.txt"),
         meta(
@@ -377,6 +389,9 @@ fn pingpong(a: &Args) -> BoxResult<()> {
     let mut payload = vec![0u8; payload_len];
     let mut frame = Vec::with_capacity(payload_len + 16);
     let (mut seq, mut next_send, mut due_ns, mut outstanding) = (0i64, 0i64, 0i64, false);
+    // Round trips not recorded because the vector was full, and sends that went
+    // out after their slot: the work counts shown beside the percentiles.
+    let (mut dropped, mut late, mut first_due) = (0u64, 0u64, 0i64);
     let start = monotonic_ns();
     let end = start + duration_s * 1_000_000_000;
     let mut reason = "deadline";
@@ -404,6 +419,11 @@ fn pingpong(a: &Args) -> BoxResult<()> {
                             user_ns: realtime_ns(),
                             ..Record::default()
                         });
+                    } else {
+                        // Counted, not silent: the percentiles are over the
+                        // recorded round trips alone, and this is the work they
+                        // leave out.
+                        dropped += 1;
                     }
                     *now_rx = false;
                 })?;
@@ -428,6 +448,10 @@ fn pingpong(a: &Args) -> BoxResult<()> {
         if !outstanding {
             let now = realtime_ns();
             if interval == 0 || now >= next_send {
+                // Past its slot, not merely at it: the schedule never slips.
+                if interval != 0 && next_send != 0 && now > next_send {
+                    late += 1;
+                }
                 seq += 1;
                 payload[..8].copy_from_slice(&seq.to_le_bytes());
                 payload[8..16].copy_from_slice(&now.to_le_bytes());
@@ -436,7 +460,12 @@ fn pingpong(a: &Args) -> BoxResult<()> {
                 if interval == 0 {
                     due_ns = 0;
                 } else {
-                    due_ns = if next_send == 0 { now } else { next_send };
+                    due_ns = if next_send == 0 {
+                        first_due = now;
+                        now
+                    } else {
+                        next_send
+                    };
                     next_send = due_ns + interval;
                 }
             }
@@ -445,11 +474,21 @@ fn pingpong(a: &Args) -> BoxResult<()> {
     }
     stalls.write(&out.join("stalls-0.txt"))?;
     write_records(&out.join("records.bin"), &records)?;
-    let extra = format!(
+    // Beside the percentiles: what the run planned and what became of it.
+    let mut extra = format!(
         "rate={rate}\npayload={payload_len}\nconns_per_variant={}\nfeeds={feeds}\nfeed_messages={feed_messages}\nfeed_last_seq={}\n",
         feeds + 1,
         feed_last.0
     );
+    io_bench::stats::Work::paced(
+        realtime_ns(),
+        first_due,
+        interval,
+        u64::try_from(seq).unwrap_or(0),
+        records.len() as u64,
+        late,
+    )
+    .write_meta(&mut extra);
     std::fs::write(
         out.join("meta.txt"),
         meta(

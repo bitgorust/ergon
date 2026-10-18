@@ -13,7 +13,7 @@ use std::path::Path;
 
 use crate::record::read_records;
 use crate::stalls::{self, Attribution, StallSummary};
-use crate::stats::{Summary, summarize, us};
+use crate::stats::{Summary, WORK_HEADER, Work, summarize, us, work_row};
 
 /// One run's results.
 #[derive(Debug, Clone, Default)]
@@ -60,6 +60,10 @@ pub struct Run {
     /// CPU received the packets (the SQPOLL thread's, or a softirq's), on that
     /// one: `(cpu, rates)`, loop CPU first. Empty without snapshots.
     pub irqs: Vec<(usize, [f64; 5])>,
+    /// What the run set out to do and what became of it, beside the percentiles
+    /// (which are over [`Work::completed`] alone). `None` for a run recorded
+    /// before the counts were.
+    pub work: Option<Work>,
 }
 
 /// The interrupts that show tick and IPI work on a CPU: local timer,
@@ -387,6 +391,7 @@ pub fn load_run(dir: &Path, warmup_s: i64) -> Result<Run, String> {
         one_way_over,
         irqs,
         clock_bound_ns: clock_bound,
+        work: Work::from_meta(&m),
     })
 }
 
@@ -598,6 +603,36 @@ fn view_table(out: &mut String, tags: &[Tag], kind: &str, title: &str, view: &Vi
     let _ = writeln!(out);
 }
 
+/// The work behind `kind`'s percentiles: what the run planned and what became
+/// of it.
+fn work_table(out: &mut String, tags: &[Tag], kind: &str) {
+    if !tags
+        .iter()
+        .any(|t| t.runs.get(kind).and_then(|r| r.work).is_some())
+    {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "### Work behind the percentiles\n\n\
+         Every percentile above is over `completed` alone, and the tables drop the warm-up, so `n` is \
+         smaller still. `censored` is the issued work they leave out: no reply came back before the run \
+         ended, or the reply was discarded because the record vector was full. `scheduled − issued` is \
+         work the schedule called for that never went out, and `late` is the part that went out after \
+         its slot. A WebSocket or HTTP client's send queue grows instead of refusing, and a send \
+         failure fails the run, so `rejected` is 0 on every run that reported. `not yet measured` is a \
+         count the path does not produce, never a zero. On a receive-only run the send-side counts are \
+         the sender's.\n\n\
+         {WORK_HEADER}"
+    );
+    for t in tags {
+        let Some(r) = t.runs.get(kind) else { continue };
+        let Some(w) = r.work else { continue };
+        let _ = writeln!(out, "{}", work_row(&t.name, &w));
+    }
+    let _ = writeln!(out);
+}
+
 /// Interrupts per second on the loop CPU and the receiving CPU, every run.
 fn irq_table(out: &mut String, tags: &[Tag]) {
     let mut kinds: Vec<&String> = tags
@@ -658,7 +693,9 @@ pub fn report(tags: &[Tag], skipped: &[(String, String)]) -> String {
          All values in µs. Every table keeps the maximum and names the cause of the worst case, and the \
          worst-events section lists the five slowest samples of every run with their causes. A maximum is \
          still one event, so to choose between settings weigh p99.99 and the rates over 100 µs, 500 µs, \
-         1 ms and 10 ms as well.\n"
+         1 ms and 10 ms as well. Each kind's percentiles end with the work behind them — scheduled, \
+         issued, completed, late, rejected and censored — so a shorter sample is never read as a \
+         complete one.\n"
     );
     if !skipped.is_empty() {
         let _ = writeln!(out, "**Runs not included** (they could not be loaded):\n");
@@ -740,6 +777,7 @@ pub fn report(tags: &[Tag], skipped: &[(String, String)]) -> String {
         for view in &VIEWS {
             view_table(&mut out, tags, &kind, &title, view);
         }
+        work_table(&mut out, tags, &kind);
     }
     irq_table(&mut out, tags);
     // The worst samples themselves, each with when and why.

@@ -378,6 +378,11 @@ mod imp {
         for (vi, r) in results.iter().enumerate() {
             write_thread_meta(&mut meta, vi, r);
         }
+        // Beside the percentiles: what arrived and what produced no sample.
+        // A receive-only run does not see the sender's schedule.
+        let completed: u64 = results.iter().map(|r| r.records.len() as u64).sum();
+        let censored: u64 = results.iter().map(|r| r.dropped + r.unparsed).sum();
+        io_bench::stats::Work::received(completed, censored).write_meta(&mut meta);
         std::fs::write(out.join("meta.txt"), &meta)?;
         print!("{meta}");
         Ok(())
@@ -504,6 +509,7 @@ mod imp {
             .with_order(order);
         let mut stalls = stall_log(a)?;
         let (stats, sockets, conn_stats) = run_app(&mut driver, &mut app, duration_s, &mut stalls)?;
+        let work = app.work(realtime_ns());
         stalls.write(&out.join("stalls-0.txt"))?;
         write_records(&out.join("records.bin"), &app.records)?;
         let mut meta = base_meta("pingpong", duration_s, busy_poll_us);
@@ -524,6 +530,8 @@ mod imp {
             unparsed: 0,
         };
         write_thread_meta(&mut meta, 0, &r);
+        // Beside the percentiles: what the run planned and what became of it.
+        work.write_meta(&mut meta);
         std::fs::write(out.join("meta.txt"), &meta)?;
         print!("{meta}");
         Ok(())

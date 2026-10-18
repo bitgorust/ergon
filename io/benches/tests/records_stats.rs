@@ -30,7 +30,10 @@ fn record_round_trip() {
 
 #[test]
 fn a_record_file_cut_mid_record_is_an_error_not_a_shorter_run() {
-    let r = Record { id: 7, ..Record::default() };
+    let r = Record {
+        id: 7,
+        ..Record::default()
+    };
     let dir = std::env::temp_dir().join(format!("io-bench-trunc-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("r.bin");

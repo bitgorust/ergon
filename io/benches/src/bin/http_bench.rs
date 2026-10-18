@@ -70,6 +70,8 @@ mod imp {
         pub extra: String,
         /// The timed loop's slow iterations.
         pub stalls: StallLog,
+        /// The work of the run, shown beside its percentiles.
+        pub work: io_bench::stats::Work,
     }
 
     struct Plan {
@@ -169,6 +171,8 @@ mod imp {
         let _ = writeln!(m, "connect_us={:.1}", run.connect_ns as f64 / 1000.0);
         let _ = writeln!(m, "loop.0.vol_ctx_switches={}", v1 - v0);
         m.push_str(&run.extra);
+        // Beside the percentiles: what the run planned and what became of it.
+        run.work.write_meta(&mut m);
         let _ = writeln!(
             m,
             "kernel={}",
@@ -217,6 +221,61 @@ mod imp {
         if slot == 0 { 0 } else { sent - (mono - slot) }
     }
 
+    /// Pushes a sample, counting it as dropped when the vector is full: the
+    /// percentiles are over the recorded samples alone, and this is part of the
+    /// work they leave out.
+    fn push_sample(v: &mut Vec<Record>, r: Record, dropped: &mut u64) {
+        if v.len() < v.capacity() {
+            v.push(r);
+        } else {
+            *dropped += 1;
+        }
+    }
+
+    /// The schedule bookkeeping every paced client loop keeps for
+    /// [`io_bench::stats::Work`]: when the first request was due, and how many
+    /// went out after their slot.
+    struct Pace {
+        first_due_ns: i64,
+        late: u64,
+    }
+
+    impl Pace {
+        fn new() -> Self {
+            Self {
+                first_due_ns: 0,
+                late: 0,
+            }
+        }
+
+        /// Records one send: `slot` is [`wait_slot`]'s return (0 when unpaced),
+        /// `mono` when the send was attempted, `sent` its wall-clock time.
+        fn sent(&mut self, slot: i64, mono: i64, sent: i64) {
+            if slot == 0 {
+                return;
+            }
+            if mono > slot {
+                self.late += 1;
+            }
+            if self.first_due_ns == 0 {
+                self.first_due_ns = due(slot, mono, sent);
+            }
+        }
+
+        /// The work of the run: `issued` sends, `completed` of them with a
+        /// recorded sample, out of `interval_ns`'s schedule (0 when unpaced).
+        fn work(&self, interval_ns: i64, issued: u64, completed: u64) -> io_bench::stats::Work {
+            io_bench::stats::Work::paced(
+                realtime_ns(),
+                self.first_due_ns,
+                interval_ns,
+                issued,
+                completed,
+                self.late,
+            )
+        }
+    }
+
     struct Collect {
         records: Vec<Record>,
         sent_ns: i64,
@@ -225,6 +284,8 @@ mod imp {
         done: bool,
         status: u16,
         opened: bool,
+        /// Responses dropped because the record vector was full.
+        dropped: u64,
         closed: Option<Error>,
     }
 
@@ -241,8 +302,9 @@ mod imp {
         fn on_response(&mut self, _: ConnId, _: u64, r: &Response<'_>, meta: &RxMeta) {
             let now = realtime_ns();
             self.status = r.status;
-            if self.records.len() < self.records.capacity() {
-                self.records.push(Record {
+            push_sample(
+                &mut self.records,
+                Record {
                     id: i64::try_from(self.seq).unwrap_or(i64::MAX),
                     src_ns: self.sent_ns,
                     src2_ns: self.due_ns,
@@ -250,8 +312,9 @@ mod imp {
                     user_ns: now,
                     read_seq: meta.read_seq,
                     ..Record::default()
-                });
-            }
+                },
+                &mut self.dropped,
+            );
             self.done = true;
         }
     }
@@ -282,6 +345,7 @@ mod imp {
             done: false,
             status: 0,
             opened: false,
+            dropped: 0,
             closed: None,
         };
         let background = a.str_or("connect", "inline") == "background";
@@ -307,6 +371,7 @@ mod imp {
         let mut next = monotonic_ns();
         let method = if plan.live { "GET" } else { "POST" };
         let mut stalls = StallLog::new(plan.stall_us, 1 << 20);
+        let mut pace = Pace::new();
         stalls.start(0);
         while monotonic_ns() < end {
             let slot = wait_slot(&mut next, interval, &mut stalls, h.seq);
@@ -321,6 +386,7 @@ mod imp {
             let mono = monotonic_ns();
             h.sent_ns = realtime_ns();
             h.due_ns = due(slot, mono, h.sent_ns);
+            pace.sent(slot, mono, h.sent_ns);
             let mut c = d.get_mut(id).ok_or("connection closed")?;
             c.request(method, &plan.path, &[], body.as_bytes())?;
             d.flush()?;
@@ -351,12 +417,15 @@ mod imp {
             "span_copy_bytes={} chunk_copy_bytes={}",
             st.span_copy_bytes, st.chunk_copy_bytes
         );
+        let _ = writeln!(extra, "loop.0.dropped={}", h.dropped);
+        let work = pace.work(interval, h.seq, h.records.len() as u64);
         Ok(Run {
             label: format!("ergon/{backend}"),
             records: h.records,
             connect_ns,
             extra,
             stalls,
+            work,
         })
     }
 
@@ -372,20 +441,24 @@ mod imp {
             status: u16,
             error: Option<String>,
             records: Vec<Record>,
+            /// Responses dropped because the record vector was full.
+            dropped: u64,
         }
         impl ClientHandler for Done {
             fn on_response(&mut self, _: u64, r: &Response<'_>) {
                 let now = realtime_ns();
                 self.status = r.status;
-                if self.records.len() < self.records.capacity() {
-                    self.records.push(Record {
+                push_sample(
+                    &mut self.records,
+                    Record {
                         id: i64::try_from(self.seq).unwrap_or(i64::MAX),
                         src_ns: self.sent_ns,
                         src2_ns: self.due_ns,
                         user_ns: now,
                         ..Record::default()
-                    });
-                }
+                    },
+                    &mut self.dropped,
+                );
                 self.done = true;
             }
             fn on_error(&mut self, _: u64, _: ergon_io::Sent, e: Error) {
@@ -432,6 +505,7 @@ mod imp {
             status: 0,
             error: None,
             records: Vec::with_capacity(plan.capacity),
+            dropped: 0,
         };
         // Every connection of the pool open before timing starts: a pool
         // still connecting would put its handshakes in the measured loop.
@@ -453,6 +527,7 @@ mod imp {
         let mut next = monotonic_ns();
         let method = if plan.live { "GET" } else { "POST" };
         let mut stalls = StallLog::new(plan.stall_us, 1 << 20);
+        let mut pace = Pace::new();
         stalls.start(0);
         while monotonic_ns() < end {
             let slot = wait_slot(&mut next, interval, &mut stalls, h.seq);
@@ -467,6 +542,7 @@ mod imp {
             let mono = monotonic_ns();
             h.sent_ns = realtime_ns();
             h.due_ns = due(slot, mono, h.sent_ns);
+            pace.sent(slot, mono, h.sent_ns);
             c.request(method, &plan.path, &[], body.as_bytes())?;
             while !h.done {
                 stalls.tick(h.seq - 1);
@@ -487,17 +563,23 @@ mod imp {
                 a.str_or("curl-label", "distro")
             ),
         };
-        // The first request with libcurl includes its connect; drop it.
+        // The first request with libcurl includes its connect; drop it. It is
+        // issued work with no sample, so it counts as censored either way.
         let mut records = h.records;
         if imp == HttpImpl::Curl && !records.is_empty() {
             records.remove(0);
         }
+        let work = pace.work(interval, h.seq, records.len() as u64);
         Ok(Run {
             label,
             records,
             connect_ns,
-            extra: format!("pool={}\nconns_per_variant={}\n", cfg.pool, cfg.pool),
+            extra: format!(
+                "pool={}\nconns_per_variant={}\nloop.0.dropped={}\n",
+                cfg.pool, cfg.pool, h.dropped
+            ),
             stalls,
+            work,
         })
     }
 
@@ -517,6 +599,7 @@ mod imp {
             done: false,
             status: 0,
             opened: false,
+            dropped: 0,
             closed: None,
         };
         let mut worst = Vec::with_capacity(n);
@@ -596,8 +679,8 @@ mod imp {
         use curl::multi::Multi;
 
         use super::{
-            API_KEY, Args, BoxResult, Plan, Record, Run, StallLog, due, monotonic_ns, order_body,
-            realtime_ns, wait_slot,
+            API_KEY, Args, BoxResult, Pace, Plan, Record, Run, StallLog, due, monotonic_ns,
+            order_body, push_sample, realtime_ns, wait_slot,
         };
 
         struct Sink(Vec<u8>);
@@ -648,6 +731,8 @@ mod imp {
             let mut connect_ns = 0;
             let mut seq = 0u64;
             let mut slot = Some(easy);
+            let mut dropped = 0u64;
+            let mut pace = Pace::new();
             let mut stalls = StallLog::new(plan.stall_us, 1 << 20);
             stalls.start(0);
             while monotonic_ns() < end {
@@ -660,6 +745,7 @@ mod imp {
                 }
                 let t_mono = monotonic_ns();
                 let sent = realtime_ns();
+                pace.sent(due_slot, t_mono, sent);
                 let handle = multi.add2(e)?;
                 let result = loop {
                     stalls.tick(seq - 1);
@@ -682,16 +768,21 @@ mod imp {
                     return Err(format!("status {code}").into());
                 }
                 if seq == 1 {
-                    // The first request includes connect and TLS.
+                    // The first request includes connect and TLS: issued work
+                    // with no sample, so it counts as censored.
                     connect_ns = monotonic_ns() - t_mono;
-                } else if records.len() < records.capacity() {
-                    records.push(Record {
-                        id: i64::try_from(seq).unwrap_or(i64::MAX),
-                        src_ns: sent,
-                        src2_ns: due(due_slot, t_mono, sent),
-                        user_ns: now,
-                        ..Record::default()
-                    });
+                } else {
+                    push_sample(
+                        &mut records,
+                        Record {
+                            id: i64::try_from(seq).unwrap_or(i64::MAX),
+                            src_ns: sent,
+                            src2_ns: due(due_slot, t_mono, sent),
+                            user_ns: now,
+                            ..Record::default()
+                        },
+                        &mut dropped,
+                    );
                 }
                 e.get_mut().0.clear();
                 slot = Some(e);
@@ -708,12 +799,15 @@ mod imp {
                 v.host()
             );
             let _ = writeln!(extra, "first_request_includes_connect=1");
+            let _ = writeln!(extra, "loop.0.dropped={dropped}");
+            let work = pace.work(interval, seq, records.len() as u64);
             Ok(Run {
                 label,
                 records,
                 connect_ns,
                 extra,
                 stalls,
+                work,
             })
         }
     }
@@ -721,8 +815,8 @@ mod imp {
     #[cfg(feature = "reqwest")]
     mod reqwest_client {
         use super::{
-            API_KEY, Args, BoxResult, Plan, Record, Run, StallLog, due, monotonic_ns, order_body,
-            realtime_ns, wait_slot,
+            API_KEY, Args, BoxResult, Pace, Plan, Record, Run, StallLog, due, monotonic_ns,
+            order_body, push_sample, realtime_ns, wait_slot,
         };
 
         pub fn run(a: &Args, plan: &Plan) -> BoxResult<Run> {
@@ -747,6 +841,8 @@ mod imp {
                 let mut next = monotonic_ns();
                 let mut connect_ns = 0;
                 let mut seq = 0u64;
+                let mut dropped = 0u64;
+                let mut pace = Pace::new();
                 // tokio owns the loop: only the pacing spin and one tick per
                 // request are timed.
                 let mut stalls = StallLog::new(plan.stall_us, 1 << 20);
@@ -757,6 +853,7 @@ mod imp {
                     seq += 1;
                     let t_mono = monotonic_ns();
                     let sent = realtime_ns();
+                    pace.sent(due_slot, t_mono, sent);
                     let req = if plan.live {
                         client.get(&url)
                     } else {
@@ -773,23 +870,31 @@ mod imp {
                         return Err(format!("status {status}").into());
                     }
                     if seq == 1 {
+                        // The first request includes connect and TLS: issued
+                        // work with no sample, so it counts as censored.
                         connect_ns = monotonic_ns() - t_mono;
-                    } else if records.len() < records.capacity() {
-                        records.push(Record {
-                            id: i64::try_from(seq).unwrap_or(i64::MAX),
-                            src_ns: sent,
-                            src2_ns: due(due_slot, t_mono, sent),
-                            user_ns: now,
-                            ..Record::default()
-                        });
+                    } else {
+                        push_sample(
+                            &mut records,
+                            Record {
+                                id: i64::try_from(seq).unwrap_or(i64::MAX),
+                                src_ns: sent,
+                                src2_ns: due(due_slot, t_mono, sent),
+                                user_ns: now,
+                                ..Record::default()
+                            },
+                            &mut dropped,
+                        );
                     }
                 }
+                let work = pace.work(interval, seq, records.len() as u64);
                 Ok(Run {
                     label: "reqwest/tokio-current-thread".to_owned(),
                     records,
                     connect_ns,
-                    extra: "first_request_includes_connect=1\n".to_owned(),
+                    extra: format!("first_request_includes_connect=1\nloop.0.dropped={dropped}\n"),
                     stalls,
+                    work,
                 })
             })
         }

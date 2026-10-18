@@ -24,7 +24,7 @@ use std::process::ExitCode;
 
 use io_bench::record::{Record, read_records};
 use io_bench::stalls::{self, Attribution, StallSummary};
-use io_bench::stats::{HEADER, Summary, row, summarize, us};
+use io_bench::stats::{HEADER, Summary, WORK_HEADER, Work, row, summarize, us, work_row};
 
 type BoxResult<T> = Result<T, Box<dyn Error>>;
 type Meta = HashMap<String, String>;
@@ -93,6 +93,7 @@ fn main() -> ExitCode {
     }
     let mut out = String::new();
     let mut pingpong_rows = Vec::new();
+    let mut work_rows = Vec::new();
     let mut summary_rows = Vec::new();
     for d in &dirs {
         if let Err(e) = analyse(
@@ -100,6 +101,7 @@ fn main() -> ExitCode {
             warmup_s,
             &mut out,
             &mut pingpong_rows,
+            &mut work_rows,
             &mut summary_rows,
         ) {
             eprintln!("{d}: {e}");
@@ -113,6 +115,26 @@ fn main() -> ExitCode {
         );
         let _ = writeln!(out, "{}", HEADER.replacen("| |", "| variant @ rate |", 1));
         for r in &pingpong_rows {
+            let _ = writeln!(out, "{r}");
+        }
+        let _ = writeln!(out);
+    }
+    if !work_rows.is_empty() {
+        let _ = writeln!(
+            out,
+            "### Work behind those percentiles\n\n\
+             The percentiles are over `completed` alone, and the tables drop the warm-up, so `n` is smaller \
+             still. `censored` is the issued work they leave out: no reply came back before the run ended, \
+             or the reply was discarded because the record vector was full. `scheduled − issued` is work \
+             the schedule called for that never went out, and `late` is the part that went out after its \
+             slot. A WebSocket or HTTP client's send queue grows instead of refusing, and a send failure \
+             fails the run, so `rejected` is 0 on every run that reported. `not yet measured` is a count \
+             the path does not produce, never a zero. On a receive-only run the send-side counts are the \
+             sender's.\n\n\
+             {}",
+            WORK_HEADER.replacen("| |", "| variant @ rate |", 1)
+        );
+        for r in &work_rows {
             let _ = writeln!(out, "{r}");
         }
         let _ = writeln!(out);
@@ -156,6 +178,7 @@ fn analyse(
     warmup_s: i64,
     out: &mut String,
     pingpong: &mut Vec<String>,
+    work_rows: &mut Vec<String>,
     summary: &mut Vec<String>,
 ) -> BoxResult<()> {
     let meta = load_meta(dir)?;
@@ -215,6 +238,13 @@ fn analyse(
                 &s,
             ));
         }
+        // The work those percentiles are over, next to them.
+        if let Some(w) = Work::from_meta(&meta) {
+            work_rows.push(work_row(
+                &format!("{name}: {} @ {}/s", variants[0], get(&meta, "rate")),
+                &w,
+            ));
+        }
         // HTTP client runs (http_bench) carry no full loop counters.
         if meta.contains_key("loop.0.spins") {
             loop_table(&meta, &variants, out, &name);
@@ -257,6 +287,24 @@ fn analyse(
     loop_table(&meta, &variants, out, &name);
     queue_table(&meta, &variants, out);
     copy_table(&meta, &variants, out);
+    if let Some(w) = Work::from_meta(&meta) {
+        // What arrived and what produced no sample. The tables drop the
+        // warm-up, so `n` is smaller than `completed`. A receive-only run does
+        // not see the sender's schedule, so those counts are "not yet measured"
+        // and never a zero.
+        let _ = writeln!(
+            out,
+            "### Work behind the percentiles\n\n\
+             The percentiles are over `completed` alone, and the tables drop the warm-up, so `n` is \
+             smaller still. `censored` is what arrived and produced no sample (unparsed, and those \
+             dropped for lack of record room); messages that never arrived are the sender's to account \
+             for. `not yet measured` is a count the path does not produce, never a zero.\n\n\
+             {}\n{}",
+            WORK_HEADER.replacen("| |", "| run |", 1),
+            work_row(&name, &w)
+        );
+        let _ = writeln!(out);
+    }
 
     let label = |v: usize| -> String {
         if aa {

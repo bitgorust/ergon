@@ -63,6 +63,14 @@ impl Recorder {
             self.dropped += 1;
         }
     }
+
+    /// The work of the run, to be shown beside its percentiles. A receive-only
+    /// run sees arrivals rather than sends: `censored` is what arrived and
+    /// produced no sample, and the send-side counts are the sender's.
+    #[must_use]
+    pub fn work(&self) -> crate::stats::Work {
+        crate::stats::Work::received(self.records.len() as u64, self.dropped + self.unparsed)
+    }
 }
 
 impl Handler for Recorder {
@@ -156,6 +164,11 @@ pub struct PingPong {
     pub records: Vec<Record>,
     /// Round trips not recorded because the vector was full.
     pub dropped: u64,
+    /// Sends that went out after their slot on the paced schedule.
+    late: u64,
+    /// When the first message was due on the schedule (for
+    /// [`PingPong::work`]; 0 before the first send).
+    first_due: i64,
     /// The order connection (None: the first connection, and no feeds).
     order: Option<ConnId>,
     /// Feed messages decoded.
@@ -179,6 +192,8 @@ impl PingPong {
             payload: vec![0u8; payload_len.max(16)],
             records: Vec::with_capacity(capacity),
             dropped: 0,
+            late: 0,
+            first_due: 0,
             order: None,
             feed_messages: 0,
             feed_last: (0, 0),
@@ -191,6 +206,22 @@ impl PingPong {
     pub const fn with_order(mut self, order: ConnId) -> Self {
         self.order = Some(order);
         self
+    }
+
+    /// The work of the run, to be shown beside its percentiles. `end_real_ns`
+    /// is when the run ended (wall clock), so the schedule's slots can be
+    /// counted. Unpaced there is no schedule beyond the replies, so
+    /// `scheduled` is the sends made.
+    #[must_use]
+    pub fn work(&self, end_real_ns: i64) -> crate::stats::Work {
+        crate::stats::Work::paced(
+            end_real_ns,
+            self.first_due,
+            self.interval_ns,
+            self.seq as u64,
+            self.records.len() as u64,
+            self.late,
+        )
     }
 }
 
@@ -260,6 +291,11 @@ impl App for PingPong {
         else {
             return Err(Error::Closed);
         };
+        // Past its slot, not merely at it: the schedule never slips, so a send
+        // after a stall is late by however far behind the run is.
+        if self.interval_ns != 0 && self.next_send != 0 && now > self.next_send {
+            self.late += 1;
+        }
         driver
             .get_mut(conn)
             .ok_or(Error::Closed)?
@@ -271,6 +307,7 @@ impl App for PingPong {
             // A fixed schedule: after a stall the late messages go back to
             // back until it catches up.
             self.due_ns = if self.next_send == 0 {
+                self.first_due = now;
                 now
             } else {
                 self.next_send
