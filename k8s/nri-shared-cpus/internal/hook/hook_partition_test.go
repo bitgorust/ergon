@@ -350,6 +350,39 @@ func TestApplyPartitionFailsWhenTheAncestorFileIsMissing(t *testing.T) {
 	}
 }
 
+// TestApplyPartitionNamesTheMissingFeature: a kernel without
+// cpuset.cpus.exclusive answers ENOENT on every ancestor write. The plan must
+// fail closed and say why: a bare "no such file" sends an operator looking at
+// the path when the real answer is that the kernel has no such file before
+// Linux 6.7 (or has not backported it).
+func TestApplyPartitionNamesTheMissingFeature(t *testing.T) {
+	useTempLock(t)
+	root := t.TempDir()
+	ctrDir := writeTree(t, root, "kubepods/pod/ctr")
+	for _, dir := range []string{filepath.Join(root, "kubepods"), filepath.Join(root, "kubepods/pod"), ctrDir} {
+		if err := os.Remove(filepath.Join(dir, "cpuset.cpus.exclusive")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan, err := cpuset.PartitionPlan(root, ctrDir, cpuset.New(1), cpuset.Set{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = ApplyPartition(plan)
+	if err == nil {
+		t.Fatal("a kernel with no cpuset.cpus.exclusive must refuse the partition")
+	}
+	for _, want := range []string{"cpuset.cpus.exclusive", "6.7", "remote partition"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	// A kernel that cannot take the partition must leave nothing behind.
+	if _, statErr := os.Stat(plan.Child); !os.IsNotExist(statErr) {
+		t.Errorf("the half-made child %s is still there (err %v)", plan.Child, statErr)
+	}
+}
+
 // TestApplyPartitionRollsBackTheAncestorsOnAFailedPlan is the P2 regression:
 // a half-applied plan must leave no cpuset.cpus.exclusive claim behind. Those
 // claims are the kernel's exclusivity currency: while podB.slice still lists

@@ -136,7 +136,10 @@ failure and interrupt.
 1. Node: Kubernetes >= 1.33, `cpuManagerPolicy: static`,
    `reservedSystemCPUs` = the IRQ CPU(s) + the shared CPUs, kernel >= 6.2,
    cgroup v2, containerd >= 2.2 with the NRI default validator on. Label
-   the node `ergon.io/shared-cpus=true`.
+   the node `ergon.io/shared-cpus=true`. A `cpu-partition` opt-in also needs
+   `cpuset.cpus.exclusive`, which is Linux 6.7 or a vendor kernel that
+   backported it: 6.2 is only enough for the shared CPUs. The plugin reads
+   the file rather than the version, so a backport is accepted.
 2. Image: `docker build -t ergon-shared-cpus:dev .` and load it on the node.
 3. `kubectl apply -f deploy/namespace.yaml -f deploy/configmap.yaml -f deploy/daemonset.yaml`
 4. Edit `deploy/configmap.yaml` first: `sharedCpus` must be inside
@@ -191,6 +194,7 @@ Then run a pod with the example above and check
 | kubelet restart, plugin up | the re-write goes through `UpdateContainer` and keeps the union |
 | kubelet restart, plugin down | cpuset shrinks to the exclusive CPUs; helpers fall onto them; `Synchronize` re-widens on return |
 | kernel < 6.2 or cgroup v1 | the plugin exits with one clear line |
+| kernel has no `cpuset.cpus.exclusive` | shared-only pods work; every `cpu-partition` opt-in is refused and the pod stays out of the partition (6.7 or a vendor backport of that file) |
 
 ## Limits
 

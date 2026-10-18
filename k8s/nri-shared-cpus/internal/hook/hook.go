@@ -248,6 +248,16 @@ func setupPartition(pid int, part *PartitionRequest) error {
 	if err != nil {
 		return err
 	}
+	// A remote partition writes cpuset.cpus.exclusive down the hierarchy, and
+	// that file only exists from Linux 6.7 (or a vendor kernel that backported
+	// it). Ask the filesystem, not osrelease: a version gate would refuse a
+	// backport that works and accept a build that does not. When nothing on the
+	// way to the cgroup root has the cpuset controller enabled yet there is
+	// nothing to look at, and the write itself reports the missing file.
+	if present, probed := cpuset.HasExclusive(root, cgroup); probed && !present {
+		return fmt.Errorf("hook: kernel %s has no %s on the cgroup %s: a remote partition needs it (Linux 6.7 or a vendor backport of it)",
+			kernelRelease(), cpuset.ExclusiveFile, cgroup)
+	}
 	plan, err := cpuset.PartitionPlan(root, cgroup, part.Exclusive, cpuset.Set{})
 	if err != nil {
 		return fmt.Errorf("hook: %w", err)
@@ -384,7 +394,7 @@ func undoReserves(reserved []reserve) error {
 func subtractFrom(path string, cpus cpuset.Set) error {
 	current, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("read %s: %w", path, err)
+		return cpuset.MissingExclusive(path, fmt.Errorf("read %s: %w", path, err))
 	}
 	base := cpuset.Set{}
 	if text := strings.TrimSpace(string(current)); text != "" {
@@ -405,11 +415,11 @@ func writeCPUSet(path string, set cpuset.Set) error {
 		value = set.List()
 	}
 	if err := os.WriteFile(path, []byte(value+"\n"), 0o644); err != nil {
-		return fmt.Errorf("hook: write %s=%q: %w", path, value, err)
+		return cpuset.MissingExclusive(path, fmt.Errorf("hook: write %s=%q: %w", path, value, err))
 	}
 	got, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("hook: read back %s: %w", path, err)
+		return cpuset.MissingExclusive(path, fmt.Errorf("hook: read back %s: %w", path, err))
 	}
 	text := strings.TrimSpace(string(got))
 	if text == "" {
@@ -609,7 +619,7 @@ func lockPartition() (func(), error) {
 func unionInto(path, add string) (string, cpuset.Set, error) {
 	current, err := os.ReadFile(path)
 	if err != nil {
-		return "", cpuset.Set{}, err
+		return "", cpuset.Set{}, cpuset.MissingExclusive(path, err)
 	}
 	base := cpuset.Set{}
 	if text := strings.TrimSpace(string(current)); text != "" {
@@ -632,11 +642,11 @@ func unionInto(path, add string) (string, cpuset.Set, error) {
 // kernel may print "2-3" where we wrote "2,3".
 func writeCPUList(path, value string) error {
 	if err := os.WriteFile(path, []byte(value), 0o644); err != nil {
-		return fmt.Errorf("hook: write %s=%q: %w", path, value, err)
+		return cpuset.MissingExclusive(path, fmt.Errorf("hook: write %s=%q: %w", path, value, err))
 	}
 	got, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("hook: read back %s: %w", path, err)
+		return cpuset.MissingExclusive(path, fmt.Errorf("hook: read back %s: %w", path, err))
 	}
 	want, err := cpuset.Parse(value)
 	if err != nil {

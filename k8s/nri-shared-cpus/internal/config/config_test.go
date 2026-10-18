@@ -141,6 +141,63 @@ func TestCheckHost(t *testing.T) {
 	}
 }
 
+// TestCheckHostWarnsWithoutTheExclusiveFeature: a kernel that provides no
+// cpuset.cpus.exclusive cannot host a remote partition, so every cpu-partition
+// opt-in is refused. That is a warning, not an error: shared-only pods work
+// without it. The filesystem is the authority, not the version string — the
+// same release is used below for both a kernel that has the file (a backport)
+// and one that does not, so a version gate would get one of them wrong.
+func TestCheckHostWarnsWithoutTheExclusiveFeature(t *testing.T) {
+	c, err := Parse([]byte("sharedCpus: \"0,1\"\nnamespaces: [a]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := fakeSys(t, "0-9\n", "\n", "(null)\n")
+	for _, tc := range []struct {
+		name      string
+		exclusive bool
+		want      string
+	}{
+		{"backport provides the file", true, ""},
+		{"no such file", false, "cpuset.cpus.exclusive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := fakeCgroup(t, true)
+			child := filepath.Join(root, "kubepods.slice")
+			if err := os.MkdirAll(child, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(child, "cpuset.cpus"), []byte("\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tc.exclusive {
+				if err := os.WriteFile(filepath.Join(child, "cpuset.cpus.exclusive"), []byte("\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			warn, err := CheckHost(c, good, root, "6.6.0")
+			if err != nil {
+				t.Fatalf("CheckHost: %v", err)
+			}
+			if tc.want == "" {
+				if len(warn) != 0 {
+					t.Errorf("warn = %v, want none when the file is there", warn)
+				}
+				return
+			}
+			found := false
+			for _, w := range warn {
+				if strings.Contains(w, tc.want) {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("warn = %v, want one mentioning %q", warn, tc.want)
+			}
+		})
+	}
+}
+
 func TestKernelAtLeast(t *testing.T) {
 	for release, want := range map[string]bool{
 		"6.2.0": true, "6.12.72-linuxkit": true, "7.0": true, "6.1.99": false, "5.15.0-1": false, "6.18.1-amzn": true,

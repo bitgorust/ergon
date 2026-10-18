@@ -133,7 +133,7 @@ The full check list is `k8s/nri-hft/node-checks.md`. The short version:
 | kubelet | `cpuManagerPolicy: static`; `reservedSystemCPUs` = the IRQ CPU(s) plus the shared CPUs; x86 `full-pcpus-only` |
 | `strict-cpu-reservation` | **off** (on, it empties the shared pool) |
 | `cpu.idle` | **off** for latency pods |
-| kernel | >= 6.2, cgroup v2; `nohz_full`, `rcu_nocbs`, `isolcpus=managed_irq` on the exclusive CPUs, never the shared ones |
+| kernel | >= 6.7, cgroup v2 (`cpuset.cpus.exclusive` is what the partition writes, and it is 6.7; a vendor backport of that file also works — the plugin reads the file, not the version). Also `nohz_full`, `rcu_nocbs`, `isolcpus=managed_irq` on the exclusive CPUs, never the shared ones. 6.2 is enough for the shared CPUs only |
 | `transparent_hugepage` | `never` |
 | `net.core.rmem_max` / `wmem_max` | 4–16 MiB |
 | `net.core.busy_poll` / `busy_read` | **off** on Graviton (busy polling there was catastrophic: p50 4,973 µs, 61,488 NAKs) |

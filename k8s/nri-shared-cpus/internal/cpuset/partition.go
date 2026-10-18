@@ -3,7 +3,10 @@
 package cpuset
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -181,4 +184,63 @@ func Ancestors(root, dir string) []string {
 		out[i], out[j] = out[j], out[i]
 	}
 	return out
+}
+
+// ExclusiveFile is the kernel file a remote partition writes its ancestor
+// reservations to. It exists on non-root cpuset-enabled cgroups from Linux
+// 6.7 (cgroup-v2.rst, "cpuset.cpus.exclusive"); writing it down the hierarchy
+// is mandatory for a remote partition, which is what this plan makes. A
+// kernel without it cannot host one at all.
+//
+// The filesystem is the authority, not osrelease: a vendor kernel that
+// backported the file provides the same one, and a version gate would refuse
+// it for no reason.
+const ExclusiveFile = "cpuset.cpus.exclusive"
+
+// MissingExclusive rewrites an error from an access to ExclusiveFile into what
+// a bare "no such file" actually means. Two things produce it: a kernel that
+// does not provide the file at all, and a cgroup whose cpuset controller is
+// not enabled. Either way a remote partition cannot be made there, and the
+// bare ENOENT does not say so. Every other error is returned unchanged.
+func MissingExclusive(path string, err error) error {
+	if filepath.Base(path) != ExclusiveFile {
+		return err
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return fmt.Errorf("%s does not exist: a remote partition needs %s (Linux 6.7 or a vendor backport of it), and the cpuset controller must be enabled on that cgroup: %w",
+		path, ExclusiveFile, err)
+}
+
+// HasExclusive reports whether ExclusiveFile exists on a cgroup that has the
+// cpuset controller enabled. A cgroup with cpuset.cpus is the probe: the file
+// sits next to it. dir is where to start looking — its chain up to root first,
+// then root's children. probed is false when nothing found has the cpuset
+// controller enabled, so the filesystem cannot answer yet: the caller then
+// lets the write itself report the missing file.
+func HasExclusive(root, dir string) (present, probed bool) {
+	for _, d := range Ancestors(root, dir) {
+		if _, err := os.Stat(filepath.Join(d, "cpuset.cpus")); err != nil {
+			continue
+		}
+		_, err := os.Stat(filepath.Join(d, ExclusiveFile))
+		return err == nil, true
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return false, false
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		d := filepath.Join(root, e.Name())
+		if _, err := os.Stat(filepath.Join(d, "cpuset.cpus")); err != nil {
+			continue
+		}
+		_, err := os.Stat(filepath.Join(d, ExclusiveFile))
+		return err == nil, true
+	}
+	return false, false
 }

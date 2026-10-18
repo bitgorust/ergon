@@ -352,6 +352,15 @@ func CheckHost(c *Config, sysRoot, cgroupRoot, kernelRelease string) ([]string, 
 	if _, err := os.Stat(filepath.Join(cgroupRoot, "cgroup.controllers")); err != nil {
 		return nil, fmt.Errorf("host: cgroup v2 is needed (%s/cgroup.controllers: %w)", cgroupRoot, err)
 	}
+	// Partition mode writes cpuset.cpus.exclusive down the hierarchy, and that
+	// file only exists from Linux 6.7 or a vendor kernel that backported it.
+	// A warning, not an error: shared-only pods work without it, and the
+	// filesystem is the authority rather than this node's version number.
+	if present, probed := cpuset.HasExclusive(cgroupRoot, cgroupRoot); probed && !present {
+		warnings = append(warnings, fmt.Sprintf(
+			"kernel %s has no %s: every cpu-partition opt-in will be refused (a remote partition needs Linux 6.7 or a vendor backport of it)",
+			kernelRelease, cpuset.ExclusiveFile))
+	}
 	if len(c.Namespaces) == 0 {
 		warnings = append(warnings, "namespaces is empty: every opt-in will be refused")
 	}

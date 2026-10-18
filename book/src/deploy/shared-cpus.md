@@ -66,16 +66,19 @@ Do this before installing the plugin. Everything here is per node.
 |---|---|
 | Kubernetes | >= 1.33 (1.36 recommended): no CPU quota on exclusive containers |
 | kubelet | `cpuManagerPolicy: static`; x86 `full-pcpus-only`; `reservedSystemCPUs` = the IRQ CPU(s) + the shared CPUs |
-| kernel | >= 6.2, cgroup v2. Boot line: `nohz_full`, `rcu_nocbs`, `isolcpus=managed_irq` on the exclusive CPUs, never on the shared ones |
+| kernel | >= 6.2, cgroup v2. Boot line: `nohz_full`, `rcu_nocbs`, `isolcpus=managed_irq` on the exclusive CPUs, never on the shared ones. A `cpu-partition` opt-in also needs `cpuset.cpus.exclusive`: Linux 6.7, or a vendor kernel that backported that file. The plugin reads the file, not the version |
 | containerd | >= 2.2, NRI on, default validator on |
 | node label | `ergon.io/shared-cpus=true` |
 
 Check the node first. Each command must print what the comment says:
 
 ```sh
-# kernel >= 6.2, cgroup v2
+# kernel >= 6.2 (>= 6.7 for cpu-partition), cgroup v2
 uname -r
 stat -fc %T /sys/fs/cgroup                       # cgroup2fs
+find /sys/fs/cgroup -maxdepth 4 -name cpuset.cpus.exclusive | head -1
+                                               # one path = the file exists;
+                                               # empty = no cpu-partition on this node
 
 # containerd >= 2.2 with NRI
 containerd --version
