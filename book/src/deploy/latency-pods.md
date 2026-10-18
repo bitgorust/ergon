@@ -45,6 +45,27 @@ only node is the answer. A request the node cannot answer is refused and
 says why — an unread topology, a node the machine does not have, or `""`
 with several nodes and no NIC node. A binding is never dropped in silence.
 
+The five grants on one pod. Everything stays inside the pod's own cpuset:
+exclusive CPUs from the kubelet's static CPU manager, shared CPUs from
+`ergon.io/shared-millicpus`. Helpers and SQPOLL never get a second
+isolated full core.
+
+```mermaid
+flowchart TD
+    POD["latency pod: exclusive CPU(s) and shared CPU(s) in its cpuset"]
+    POD --> A["1 hugepages.ergon.io"]
+    POD --> B["2 cpu-partition.ergon.io"]
+    POD --> C["3 seccomp.ergon.io/io-uring"]
+    POD --> D["4 ergon.io/latency hot"]
+    POD --> E["5 ptp. and cpuqos.ergon.io"]
+    A --> A1["sized hugetlbfs + hugepage limit"]
+    B --> B1["child cgroup, isolated partition"]
+    C --> C1["seccomp + io_uring_* rules"]
+    D --> D1["no exec probes, no Always sidecars"]
+    E --> E1["PHC, cpu_dma_latency, node facts"]
+    SQ["helpers and SQPOLL on shared CPUs"] -.-> POD
+```
+
 ### 1. The app owns `AERON_DIR`
 
 The plugin mounts a **sized** hugetlbfs at `/dev/hugepages` and exports
@@ -55,8 +76,8 @@ mlockalls.
 
 Why: an unsized hugetlbfs is what an emptyDir `medium: HugePages` gives
 you, and Aeron refuses it. A 4 KiB `AERON_DIR` costs page faults on the
-hot path. Turning THP off on the node cut the idle **max** from 546 µs
-to 106 µs (the p99 moved far less; the max is what matters).
+hot path. Turning THP off on the node cut the idle **max** hard (the p99
+moved far less; the max is what matters).
 
 ### 2. Isolated partition
 
@@ -113,19 +134,18 @@ from outside the container.
 ### 5. Devices
 
 The NIC's PHC (`/dev/ptp*`) for clock work, and on x86
-`/dev/cpu_dma_latency` to cap C-states. Deep C-states cost about 3.5 µs
-per update from idle; a C1 cap cut the idle **max** from 445 µs to
-196 µs. Graviton (c8g) has no `cpu_dma_latency` node, so that grant is
-x86 only.
+`/dev/cpu_dma_latency` to cap C-states. Deep C-states cost every update
+from idle; a C1 cap cut the idle **max** hard. Graviton (c8g) has no
+`cpu_dma_latency` node, so that grant is x86 only.
 
 ## Deliberately not built
 
 | item | why |
 |---|---|
-| `SCHED_FIFO`, any `sched_setscheduler`, a `--fifo` wrapper | measured not worth it on AWS: loop deltas +0.5/−1.8 µs, and the RT throttle and RT group scheduling bite it (`io/benches/BENCHMARK.md`) |
+| `SCHED_FIFO`, any `sched_setscheduler`, a `--fifo` wrapper | measured not worth it on AWS: the loop got no better, and the RT throttle and RT group scheduling bite it (`io/benches/BENCHMARK.md`) |
 | SR-IOV VF per pod | Nitro guests have one ENA per ENI; there are no in-guest VFs |
 | a netns-sysctl writer pretending the knobs are per-netns | `busy_poll`/`busy_read` are global; `gro_flush_timeout` and `napi_defer_hard_irqs` are per-netdev sysfs; `rmem_max` is not writable in a non-init netns. The node sets them (`node-checks.md`) |
-| an IRQ DaemonSet that pins the latency pod's NIC IRQs to the **shared** CPUs | our Graviton data: IRQs on a busy housekeeping CPU cost the tail and lose frames (max 151 µs against 79–93, and lost frames at 1 M msgs/s with a 10.8 ms max). The kept-CPU default stays |
+| an IRQ DaemonSet that pins the latency pod's NIC IRQs to the **shared** CPUs | our Graviton data: IRQs on a busy housekeeping CPU cost the tail and lose frames. The kept-CPU default stays |
 
 `RTPRIO` is granted as a **limit only**. The plugin never changes a
 scheduler policy, and the e2e asserts PID 1 stays `SCHED_OTHER`.
@@ -143,7 +163,7 @@ The full check list is `k8s/nri-hft/node-checks.md`. The short version:
 | kernel | >= 6.7, cgroup v2 (`cpuset.cpus.exclusive` is what the partition writes, and it is 6.7; a vendor backport of that file also works — the plugin reads the file, not the version). Also `nohz_full`, `rcu_nocbs`, `isolcpus=managed_irq` on the exclusive CPUs, never the shared ones. 6.2 is enough for the shared CPUs only |
 | `transparent_hugepage` | `never` |
 | `net.core.rmem_max` / `wmem_max` | 4–16 MiB |
-| `net.core.busy_poll` / `busy_read` | **off** on Graviton (busy polling there was catastrophic: p50 4,973 µs, 61,488 NAKs) |
+| `net.core.busy_poll` / `busy_read` | **off** on Graviton (busy polling there was catastrophic) |
 | containerd | >= 2.2, NRI on, the default validator on |
 
 **Why not AKS:** it has no supported way to change containerd (so an NRI

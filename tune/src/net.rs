@@ -273,8 +273,8 @@ pub fn nic_irqs(host: &Host, nic: &Nic) -> Result<Vec<NicIrq>, ReadError> {
     Ok(out)
 }
 
-const T2_EVIDENCE: &str = "io/benches/results/flags-aws-20261014T163114Z/tables-local.md (r1-irqlocal); \
-     io/benches/results/flags-azure-20261014T144146Z/tables-local.md (r1-irqlocal); \
+const T2_EVIDENCE: &str = "io/benches/results/flags-aws-20261014T163114Z (r1-irqlocal); \
+     io/benches/results/flags-azure-20261014T144146Z (r1-irqlocal); \
      io/benches/BENCHMARK.md (Host and NIC settings on AWS); \
      md-dpdk/BENCHMARKS.md (Experiment log 2026-10-15, ENA IRQs on the isolated CPUs)";
 

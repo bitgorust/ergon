@@ -10,9 +10,9 @@ follows. It can be no closer to UTC than the host's own clock.
   second it samples the wall clock (the tightest of up to 8 brackets — each
   bracket is an ordered read, a `CLOCK_REALTIME` read, an ordered read, and
   its width bounds the error) and re-anchors the clock to follow it.
-- **Run the owner on a thread that never idles.** The slow updates below
-  (c7i, 18.7 µs) came after deep idle and are not confirmed; on Graviton
-  the slowest is the start update.
+- **Run the owner on a thread that never idles.** Slow updates on c7i
+  came after deep idle and are not confirmed; on Graviton the slowest is
+  the start update.
 - **Rate cap:** ±500 ppm, NTP's and Linux's own limit.
 - **Never backwards:** a clock behind the wall clock runs faster until it
   catches up; one ahead runs slower.
@@ -25,38 +25,31 @@ follows. It can be no closer to UTC than the host's own clock.
 - **The fallback** is kept the same way: `CLOCK_MONOTONIC` plus a
   disciplined offset, never the raw `CLOCK_REALTIME`.
 
+Calibrate once; the hot read never waits on discipline:
+
+```mermaid
+flowchart TD
+    CAL["calibrate once at start-up"]
+    CAL --> SEG["segment: rate and UTC offset"]
+    SEG --> HOT["now_ns: counter x rate + offset"]
+    SEG --> OWN["owner update(), idle only"]
+    HOT --> FOL["Follower on other threads"]
+    OWN -->|seqlock publish| FOL
+    CH["chrony / PTP / PHC"] --> RT["CLOCK_REALTIME"]
+    RT -->|"sample at most 1 Hz, slew 500 ppm"| OWN
+    FB["fallback: CLOCK_MONOTONIC + offset"] --> SEG
+```
+
+The hot read is one counter instruction and one multiply. Discipline
+touches the segment between reads, never the read itself.
+
 ### Measured
 
-30 minutes per node, isolated CPU, LTO, chrony against the Amazon Time Sync
-Service; runs as on [the overview](overview.md#measured). Residual: how far
-the clock was from the host's wall clock, ns, as a follower thread saw it
-100 times a second (brackets cut by an interrupt left out). Update: the
-owner's whole once-a-second update, ns.
-
-| host, node | residual p50 / p99 / max | update p50 / p99 / max |
-|---|---|---|
-| c7i.2xlarge a | 134 / 2,641 / 9,404 | 3,478 / 4,460 / 18,737 |
-| c7i.2xlarge b | 133 / 692 / 3,821 | 3,480 / 4,426 / 6,064 |
-| c8g.xlarge a | 4 / 523 / 2,144 | 334 / 572 / 2,894 |
-| c8g.xlarge b | 3 / 303 / 1,465 | 329 / 435 / 2,895 |
-| c9g.2xlarge a | 12 / 240 / 2,662 | 295 / 373 / 1,759 |
-| c9g.2xlarge b | 7 / 360 / 2,662 | 278 / 365 / 1,840 |
-
-- No sample was rejected, and no clock stepped after the start.
-- **The largest residuals follow chrony's own frequency changes.** A
-  change of `f` ppm holds the clock off by about `f` ns for one second
-  (measured 0.8–1.0 of that), not an ergon-clock error. c7i's p50 of
-  133–134 ns is its wide brackets (about 350 ns); the same hosts at the
-  owner's own samples read 2–3 ns.
-- **c7i's updates cost ten times Graviton's.** The bench's owner slept
-  between updates, so each ran with cold caches, likely after deep idle
-  (not confirmed; the platform is a vCPU). It now busy-waits, as a runtime
-  thread does; the sleeping figures are what is measured. c7i's slowest
-  (18.7 µs) is unattributed and is not the start update. On Graviton the
-  slowest is the start (16 brackets, not 8).
-- This is the distance to the host's wall clock. The wall clock's own
-  distance to UTC is chrony's bound: 87–166 µs here.
-- [Full data](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md#disciplined-clock-residual).
+Residuals track chrony's own frequency changes, not an ergon-clock error.
+Updates cost more on c7i than on Graviton after deep idle. The clock is
+never closer to UTC than the host's own bound from chrony. One copy of
+every figure, with maxima:
+[`clock/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md#disciplined-clock-residual).
 
 ## How the host keeps the wall clock
 

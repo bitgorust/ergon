@@ -30,7 +30,7 @@
 //!   [`ThrottleWatch::check`] reads one open file (`cpu.stat` too once
 //!   throttling shows) and allocates only when it reports.
 //! - **Evidence**: this repository's measurements (`md-dpdk/BENCHMARKS.md`,
-//!   `io/benches/BENCHMARK.md`, the settings-matrix tables under
+//!   `io/benches/BENCHMARK.md`, the settings-matrix runs under
 //!   `io/benches/results/`), or the kernel's and vendors' documentation where
 //!   nothing was measured. Each finding names its source.
 //! - **The switch**: every host-check warning line ends with how to silence

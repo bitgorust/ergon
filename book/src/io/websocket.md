@@ -157,78 +157,30 @@ A refused handshake, in `on_closed`:
 ## Measured results
 
 Order round trip: a 64-byte echo, one message in flight, **1 connection**.
-p50 / p99 / max, µs. More sockets on the same loop: not measured (see the
-last bullet).
+More sockets on the same loop: not measured (see the last bullet). One copy
+of every figure, with its max:
+[`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md).
 
-‡ **Measured with the NIC's adaptive interrupt moderation ON** (ENA's
-default, `rx-usecs` 20; not a tuned host), and the NIC's interrupts on the
-shared housekeeping CPUs, deep idle states on. These interrupt-driven rows
-include the moderation delay, so they are not a fair comparison with the
-polling rows (`recv-busy`, `uring-sqpoll`). A fair rerun is planned.
-
-**AWS Tokyo**, `c7i.2xlarge` VM, adaptive RX on
-(`flags-aws-20261015T045527Z`, 3–4 baselines):
-
-| backend | back to back | 10,000/s |
-|---|---|---|
-| `recv-busy` | 39.5–42.0 / 45.5–49.7 / 130–1,038 | 41.0–41.8 / 45.4–48.4 / 128–255 |
-| `uring-sqpoll` | 40.0–41.0 / 45.5–47.0 / 176–862 | 41.7–42.9 / 47.3–50.6 / 127–206 |
-| `uring-spin` ‡ | 47.7–48.4 / 55–91 / 197–1,035 | 45.4–48.0 / 51–94 / 432–982 |
-| `epoll-spin` ‡ | 47.1–49.0 / 55–98 / 188–369 | 47.2–48.3 / 53–91 / 127–982 |
-
-**AWS Tokyo**, another VM pair, with mio and the SQPOLL thread on the
-loop's sibling (`flags-aws-20261015T124649Z`, 2 baselines):
-
-| backend | back to back | 10,000/s |
-|---|---|---|
-| `recv-busy` | 36.3–37.4 / 51.7–51.8 / 902–1,016 | 38.3–38.8 / 50.5–54.0 / 640–961 |
-| `uring-sqpoll`, its own core | 38.7–38.8 / 53.0–55.2 / 165–180 | 38.9–39.6 / 53.5–53.6 / 233–1,124 |
-| `uring-sqpoll`, the loop's sibling | 38.3–38.5 / 51.5–52.6 / 281–432 | 40.7–40.8 / 55.9–56.7 / 700–913 |
-| `epoll-spin` ‡ | 43.2–45.3 / 68.1 / 230–1,018 | 43.4–49.9 / 89–94 / 210–243 |
-| mio + rustls ‡ | 43.7–48.7 / 61–93 / 207–304 | 45.6–47.8 / 88–90 / 225–519 |
-
-**AWS bare metal**, `c7i.metal-24xl` receiver, adaptive RX on too
-(`flags-aws-20261015T142240Z`, 2 baselines):
-
-| backend | back to back | 10,000/s |
-|---|---|---|
-| `recv-busy` | 35.3–35.7 / 43.3–43.4 / 160–206 | 37.1–37.8 / 43.9–44.8 / 113–963 |
-| `uring-sqpoll` | 38.1–39.7 / 45.5–53.8 / 332–429 | 38.2–40.2 / 50.2–52.7 / 169–852 |
-| `uring-sqpoll`, the loop's sibling | 37.8–38.4 / 45.3–46.4 / 312–859 | 41.0–41.3 / 48–74 / 766–881 |
-| `epoll-spin` ‡ | 39.4–41.1 / 56–67 / 193–380 | 40.0–41.2 / 51 / 149–928 |
-
-**Azure East Asia**, `D8ds_v6` (`confirm-20261014T085509Z`, 1 run; the
-NIC's interrupt settings were not recorded):
-
-| backend | 1,000/s | back to back |
-|---|---|---|
-| `recv-busy` | 57.3 / 64.8 / 143 | 54.5 / 68.0 / 1,081 |
-| `uring-sqpoll` | 58.0 / 65.1 / 441 | 54.6 / 68.5 / 642 |
-| `uring-spin` | 63.1 / 73.9 / 1,061 | 57.9 / 72.2 / 890 |
-| `epoll-spin` | 62.9 / 73.2 / 279 | 59.2 / 73.4 / 612 |
-
-- **AWS, polling against interrupt-driven: no conclusion.** The ‡ rows
-  had adaptive moderation on; a fair rerun is planned.
-- **Azure** (`confirm-20261014T085509Z`, 1 connection): NIC polling was
-  4–6 µs ahead of `epoll-spin` at the median and 5–8 µs at p99, with no
-  lower max. That run did not record the NIC's interrupt settings.
-- **`epoll-spin`'s p99 varied** from 53 to 98 µs between AWS baselines (‡);
-  the cause was not traced.
-- **The max is not lower with polling.** On AWS about 1 round trip in 1.8
-  million takes about 1 ms, on every backend and on bare metal too. Neither
-  loop stalled, so it is the network path or the sender VM
-  ([worst cases on AWS](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#worst-cases-on-aws)). Azure's traced runs put
-  every maximum in a once-a-minute hypervisor stall of 0.5–3.7 ms
+- **AWS, polling against interrupt-driven: no conclusion.** The
+  interrupt-driven runs had ENA's adaptive moderation on; a fair rerun is
+  planned.
+- **On Azure, NIC polling was ahead** of `epoll-spin` at the median and at
+  p99, with no lower max. That run did not record the NIC's interrupt
+  settings.
+- **The max is not lower with polling.** On AWS a rare round trip takes
+  about a millisecond on every backend and on bare metal too. Neither loop
+  stalled: the network path or the sender VM
+  ([worst cases on AWS](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#worst-cases-on-aws)).
+  Azure's traced runs put every maximum in a once-a-minute hypervisor stall
   ([settings matrix](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#settings-matrix)).
-- **mio** (the usual Rust way): level with `epoll-spin` at the median
-  (`124649Z`, both ‡).
-- **The SQPOLL thread on the loop's sibling** costs −0.4 to +1.8 µs at the
-  median against a core of its own.
-- **More sockets on the loop: not measured.** With plain `recv-busy` each
-  extra socket adds about 0.6 µs to every poll
-  ([cost per poll](backends.md#cost-per-poll)). With N other sockets,
-  expect about N × 0.3 µs more at the median and up to N × 0.6 µs at p99,
-  plus the time spent on their messages. Past 4 sockets in all, use
-  `recv-busy,per_queue=true` or `uring-sqpoll`.
+- **mio** (the usual Rust way) is level with `epoll-spin` at the median.
+- **The SQPOLL thread on the loop's sibling** costs a little at the median
+  against a core of its own. Never a second isolated full core just for
+  SQPOLL.
+- **More sockets on the loop: not measured.** Each extra socket adds a
+  little to every poll of plain `recv-busy`
+  ([cost per poll](backends.md#cost-per-poll)); expect the poll cost to
+  scale with the sockets, plus the time on their messages. Past 4 sockets
+  in all, use `recv-busy,per_queue=true` or `uring-sqpoll`.
 - **Feeds** (market data, 1 to 256 connections):
   [by number of connections](overview.md#by-number-of-connections).

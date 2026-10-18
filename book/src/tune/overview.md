@@ -28,16 +28,16 @@ In brackets: the check (T1–N4) and the run behind a number (A–G, in
 | loop gap | A pause seen by a loop that only reads the clock (the TSC, the CPU's time-stamp counter). | Shows how often something took the CPU, and for how long. |
 | interrupt (IRQ) | A device or timer stops the CPU to run a kernel handler. | On a hot CPU, the loop waits for the handler. |
 | timer tick | The kernel's regular timer interrupt, `CONFIG_HZ` times a second: 1,000 on the AWS lab's Ubuntu kernel. | `nohz_full` stops nearly all of it on hot CPUs (T1). |
-| [`isolcpus`](../deploy/hosts.md#kernel-command-line) | A boot option that keeps other tasks off the listed CPUs. | Alone, the tick stays on. Loop gaps over 5 µs a minute: 60,120 stock, 60,063.5 with it, 50 with all of T1 (B). |
+| [`isolcpus`](../deploy/hosts.md#kernel-command-line) | A boot option that keeps other tasks off the listed CPUs. | Alone, the tick stays on. |
 | [`nohz_full`](../deploy/hosts.md#kernel-command-line) | A boot option that stops nearly all timer ticks on the listed CPUs while one task runs there. | Use it with `isolcpus` (T1). |
 | [`rcu_nocbs`](../deploy/hosts.md#kernel-command-line) | A boot option that moves RCU callbacks (the kernel's deferred clean-up work) off the listed CPUs. | Part of T1's boot line. Not measured alone. |
-| [IRQ affinity](../deploy/hosts.md#interrupts-and-the-nic) | The CPUs an interrupt may run on. `irqaffinity` sets the boot default; `/proc/irq/<n>/smp_affinity_list` sets one interrupt's. | NIC interrupts on the loop's CPU: burst p99 7.87 → 26.09 (T2, C). |
+| [IRQ affinity](../deploy/hosts.md#interrupts-and-the-nic) | The CPUs an interrupt may run on. `irqaffinity` sets the boot default; `/proc/irq/<n>/smp_affinity_list` sets one interrupt's. | NIC interrupts on the loop's CPU cost the tail (T2). |
 | [SMT siblings](../deploy/hosts.md#cpu-layout) (hyperthreads) | Two hardware threads that share one core. | Two busy siblings slow each other; the effect measured here was weak (T8). Graviton, AWS's Arm CPU, has no SMT. |
-| real-time scheduling (`SCHED_FIFO`, `SCHED_RR`) | Runs a thread ahead of all normal ones. RT throttling caps it at 0.95 s a second by default. | No gain on an isolated CPU, and its tick stayed on: 19 → 533 a second (T7, C). |
+| real-time scheduling (`SCHED_FIFO`, `SCHED_RR`) | Runs a thread ahead of all normal ones. RT throttling caps it at 0.95 s a second by default. | No gain on an isolated CPU, and its tick stays on (T7). |
 | [CPU quota (CFS quota)](../deploy/kubernetes.md#latency-checklist) | A cgroup's CPU limit: its threads may run for the quota in each period (100 ms by default). Kubernetes sets one from a container's CPU limit, `docker run --cpus` too. | A busy-spinning thread runs at the cap: when the cgroup's threads use the quota up, the kernel stops all of them until the period ends (T9). |
 | throttled, `nr_throttled` | A cgroup stopped because its quota ran out. `nr_throttled` in its `cpu.stat` counts the periods it happened in. | Should never grow for a busy-spinning container. `cpu.stat.local` also counts a parent's (a pod's) quota (T9). |
 | [CPU idle states (C-states), frequency](../deploy/hosts.md#c-states) | How deeply an idle CPU sleeps, and how fast it runs. | Deeper sleep saves power but wakes later. Not checked. |
-| [transparent hugepages (THP)](../deploy/hosts.md#memory) | The kernel's own 2 MiB pages: `always`, or where the app asks (`madvise`). `khugepaged` builds them in the background. | It pauses spinning threads and still runs under `madvise`. `never` cut idle max 546 → 106 (T3, D). |
+| [transparent hugepages (THP)](../deploy/hosts.md#memory) | The kernel's own 2 MiB pages: `always`, or where the app asks (`madvise`). `khugepaged` builds them in the background. | It pauses spinning threads and still runs under `madvise`. `never` cuts the idle max (T3). |
 | Aeron directory | Where Aeron, the messaging library under ergon's transports, keeps its buffers as memory-mapped files. | On a disk filesystem, the kernel writes them back to disk (T4). |
 | media driver | Aeron's process that moves messages between the network and the applications, through the Aeron directory. | The ergon-md-dpdk one runs these checks before it starts. |
 | tmpfs, [hugetlbfs](../deploy/hosts.md#memory) | Filesystems held in memory. `/dev/shm` is tmpfs; hugetlbfs uses reserved 2 MiB pages. | T4 wants the Aeron directory on one: nothing is written back to disk. |
@@ -46,16 +46,16 @@ In brackets: the check (T1–N4) and the run behind a number (A–G, in
 | kernel UDP | UDP through the kernel's network stack and sockets. *Plain*: interrupt-driven, no busy polling. | No setup, but a higher median and tail than DPDK (A). |
 | interrupt-driven | Packets reach the socket through the NIC's interrupt, not busy polling. | Its tail is interrupts, so CPU isolation did not help it (T1, A). |
 | [NIC receive queue](../deploy/hosts.md#interrupts-and-the-nic) | A lane the NIC puts arriving packets on. Each has its own interrupt. | After every reset, ENA puts queue *i*'s interrupt on CPU *i*, isolated CPUs included (T2). |
-| [interrupt moderation](../deploy/hosts.md#interrupts-and-the-nic) (`rx-usecs`) | The NIC waits up to `rx-usecs` µs so one interrupt covers several packets. | Fewer interrupts, later packets. All off: plain kernel UDP p50 71.17 → 46.69 (E). With busy polling, keep `rx-usecs` at 20. |
-| adaptive RX moderation | The driver re-tunes that wait by itself: ENA about 40 times a second. | That work runs on the polling CPU. Off: p99.99 118.85 → 71.89 (N1, C). |
-| [busy polling](../deploy/hosts.md#interrupts-and-the-nic) | A socket read polls the NIC queue itself instead of sleeping until an interrupt. | p50 21.54 against plain kernel UDP's 35.10 (A). Collapsed on Graviton at 1 M msgs/s of 288 B (G). |
+| [interrupt moderation](../deploy/hosts.md#interrupts-and-the-nic) (`rx-usecs`) | The NIC waits up to `rx-usecs` µs so one interrupt covers several packets. | Fewer interrupts, later packets. With busy polling, keep `rx-usecs` at 20. |
+| adaptive RX moderation | The driver re-tunes that wait by itself: ENA about 40 times a second. | That work runs on the polling CPU. Off helps a busy-polling loop (N1). |
+| [busy polling](../deploy/hosts.md#interrupts-and-the-nic) | A socket read polls the NIC queue itself instead of sleeping until an interrupt. | Faster median than plain kernel UDP on x86 (A). Collapsed on Graviton at 1 M msgs/s of 288 B (G). |
 | deferred interrupts (`napi_defer_hard_irqs`, `gro_flush_timeout`) | The kernel keeps the NIC's interrupts off and polls from a timer instead, so a busy poller can take the packets. | With no busy poller, packets wait for the timer (N2). |
-| [RX ring](../deploy/hosts.md#interrupts-and-the-nic) | The NIC's buffer for arriving packets: how many it can hold. | Too small drops bursts. 4,096 removed the drops and NAKs, not the tail (N4, F). |
+| [RX ring](../deploy/hosts.md#interrupts-and-the-nic) | The NIC's buffer for arriving packets: how many it can hold. | Too small drops bursts. A larger ring removes drops and NAKs, not the tail (N4). |
 | NIC reset | The driver restarts the NIC: a device reset, `ethtool -G` or `-L`, a NIC back from DPDK. | On ENA it undoes T2 and N1: re-apply at each link-up. Checks re-run when `carrier_changes` moves. |
 | ENA | AWS's virtual NIC (Elastic Network Adapter) and its Linux driver. | N1 checks its adaptive moderation. |
 | `ethtool` | Linux's tool for NIC settings: `-C` moderation, `-G` ring sizes, `-L` queue counts. | N1 and N4 read the same settings over netlink (a kernel socket API), without root. |
 | accelerated networking (VF) | Azure gives the VM a virtual function (VF): a slice of the real NIC (SR-IOV). | Without it, traffic takes the hypervisor's (Hyper-V's) slower software path (N3). |
-| [DPDK](../md-dpdk/overview.md) | A library that drives the NIC from user space, skipping the kernel. | p50 20.13 against plain kernel UDP's 35.10 (A). Its costs: [ergon-md-dpdk](../md-dpdk/overview.md#why-bypass-is-faster-and-what-it-costs). |
+| [DPDK](../md-dpdk/overview.md) | A library that drives the NIC from user space, skipping the kernel. | Faster median than plain kernel UDP (A). Its costs: [ergon-md-dpdk](../md-dpdk/overview.md#why-bypass-is-faster-and-what-it-costs). |
 | [SQPOLL thread](../io/backends.md) | An io_uring kernel thread that runs the ring's requests, so the loop makes no system calls. `sqpoll_cpu` pins it. | It spins, so its CPU is hot: T1 and T8 check it. |
 | sysfs, `/proc` | Files under `/sys` and `/proc` where the kernel shows its settings. | Most checks only read these, so they also run on a copied tree (`Host::at`). |
 | NAK | An Aeron receiver's request to resend lost data. | NAKs in bursts with kernel busy polling: check the RX ring (N4). |
@@ -83,7 +83,7 @@ In brackets: the check (T1–N4) and the run behind a number (A–G, in
 | T7 | real-time scheduling | `SCHED_FIFO` or `SCHED_RR` on an isolated CPU gains nothing and keeps the tick on. RT throttling (the kernel's cap on real-time threads, 0.95 s of each second by default) can take the CPU away. |
 | T8 | SMT siblings | Two hyperthreads share one core. Two busy threads on one core slow each other. |
 | T9 | CPU quota (a container's CPU limit) | A cgroup with a quota may use only that much CPU time per period. A busy-spinning thread uses its CPU all the time, so it runs at the cap, and the kernel stops the whole container when the cap is reached. On Kubernetes 1.33+ the kubelet drops the quota itself for a container with exclusive CPUs; never turn it off for the whole node. |
-| T10 | SMT (hyperthreading) on, x86 | One Kubernetes `cpu: 2` is one physical core, not two. A busy sibling slows the loop: SQPOLL on the sibling cost +0.5 µs p50 at 1 connection, +2.3–2.7 µs p50 and +9–12 µs p99 at 10–100 (arrival → decoded). Turn SMT off on the node: EKS/EC2 `"CpuOptions": {"CoreCount": 4, "ThreadsPerCore": 1}` (no extra charge; not on T2, C7a, M7a, R7a, Mac or Graviton), self-managed `nosmt` or `echo off > /sys/devices/system/cpu/smt/control` before the kubelet (then delete its `cpu_manager_state`), or an Azure size without SMT (Fasv6, Falsv6, Famsv6, Dpsv6, Dplsv6). Graviton and arm64 pass: one vCPU is one physical core. |
+| T10 | SMT (hyperthreading) on, x86 | One Kubernetes `cpu: 2` is one physical core, not two. A busy sibling slows the loop. Turn SMT off on the node: EKS/EC2 `"CpuOptions": {"CoreCount": 4, "ThreadsPerCore": 1}` (no extra charge; not on T2, C7a, M7a, R7a, Mac or Graviton), self-managed `nosmt` or `echo off > /sys/devices/system/cpu/smt/control` before the kubelet (then delete its `cpu_manager_state`), or an Azure size without SMT (Fasv6, Falsv6, Famsv6, Dpsv6, Dplsv6). Graviton and arm64 pass: one vCPU is one physical core. |
 | K1 | the pod's `QoS` class | Anything but Guaranteed gets a CPU limit and shares CPUs; the loop runs at the cap or with a neighbour. Fix (pod spec): `resources.requests` = `resources.limits`. |
 | K2 | exclusive CPUs | The shared pool means other pods land on the loop's CPU. Fix (node): kubelet `cpuManagerPolicy: static` (with `full-pcpus-only` on x86); fix (pod spec): whole-CPU requests in a Guaranteed pod. |
 | K3 | the loop's SMT sibling | A sibling in another pod is a busy neighbour (the T10 numbers). Fix (node): turn SMT off; fix (pod spec): ask for whole cores so both siblings come together. |
@@ -103,17 +103,17 @@ Not checked: CPU idle states and frequency.
 | symptom | check | fix |
 |---|---|---|
 | tens of thousands of loop gaps a minute; about 1,000 timer interrupts a second on the loop's CPU | T1 | boot with `isolcpus=nohz,domain,managed_irq,<hot> nohz_full=<hot> rcu_nocbs=<hot> irqaffinity=<housekeeping>` |
-| hundreds of loop gaps a minute; burst p99 up by 12–18 µs | T2 | `echo <housekeeping> > /proc/irq/<n>/smp_affinity_list`, again after every NIC reset |
-| pauses of 8–22 µs every 10.24 s | T3 | `echo never > /sys/kernel/mm/transparent_hugepage/enabled`, or boot with `transparent_hugepage=never` |
+| hundreds of loop gaps a minute; burst p99 up | T2 | `echo <housekeeping> > /proc/irq/<n>/smp_affinity_list`, again after every NIC reset |
+| pauses of tens of µs every 10.24 s | T3 | `echo never > /sys/kernel/mm/transparent_hugepage/enabled`, or boot with `transparent_hugepage=never` |
 | Aeron directory on ext4, xfs or overlayfs | T4 | `/dev/shm`, or a sized 2 MiB hugetlbfs: `mount -t hugetlbfs -o pagesize=2M,size=1G none /mnt/huge` with `AERON_FILE_PAGE_SIZE=2097152` |
 | page faults on pinned threads; several NUMA nodes | T5 | `sysctl -w kernel.numa_balancing=0` |
 | NIC and hot CPUs on different nodes | T6 | pin the threads to the NIC's node, or use a NIC on theirs |
 | a real-time thread is no faster | T7 | `chrt --other -p 0 <tid>`, on an isolated CPU |
 | two busy threads on one core | T8 | pin them to separate cores; leave the sibling idle |
 | stalls of milliseconds in a container; `nr_throttled` in `/sys/fs/cgroup/cpu.stat` grows | T9 | Kubernetes 1.33+ (1.36+ for a latency node): `cpuManagerPolicy: static`, a Guaranteed pod and whole-number CPU requests, so the kubelet drops the quota itself. Never `cpuCFSQuota: false`: it removes every pod's CPU limit on the node ([checklist](../deploy/kubernetes.md#latency-checklist)) |
-| a `cpu: 2` pod runs like one core; p50 up 2–3 µs with traffic on the node | T10, K3 | turn SMT off on the node (EKS `CpuOptions: ThreadsPerCore: 1`, `nosmt`, or an Azure size without SMT) |
+| a `cpu: 2` pod runs like one core; p50 up with traffic on the node | T10, K3 | turn SMT off on the node (EKS `CpuOptions: ThreadsPerCore: 1`, `nosmt`, or an Azure size without SMT) |
 | a Burstable pod, the shared CPU pool, or a CPU for helpers missing | K1, K2, K4 | Guaranteed with requests = limits; the kubelet's static CPU manager; `cpu: 2` |
-| AWS: p99.99 about 40 µs high with a busy-polling loop; Aeron kernel UDP p50 about 100 µs at 100 k msgs/s | N1 | busy polling: `ethtool -C <if> adaptive-rx off` (leave `rx-usecs` at 20). Interrupt-driven: `ethtool -C <if> adaptive-rx off rx-usecs 0 tx-usecs 0`, with the NIC's interrupts on a core of their own. Again after every reset |
+| AWS: p99.99 high with a busy-polling loop | N1 | busy polling: `ethtool -C <if> adaptive-rx off` (leave `rx-usecs` at 20). Interrupt-driven: `ethtool -C <if> adaptive-rx off rx-usecs 0 tx-usecs 0`, with the NIC's interrupts on a core of their own. Again after every reset |
 | packets on sockets that do not busy-poll held for `gro_flush_timeout` | N2 | `echo 0 > /sys/class/net/<if>/napi_defer_hard_irqs; echo 0 > /sys/class/net/<if>/gro_flush_timeout` |
 | Azure: VF missing or down | N3 | `az vm deallocate`, then `az network nic update --name <NIC> --resource-group <group> --accelerated-networking true`, then `az vm start` |
 | NIC drops and NAKs in bursts with kernel busy polling | N4 | `ethtool -G <if> rx 4096` (on ENA this resets the NIC: re-pin, turn adaptive-rx off again) |
@@ -125,37 +125,14 @@ numbers. T1 with the loop on CPU 2 of 8:
 
 ## Measured effect
 
-One A/B per row, in µs; "first, second" where it ran twice. Medians across
-reps where a run had reps. The max is one sample, so it moves most.
-
-| check | change; measurement | env | p50 | tail and max |
-|---|---|---|---|---|
-| T1 | stock boot → isolated; DPDK round trip | A | 20.13 → 20.11 | p99.99 68.73 → 30.29; max 215.94 → 71.10 |
-| T1 | the same, kernel busy polling | A | 21.54 → 21.57 | p99.99 96.32 → 33.92; max 279.81 → 82.43 |
-| T1 | the same, plain kernel UDP | A | 35.10 → 35.26 | p99.99 109.12 → 115.20; max 336.13 → 289.28. No gain: its tail is interrupts |
-| T1 | stock → `isolcpus` only → full boot line; loop gaps over 5 µs a minute | B | – | 60,120 → 60,063.5 → 50; longest gap 146.95 → 52.30 → 133.90 |
-| T2 | NIC interrupts moved onto the loop's CPU; market-data burst | C | 3.42 → 6.49, 2.86 → 4.68 | p99 7.87 → 26.09, 8.05 → 20.11; max 36.31 → 98.61, 47.96 → 73.64 |
-| T3 | THP default → `never`; DPDK round trip | D | 43.77 → 43.81 | idle max 546 → 106; receiver's longest loop gap about 670 → 120–277; max under load: bursts 632 → 272, 1,344 B at 1 M msgs/s 1,148 → 149 |
-| T7 | `SCHED_FIFO` loop; WebSocket round trip | C | 43.90 → 44.39, 40.65 → 42.12 | p99.99 118.85 → 119.81, 116.53 → 73.87; max 1,023.80 → 579.59, 259.23 → 1,008.92; timer interrupts on the loop's CPU 19 → 533/s, 19 → 543/s |
-| N1 | adaptive moderation off; WebSocket round trip | C | 43.90 → 40.88, 40.65 → 40.93 | p99.99 118.85 → 71.89, 116.53 → 76.02; over 100 µs a minute 117.1 → 14.7, 73.4 → 32.3; max 1,023.80 → 354.05, 259.23 → 970.07 |
-| N1 | adaptive moderation off; Aeron kernel UDP, 288 B at 100 k msgs/s | E | 105.79 → 71.17 | p99 145.41 → 112.06; max 606 → 560 |
-| N4 | RX ring default → 4,096; kernel busy polling, 288 B at 1 M msgs/s | F | 101.44 → 101.50 | 3 NAKs and 64 NIC drops → none; max 15,049 → 21,152: it removes loss, not the tail |
-| N2's Graviton advice | NIC interrupts: housekeeping CPU → a core of their own; kernel UDP, moderation off | G | 18.50 → 18.54 | p99.99 51.84 → 38.14; max 151 → 93; lossy reps at 1 M msgs/s 5 of 5 → 0 of 5 |
-
-| env | hosts; OS and kernel | date; run | method | data |
-|---|---|---|---|---|
-| A | Azure `Standard_D8s_v6` pair, Xeon Platinum 8573C; Debian 13, Linux 7.2.6 | 2026-10-13; `20261013-100610` (stock), `20261013-102659` (isolated) | Aeron ping-pong, 32 B, 5 reps of 300,000 | [md-dpdk](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#kernel-udp-against-dpdk-on-an-azure-d8s_v6-pair-2026-10-13) |
-| B | AWS `c7i.2xlarge`, Xeon Platinum 8488C; Ubuntu 24.04, `7.0.0-1014-aws` | 2026-10-14; `flags-aws-20261014T163114Z` | a loop that only reads the TSC; its CPU's interrupt counts | [tables](https://github.com/mimran1980/ergon/blob/main/io/benches/results/flags-aws-20261014T163114Z/tables-local.md) |
-| C | as B, ap-northeast-1 | 2026-10-15; `flags-aws-20261015T062428Z` (T2), `flags-aws-20261015T070339Z` (T7, N1) | ergon-io `recv-busy` loop: WebSocket round trip at 10,000/s, or market-data bursts (arrival → decoded); 8 minutes per setting, A/B/A/B | [summary](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#host-and-nic-settings-on-aws), [T2](https://github.com/mimran1980/ergon/blob/main/io/benches/results/flags-aws-20261015T062428Z/tables.md), [T7, N1](https://github.com/mimran1980/ergon/blob/main/io/benches/results/flags-aws-20261015T070339Z/tables.md) |
-| D | Azure `Standard_D16s_v6` and `Standard_D8ds_v6`, Xeon Platinum 8573C; Debian 13, Linux 7.2.6 | 2026-10-15; `20261014-220612` | Aeron over DPDK, 32 B idle and under load, 5 reps | [round 6](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#round-6-settings-on-top-of-io-vectors-16-2026-10-15) |
-| E | AWS `c7i.2xlarge` pair, Xeon Platinum 8488C; Debian 13, Linux 7.2.6 | 2026-10-15; `aws-20261015-214713` | Aeron kernel UDP, 288 B, open loop; 3 of 5 reps | [Aeron's figure](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-kernel-udp-against-aerons-published-open-source-figure-2026-10-15) |
-| F | as D | 2026-10-14; `20261014-173745` | as D | [round 5](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#round-5-reproducing-round-4-five-reps-2026-10-14) |
-| G | AWS `c9g.2xlarge` pair, Graviton5, no SMT; Debian 13, Linux 7.2.6 | 2026-10-16; `aws-20261016-072005` | Aeron kernel UDP, 32 B idle and 288 B under load, 5 reps | [round G1](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-graviton5-c9g2xlarge-round-g1-2026-10-16) |
-
-The Aeron load runs are open loop: each message is timed from when it was
-due, so a stall counts against every message it delays. Not measured: T4, T5, T6 (every
-lab host had one NUMA node), T9, N2's timer wait and N3. T8's effect was weak.
-Their findings cite Aeron's, the kernel's or the vendor's documentation.
+One A/B per check, with its max, lives in
+[`md-dpdk/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)
+and
+[`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md).
+The checks name the cost of the missing setting; the crate files hold the
+number. Not measured: T4, T5, T6 (every lab host had one NUMA node), T9,
+N2's timer wait and N3. T8's effect was weak. Their findings cite Aeron's,
+the kernel's or the vendor's documentation.
 
 ## Where the checks run
 
@@ -270,8 +247,8 @@ too.
 | tool | good at | short of | use it |
 |---|---|---|---|
 | `tuned` profiles (`cpu-partitioning`, `latency-performance`) | applying isolation, IRQ and power settings; `tuned-adm verify` checks they stuck | does not know which threads spin, which NIC they use, or what a setting costs; not measured here | to apply settings, with ergon-tune checking the result |
-| a gap spinner, or the kernel's `osnoise` and `hwlat` tracers (`rtla`) | measuring noise on each CPU, whatever its cause | says how much, not which setting | to choose quiet cores: the labs' 120 s spinner found Azure vCPUs that stop for up to 3.7 ms once a minute, which no setting explains |
-| provisioning scripts alone | setting everything once | drift: ENA re-places queue IRQs whenever an interface comes up; one lab traced 1.1 M NIC interrupts on isolated CPUs before it re-pinned | with ergon-tune re-checking |
+| a gap spinner, or the kernel's `osnoise` and `hwlat` tracers (`rtla`) | measuring noise on each CPU, whatever its cause | says how much, not which setting | to choose quiet cores: the labs' spinner found Azure vCPUs that stop for milliseconds once a minute, which no setting explains |
+| provisioning scripts alone | setting everything once | drift: ENA re-places queue IRQs whenever an interface comes up; one lab found NIC interrupts on isolated CPUs before it re-pinned | with ergon-tune re-checking |
 
 ## Best practices and pitfalls
 
@@ -282,18 +259,17 @@ too.
   queue *i*'s interrupt on CPU *i*, isolated CPUs included, and turns adaptive
   moderation back on. Re-pin from a link-event hook.
 - **N1 with busy polling: turn off only adaptive moderation.** Zeroing
-  `rx-usecs` as well raised the p50 at 250 k msgs/s from 33 to 41 µs
+  `rx-usecs` as well made it worse
   ([AWS round 2](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-c7i2xlarge-2026-10-14)).
-- **N1 without busy polling:** all moderation off took plain kernel UDP's p50
-  at 100 k msgs/s from 71.17 to 46.69 µs (E), but give the NIC's interrupts a
-  core of their own: on the housekeeping CPU it fell behind from 500 k msgs/s
-  (p99.9 12,182 µs, E).
+- **N1 without busy polling:** all moderation off helped plain kernel UDP,
+  but give the NIC's interrupts a core of their own: on the housekeeping CPU
+  its tail blew up under load.
 - **Use THP `never`, not `madvise`.** khugepaged still runs under `madvise`.
 - **No CPU quota on a busy-spinning container.** `/sys/fs/cgroup/cpu.max`
   should read `max 100000`, and `nr_throttled` should not grow while it runs
   (T9, `ThrottleWatch`). Set-up: [Kubernetes](../deploy/kubernetes.md#latency-checklist).
 - **Graviton** has no SMT, so T8 never fires. Kernel busy polling collapsed
-  at 1 M msgs/s of 288 B (G), so N2 does not suggest it there.
+  under 1 M msgs/s of 288 B (G), so N2 does not suggest it there.
 - **Test your host image.** Build a tree with the files your provisioning
   writes and assert on the findings, as `tune/tests/common` does for five
   hosts.

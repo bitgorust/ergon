@@ -72,11 +72,9 @@ until there is work. One warning line at start says all this.
 - **This is not a hidden latency cost.** A helper on the loop's core
   would time-slice the polling thread: worse than the handshake. With
   `inline_connect_fallback=true` `connect_background` connects as
-  `Driver::connect` does: the TLS handshake runs on the loop, about
-  0.7 ms of CPU once per connect or reconnect. Measured worst poll per
-  reconnect on the loop, 50 cycles, Azure (`confirm-20261014T093250Z`):
-  `recv-busy` 104.5 / 109.2 / 774.6 µs (p50 / p90 / max; the max is the
-  first connect's full TLS handshake, about 0.75 ms).
+  `Driver::connect` does: the TLS handshake runs on the loop, once per
+  connect or reconnect. Figures:
+  [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md).
 - **For production, give the pod 2 CPUs** (the warning line ends with
   that). `ERGON_HOST_CHECKS=off` silences the line; the typed refusals
   stay.
@@ -91,16 +89,13 @@ warning thread take the other. Nothing to configure.
 {{#include ../../../io/tests/placement_book.rs:x86_two_cpus}}
 ```
 
-What a busy sibling costs (AWS `c7i.2xlarge`, market data):
-
-| what | run | result |
-|---|---|---|
-| `uring-sqpoll` on the loop's sibling against a core of its own (arrival → decoded, 10–100 connections) | `flags-aws-20261015T122127Z` | 2.3–2.7 µs at p50, 9–12 µs at p99. At 100 connections the sibling was still ahead of the other one-core polling backends in every round (whole path), by 5–12 µs over `per_queue` |
-| 100 connections, arrival → decoded, p50 / p99 / max | same | sibling 7.5–7.8 / 32–34 / 95–112 µs; own core 5.0–5.3 / 21–22 / 76–301 µs (maxima: a message waiting while the loop decoded a burst) |
-| WebSocket round trip, one clock, back to back, p50 / p99 / p99.99 / max | `flags-aws-20261015T124649Z` | sibling 38.3–38.5 / 51.5–52.6 / 94–95 / 281–432 µs; own core 38.7–38.8 / 53.0–55.2 / 97–99 / 165–180 µs (−0.4 to +1.8 µs at p50) |
+What a busy sibling costs: a little at p50 against a CPU of its own, more
+at p99. On a `cpu: 2` x86 pod the sibling was still ahead of the other
+one-core polling backends at 100 connections. Tables:
+[`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#many-connections).
 
 - It needs both hyperthreads and nothing else on the sibling.
-- Tables: [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#many-connections).
+- Never a second isolated full core just for SQPOLL.
 
 ### Graviton, `cpu: 2`: two cores
 
@@ -148,7 +143,7 @@ env:
 The kubelet gives the pod its CPUs; it never pins threads to them. Each
 busy thread pins itself to one CPU of the pod's cpuset before
 `Driver::new`, so the host checks and the helper choice know the polling
-CPU.
+CPU. Node settings: [deployment: Kubernetes](../deploy/kubernetes.md).
 
 ```rust,ignore
 {{#include ../../../io/tests/placement_book.rs:pin_loop}}
@@ -159,7 +154,6 @@ CPU.
   `/proc/self/status`.
 - Pinned by other means? Name the CPU as `loop_cpu` in the backend
   configuration ([backends](backends.md#configuration-strings)).
-- Same rule as on a host: [deployment: pods](../deploy/kubernetes.md#pods).
 
 ## What the driver reports
 

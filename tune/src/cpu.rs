@@ -144,7 +144,7 @@ pub fn housekeeping(host: &Host, busy: &CpuSet) -> String {
 }
 
 const T1_EVIDENCE: &str = "md-dpdk/BENCHMARKS.md (Summary; UDP round trip between the two hosts); \
-     io/benches/results/flags-aws-20261014T163114Z/tables-local.md (boot-stock, boot-isolcpus, boot-full); \
+     io/benches/results/flags-aws-20261014T163114Z (boot-stock, boot-isolcpus, boot-full); \
      io/benches/BENCHMARK.md (Host and network (AWS))";
 
 /// What T1 reads and the boot line it recommends.
@@ -350,7 +350,7 @@ pub fn t1_isolation(host: &Host, cpus: &HotSet) -> Vec<Finding> {
 }
 
 const T7_EVIDENCE: &str = "io/benches/BENCHMARK.md (Host and NIC settings on AWS); \
-     io/benches/results/flags-aws-20261014T163114Z/tables-local.md (r1-rt); \
+     io/benches/results/flags-aws-20261014T163114Z (r1-rt); \
      Linux Documentation/scheduler/sched-rt-group.rst";
 
 /// T7: `thread`, in `role`, is not under `SCHED_FIFO` or `SCHED_RR`. The

@@ -63,7 +63,7 @@ Each returns `Result<_, DpdkError>`, except `clock()`.
 | `configure_media_transport_from_env(&context)` | `None` for the kernel transport, `Some(DpdkTransport)` for DPDK | you set up Aeron yourself and only want the transport |
 | `DpdkTransport::install(&context, &config)` | a `DpdkTransport`, from a typed `DpdkTransportConfig` | you want no environment variables ([example](https://github.com/mimran1980/ergon/blob/main/md-dpdk/examples/embedded_dpdk.rs), built by `just check-dpdk`) |
 | `pin_agents_to_configured_cpus(&context)` | nothing | your own driver on the kernel transport: Aeron's C driver reads `AERON_*_CPU_AFFINITY`, but only `aeronmd` applies it |
-| `lock_memory_from_env()` | `true` if it locked memory | **Not recommended.** `RUSTERON_MEDIA_DRIVER_MLOCKALL=1`; measured no gain on AWS or Azure, and a worse idle max (709 against 546 µs). A sized hugetlbfs already removes the page faults it targets |
+| `lock_memory_from_env()` | `true` if it locked memory | **Not recommended.** `RUSTERON_MEDIA_DRIVER_MLOCKALL=1`; measured no gain on AWS or Azure, and a worse idle max. A sized hugetlbfs already removes the page faults it targets |
 | `DpdkTransport::clock()` | the `ergon_clock::advanced::Clock` the transport uses (ns since boot) | your threads should stamp in the same timebase |
 
 **Keep the `DpdkTransport` alive until the driver has stopped.** The driver's
@@ -122,29 +122,48 @@ stalling ([hosts](../deploy/hosts.md#cpu-layout)):
 | receiver | the media driver's receiver |
 
 - **The agents are pinned for you**, in every mode. Without the pins the
-  sender and receiver once shared one core: a 2.8 ms round trip.
-- **`SHARED_NETWORK` saves a core but is not recommended** (Graviton, round
-  G1): idle median +0.1–0.3 µs, 1,344 B bursts 2.2 times slower (p50 522
-  against 234 µs, max 748 against 493).
+  sender and receiver once shared one core and the round trip was
+  milliseconds.
+- **`SHARED_NETWORK` saves a core but is not recommended** (Graviton): more
+  than double the 1,344 B burst latency, with a worse max.
 - **Start the driver on housekeeping** (`taskset -c 0 media_driver`), so the
   threads it does not pin stay off the busy cores.
 
+Where the transport sits, and the same core placement on both hosts:
+
+```mermaid
+flowchart LR
+    NIC["NIC"] --> T{"transport"}
+    T -->|"kernel UDP"| MD["media driver"]
+    T -->|"dpdk-ena"| MD
+    MD --> HK["conductor on housekeeping"]
+    MD --> TX["sender on own core"]
+    MD --> RX["receiver on own core"]
+    APP["app on own core"] --> MD
+```
+
+Same layout on host A and host B: housekeeping, app, sender, receiver.
+Host-local channels still use kernel sockets, so the same host is IPC
+or kernel UDP, never DPDK.
+
 ## Aeron settings
 
-What the measurements used; each won a reproduced A/B unless marked.
+What the measurements used; each won a reproduced A/B unless marked. One
+copy of every figure:
+[`md-dpdk/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md).
 
 | setting | what it does | measured |
 |---|---|---|
-| `AERON_RECEIVER_IO_VECTOR_CAPACITY=16` (the default under `dpdk-ena`) | the receiver takes up to 16 frames a cycle instead of 4; the DPDK path now drains whole bursts itself, so this mainly helps host-local sockets | Azure, before that drain: no NAKs at 288 B up to 4.5 M msgs/s; with 4, 1–2 of 5 reps lost from 3 M |
+| `AERON_RECEIVER_IO_VECTOR_CAPACITY=16` (the default under `dpdk-ena`) | the receiver takes up to 16 frames a cycle instead of 4; the DPDK path now drains whole bursts itself, so this mainly helps host-local sockets | before that drain, 16 frames a cycle removed NAKs under load where 4 lost frames |
 | `AERON_DIR` on a *sized* 2 MiB hugetlbfs, `AERON_FILE_PAGE_SIZE=2097152`, `AERON_TERM_BUFFER_SPARSE_FILE=false` | the log buffers sit on hugepages (hugetlbfs is a filesystem of them), allocated up front: no page faults | an unsized hugetlbfs reports no free space, and Aeron refuses every log buffer |
 | `AERON_CLIENT_PRE_TOUCH_MAPPED_MEMORY=true` on clients | clients fault their mappings in before the first message | not A/B'd |
-| `AERON_MTU_LENGTH=1408` (at most `RUSTERON_DPDK_MAX_AERON_MTU`) | every frame fits one packet buffer | jumbo frames (MTU 8,192), one run (Graviton G2): idle unchanged; 1,344 B bursts p50 242 → 210 µs, ceiling +2.6%. Only for bulk or bursty channels, after a second run |
-| `AERON_RCV_INITIAL_WINDOW_LENGTH`, `AERON_SOCKET_SO_RCVBUF`, `_SNDBUF` all 2 MiB, `net.core.rmem_max`/`wmem_max` 16 MiB | the window fits the socket buffer | a 1 MiB window instead cut 32 B throughput from 22.74 to 15.08 M msgs/s (Azure round 7) |
-| Azure: `AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`, and per channel a receiver window (`rcv-wnd`) MANA's 256-entry ring can hold: 256 × the smallest datagram, 80 KiB for 288 B | status messages (the receiver's "send more") go out every 20 µs, and the sender never has more in flight than the ring holds | 80 KiB: no lossy rep anywhere, but a lower peak rate; 256 KiB: 1,344 B loss-free 400 k → 600 k msgs/s. The fast park alone lost more than the default |
-| transparent hugepages off | the kernel stops pausing busy threads to merge pages | Azure idle max 546 → 106 µs |
+| `AERON_MTU_LENGTH=1408` (at most `RUSTERON_DPDK_MAX_AERON_MTU`) | every frame fits one packet buffer | jumbo frames: one run (Graviton) improved 1,344 B bursts and raised the ceiling a little. Only for bulk or bursty channels, after a second run |
+| `AERON_RCV_INITIAL_WINDOW_LENGTH`, `AERON_SOCKET_SO_RCVBUF`, `_SNDBUF` all 2 MiB, `net.core.rmem_max`/`wmem_max` 16 MiB | the window fits the socket buffer | a 1 MiB window instead cut 32 B throughput hard |
+| Azure: `AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`, and per channel a receiver window (`rcv-wnd`) MANA's 256-entry ring can hold: 256 × the smallest datagram, 80 KiB for 288 B | status messages (the receiver's "send more") go out every 20 µs, and the sender never has more in flight than the ring holds | 80 KiB: no lossy rep anywhere, but a lower peak rate; 256 KiB: a higher loss-free 1,344 B rate. The fast park alone lost more than the default |
+| transparent hugepages off | the kernel stops pausing busy threads to merge pages | Azure idle max falls hard |
 | a ~1 kHz keep-alive on sparse, latency-critical streams | a lost frame is noticed within a millisecond | without it, a lost frame on a quiet stream waits for the 100 ms heartbeat: one round trip took 134 ms (not A/B'd) |
 
-**AWS caps one UDP flow at 7.8–8.0 Gbit/s**, x86 and Graviton, whatever the
+**AWS caps one UDP flow** at a few Gbit/s, x86 and Graviton, whatever the
 transport. An Aeron channel is one flow, so spread a heavier stream over
 several channels on different ports
 ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-one-flow-carries-about-8-gbits)).
@@ -160,8 +179,8 @@ several channels on different ports
   25.11+); Azure MANA does not. They mean something only while chrony keeps
   the host on the NIC's clock ([time sync](../clock/wall-clock.md)).
 - **Media receive timestamps** (`media-rcv-ts-offset=reserved` on a
-  subscription): no measurable cost on Graviton DPDK (G3: p50 within
-  0.07 µs). One run: repeat it before making them a default.
+  subscription): no measurable cost on Graviton DPDK. One run: repeat it
+  before making them a default.
 
 ## Best practices
 
@@ -184,6 +203,6 @@ several channels on different ports
 | start fails naming the ENA's BAR | the NIC's memory window (BAR) is not mapped write-combined (a CPU mode that batches writes to a device), so ENA's low-latency queue is off: sends about 100 times slower | `igb_uio` with `wc_activate=1`, or a write-combining `vfio-pci` with `RUSTERON_DPDK_VFIO_WC=1` |
 | Aeron refuses every log buffer | hugetlbfs mounted without `size=` | mount it sized |
 | window smaller than asked | `net.core.rmem_max` below 2 MiB | raise it to 16 MiB |
-| a channel stops at 0.69–0.705 M msgs/s of 1,344 B on AWS | one flow's 7.8–8.0 Gbit/s cap | more channels, on different ports |
-| millisecond spikes once a minute on Azure | a vCPU stalling (up to 3.7 ms) | keep busy threads off the cores the spin test flags |
+| a channel stops at a fixed rate of 1,344 B on AWS | one flow's Gbit/s cap | more channels, on different ports |
+| millisecond spikes once a minute on Azure | a vCPU stalling | keep busy threads off the cores the spin test flags |
 | no gain on localhost | host-local channels use kernel sockets | expected; use IPC |

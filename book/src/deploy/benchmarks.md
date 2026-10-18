@@ -1,5 +1,7 @@
 # Benchmarks: x86 and Graviton
 
+Aeron transport latency between two hosts — not SBE codec benchmarks (those
+are [`sbe/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/sbe/BENCHMARKS.md)).
 Which platform: latency here, then [cost](#cost-per-hour). Each transport
 on each platform, Azure included:
 [the DPDK chapter](../md-dpdk/overview.md#measured-between-two-hosts).
@@ -8,9 +10,8 @@ Terms: [deployment glossary](overview.md#glossary),
 [network and DPDK glossary](../md-dpdk/overview.md#glossary).
 
 > The DPDK rows are this repository's
-> [proof-of-concept transport](../md-dpdk/overview.md). For kernel bypass
-> with Aeron, use Aeron Premium — it is recommended here, but never compared
-> in these tables, since it was not run on this hardware.
+> [proof-of-concept transport](../md-dpdk/overview.md). No other kernel-bypass
+> product was run on this hardware, so none is compared in these tables.
 
 **In short:** Graviton5 (`c9g.2xlarge`) had the lowest latency measured, at
 half the hourly price of the x86 pair with as many physical cores. Its median

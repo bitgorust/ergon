@@ -14,7 +14,7 @@ Terms: [deployment glossary](overview.md#glossary),
 | | x86 (`c7i`) | Graviton |
 |---|---|---|
 | manifests and node bootstrap | yes: Amazon Linux 2023, self-managed nodes | none: the bootstrap refuses non-Intel CPUs and the images are `linux/amd64` |
-| measured | DPDK pods on two `c7i.4xlarge`: p50 28.37, max 126 µs ([benchmarks](benchmarks.md#kubernetes-eks-on-c7i4xlarge)) | not measured |
+| measured | DPDK pods on two `c7i.4xlarge`, with its max ([benchmarks](benchmarks.md#kubernetes-eks-on-c7i4xlarge)) | not measured |
 
 The kubelet and pod settings are not x86-specific, but no Graviton node has
 been built with them. For Graviton's kernel arguments see [hosts](hosts.md).

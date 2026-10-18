@@ -2,8 +2,8 @@
 
 The labs (`md-dpdk/benches/cloud/host.sh` and `vm.sh`,
 `io/benches/scripts/`) and the EKS node bootstrap
-(`md-dpdk/deploy/aws-eks/node/`) apply every setting below. Each comes with
-the A/B that chose it. Full data:
+(`md-dpdk/deploy/aws-eks/node/`) apply every setting below. Each was chosen
+by an A/B. One copy of every figure:
 [`md-dpdk/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)
 and [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md).
 
@@ -14,13 +14,14 @@ Terms: [deployment glossary](overview.md#glossary),
 
 | platform | measured on | notes |
 |---|---|---|
-| AWS x86 | `c7i.2xlarge` (4 cores × 2), `c7i.4xlarge` (8 × 2), `c7i.metal-24xl` | `c7a` was 5 µs slower at the median for ergon-io, `r7iz` no better. Metal has the tightest tails, at 6 times a `c7i.4xlarge`'s price ([cost](benchmarks.md#cost-per-hour)). An EKS DPDK node needs 5 physical cores: `c7i.4xlarge` |
+| AWS x86 | `c7i.2xlarge` (4 cores × 2), `c7i.4xlarge` (8 × 2), `c7i.metal-24xl` | `c7a` was slower at the median for ergon-io, `r7iz` no better. Metal has the tightest tails, at 6 times a `c7i.4xlarge`'s price ([cost](benchmarks.md#cost-per-hour)). An EKS DPDK node needs 5 physical cores: `c7i.4xlarge` |
 | AWS Graviton | `c8g.xlarge` (Graviton4), `c9g.xlarge`, `c9g.2xlarge` (Graviton5) | no SMT: a vCPU is a core. No C-states for the OS to manage |
-| Azure x86 | `Standard_D8s_v6`, `D8ds_v6`, `D16s_v6` (Xeon Platinum 8573C), accelerated networking (MANA) | some vCPUs stall once a minute, up to 3.7 ms |
+| Azure x86 | `Standard_D8s_v6`, `D8ds_v6`, `D16s_v6` (Xeon Platinum 8573C), accelerated networking (MANA) | some vCPUs stall once a minute, for milliseconds |
 
 - **Put both hosts in one cluster placement group** (AWS) or **proximity
-  placement group** (Azure). Even then the pair matters: on Azure the DPDK
-  median was 23.7 µs on one pair and 44.5 µs on another.
+  placement group** (Azure). Even then the pair matters: on Azure two pairs
+  of the same instance type differed by nearly a factor of two at the DPDK
+  median.
 - **Pick the smallest size with enough cores** for the layout below. A
   bigger size buys quieter cores, not a faster network path.
 
@@ -34,10 +35,9 @@ CPUs):
 isolcpus=nohz,domain,managed_irq,1-N nohz_full=1-N rcu_nocbs=1-N irqaffinity=0
 ```
 
-**Effect:** on Azure, DPDK's p99.99 fell from 69 to 30 µs and its max from 216
-to 71 µs. Plain kernel UDP did not change: its tail is interrupts, not
-scheduling. On x86, isolate whole cores (SMT is off on latency nodes, so one
-CPU is one core).
+**Effect:** on Azure this cut DPDK's worst percentiles hard. Plain kernel UDP
+did not change: its tail is interrupts, not scheduling. On x86, isolate whole
+cores (SMT is off on latency nodes, so one CPU is one core).
 
 | platform | also add |
 |---|---|
@@ -53,11 +53,11 @@ interrupt: less CPU, more latency.
 
 | setting | what it does | measured effect |
 |---|---|---|
-| every movable interrupt on housekeeping, `irqbalance` stopped, `/proc/irq/default_smp_affinity` the housekeeping mask | keeps interrupts off the busy cores | AWS round 5 traced 1.1 M ENA interrupts on isolated CPUs before the lab re-pinned them |
+| every movable interrupt on housekeeping, `irqbalance` stopped, `/proc/irq/default_smp_affinity` the housekeeping mask | keeps interrupts off the busy cores | AWS: a lab left over a million ENA interrupts on isolated CPUs before it re-pinned them |
 | pin again after every NIC reset | ENA puts each queue's interrupt back on CPU *i* (mostly isolated) whenever the interface comes up: reset, `ethtool -G`/`-L`, a NIC back from DPDK | the EKS node re-pins within milliseconds of a link event (`node/irq-affinity.sh watch`) |
-| ENA, busy-polling loop: `ethtool -C <if> adaptive-rx off` | stops ENA's moderation work running on the polling CPU about 40 times a second | p99.99 about 40 µs lower (ergon-io) |
-| ENA, interrupt path: `ethtool -C <if> adaptive-rx off rx-usecs 0 tx-usecs 0`, **with the NIC's interrupts on a core of their own** | one interrupt per packet, no waiting | `c7i.2xlarge`, 288 B at 100 k msgs/s: p50 106 → 47 µs. Interrupts left on housekeeping: lost frames from 500 k msgs/s. Graviton: the best kernel path, no lossy rep at 1 M msgs/s in rounds G1 and G3 (one in G2) |
-| kernel busy polling: `net.core.busy_read=50`, `busy_poll=50` (Azure also `napi_defer_hard_irqs=2`, `gro_flush_timeout=200000` on the VF) | a socket read spins on the NIC queue instead of sleeping | Azure idle p50 35.3 → 21.6 µs, p99.99 115 → 34 µs. Graviton: collapsed at 1 M msgs/s of 288 B, so not there. It reaches every blocking read on the host: dedicated hosts only |
+| ENA, busy-polling loop: `ethtool -C <if> adaptive-rx off` | stops ENA's moderation work running on the polling CPU about 40 times a second | lowers ergon-io's worst percentiles |
+| ENA, interrupt path: `ethtool -C <if> adaptive-rx off rx-usecs 0 tx-usecs 0`, **with the NIC's interrupts on a core of their own** | one interrupt per packet, no waiting | the best kernel path on both. Interrupts left on housekeeping: lost frames under load. Graviton: the best kernel path, no lossy rep at 1 M msgs/s in rounds G1 and G3 (one in G2) |
+| kernel busy polling: `net.core.busy_read=50`, `busy_poll=50` (Azure also `napi_defer_hard_irqs=2`, `gro_flush_timeout=200000` on the VF) | a socket read spins on the NIC queue instead of sleeping | helps Azure's idle path a lot. Graviton: collapsed at 1 M msgs/s of 288 B, so not there. It reaches every blocking read on the host: dedicated hosts only |
 | receive ring: `ethtool -G <if> rx 4096` | room for bursts while the reader catches up | Azure: no NIC drops or NAKs, where the default ring dropped at 1 M msgs/s of 288 B |
 
 ENA turns adaptive moderation back on whenever the interface comes up:
@@ -66,20 +66,20 @@ re-apply it together with the interrupt pins.
 ## C-states
 
 A C-state is how deeply an idle CPU sleeps: deeper saves power but wakes
-later (C6 on `c7i`: 190 µs).
+later, up to hundreds of microseconds.
 
 | host | setting | measured effect |
 |---|---|---|
-| x86 VM | cap at C1 (`intel_idle.max_cstate=1`), or leave it | mixed. Plain kernel UDP waits for the housekeeping CPU to wake: a 235 µs median on a `c7i.4xlarge` in one round. Capping helped in one round (idle max 445 → 196 µs) and cost the 288 B loss-free rate in another (500 k msgs/s → none). The EKS node caps VMs at C1 |
-| x86 metal | no cap | C1 made kernel UDP 2 µs slower at the median, with single-rep collapses under load |
+| x86 VM | cap at C1 (`intel_idle.max_cstate=1`), or leave it | mixed. Plain kernel UDP waits for the housekeeping CPU to wake. Capping helped in one round and cost the 288 B loss-free rate in another. The EKS node caps VMs at C1 |
+| x86 metal | no cap | C1 made kernel UDP a little slower at the median, with single-rep collapses under load |
 | Graviton | nothing to set | the OS has no C-states to pick: an idle core just waits for an interrupt (`WFI`). `nohlt` (idle cores poll instead) is not measured |
-| any, busy cores | nothing to set | a spinning core never idles; capping ergon-io's receiver cost 2 µs at the median |
+| any, busy cores | nothing to set | a spinning core never idles; capping cost ergon-io's receiver a little at the median |
 
 ## Memory
 
 | setting | what it does | measured effect |
 |---|---|---|
-| transparent hugepages off (`/sys/kernel/mm/transparent_hugepage/enabled` = `never`) | stops khugepaged pausing busy threads to merge pages | Azure idle max 546 → 106 µs |
+| transparent hugepages off (`/sys/kernel/mm/transparent_hugepage/enabled` = `never`) | stops khugepaged pausing busy threads to merge pages | Azure idle max falls hard |
 | 2 MiB hugepages, `vm.nr_hugepages=2048` | backs DPDK's packet buffers and Aeron's directory | required by DPDK. On Graviton use a 4 KiB-page kernel (Debian's cloud-arm64 is) so 2 MiB pages exist |
 | Aeron's directory on a sized hugetlbfs: `mount -t hugetlbfs -o pagesize=2M,size=1G nodev /mnt/huge-aeron`, `AERON_FILE_PAGE_SIZE=2097152`, `AERON_TERM_BUFFER_SPARSE_FILE=false` | no page faults on the log buffers | without `size=`, Aeron sees no free space and refuses every log buffer |
 | `net.core.rmem_max`, `wmem_max` 16 MiB | lets the kernel grant Aeron's 2 MiB socket buffers, which the 2 MiB window needs | the EKS lab's first attempts failed without it |
@@ -104,10 +104,11 @@ saw stall for 300 µs or more. SMT is off on x86 latency nodes
 | media driver receiver | one CPU | one CPU |
 
 - **`SHARED_NETWORK`** puts sender and receiver on one thread and saves a
-  core. Not recommended: on Graviton 1,344 B bursts were 2.2 times slower (p50
-  522 against 234 µs).
-- **ergon-io with many sockets:** `uring-sqpoll`, its kernel thread on a CPU
-  of its own.
+  core. Not recommended: on Graviton it more than doubled 1,344 B burst
+  latency.
+- **ergon-io with many sockets:** `uring-sqpoll`, its kernel thread on a
+  CPU the pod already has — the loop's SMT sibling or another CPU. Never a
+  second isolated full core just for SQPOLL.
 - **Name one CPU per core.** `thread_siblings_list` still lists the offline
   twin; the lowest id of each core is the one to use. AWS numbers x86
   siblings N and N + cores, Azure adjacently (0–1, 2–3).

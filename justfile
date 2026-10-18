@@ -11,6 +11,7 @@ import 'just/aeron.just'
 import 'just/housekeeping.just'
 import 'just/book.just'
 import 'just/dpdk.just'
+import 'just/nri.just'
 
 # Default: list available commands.
 [private]

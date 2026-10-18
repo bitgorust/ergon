@@ -19,13 +19,13 @@ Kubernetes and Java terms:
 
 | term | what it is | pros / cons, when it matters |
 |---|---|---|
-| [C-state](hosts.md#c-states) | how deeply an idle CPU sleeps | deeper saves power but wakes later (C6 on `c7i`: 190 µs). A spinning core never idles |
-| [timer tick, RCU callbacks](hosts.md#kernel-command-line) | kernel work on every CPU: a regular timer interrupt; deferred clean-up | `isolcpus` keeps tasks off, `nohz_full` stops the tick, `rcu_nocbs` moves the callbacks: Azure DPDK p99.99 69 → 30 µs |
+| [C-state](hosts.md#c-states) | how deeply an idle CPU sleeps | deeper saves power but wakes later, up to hundreds of microseconds. A spinning core never idles |
+| [timer tick, RCU callbacks](hosts.md#kernel-command-line) | kernel work on every CPU: a regular timer interrupt; deferred clean-up | `isolcpus` keeps tasks off, `nohz_full` stops the tick, `rcu_nocbs` moves the callbacks; that cut Azure DPDK's worst percentiles hard |
 | [interrupt affinity, `irqbalance`](hosts.md#interrupts-and-the-nic) | the CPUs an interrupt may run on; `irqbalance` is a daemon that moves interrupts around | stop `irqbalance`, pin interrupts to housekeeping, pin again after every NIC reset |
 | IOMMU passthrough | IOMMU: the unit that checks which memory a device may reach. Passthrough (`iommu=pt`; Graviton `iommu.passthrough=1`) skips it for the host's own drivers | lets `igb_uio` work on metal; harmless on a VM |
 | NUMA node | a group of cores and the memory nearest them | keep a pod's CPUs and devices on one; every `c7i` below `metal-48xl` has only one |
 | KSM, NUMA balancing | kernel background work: merging identical pages; moving pages nearer the CPU that uses them | either can stop a busy thread with a page fault; the EKS node turns both off |
-| [spin test](hosts.md#cpu-layout) | spin on every CPU for two minutes; note any that stall 300 µs or more | keep busy threads off those: Azure vCPUs stalled up to 3.7 ms once a minute |
+| [spin test](hosts.md#cpu-layout) | spin on every CPU for two minutes; note any that stall 300 µs or more | keep busy threads off those: Azure vCPUs stall for milliseconds once a minute |
 | [`-march`, `-mcpu`, `target-cpu`](hosts.md#build-for-the-cpu) | compiler options that build for one CPU: `-march`, `-mcpu` (C), `target-cpu` (Rust). On AArch64 only `-mcpu` sets the core | Graviton: without them, gcc calls a library helper for each atomic add |
 | `clocksource=tsc`, `tsc=reliable` | boot options: the kernel keeps time with the CPU counter, and `tsc=reliable` turns its runtime checks off | only on hardware measured as the same TSC across cores against a PTP/PHC reference, and never on a VM. The EKS node takes it with `RUSTERON_FORCE_TSC=1` and records the choice ([ergon-clock](../clock/overview.md)) |
 | [wall clock, NTP, PTP](../clock/wall-clock.md) | the time of day (UTC), kept right by chrony over the network (NTP) or from a hardware clock (PTP) | pro: matches other hosts and NIC stamps. Con: a correction can step it back; time intervals with the CPU counter |
@@ -73,15 +73,15 @@ Kubernetes and Java terms:
 5. **No page faults:** transparent hugepages off, Aeron's directory on a sized
    2 MiB hugetlbfs, non-sparse term buffers, clients that pre-touch.
 6. **Quiet cores:** spin on every core for two minutes and keep busy threads
-   off any that stalled. Azure vCPUs stall up to 3.7 ms once a minute.
+   off any that stalled. Azure vCPUs stall for milliseconds once a minute.
 7. **A disciplined wall clock:** chrony, on PTP where you can; stamp with
    [ergon-clock](../clock/overview.md).
 8. **Let the code check:** [ergon-tune](../tune/overview.md) runs at start-up
    in ergon-io's driver and the media driver, and names each missing setting
    with its fix.
 9. **Compare only within one run:** two pairs of one instance type differed
-   by 7 µs at the median.
+   at the median.
 
-> **Kernel bypass:** for Aeron, use Aeron Premium. This repository's DPDK
-> transport is a [proof of concept](../md-dpdk/overview.md), not recommended
-> for production.
+> **Kernel bypass:** this repository's DPDK transport is a
+> [proof of concept](../md-dpdk/overview.md), not recommended for
+> production.

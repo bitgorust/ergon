@@ -15,6 +15,8 @@ ergon-clock = "0.1"
 
 Numbers: ns on AWS c7i.2xlarge (x86), c8g.xlarge (Graviton4) and
 c9g.2xlarge (Graviton5), median (slowest batch) ([Measured](#measured)).
+One copy of every figure, with its max and slowest batch, is in
+[`clock/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md).
 
 ## Words used here
 
@@ -22,8 +24,8 @@ c9g.2xlarge (Graviton5), median (slowest batch) ([Measured](#measured)).
 |---|---|
 | hardware counter | A register in each CPU core that counts up at a fixed rate: the TSC on x86-64 (`rdtsc`), `CNTVCT_EL0` on 64-bit Arm. One instruction reads it. |
 | calibrate | Find, once at start-up, how many counter ticks make a second, so each later read is one multiply. |
-| wall clock | `CLOCK_REALTIME`: the time of day, UTC. Pro: comparable across hosts and with exchange and NIC stamps. Con: NTP or an admin can step it back or forward; a read costs 21–31 ns (31.97). |
-| monotonic clock | `CLOCK_MONOTONIC`, `std::time::Instant`. Pro: never goes back. Con: counts from boot, so not comparable across hosts; a read costs 20.78–30.92 ns (31.22). |
+| wall clock | `CLOCK_REALTIME`: the time of day, UTC. Pro: comparable across hosts and with exchange and NIC stamps. Con: NTP or an admin can step it back or forward. |
+| monotonic clock | `CLOCK_MONOTONIC`, `std::time::Instant`. Pro: never goes back. Con: counts from boot, so not comparable across hosts. |
 | UTC | The world's time standard: what exchanges and NICs stamp in. |
 | epoch | A clock's zero: 1970-01-01 00:00 UTC for UTC stamps; boot for a monotonic clock. |
 | NTP | Network Time Protocol: keeps the wall clock near UTC over the network (chrony, ntpd). |
@@ -41,8 +43,8 @@ c9g.2xlarge (Graviton5), median (slowest batch) ([Measured](#measured)).
 
 ## Why it exists
 
-- **Cheap reads:** `now_ns` 10.92–15.16 ns (16.13); `Instant::now`
-  21.29–31.69 (33.35).
+- **Cheap reads:** one counter read and one multiply, faster than
+  `Instant::now`.
 - **UTC stamps for that price**, and durations that never go negative.
 - **An ordered read** for timing short sections.
 - **One rate** shared by every process on a host (they convert ticks the
@@ -73,11 +75,9 @@ c9g.2xlarge (Graviton5), median (slowest batch) ([Measured](#measured)).
 ```text
 Instant::now()   in the vDSO: check the kernel's time data ─► read the counter (ordered)
                  ─► scale ─► add ─► check again
-                 c7i 24.85 (25.99)   c8g 31.69 (33.35)   c9g 21.29 (21.68)
 
 clock.now_ns()   read the counter ─► one multiply, by numbers set at start-up
                  and changed only by `update` between reads
-                 c7i 15.16 (16.13)   c8g 12.17 (12.47)   c9g 10.92 (11.25)
 ```
 
 The kernel checks twice because NTP may change its numbers mid-read.
@@ -98,16 +98,11 @@ An unordered read is **not** fine at the start of a measurement. The
 region's work can begin before the stamp is taken, so the interval comes
 out too short.
 
-**Without an ordered end** a measurement's end is read early:
-
-- A crate test times 16 cache-missing loads: about 1.9 µs on an M1 Pro
-  (release build). The unordered end read measured 0 (median of 1,000
-  tries; the figure is a note in the test, not its own measurement).
-- On c7i, in run `aws-20261016-085442`, a stamp taken after a hand-off
-  (one thread's write, another thread's read of it) from another thread
-  came out up to 59 ns earlier than that thread's, in at most 5 of 200,000
-  hand-offs. Ordered stamps never did. A later event must never carry an
-  earlier stamp.
+**Without an ordered end** a measurement's end is read early. A stamp
+taken after a hand-off from another thread can come out earlier than that
+thread's. Ordered stamps never did. A later event must never carry an
+earlier stamp. Data:
+[`clock/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md).
 
 ```rust,ignore
 {{#include ../../../clock/tests/guide.rs:ordered_read}}
@@ -157,29 +152,26 @@ between two pieces of work, even in a loop that never sleeps:
 
 ## Why not quanta or minstant?
 
-Not speed: on x86 all read as fast (c7i: `now_ns` 15.16 (16.13), quanta
-15.99 (16.95); the bare counter instruction 14.24 (15.19), minstant 14.55
-(15.44)). The reasons:
+Not speed: on x86 all read at about the same cost. The reasons:
 
 | | ergon-clock | quanta | minstant |
 |---|---|---|---|
-| one rate in every process, and in C | yes: the same calibration in every process (0.000 ppm apart for the counter's rate; in UTC each owner then disciplines its own offset) | no: measured per process, 1.9–6.9 ppm apart (64.9 while NTP slewed after boot) | x86: measured per process |
+| one rate in every process, and in C | yes: the same calibration in every process | no: measured per process, and the rates differ | x86: measured per process |
 | ordered read | yes | no | no |
 | UTC stamps kept on UTC, at counter cost | yes | no | no: a fixed offset |
-| on Graviton | the counter | the counter | the wall clock: 28.16–39.64 ns (42.22), and it can go back |
+| on Graviton | the counter | the counter | the wall clock, and it can go back |
 | checks that Linux keeps time with the counter | yes | no: x86 CPU flags only, nothing on Arm | only that `tsc` is listed in `available_clocksource` |
 
 ## Details
 
 ### Calibration and the fallback
 
-`calibrate` blocks once: 40–70 ms (40 ms on Arm, 70 ms on x86), plus up to
-50 ms for the time-sync probe. It checks the counter (by default Linux must
-keep its own time with it: clock source `tsc` or `arch_sys_counter`; a read
-must cost under 200 ns, or a hypervisor traps it), takes its rate (Arm's
-frequency register, one read; x86: a 50 ms measurement against
-`CLOCK_MONOTONIC_RAW`), verifies it for 20 ms, and anchors the result to
-`CLOCK_REALTIME`.
+`calibrate` blocks once, for tens of milliseconds, plus a short time-sync
+probe. It checks the counter (by default Linux must keep its own time with
+it: clock source `tsc` or `arch_sys_counter`; a read must be cheap, or a
+hypervisor traps it), takes its rate (Arm's frequency register, one read;
+x86: a short measurement against `CLOCK_MONOTONIC_RAW`), verifies it, and
+anchors the result to `CLOCK_REALTIME`.
 
 ```rust,ignore
 {{#include ../../../clock/tests/guide.rs:calibrate}}
@@ -217,11 +209,11 @@ by default.
 ### `update` and health
 
 - **Call `clock.update()` from idle time**, as often as you like. At most
-  once a second it samples `CLOCK_REALTIME` and steers the clock (0.3 µs on
-  Graviton, max 2.9 µs; 3.5 µs on c7i, max 18.7 µs, the slow ones after
-  deep idle: [UTC and Time Sync](wall-clock.md)). Every other call is one
-  counter read, a compare and the health maths; on the fallback it is one
-  `clock_gettime` too. It never prints, blocks or allocates.
+  once a second it samples `CLOCK_REALTIME` and steers the clock (a few
+  microseconds, more after deep idle: [UTC and Time Sync](wall-clock.md)).
+  Every other call is one counter read, a compare and the health maths; on
+  the fallback it is one `clock_gettime` too. It never prints, blocks or
+  allocates.
 - **It never jumps after start:** it slews at most 500 ppm (0.5 ms a
   second), so closing a 100 ms gap to `CLOCK_REALTIME` takes about 3.3
   minutes and 1 s about 33 minutes. Stamps are off until then.
@@ -260,32 +252,12 @@ never prints.
 
 ### Measured
 
-AWS spot, Linux 7.2.6, rustc 1.99.0 with LTO, isolated CPU, chrony;
-2026-10-16. Median of the batch means of 10,000 reads (200 batches; c9g
-50), slowest batch in brackets. A UTC read is the same instructions as a
-since-boot one; only the numbers it multiplies by differ.
-[Full data](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md#aws-c7i-c8g-and-c9g-with-chrony-2026-10-16).
-
-| ns | c7i.2xlarge (Sapphire Rapids) | c8g.xlarge (Graviton4) | c9g.2xlarge (Graviton5) |
-|---|---|---|---|
-| run | `aws-20261016-231320` | `aws-20261016-223331` | `aws-20261016-223251` |
-| `now_ns` | 15.16 (16.13) | 12.17 (12.47) | 10.92 (11.25) |
-| `now_ns_ordered` | 22.73 (23.88) | 21.93 (22.34) | 11.35 (11.65) |
-| `ClockFollower::now_ns` (`follower_now_ns`) | 15.15 (16.24) | 12.17 (12.41) | 10.92 (11.28) |
-| bare counter instruction | 14.24 (15.19) | 12.16 (12.60) | 10.91 (11.40) |
-| one measurement: `now_ns` + `now_ns_ordered` | 37.89 (40.01) | 34.10 (34.81) | 22.27 (22.90) |
-| the same with two `Instant::now` | 49.70 (51.98) | 63.38 (66.70) | 42.58 (43.36) |
-| `clock_gettime(CLOCK_MONOTONIC)` | 24.25 (25.54) | 30.92 (31.22) | 20.78 (21.30) |
-| calibration, ms, slowest process | 70.221 | 40.203 | 40.133 |
-
-- **Max:** the longest stall between two `now_ns` reads was 7.4 µs (c7i),
-  3.2 µs (c8g) and 3.9 µs (c9g) — the VM pausing the vCPU, which slowed the
-  bare instruction just as much. No read went backwards, on one core or
-  across two. (The front `Follower` was not in these runs; the row is the
-  bench's `advanced::share::ClockFollower`, which the front `Follower`
-  compiles to within one register move.)
-- One measurement is the sum of the two reads' medians (and slowest
-  batches). The Instant row is the same sum of two `Instant::now` reads.
+A read is a few tens of nanoseconds on every host measured; an ordered
+end costs more than an unordered read. The longest stall between two
+`now_ns` reads was 7.4 µs (c7i), 3.2 µs (c8g) and 3.9 µs (c9g) — the VM
+pausing the vCPU. No read went backwards. One copy of every figure, with
+its max and slowest batch, is in
+[`clock/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md#aws-c7i-c8g-and-c9g-with-chrony-2026-10-16).
 
 ### Fake time for tests
 
@@ -311,7 +283,8 @@ time-sync probe.
 
 - Calibrate once, before the hot loop; log `clock.report()`.
 - Call `update` from idle time; log its warnings off the hot path, and
-  only when `health.sampled` is true.
+  only when `health.sampled` is true. The owner/follower picture is in
+  [UTC and Time Sync](wall-clock.md).
 - One `Follower` per other thread; no lock, no `Arc`.
 - Under about 1 µs, bracket with
   `advanced::segment(&clock).ticks_ordered()` at both ends and convert the
