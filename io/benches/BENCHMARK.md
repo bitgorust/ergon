@@ -414,8 +414,8 @@ From the earlier run `20261014T005221Z` and its sensitivity run `…-sens`. Thes
 
 Values are ns per message. † OpenSSL allocates through its own `malloc`, which the counting allocator does not see.
 
-- In place saves 76–82 ns per typical Binance message (200 B–1 KB) against rustls's fastest API and removes its allocation and copy per record. The receive stack is several µs, so this is a CPU and allocation-free-steady-state win, not a latency lever.
-- **Production caveat:** record encryption and decryption are then this crate's code, as with kTLS: per-direction sequence numbers and nonces, key updates in both directions, alerts, and the AES-GCM confidentiality limit (rotate keys or reconnect well before it). For production use this code needs an independent review, or replacement by kTLS or by rustls once its in-place decryption lands.
+- In place saves 76–82 ns per typical Binance message (200 B–1 KB) against rustls's fastest API and removes its allocation and copy per record. The receive stack is several µs, so this is a CPU and allocation-free-steady-state win, not a latency lever. The figure is decrypt only, in memory, best of five; the effect on a whole request is not yet measured.
+- **Recommendation: stock rustls by default.** The in-place path is this crate's code for the record cryptography, the same duty kTLS or rustls takes on: per-direction sequence numbers and nonces, key updates in both directions, and the AES-GCM confidentiality limit. Those obligations are implemented and tested (`io/tests/tls_records.rs`), so the layer is wire-correct, but keep it only while a fair whole-path A/B shows a material win over stock rustls. Aeron and DPDK need no TLS; none should be added there.
 
 ## AWS Tokyo
 

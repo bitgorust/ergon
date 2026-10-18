@@ -177,6 +177,14 @@ planned. The backends picked below are the polling ones; see the note under
 - **TLS 1.3 only.** TLS 1.2 is refused with a clear error.
 - **Trust** is the rustls configuration you pass
   (`tls::client_config(roots)`); feature `webpki-roots` adds Mozilla's roots.
+- **Which TLS stack: stock rustls by default.** The in-place record layer
+  (`tls::RecordLayer`) decrypts in the receive buffer with no allocation —
+  105 ns against rustls's 181 ns for a 200-byte record — but that figure is
+  decrypt only, in memory, best of five. The effect on a whole request is not
+  yet measured. The in-place layer also owns the record cryptography that
+  kTLS or rustls would own: post-handshake messages, key updates and the
+  cipher's confidentiality limit. Keep it only while a whole-path measurement
+  shows a material win; otherwise take stock rustls.
 
 ## Defaults
 

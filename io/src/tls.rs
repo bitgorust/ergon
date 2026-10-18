@@ -7,8 +7,12 @@
 //! - How: drive `UnbufferedClientConnection` to `WriteTraffic`, call
 //!   `dangerous_into_kernel_connection` (the kTLS-style API), then run
 //!   AES-GCM or ChaCha20-Poly1305 with ring.
-//! - The returned `KernelConnection` still handles post-handshake messages
-//!   (session tickets, key updates).
+//! - What the kernel API does *not* do: [`KernelConnection`] stores a session
+//!   ticket body it is handed and computes new traffic secrets, and stops
+//!   there. Parsing post-handshake messages, reassembling one that a peer
+//!   split across records, dispatching it, and honouring the cipher suite's
+//!   confidentiality limit are this module's, because rustls leaves those to
+//!   the caller.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -30,6 +34,11 @@ pub const HEADER_LEN: usize = 5;
 pub const TAG_LEN: usize = 16;
 /// Largest TLS 1.3 record on the wire: 2^14 plaintext + content type + padding + tag.
 pub const MAX_RECORD: usize = HEADER_LEN + (1 << 14) + 256;
+
+/// Largest post-handshake handshake message this layer will reassemble. A
+/// `NewSessionTicket` is far smaller; the bound stops a peer from making us
+/// buffer without limit.
+pub const MAX_HS_MSG: usize = 1 << 18;
 
 const CT_ALERT: u8 = 21;
 const CT_HANDSHAKE: u8 = 22;
@@ -60,13 +69,31 @@ pub fn client_config_with(
     provider: Arc<rustls::crypto::CryptoProvider>,
     extract_secrets: bool,
 ) -> Result<Arc<ClientConfig>> {
+    client_config_with_store(
+        roots,
+        provider,
+        extract_secrets,
+        Arc::new(NonBlockingSessionStore::new(256)),
+    )
+}
+
+/// A TLS 1.3 client config whose session tickets land in `store`.
+///
+/// # Errors
+/// The provider rejects TLS 1.3.
+pub fn client_config_with_store(
+    roots: RootCertStore,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    extract_secrets: bool,
+    store: Arc<dyn rustls::client::ClientSessionStore>,
+) -> Result<Arc<ClientConfig>> {
     let mut cfg = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
         .with_no_client_auth();
     cfg.enable_secret_extraction = extract_secrets;
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-    cfg.resumption = rustls::client::Resumption::store(Arc::new(NonBlockingSessionStore::new(256)));
+    cfg.resumption = rustls::client::Resumption::store(store);
     Ok(Arc::new(cfg))
 }
 
@@ -98,10 +125,18 @@ pub struct NonBlockingSessionStore(std::sync::Mutex<rustls::client::ClientSessio
 
 impl NonBlockingSessionStore {
     /// A store holding tickets for up to `size` servers.
+    ///
+    /// Two is the floor, even when one server is asked for. rustls's cache
+    /// keeps at most eight tickets per server and, at one server slot, evicts
+    /// the oldest key whenever a new key fills the ring — which drops the
+    /// ticket it has just stored. Two slots keep the first ticket and make
+    /// `size` mean what it says.
     #[must_use]
     pub fn new(size: usize) -> Self {
+        const SESSIONS_PER_SERVER: usize = 8;
+        let servers = size.max(2);
         Self(std::sync::Mutex::new(
-            rustls::client::ClientSessionMemoryCache::new(size),
+            rustls::client::ClientSessionMemoryCache::new(servers * SESSIONS_PER_SERVER),
         ))
     }
 
@@ -169,6 +204,41 @@ struct Direction {
     seq: u64,
 }
 
+/// Records under one key before a proactive `KeyUpdate`: half the cipher's
+/// confidentiality limit, so a peer that is slow to answer still has a wide
+/// margin. ChaCha20-Poly1305 has no practical limit; it gets a long period so
+/// the record counter never approaches the nonce.
+fn default_key_update_at(limit: u64) -> u64 {
+    if limit == u64::MAX {
+        1 << 62
+    } else {
+        (limit / 2).max(1)
+    }
+}
+
+/// One handshake message split off the front of a buffer: its type, its body
+/// and whatever follows.
+type HsMessage<'a> = Option<(u8, &'a [u8], &'a [u8])>;
+
+/// Splits one handshake message off the front of `buf`.
+///
+/// `Ok(None)` means the message runs past the end of `buf`: a fragment of a
+/// message that continues in a later record (RFC 8446 §5.1).
+fn split_hs_message(buf: &[u8]) -> Result<HsMessage<'_>> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+    let len = usize::from(buf[1]) << 16 | usize::from(buf[2]) << 8 | usize::from(buf[3]);
+    if len > MAX_HS_MSG - 4 {
+        return Err(Error::Record("post-handshake message too large"));
+    }
+    let total = 4 + len;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    Ok(Some((buf[0], &buf[4..total], &buf[total..])))
+}
+
 impl Direction {
     fn new(seq: u64, secrets: &ConnectionTrafficSecrets) -> Result<Self> {
         let (alg, key, iv) = match secrets {
@@ -213,15 +283,105 @@ pub enum Opened {
 }
 
 /// The TLS 1.3 record layer after the handshake.
+///
+/// rustls's [`KernelConnection`] stores session tickets and computes new
+/// traffic secrets. Everything else about post-handshake messages — parsing,
+/// reassembly across records, dispatch — and the cipher suite's
+/// confidentiality limit is this type's, because the kernel API leaves those
+/// to the caller.
 pub struct RecordLayer {
     rx: Direction,
     tx: Direction,
     kconn: KernelConnection<ClientConnectionData>,
     /// Number of records opened.
     pub records_in: u64,
+    /// Bytes of a post-handshake handshake message that arrived split across
+    /// records. Empty on the common path, where a message sits whole inside
+    /// one record and never touches this buffer.
+    hs: Vec<u8>,
+    /// Records opened under one key before the layer refuses: the negotiated
+    /// suite's confidentiality limit, or an operator's tighter policy.
+    limit: u64,
+    /// Records under one key before a proactive `KeyUpdate` goes out.
+    key_update_at: u64,
+    /// Key updates applied, in either direction.
+    key_updates: u64,
+    /// A `KeyUpdate(update_requested)` is in flight. Do not send another
+    /// until the peer's reply has rotated the receive key.
+    rx_rekey_requested: bool,
 }
 
 impl RecordLayer {
+    /// Builds the record layer from the secrets of a completed handshake.
+    /// This is the kTLS-style entry point: drive the handshake yourself and
+    /// hand over what rustls extracted.
+    ///
+    /// # Errors
+    /// The secrets name a cipher suite this layer cannot run.
+    pub fn from_parts(
+        secrets: &rustls::ExtractedSecrets,
+        kconn: KernelConnection<ClientConnectionData>,
+    ) -> Result<Self> {
+        let limit = kconn
+            .negotiated_cipher_suite()
+            .tls13()
+            .map_or(u64::MAX, |s| s.common.confidentiality_limit);
+        let key_update_at = default_key_update_at(limit);
+        Ok(Self {
+            rx: Direction::new(secrets.rx.0, &secrets.rx.1)?,
+            tx: Direction::new(secrets.tx.0, &secrets.tx.1)?,
+            kconn,
+            records_in: 0,
+            hs: Vec::with_capacity(MAX_HS_MSG),
+            limit,
+            key_update_at,
+            key_updates: 0,
+            rx_rekey_requested: false,
+        })
+    }
+
+    /// Records that may be sealed or opened under one key before the layer
+    /// refuses: the negotiated suite's confidentiality limit.
+    #[must_use]
+    pub const fn record_limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// Records under one key before a proactive `KeyUpdate` goes out. Always
+    /// below [`RecordLayer::record_limit`].
+    #[must_use]
+    pub const fn key_update_at(&self) -> u64 {
+        self.key_update_at
+    }
+
+    /// Sets the proactive `KeyUpdate` threshold. Clamped below
+    /// [`RecordLayer::record_limit`]; `0` means "rotate before the first
+    /// record". `u64::MAX` turns the proactive update off, so the hard limit
+    /// is what stops the key.
+    pub fn set_key_update_at(&mut self, n: u64) -> &mut Self {
+        self.key_update_at = if n == u64::MAX {
+            u64::MAX
+        } else {
+            n.min(self.limit.saturating_sub(1))
+        };
+        self
+    }
+
+    /// Sets the hard record limit for one key, replacing the suite's
+    /// confidentiality limit. Clamped to at least 1. Use it to rekey earlier
+    /// than the cipher requires, never later.
+    pub fn set_record_limit(&mut self, n: u64) -> &mut Self {
+        self.limit = n.max(1);
+        self.set_key_update_at(self.key_update_at);
+        self
+    }
+
+    /// Key updates applied, in either direction.
+    #[must_use]
+    pub const fn key_updates(&self) -> u64 {
+        self.key_updates
+    }
+
     /// Length of the complete record at the front of `buf`, if it has fully arrived.
     ///
     /// # Errors
@@ -249,6 +409,9 @@ impl RecordLayer {
     /// # Errors
     /// AEAD failure, an alert, or a malformed post-handshake message.
     pub fn open_in_place(&mut self, record: &mut [u8], tx_out: &mut Vec<u8>) -> Result<Opened> {
+        if self.rx.seq >= self.limit {
+            return Err(Error::Record("confidentiality limit reached"));
+        }
         let mut aad = [0u8; HEADER_LEN];
         aad.copy_from_slice(&record[..HEADER_LEN]);
         let nonce = self.rx.next_nonce();
@@ -280,44 +443,121 @@ impl RecordLayer {
         }
     }
 
-    fn handle_handshake(&mut self, mut msgs: &[u8], tx_out: &mut Vec<u8>) -> Result<()> {
-        while !msgs.is_empty() {
-            if msgs.len() < 4 {
-                return Err(Error::Record("truncated handshake message"));
-            }
-            let typ = msgs[0];
-            let len = usize::from(msgs[1]) << 16 | usize::from(msgs[2]) << 8 | usize::from(msgs[3]);
-            if msgs.len() < 4 + len {
-                return Err(Error::Record("handshake message split across records"));
-            }
-            let body = &msgs[4..4 + len];
-            match typ {
-                HS_NEW_SESSION_TICKET => self.kconn.handle_new_session_ticket(body)?,
-                HS_KEY_UPDATE => {
-                    let (seq, secrets) = self.kconn.update_rx_secret()?;
-                    self.rx = Direction::new(seq, &secrets)?;
-                    if body.first() == Some(&1) {
-                        // update_requested: answer with our own KeyUpdate under the
-                        // old key, then switch our sending key.
-                        self.seal(CT_HANDSHAKE, &[HS_KEY_UPDATE, 0, 0, 1, 0], tx_out)?;
-                        let (seq, secrets) = self.kconn.update_tx_secret()?;
-                        self.tx = Direction::new(seq, &secrets)?;
-                    }
+    /// Dispatches the handshake bytes of one record. TLS 1.3 allows a
+    /// handshake message to span records (RFC 8446 §5.1) and a server does
+    /// exactly that with a session ticket, so a runt is a fragment to hold,
+    /// not an error.
+    fn handle_handshake(&mut self, msgs: &[u8], tx_out: &mut Vec<u8>) -> Result<()> {
+        if self.hs.is_empty() {
+            let mut rest = msgs;
+            while !rest.is_empty() {
+                if let Some((typ, body, next)) = split_hs_message(rest)? {
+                    self.dispatch_hs(typ, body, tx_out)?;
+                    rest = next;
+                } else {
+                    self.append_hs(rest)?;
+                    return Ok(());
                 }
-                _ => return Err(Error::Record("unexpected post-handshake message")),
             }
-            msgs = &msgs[4 + len..];
+            return Ok(());
         }
+        self.append_hs(msgs)?;
+        self.drain_hs(tx_out)
+    }
+
+    /// Copies a fragment into the reassembly buffer. The buffer is reserved
+    /// once at construction, so this does not allocate.
+    fn append_hs(&mut self, more: &[u8]) -> Result<()> {
+        if self.hs.len() + more.len() > MAX_HS_MSG {
+            return Err(Error::Record("post-handshake message too large"));
+        }
+        self.hs.extend_from_slice(more);
+        Ok(())
+    }
+
+    /// Dispatches every message now complete in the reassembly buffer.
+    fn drain_hs(&mut self, tx_out: &mut Vec<u8>) -> Result<()> {
+        let mut buf = std::mem::take(&mut self.hs);
+        let r = self.drain_hs_from(&mut buf, tx_out);
+        self.hs = buf;
+        r
+    }
+
+    fn drain_hs_from(&mut self, buf: &mut Vec<u8>, tx_out: &mut Vec<u8>) -> Result<()> {
+        while !buf.is_empty() {
+            let Some((typ, body, next)) = split_hs_message(buf)? else {
+                return Ok(());
+            };
+            let consumed = buf.len() - next.len();
+            self.dispatch_hs(typ, body, tx_out)?;
+            buf.drain(..consumed);
+        }
+        Ok(())
+    }
+
+    fn dispatch_hs(&mut self, typ: u8, body: &[u8], tx_out: &mut Vec<u8>) -> Result<()> {
+        match typ {
+            HS_NEW_SESSION_TICKET => Ok(self.kconn.handle_new_session_ticket(body)?),
+            HS_KEY_UPDATE => {
+                if body.len() != 1 {
+                    return Err(Error::Record("malformed key update"));
+                }
+                let (seq, secrets) = self.kconn.update_rx_secret()?;
+                self.rx = Direction::new(seq, &secrets)?;
+                self.key_updates += 1;
+                self.rx_rekey_requested = false;
+                if body[0] == 1 {
+                    // update_requested: answer with our own KeyUpdate under the
+                    // old key, then switch our sending key.
+                    self.seal_inner(CT_HANDSHAKE, &[HS_KEY_UPDATE, 0, 0, 1, 0], tx_out)?;
+                    let (seq, secrets) = self.kconn.update_tx_secret()?;
+                    self.tx = Direction::new(seq, &secrets)?;
+                    self.key_updates += 1;
+                }
+                Ok(())
+            }
+            _ => Err(Error::Record("unexpected post-handshake message")),
+        }
+    }
+
+    /// Rotates the sending key before it gets old. One message covers both
+    /// directions: `update_requested` is set when the *receive* key is the one
+    /// that needs the peer to move, and the sender of a `KeyUpdate` always
+    /// switches its own sending key.
+    fn maybe_rekey(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        let tx_due = self.tx.seq >= self.key_update_at;
+        let rx_due = self.rx.seq >= self.key_update_at && !self.rx_rekey_requested;
+        if !tx_due && !rx_due {
+            return Ok(());
+        }
+        self.seal_inner(
+            CT_HANDSHAKE,
+            &[HS_KEY_UPDATE, 0, 0, 1, u8::from(rx_due)],
+            out,
+        )?;
+        let (seq, secrets) = self.kconn.update_tx_secret()?;
+        self.tx = Direction::new(seq, &secrets)?;
+        self.key_updates += 1;
+        self.rx_rekey_requested |= rx_due;
         Ok(())
     }
 
     /// Encrypts `payload` as one record of `inner_type` and appends it to `out`.
     ///
     /// # Errors
-    /// The payload is larger than one record.
+    /// The payload is larger than one record, or the sending key has reached
+    /// its confidentiality limit.
     pub fn seal(&mut self, inner_type: u8, payload: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        self.maybe_rekey(out)?;
+        self.seal_inner(inner_type, payload, out)
+    }
+
+    fn seal_inner(&mut self, inner_type: u8, payload: &[u8], out: &mut Vec<u8>) -> Result<()> {
         if payload.len() > 1 << 14 {
             return Err(Error::Record("payload larger than one record"));
+        }
+        if self.tx.seq >= self.limit {
+            return Err(Error::Record("confidentiality limit reached"));
         }
         let start = out.len();
         let ct_len = payload.len() + 1 + TAG_LEN;
@@ -342,12 +582,25 @@ impl RecordLayer {
     /// directly after the header, so the payload is written exactly once.
     ///
     /// # Errors
-    /// `build` fails or produces more than one record of plaintext.
+    /// `build` fails, produces more than one record of plaintext, or the
+    /// sending key has reached its confidentiality limit.
     pub fn seal_build(
         &mut self,
         out: &mut Vec<u8>,
         build: impl FnOnce(&mut Vec<u8>) -> Result<()>,
     ) -> Result<()> {
+        self.maybe_rekey(out)?;
+        self.seal_build_inner(out, build)
+    }
+
+    fn seal_build_inner(
+        &mut self,
+        out: &mut Vec<u8>,
+        build: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        if self.tx.seq >= self.limit {
+            return Err(Error::Record("confidentiality limit reached"));
+        }
         let start = out.len();
         out.extend_from_slice(&[CT_APPDATA, 0x03, 0x03, 0, 0]);
         if let Err(e) = build(out) {
@@ -537,13 +790,7 @@ impl TlsHandshake {
     /// The handshake is not complete or negotiated an unsupported suite.
     pub fn finish(self) -> Result<(RecordLayer, Vec<u8>)> {
         let (secrets, kconn, rest) = self.finish_raw()?;
-        let layer = RecordLayer {
-            rx: Direction::new(secrets.rx.0, &secrets.rx.1)?,
-            tx: Direction::new(secrets.tx.0, &secrets.tx.1)?,
-            kconn,
-            records_in: 0,
-        };
-        Ok((layer, rest))
+        Ok((RecordLayer::from_parts(&secrets, kconn)?, rest))
     }
 
     /// Like [`TlsHandshake::finish`] with the raw secrets.
