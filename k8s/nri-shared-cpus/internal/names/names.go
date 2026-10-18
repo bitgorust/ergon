@@ -72,12 +72,18 @@ const (
 	EnvOpenShiftShared = "OPENSHIFT_SHARED_CPUS"
 
 	// EnvIsolatedCgroup is the child cgroup that holds the exclusive CPUs as
-	// an isolated partition (cpu-partition.ergon.io). A process moves into it
-	// by writing its pid to $ERGON_ISOLATED_CGROUP/cgroup.procs, which takes
-	// every thread of that process. One hot thread of a multi-threaded program
-	// cannot be moved alone: cgroup.threads needs a threaded subtree, which
-	// cannot use cpuset partitions. Pin such a thread to EnvIsolated with
-	// sched_setaffinity instead.
+	// an isolated partition (cpu-partition.ergon.io). It is a threaded child,
+	// so both kinds of move work here: a whole process with
+	// $ERGON_ISOLATED_CGROUP/cgroup.procs, and one thread of a multi-threaded
+	// program with $ERGON_ISOLATED_CGROUP/cgroup.threads. The kernel then
+	// confines that thread to the exclusive CPUs and keeps the helpers on the
+	// container's shared CPUs. A thread moves across the threaded subtree
+	// only once its whole process is inside it: put the process in with
+	// cgroup.procs first, then move the threads.
+	//
+	// In a threaded child, cgroup.procs is write-only: reading it is
+	// EOPNOTSUPP, because the processes belong to the thread root. Read
+	// cgroup.threads for the membership list.
 	EnvIsolatedCgroup = "ERGON_ISOLATED_CGROUP"
 	// EnvHugepagesDir is the sized hugetlbfs mount the plugin gave the pod.
 	EnvHugepagesDir = "ERGON_HUGEPAGES_DIR"

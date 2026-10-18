@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# gofmt, go vet, go test -race and a static build for amd64 and arm64.
-# Runs in a golang container, so nothing is installed on the host.
-#   scripts/check.sh            in Docker (needs only docker)
-#   scripts/check.sh --local    with the go on PATH (CI)
+# gofmt, go vet, go test -race and a static build for amd64 and arm64, then
+# the cgroup kernel lane. Both run in a golang container, so nothing is
+# installed on the host.
+#   scripts/check.sh            both lanes in Docker (needs only docker)
+#   scripts/check.sh --local    the unit lane with the go on PATH (CI)
+#   scripts/check-cgroup.sh     the cgroup kernel lane on its own
 # Extra `docker run` arguments, e.g. a module cache volume:
 #   CHECK_DOCKER_ARGS="-v my-gomod:/go/pkg/mod" scripts/check.sh
 set -euo pipefail
@@ -19,9 +21,12 @@ if [[ "${1:-}" != "--local" ]]; then
     # capability, because containerd runs hooks as root with full
     # capabilities. The tests must run where the write can succeed.
     # shellcheck disable=SC2086 # CHECK_DOCKER_ARGS is a list of arguments
-    exec docker run --rm --name "ergon-nri-check-$$" --cap-add=SYS_NICE \
+    docker run --rm --name "ergon-nri-check-$$" --cap-add=SYS_NICE \
         -v "$here":/src -w /src ${CHECK_DOCKER_ARGS:-} \
         "$image" bash scripts/check.sh --local
+    # The cgroup kernel lane needs a privileged container with the host's
+    # cgroup namespace; see scripts/check-cgroup.sh.
+    exec "$here/scripts/check-cgroup.sh"
 fi
 
 cd "$here"

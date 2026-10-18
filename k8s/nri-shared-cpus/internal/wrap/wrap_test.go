@@ -77,6 +77,71 @@ func TestFromEnvRejectsListOutsideCPUs(t *testing.T) {
 	}
 }
 
+// TestFromEnvAcceptsAnIsolatedPartition is the P2 regression: a valid child
+// partition takes the exclusive CPUs out of the container's
+// cpuset.cpus.effective, so the wrapper cannot require E to be in the
+// container's own set. E belongs to the partition; S stays with the
+// container.
+func TestFromEnvAcceptsAnIsolatedPartition(t *testing.T) {
+	dir := t.TempDir()
+	// The container keeps only the shared CPUs; the partition holds E.
+	if err := os.WriteFile(filepath.Join(dir, "cpuset.cpus.effective"), []byte("1-9\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "ergon-isolated"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ergon-isolated", "cpuset.cpus"), []byte("0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := FromEnv(testEnv("0", "1,5", "", ""), filepath.Join(dir, "cpuset.cpus.effective"), t.TempDir())
+	if err != nil {
+		t.Fatalf("a valid isolated partition must be accepted: %v", err)
+	}
+	if p.Isolated.List() != "0" || p.Shared.List() != "1,5" {
+		t.Fatalf("plan is %+v", p)
+	}
+}
+
+// TestFromEnvRejectsAnIsolatedListThatIsNotThePartition: the partition holds
+// exactly E. A different E means the wrapper would name CPUs the hot thread
+// does not get.
+func TestFromEnvRejectsAnIsolatedListThatIsNotThePartition(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cpuset.cpus.effective"), []byte("1-9\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "ergon-isolated"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ergon-isolated", "cpuset.cpus"), []byte("2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := FromEnv(testEnv("0", "1", "", ""), filepath.Join(dir, "cpuset.cpus.effective"), t.TempDir())
+	if err == nil {
+		t.Fatal("FromEnv accepted an isolated list that is not the partition's cpuset")
+	}
+}
+
+// TestFromEnvRejectsSharedOutsideWhatIsLeft: the helpers run on the CPUs the
+// container still has. A shared CPU that the partition took is a contradiction.
+func TestFromEnvRejectsSharedOutsideWhatIsLeft(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cpuset.cpus.effective"), []byte("1-3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "ergon-isolated"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ergon-isolated", "cpuset.cpus"), []byte("0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := FromEnv(testEnv("0", "0,1", "", ""), filepath.Join(dir, "cpuset.cpus.effective"), t.TempDir())
+	if err == nil {
+		t.Fatal("FromEnv accepted a shared CPU the partition holds")
+	}
+}
+
 func TestFromEnvRejectsOverlap(t *testing.T) {
 	env := testEnv("1,2", "2,3", "", "")
 	_, err := FromEnv(env, writeCPUs(t, "1-3"), t.TempDir())

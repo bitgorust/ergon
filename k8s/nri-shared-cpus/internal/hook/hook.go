@@ -6,12 +6,14 @@
 // written and before the user program starts. Every thread the program later
 // creates inherits the mask.
 //
-// The isolated child takes whole processes, not single threads. cgroup.procs
-// moves a thread group and cgroup.threads only exists in a threaded subtree,
-// which cannot use cpuset partitions, so one hot thread of a multi-threaded
-// program stays in the container cgroup and is placed with sched_setaffinity
-// (see PinProcess and the ergon-cpus wrapper). Use the partition when every
-// thread of the process belongs on the exclusive CPUs.
+// The isolated child is a threaded cpuset partition, so both kinds of move
+// work: a whole process through cgroup.procs, and one thread of a
+// multi-threaded program through cgroup.threads. The kernel confines each to
+// the exclusive CPUs and keeps the helpers on the container's shared CPUs.
+// A thread can only move inside the threaded subtree once its whole process
+// is in there, so put the process in first and then scatter the threads. Use
+// the partition when the threads that matter belong on the exclusive CPUs;
+// PinProcess is the sched_setaffinity path for when there is no partition.
 package hook
 
 import (
@@ -267,6 +269,14 @@ func ApplyPartition(plan *cpuset.Plan) error {
 			if err := writeCPUList(w.Path, w.Value); err != nil {
 				return err
 			}
+		case cpuset.WriteSubtreeControl:
+			if err := enableController(w.Path, w.Value); err != nil {
+				return fmt.Errorf("hook: enable %s in %s: %w", w.Value, w.Path, err)
+			}
+		case cpuset.WriteCgroupType:
+			if err := writeCgroupType(w.Path, w.Value); err != nil {
+				return err
+			}
 		default:
 			if err := writeAndVerify(w.Path, w.Value); err != nil {
 				return err
@@ -343,6 +353,54 @@ func writeCPUList(path, value string) error {
 		return fmt.Errorf("hook: %s is %s after writing %s", path, have.List(), want.List())
 	}
 	return nil
+}
+
+// enableController adds name to the space-separated controller list in
+// cgroup.subtree_control, keeping whatever is already enabled there. A child
+// has no cpuset.* files until the parent enables the controller, so this is
+// the write that gives the isolated child its cpuset files at all. Writing a
+// controller that is already enabled is a no-op, so a re-run is safe.
+func enableController(path, name string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	for _, f := range strings.Fields(string(data)) {
+		if strings.TrimPrefix(f, "+") == name {
+			return nil
+		}
+	}
+	// cgroup.subtree_control takes operations, not a list of what is already
+	// on: "+name" enables, "-name" disables, and a bare name is EINVAL
+	// (cgroup-v2.rst, "cgroup.subtree_control"). Write the one operation and
+	// leave the rest alone; echoing the current state back would be an
+	// invalid write on every kernel.
+	if err := os.WriteFile(path, []byte("+"+name+"\n"), 0o644); err != nil {
+		return fmt.Errorf("hook: write %s=%q: %w", path, "+"+name, err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("hook: read back %s: %w", path, err)
+	}
+	for _, f := range strings.Fields(string(got)) {
+		if strings.TrimPrefix(f, "+") == name {
+			return nil
+		}
+	}
+	return fmt.Errorf("hook: %s is %q after enabling %s", path, strings.TrimSpace(string(got)), name)
+}
+
+// writeCgroupType writes cgroup.type once. "threaded" is a one-way switch, so
+// a child that is already threaded is left alone rather than rewritten: the
+// kernel owns that transition and a repeat write is not a supported way to
+// check it.
+func writeCgroupType(path, value string) error {
+	if data, err := os.ReadFile(path); err == nil {
+		if strings.TrimSpace(string(data)) == value {
+			return nil
+		}
+	}
+	return writeAndVerify(path, value)
 }
 
 // writeAndVerify writes value to path and reads the same text back. It is for

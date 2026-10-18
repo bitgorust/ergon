@@ -28,6 +28,19 @@ const (
 	WriteExclusiveAdd WriteKind = "cpuset.cpus.exclusive+"
 	// WritePartition writes cpuset.cpus.partition.
 	WritePartition WriteKind = "cpuset.cpus.partition"
+	// WriteSubtreeControl enables the controller named by Value in the
+	// cgroup's cgroup.subtree_control, keeping whatever is already enabled.
+	// A child cgroup has no cpuset.* files at all until the parent enables
+	// the controller there: writing cpuset.cpus first is a write to a file
+	// that does not exist. A populated container can only host a cpuset
+	// child as a threaded domain (cgroup-v2.rst, "Threads").
+	WriteSubtreeControl WriteKind = "cgroup.subtree_control+"
+	// WriteCgroupType writes cgroup.type. A child created under a threaded
+	// domain is "domain invalid": it takes no task, and the move fails with
+	// EOPNOTSUPP, until this says "threaded". A threaded child is still a
+	// legal cpuset partition root, which is what lets one hot thread live on
+	// the exclusive CPUs while the helpers stay on the shared ones.
+	WriteCgroupType WriteKind = "cgroup.type"
 )
 
 // Write is one filesystem write in a partition plan. Path is absolute; Value
@@ -57,6 +70,14 @@ type Plan struct {
 // containerCgroup is the container's own cgroup directory. exclusive is the
 // container's exclusive CPUs (ERGON_ISOLATED_CPUS); shared is the CPUs helpers
 // use (ERGON_SHARED_CPUS).
+//
+// The hierarchy is part of the plan, not a precondition. A child cgroup has
+// no cpuset.* files until the container enables the controller in its
+// cgroup.subtree_control, and a populated container can only host a cpuset
+// child as a threaded domain: the child is then created "domain invalid" and
+// takes no task until its cgroup.type says "threaded". A threaded child is
+// still a legal cpuset partition root, so one hot thread can live on the
+// exclusive CPUs while the helpers stay on the container's shared CPUs.
 //
 // The plan never writes "isolated" on a cgroup that holds shared CPUs: the
 // child's cpuset.cpus is exactly exclusive, and an exclusive/shared overlap is
@@ -93,6 +114,24 @@ func PartitionPlan(cgroupRoot, containerCgroup string, exclusive, shared Set) (*
 	child := filepath.Join(dir, "ergon-isolated")
 	plan := &Plan{Child: child}
 	plan.Writes = append(plan.Writes, Write{Kind: WriteMkdir, Path: child})
+
+	// The controller has to be enabled on the container before the child can
+	// have cpuset files, and the child has to be threaded before it can take
+	// a task. The kernel owns that order too: a populated container that
+	// enables a threaded controller becomes a threaded domain, and a child
+	// created under a threaded domain is "domain invalid" until its
+	// cgroup.type says "threaded".
+	plan.Writes = append(plan.Writes, Write{
+		Kind:  WriteSubtreeControl,
+		Path:  filepath.Join(dir, "cgroup.subtree_control"),
+		Value: "cpuset",
+	})
+	plan.Writes = append(plan.Writes, Write{
+		Kind:  WriteCgroupType,
+		Path:  filepath.Join(child, "cgroup.type"),
+		Value: "threaded",
+	})
+
 	plan.Writes = append(plan.Writes, Write{Kind: WriteCpus, Path: filepath.Join(child, "cpuset.cpus"), Value: exclusive.List()})
 
 	// cpuset.cpus.exclusive down the hierarchy, outermost first, so each

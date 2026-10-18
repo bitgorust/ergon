@@ -37,9 +37,15 @@ type Plan struct {
 	Milli int
 }
 
-// FromEnv reads the plugin's env and checks both lists are inside the
-// container's cpuset. sysRoot is usually /sys (cores are read from it when
-// ERGON_ISOLATED_CORES is missing). env is usually os.Environ.
+// FromEnv reads the plugin's env and checks both lists against the CPUs the
+// kernel actually gave this container. Without a partition both are inside
+// the container's cpuset. With one, the exclusive list is the partition
+// child's cpuset exactly and the shared list is inside what is left of the
+// container's: a valid partition takes the exclusive CPUs out of the
+// container's cpuset.cpus.effective.
+//
+// sysRoot is usually /sys (cores are read from it when ERGON_ISOLATED_CORES
+// is missing). env is usually os.Environ.
 func FromEnv(env []string, cgroupCPUs, sysRoot string) (*Plan, error) {
 	get := func(key string) (string, bool) {
 		for _, e := range env {
@@ -111,16 +117,48 @@ func FromEnv(env []string, cgroupCPUs, sysRoot string) (*Plan, error) {
 		return nil, fmt.Errorf("%s: %w", cgroupCPUs, err)
 	}
 	p.Allowed = allowed
-	if missing := iso.Difference(allowed); !missing.IsEmpty() {
-		return nil, fmt.Errorf("%s is %s, which is not in %s (%s)", names.EnvIsolated, missing, cgroupCPUs, allowed)
-	}
-	if missing := shared.Difference(allowed); !missing.IsEmpty() {
-		return nil, fmt.Errorf("%s is %s, which is not in %s (%s)", names.EnvShared, missing, cgroupCPUs, allowed)
+	// A valid isolated partition takes the exclusive CPUs out of the
+	// container's cpuset.cpus.effective, so E is not in Allowed and cannot
+	// be checked against it. E belongs to the partition child; S stays with
+	// the container. Without a partition, both are in the container's set.
+	part, hasPart := partitionCPUs(filepath.Dir(cgroupCPUs))
+	if hasPart {
+		if !iso.Equals(part) {
+			return nil, fmt.Errorf("%s is %s, but the isolated partition %s holds %s",
+				names.EnvIsolated, iso, filepath.Join(filepath.Dir(cgroupCPUs), names.CpuPartitionChild), part)
+		}
+		if missing := shared.Difference(allowed); !missing.IsEmpty() {
+			return nil, fmt.Errorf("%s is %s, which is not in %s (%s)", names.EnvShared, missing, cgroupCPUs, allowed)
+		}
+	} else {
+		if missing := iso.Difference(allowed); !missing.IsEmpty() {
+			return nil, fmt.Errorf("%s is %s, which is not in %s (%s)", names.EnvIsolated, missing, cgroupCPUs, allowed)
+		}
+		if missing := shared.Difference(allowed); !missing.IsEmpty() {
+			return nil, fmt.Errorf("%s is %s, which is not in %s (%s)", names.EnvShared, missing, cgroupCPUs, allowed)
+		}
 	}
 	if both := iso.Intersection(shared); !both.IsEmpty() {
 		return nil, fmt.Errorf("CPU %s is both isolated and shared", both)
 	}
 	return p, nil
+}
+
+// partitionCPUs reads the isolated child's cpuset.cpus, under the container
+// directory that cgroupCPUs lives in. The second result is false when there
+// is no partition, or when the child exists but holds no CPUs yet. A child
+// holding CPUs is the partition: those CPUs are no longer in the container's
+// own effective set, which is exactly the case the caller has to allow.
+func partitionCPUs(containerDir string) (cpuset.Set, bool) {
+	data, err := os.ReadFile(filepath.Join(containerDir, names.CpuPartitionChild, "cpuset.cpus"))
+	if err != nil {
+		return cpuset.Set{}, false
+	}
+	set, err := cpuset.Parse(strings.TrimSpace(string(data)))
+	if err != nil || set.IsEmpty() {
+		return cpuset.Set{}, false
+	}
+	return set, true
 }
 
 // Resolve turns one SPEC into a value for an environment variable.

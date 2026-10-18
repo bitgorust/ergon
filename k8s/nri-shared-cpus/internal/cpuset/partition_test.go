@@ -209,6 +209,81 @@ func TestPartitionPlanExclusiveValueIsOnlyE(t *testing.T) {
 	}
 }
 
+// TestPartitionPlanEnablesCpusetOnTheContainer is the P1 regression: a child
+// cgroup has no cpuset.* files until the parent enables the controller in its
+// cgroup.subtree_control. Writing cpuset.cpus on the child first fails with
+// "Permission denied" on a real kernel. The plan has to write +cpuset on the
+// container itself, before any cpuset write on the child.
+func TestPartitionPlanEnablesCpusetOnTheContainer(t *testing.T) {
+	e := mustParse(t, "2,3")
+	s := mustParse(t, "0")
+	plan, err := PartitionPlan(cgroupRoot, containerCgroup, e, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := -1
+	for i, w := range plan.Writes {
+		if w.Kind == WriteSubtreeControl {
+			if w.Path != containerCgroup+"/cgroup.subtree_control" {
+				t.Errorf("subtree_control write on %q, want the container cgroup", w.Path)
+			}
+			if w.Value != "cpuset" {
+				t.Errorf("subtree_control value %q, want the cpuset controller", w.Value)
+			}
+			at = i
+		}
+	}
+	if at < 0 {
+		t.Fatal("no +cpuset write on the container's cgroup.subtree_control: the child would have no cpuset files at all")
+	}
+	for i, w := range plan.Writes {
+		if w.Kind == WriteCpus && i < at {
+			t.Errorf("child cpuset.cpus at %d comes before the +cpuset write at %d", i, at)
+		}
+	}
+}
+
+// TestPartitionPlanMakesTheChildThreaded is the other half of the P1: a
+// populated container that enables a threaded controller becomes a threaded
+// domain, and a child created under it is "domain invalid" — it accepts no
+// task, with EOPNOTSUPP, until cgroup.type is written "threaded". The
+// threaded child is still a legal cpuset partition, so one hot thread can
+// live there and the helpers stay on the container's shared CPUs.
+func TestPartitionPlanMakesTheChildThreaded(t *testing.T) {
+	e := mustParse(t, "2,3")
+	s := mustParse(t, "0")
+	plan, err := PartitionPlan(cgroupRoot, containerCgroup, e, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	typeAt, subtreeAt := -1, -1
+	for i, w := range plan.Writes {
+		switch {
+		case w.Kind == WriteSubtreeControl:
+			subtreeAt = i
+		case w.Kind == WriteCgroupType:
+			typeAt = i
+			if w.Path != plan.Child+"/cgroup.type" {
+				t.Errorf("cgroup.type write on %q, want the child", w.Path)
+			}
+			if w.Value != "threaded" {
+				t.Errorf("cgroup.type value %q, want threaded", w.Value)
+			}
+		}
+	}
+	if typeAt < 0 {
+		t.Fatal("no cgroup.type=threaded write on the child: it stays domain invalid and takes no task")
+	}
+	if subtreeAt >= 0 && typeAt < subtreeAt {
+		t.Errorf("cgroup.type at %d comes before the +cpuset write at %d", typeAt, subtreeAt)
+	}
+	for i, w := range plan.Writes {
+		if w.Kind == WriteCpus && i < typeAt {
+			t.Errorf("child cpuset.cpus at %d comes before cgroup.type at %d", i, typeAt)
+		}
+	}
+}
+
 // TestPartitionPlanOnlyTheChildReplaces is the P1 regression: cpuset.cpus.
 // exclusive is a replace, not a union. Every directory a partition shares with
 // another container's has to be written as a union with what is already

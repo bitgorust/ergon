@@ -104,6 +104,8 @@ func TestKernelAtLeast(t *testing.T) {
 // writeTree is a tiny fake cgroup tree. Every level below root gets an empty
 // cpuset.cpus.exclusive, which is what a real cgroup shows while nothing is
 // reserved there, so a plan can union into it. The root has no such file.
+// Each level also gets the core files a real cgroup v2 directory has:
+// cgroup.subtree_control (nothing enabled) and cgroup.type ("domain").
 func writeTree(t *testing.T, root, rel string) string {
 	t.Helper()
 	dir := filepath.Join(root, rel)
@@ -111,12 +113,18 @@ func writeTree(t *testing.T, root, rel string) string {
 		t.Fatal(err)
 	}
 	for cur := dir; cur != root && cur != "/"; cur = filepath.Dir(cur) {
-		ex := filepath.Join(cur, "cpuset.cpus.exclusive")
-		if _, err := os.Stat(ex); err == nil {
-			continue
-		}
-		if err := os.WriteFile(ex, []byte("\n"), 0o644); err != nil {
-			t.Fatal(err)
+		for name, seed := range map[string]string{
+			"cpuset.cpus.exclusive":  "\n",
+			"cgroup.subtree_control": "\n",
+			"cgroup.type":            "domain\n",
+		} {
+			p := filepath.Join(cur, name)
+			if _, err := os.Stat(p); err == nil {
+				continue
+			}
+			if err := os.WriteFile(p, []byte(seed), 0o644); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	return dir
@@ -168,6 +176,62 @@ func TestApplyPartitionWritesInOrder(t *testing.T) {
 		if strings.TrimSpace(string(got)) != "1,5" {
 			t.Errorf("%s/cpuset.cpus.exclusive = %q, want 1,5", dir, got)
 		}
+	}
+}
+
+// TestApplyPartitionMakesTheChildUsable is the P1 regression end to end: the
+// child has no cpuset files until the container enables the controller, and a
+// child created under a threaded domain is "domain invalid" until cgroup.type
+// is written "threaded". Both must land, or the plan is a set of writes that
+// the kernel cannot accept and the child takes no task.
+func TestApplyPartitionMakesTheChildUsable(t *testing.T) {
+	useTempLock(t)
+	root := t.TempDir()
+	ctrDir := writeTree(t, root, "kubepods/pod/ctr")
+	writeTree(t, root, "kubepods/pod")
+	plan, err := cpuset.PartitionPlan(root, ctrDir, cpuset.New(1, 5), cpuset.New(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyPartition(plan); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(ctrDir, "cgroup.subtree_control"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The "+": cgroup.subtree_control takes operations, and a bare name is
+	// EINVAL on a real kernel. The fixture is an ordinary file, so it accepts
+	// either form; only this assertion keeps the write legal.
+	if !strings.Contains(string(got), "+cpuset") {
+		t.Errorf("container cgroup.subtree_control = %q, want it to enable cpuset with +cpuset", got)
+	}
+	got, err = os.ReadFile(filepath.Join(plan.Child, "cgroup.type"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != "threaded" {
+		t.Errorf("child cgroup.type = %q, want threaded", got)
+	}
+}
+
+// TestApplyPartitionIsIdempotentOnTheHierarchy: re-running the hook on a
+// container that already has its partition must not fail on the files that
+// are already set.
+func TestApplyPartitionIsIdempotentOnTheHierarchy(t *testing.T) {
+	useTempLock(t)
+	root := t.TempDir()
+	ctrDir := writeTree(t, root, "kubepods/pod/ctr")
+	writeTree(t, root, "kubepods/pod")
+	plan, err := cpuset.PartitionPlan(root, ctrDir, cpuset.New(1, 5), cpuset.New(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyPartition(plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyPartition(plan); err != nil {
+		t.Fatalf("a second ApplyPartition on the same plan must succeed: %v", err)
 	}
 }
 

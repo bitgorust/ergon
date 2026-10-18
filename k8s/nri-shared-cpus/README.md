@@ -112,11 +112,20 @@ refuses to translate Aeron variables when it is true.
 Nothing is installed on the host. Go and builds run in containers.
 
 ```sh
-scripts/check.sh          # gofmt, go vet, go test -race, static builds
-scripts/check.sh --local  # the same on the host (CI)
+scripts/check.sh          # gofmt, go vet, go test -race, static builds, then the cgroup kernel lane
+scripts/check.sh --local  # the unit lane on the host (CI)
+scripts/check-cgroup.sh   # the cgroup kernel lane on its own
 docker build -t ergon-shared-cpus:dev .
 test/e2e.sh               # the 18-step kind e2e (Docker only, needs >= 6 CPUs)
 ```
+
+The cgroup kernel lane runs `test/cgroup` against a real cgroup v2
+hierarchy, in a privileged container with the host's cgroup namespace. The
+unit fixtures in `internal/hook` are ordinary files, so they accept writes a
+kernel would reject — a bare name in `cgroup.subtree_control` is EINVAL, for
+example. This lane is what proves the partition is one a real kernel will
+take a task in, and that one thread of a process can sit on the exclusive
+CPUs while the others stay on the shared ones.
 
 The e2e builds both images, creates a kind cluster, runs every check and
 deletes every container, cluster, image and volume it created, on success,
