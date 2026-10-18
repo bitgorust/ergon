@@ -18,14 +18,24 @@
 //! `burst` messages (default 1) are due together, `burst / rate` seconds
 //! apart. The first second is warm-up, not recorded. Prints one line per stream:
 //! <load|mix>,<label>,<udp|udp-name>,<size>,<rate>,<burst>,p50,p90,p99,p99.9,p99.99,max,mean (ns),
-//! <samples>,<sent>,<received>,<back-pressured messages>,<achieved msgs/s>,<max send lag ns>
-//! `achieved` below `rate` means the generator or the path could not keep the
-//! schedule; `max send lag` is the longest a measured message waited past its
-//! due time to be offered, so it covers the same messages as the histogram
-//! (warm-up is in neither). `received < sent` means replies never came back within two
-//! seconds of the end (a stall: Aeron itself does not lose messages), and a
-//! run is cut short at twice its schedule if the peer stalls or goes away. With
-//! `RTT_HISTOGRAM=<path>` the first stream's full histogram is written there.
+//! <samples>,<sent>,<received>,<back-pressured messages>,<achieved msgs/s>,<max send lag ns>,
+//! <scheduled>,<late>,<censored>
+//! `achieved` is measured over that stream's own schedule window, not the
+//! run's: a mixed run's streams finish at different times, and charging them
+//! all the longest would report the fast ones at the slowest one's rate. Below
+//! `rate`, the generator or the path could not keep the schedule. `scheduled`
+//! is what the run owed; `sent` below it is work never offered. `late` counts
+//! the sends that found the following slot already due (the run owed more than
+//! one), beside `max send lag`'s worst slip. `censored` counts round trips at
+//! the histogram's bound, whose true value is only known to be at least that:
+//! a max at the bound beside a non-zero `censored` is a floor, not the slowest
+//! round trip. `max send lag` is the longest a measured message waited past
+//! its due time to be offered, so it covers the same messages as the histogram
+//! (warm-up is in neither). `received < sent` means replies never came back
+//! within two seconds of the end (a stall: Aeron itself does not lose
+//! messages), and a run is cut short at twice its schedule if the peer stalls
+//! or goes away. With `RTT_HISTOGRAM=<path>` the first stream's full histogram
+//! is written there.
 //!
 //! With `LOAD_SPIKES=<path>`, every round trip of at least `LOAD_SPIKE_NS`
 //! (default 100000) after warm-up is written there as
@@ -57,6 +67,10 @@ const HEADER: usize = 16; // intended send time (ns), sequence
 const SECOND_NS: u64 = 1_000_000_000;
 const FRAGMENT_COUNT_LIMIT: usize = 64;
 const SPIKE_CAPACITY: usize = 100_000;
+/// The histogram's highest trackable latency. A longer round trip is recorded
+/// at this bound and counted as censored: its true value is only known to be
+/// at least this, so a max at the bound is a floor, not the slowest round trip.
+const HISTOGRAM_MAX_NS: u64 = 60_000_000_000;
 
 fn udp(endpoint: Option<String>) -> CString {
     CString::new(format!("aeron:udp?endpoint={}", endpoint.expect("host:port"))).unwrap()
@@ -152,14 +166,66 @@ struct Offered {
     backpressured: u64,
     stalled: bool,
     max_lag: u64,
+    /// Sends of a measured message that found the following slot already due:
+    /// the run owed more than one. The count, beside `max_lag`'s worst slip.
+    late: u64,
+    /// Measured echoes whose latency reached the histogram's bound, so their
+    /// true value is only known to be at least that. `saturating_record` keeps
+    /// them at the bound; this says how many are not their own value.
+    censored: u64,
+    /// When this stream finished its own schedule, so its rate is over its own
+    /// window and not the window of whatever stream ran longest. 0 while the
+    /// schedule is unfinished (a stall, a lost peer, the run's deadline).
+    send_end: u64,
     histogram: Histogram<u64>,
     received: u64,
+}
+
+/// When message `n` was due: `start` plus `n / burst` burst intervals, in
+/// 32.32 fixed point so a long run does not drift.
+#[inline]
+fn due(start: u64, interval_fp: u128, burst: u64, n: u64) -> u64 {
+    start + ((interval_fp * u128::from(n / burst)) >> 32) as u64
+}
+
+/// Whether the offer of message `n` at `now` found the *following* slot already
+/// due: the run owed more than one. A run keeping its schedule reports 0. The
+/// sends of a catch-up burst after a stall report as late, the one that caught
+/// up not, because it went out before the following slot was due. This is the
+/// count behind `max send lag`: the worst slip and how often it happened.
+#[inline]
+fn is_late(burst: u64, interval_fp: u128, start: u64, n: u64, now: u64) -> bool {
+    now >= due(start, interval_fp, burst, (n / burst + 1) * burst)
+}
+
+/// The messages per second a stream offered after warm-up, over the window its
+/// own schedule occupied: from when its measured schedule was due to begin, to
+/// when it stopped offering (`send_end`), or to the run's end when it never
+/// finished. Below the requested rate, the generator or the path could not
+/// keep the schedule.
+///
+/// Each stream is measured over its own window. A mixed run's streams finish
+/// at different times; charging them all the run's end would report the fast
+/// ones at the slowest one's rate.
+#[inline]
+fn achieved_rate(sent: u64, warmup: u64, due_start: u64, send_end: u64, run_end: u64) -> f64 {
+    if sent <= warmup {
+        return 0.0;
+    }
+    let end = if send_end != 0 { send_end } else { run_end };
+    let window = end.saturating_sub(due_start);
+    if window == 0 {
+        // no window to divide by: no rate, not a measured zero and not an
+        // infinity from a one-nanosecond floor
+        return 0.0;
+    }
+    (sent - warmup) as f64 * 1e9 / window as f64
 }
 
 impl Offered {
     #[inline]
     fn due(&self, start: u64, n: u64) -> u64 {
-        start + ((self.interval_fp * u128::from(n / self.spec.burst)) >> 32) as u64
+        due(start, self.interval_fp, self.spec.burst, n)
     }
 }
 
@@ -228,7 +294,10 @@ fn run(
                 backpressured: 0,
                 stalled: false,
                 max_lag: 0,
-                histogram: Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).unwrap(),
+                late: 0,
+                censored: 0,
+                send_end: 0,
+                histogram: Histogram::<u64>::new_with_bounds(1, HISTOGRAM_MAX_NS, 3).unwrap(),
                 received: 0,
                 spec,
                 publication,
@@ -277,10 +346,18 @@ fn run(
                         // the slowest recorded round trip
                         if s.sent >= s.warmup {
                             s.max_lag = s.max_lag.max(clock.stamp().saturating_sub(intended));
+                            if is_late(s.spec.burst, s.interval_fp, start, s.sent, now) {
+                                s.late += 1;
+                            }
                         }
                         s.sent += 1;
                         budget -= 1;
                         s.stalled = false;
+                        // this stream's schedule is done: its window ends
+                        // here, not whenever a slower stream's does
+                        if s.sent == s.total {
+                            s.send_end = clock.now();
+                        }
                     }
                     Err(e) if e.is_retryable() => {
                         if !s.publication.is_connected() || s.image.is_closed() {
@@ -309,17 +386,15 @@ fn run(
         }
     }
     let send_end = clock.now();
-    // the rate actually offered after warm-up: below `rate`, the generator or
-    // the path could not keep the schedule
+    // The rate each stream actually offered after warm-up, over its own
+    // schedule's window. Below `rate`, the generator or the path could not
+    // keep the schedule. A mixed run's streams finish at different times, so
+    // each is measured to its own end (or to the run's, when it never
+    // finished): one shared end would report the fast streams at the slowest
+    // one's rate.
     let achieved: Vec<f64> = streams
         .iter()
-        .map(|s| {
-            if s.sent > s.warmup {
-                (s.sent - s.warmup) as f64 * 1e9 / send_end.saturating_sub(s.due(start, s.warmup)).max(1) as f64
-            } else {
-                0.0
-            }
-        })
+        .map(|s| achieved_rate(s.sent, s.warmup, s.due(start, s.warmup), s.send_end, send_end))
         .collect();
     // drain: replies still in flight, for up to two seconds
     let drain_until = clock.now() + 2 * SECOND_NS;
@@ -337,7 +412,7 @@ fn run(
             None => ("load", "udp".to_owned()),
         };
         println!(
-            "{kind},{},{name},{},{},{},{},{},{},{},{},{},{:.0},{},{},{},{},{achieved:.0},{}",
+            "{kind},{},{name},{},{},{},{},{},{},{},{},{},{:.0},{},{},{},{},{achieved:.0},{},{},{},{}",
             label(),
             s.spec.size,
             s.spec.rate,
@@ -353,7 +428,16 @@ fn run(
             s.sent,
             s.received,
             s.backpressured,
-            s.max_lag
+            s.max_lag,
+            // the work behind the percentiles: what the schedule owed, how
+            // often the run fell more than one slot behind, and how many
+            // recorded latencies are only known to be at least the histogram's
+            // bound. `sent` below `scheduled` is work never offered; a
+            // `censored` count above zero beside a max at the bound means that
+            // max is a floor, not the slowest round trip.
+            s.total,
+            s.late,
+            s.censored
         );
     }
     if let Some(path) = std::env::var("RTT_HISTOGRAM").ok().filter(|p| !p.is_empty()) {
@@ -380,7 +464,13 @@ fn run(
 fn poll_all(streams: &mut [Offered], clock: &Clock, start: u64, mut spikes: Option<&mut Spikes>) -> i32 {
     let mut fragments = 0;
     for s in streams.iter_mut() {
-        let (histogram, received, warmup, stream) = (&mut s.histogram, &mut s.received, s.warmup, s.spec.ping_stream);
+        let (histogram, received, censored, warmup, stream) = (
+            &mut s.histogram,
+            &mut s.received,
+            &mut s.censored,
+            s.warmup,
+            s.spec.ping_stream,
+        );
         let mut spikes = spikes.as_deref_mut();
         fragments += s
             .image
@@ -391,6 +481,12 @@ fn poll_all(streams: &mut [Offered], clock: &Clock, start: u64, mut spikes: Opti
                     if sequence >= warmup {
                         let latency = clock.stamp().wrapping_sub(intended);
                         histogram.saturating_record(latency);
+                        // `saturating_record` keeps a longer round trip at the
+                        // bound: its true value is only known to be at least
+                        // that, so it is counted, not left to read as the max
+                        if latency >= HISTOGRAM_MAX_NS {
+                            *censored += 1;
+                        }
                         if let Some(spikes) = spikes.as_deref_mut()
                             && latency >= spikes.threshold_ns
                         {
@@ -464,4 +560,84 @@ fn echo(
         Some(Halt::Stopped) => "SIGTERM",
     };
     eprintln!("load: echo ended: {why}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SECOND_NS, achieved_rate, due, is_late};
+
+    /// A stream's own send end, not the run's. A finished its 1000 messages
+    /// after a second; B dragged on for two. Reporting both against the run's
+    /// end would give each 500/s and hide that A kept its schedule.
+    #[test]
+    fn a_stream_that_finished_early_is_not_charged_the_laggards_window() {
+        let run_end = 2 * SECOND_NS;
+        assert_eq!(achieved_rate(1000, 0, 0, SECOND_NS, run_end), 1000.0);
+        assert_eq!(achieved_rate(1000, 0, 0, 2 * SECOND_NS, run_end), 500.0);
+    }
+
+    /// A stream that never finished its schedule (a stall, or a peer that went
+    /// away) has no end of its own and is reported to the run's end, so it is
+    /// never read as having kept the schedule it did not finish.
+    #[test]
+    fn a_stream_that_never_finished_is_reported_to_the_runs_end() {
+        assert_eq!(achieved_rate(1000, 0, 0, 0, 2 * SECOND_NS), 500.0);
+    }
+
+    /// Warm-up is in neither the histogram nor the rate.
+    #[test]
+    fn the_rate_covers_the_measured_messages_alone() {
+        assert_eq!(achieved_rate(1100, 100, 0, SECOND_NS, SECOND_NS), 1000.0);
+        assert_eq!(achieved_rate(100, 100, 0, SECOND_NS, SECOND_NS), 0.0);
+        assert_eq!(achieved_rate(0, 100, 0, SECOND_NS, SECOND_NS), 0.0);
+    }
+
+    /// A stream whose window is empty would divide by zero; it reports 0
+    /// rather than an infinity that would read as a spectacular rate.
+    #[test]
+    fn an_empty_window_reports_no_rate() {
+        assert_eq!(achieved_rate(1000, 0, 5, 5, 5), 0.0);
+    }
+
+    /// Late means the *following* slot was already due when the send went out:
+    /// the run owed more than one. A run keeping its schedule reports 0.
+    #[test]
+    fn a_run_keeping_its_schedule_reports_nothing_late() {
+        // 1000 msgs/s, one per slot: interval 1 ms, 32.32 fixed point.
+        let interval_fp = (SECOND_NS as u128) << 32;
+        let start = 100;
+        // on time, and a little past its own slot but before the next is due
+        assert!(!is_late(1, interval_fp, start, 0, due(start, interval_fp, 1, 0)));
+        assert!(!is_late(1, interval_fp, start, 0, due(start, interval_fp, 1, 1) - 1));
+    }
+
+    /// The sends of a catch-up burst after a stall report as late; the one that
+    /// caught up does not, because it went out before the following slot was due.
+    #[test]
+    fn a_catch_up_burst_reports_the_overtaken_slots_as_late() {
+        let interval_fp = (SECOND_NS as u128) << 32;
+        let start = 100;
+        // a stall until three intervals past the start, then four sends
+        let now = start + 3 * SECOND_NS;
+        // messages 0 and 1: their following slot was already due
+        assert!(is_late(1, interval_fp, start, 0, now));
+        assert!(is_late(1, interval_fp, start, 1, now));
+        assert!(is_late(1, interval_fp, start, 2, now));
+        // message 3 is the one that caught up: its following slot (message 4's)
+        // is a second away, so it is not late
+        assert!(!is_late(1, interval_fp, start, 3, now));
+    }
+
+    /// A burst of `b` messages shares one slot, so a burst sent a little after
+    /// its slot is not late until the *next* burst's slot is due.
+    #[test]
+    fn a_burst_is_late_only_once_the_next_bursts_slot_is_due() {
+        let interval_fp = (SECOND_NS as u128) << 32; // 1 ms per burst
+        let start = 0;
+        // messages 0 and 1 are one burst; the next burst (2,3) is due at 1 ms
+        assert!(!is_late(2, interval_fp, start, 0, SECOND_NS - 1));
+        assert!(!is_late(2, interval_fp, start, 1, SECOND_NS - 1));
+        assert!(is_late(2, interval_fp, start, 0, SECOND_NS));
+        assert!(is_late(2, interval_fp, start, 1, SECOND_NS));
+    }
 }
