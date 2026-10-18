@@ -313,14 +313,15 @@ with the receiver window below.
 
 | variable | meaning |
 |---|---|
-| `RUSTERON_DPDK_TX_RATE_MBPS` | each NIC's transmit cap, Mbit/s of frames; `0` off, up to 400000. Unset: a backstop of 25000 with a 1 MiB bucket, above every rate measured, that never makes the agent wait |
+| `RUSTERON_DPDK_TX_RATE_MBPS` | each NIC's transmit cap, Mbit/s of frames; up to 400000. Unset or `0`: no cap, the fastest path |
 | `RUSTERON_DPDK_TX_BUCKET_BYTES` | the cap's token bucket, 64 KiB by default |
-| `RUSTERON_DPDK_TX_PACE_SPIN_US` | how long a send may spin to pay a debt: 20 under `DEDICATED`, 0 (and only 0) otherwise; longer sends nothing, and Aeron retries (`tx-paced`) |
+| `RUSTERON_DPDK_TX_PACE_SPIN_US` | how long a send may spin to pay a debt: 20 under `DEDICATED`, 0 (and only 0) otherwise; longer sends nothing, and Aeron retries (`tx-paced`). `0` always refuses instead of waiting |
 | `RUSTERON_DPDK_TX_ROUTE_MBPS` | `<a.b.c.d>/<len>=<Mbit/s>,...`, up to 16 prefixes: an extra cap for a slower link, shared by every channel that crosses it |
 | `RUSTERON_DPDK_TX_LOW_STREAMS` | `<stream>\|<first>-<last>,...`, up to 16: streams that send only from what leaves `RUSTERON_DPDK_TX_LOW_RESERVE_BYTES` (half the bucket) for the rest, so latency-critical streams never queue behind them. Needs a cap set |
 
-- **The backstop is per NIC:** raise it, or set `0`, on an instance whose NIC
-  carries more than 25 Gbit/s over several flows (c7i.metal-24xl, 37.5).
+- **A cap is per NIC and opt-in.** Set one only to keep a sender below the
+  link's capacity, or to shape a slower route with `RUSTERON_DPDK_TX_ROUTE_MBPS`.
+  It costs a refill, a sum and a charge on every send.
 - **AWS caps one flow (one channel) at 7.8–8.0 Gbit/s** regardless, x86 and
   Graviton: spread a heavier stream over several channels on different ports
   ([data](BENCHMARKS.md#aws-one-flow-carries-about-8-gbits)).

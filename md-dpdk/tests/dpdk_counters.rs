@@ -10,8 +10,8 @@
 //!   * TX packet/byte totals are monotonic and attribute exactly the accepted
 //!     prefix (plan §7.4: rejected datagrams are errors, not TX bytes),
 //!   * every approved TX error path bumps its counter (nobufs, tx-eagain, ARP
-//!     miss, validation error incl. oversized), the NIC's bandwidth allowance
-//!     (on by default) counts what it holds back as tx-paced, and every RX
+//!     miss, validation error incl. oversized), a NIC bandwidth allowance the
+//!     operator set counts what it holds back as tx-paced, and every RX
 //!     reject class bumps its own counter (checksum, fragmented, unsupported
 //!     ethertype/protocol, discard, queue-drop),
 //!   * ENA SRD/Express extended statistics appear as type-92 counters with the
@@ -388,7 +388,7 @@ fn tx_error_paths_counted() {
 }
 
 // ---------------------------------------------------------------------------
-// The NIC's bandwidth allowance: on by default, counted as tx-paced
+// The NIC's bandwidth allowance: opt-in, counted as tx-paced
 // ---------------------------------------------------------------------------
 
 const TX_PACED: &str = "role=sender bdf=0000:00:01.0 port=0 q=0 dir=tx tx-paced";
@@ -408,62 +408,16 @@ fn send_wire(h: &mut Harness, dst: ([u8; 4], u16), wire: usize) -> c_int {
     h.send_to(dst, &payloads).0
 }
 
-/// With RUSTERON_DPDK_TX_RATE_MBPS unset the NIC's allowance is a backstop at
-/// 25000 Mbit/s (3.125 bytes a nanosecond) that never makes the agent wait.
-/// Drives one whose bucket is `bucket` bytes (whole 65,536-byte vectors): the
-/// bucket goes out at once, and a 78,125-byte overdraw with it (a bucket not
-/// in debt may be overdrawn). That debt takes 25,000 ns to repay: until then
-/// a send sends nothing (a zero result Aeron retries whole, counted as
-/// tx-paced) after one clock read, though the clock moves 1 µs a read, so a
-/// wait spun on it would end and send. A send 1 ns before the debt is repaid
-/// is deferred, which holds only at 25000 Mbit/s or less, and one at it goes,
-/// which holds only at 25000 or more.
-fn assert_the_backstop(h: &mut Harness, bucket: usize) {
-    const T0: u64 = 1_000_000_000;
-    const OVERDRAW: usize = 78_125; // 625,000,000 millibits: 25,000 ns at 25000 Mbit/s
-    pin_clock_ns(T0); // after the harness's reset: the first send finds the bucket full
-    h.init_tx(SENDER_IP, 40000, None, 1472);
-    h.arp_seed(PEER_IP, PEER_MAC);
-    let dst = (PEER_IP, 40123);
-    let sent = || unsafe { rusteron_dpdk_fake_capture_count() };
-
-    for _ in 0..bucket / 65_536 {
-        assert_eq!(send_wire(h, dst, 65_536), 44, "the whole bucket at once");
-    }
-    assert_eq!(send_wire(h, dst, OVERDRAW), 52, "a bucket not in debt may be overdrawn");
-    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 0, "nothing held back");
-    let burst = sent();
-    assert_eq!(burst, c_int::try_from(bucket / 65_536 * 44 + 52).unwrap());
-
-    step_pinned_clock_ns(1_000);
-    for (at, owed) in [(T0, "25,000 ns owed"), (T0 + 24_999, "1 ns owed")] {
-        pin_clock_ns(at);
-        assert_eq!(h.send_to(dst, &[b"x"]).0, 0, "{owed}: deferred, sends nothing");
-        assert_eq!(
-            unsafe { rusteron_dpdk_clock_ns() },
-            at + 1_000,
-            "{owed}: the send's one clock read, no wait"
-        );
-    }
-    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 2, "each deferral is tx-paced");
-    assert_eq!(sent(), burst);
-
-    pin_clock_ns(T0 + 25_000);
-    assert_eq!(h.send_to(dst, &[b"y"]).0, 1, "repaid: sent");
-    assert_eq!(unsafe { rusteron_dpdk_clock_ns() }, T0 + 26_000, "at once");
-    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 2, "not held back");
-    assert_eq!(sent(), burst + 1);
-    assert_no_leak();
-}
-
-/// With RUSTERON_DPDK_TX_RATE_MBPS and RUSTERON_DPDK_TX_BUCKET_BYTES unset the
-/// backstop's bucket is 1 MiB, more than a full ENA ring of 1,450-byte frames
-/// (742,400 bytes), so no burst of such frames the NIC can hold meets it;
-/// with the default RUSTERON_DPDK_TX_PACE_SPIN_US of 20 it still never waits,
-/// not even 1 ns.
+/// With RUSTERON_DPDK_TX_RATE_MBPS unset no bandwidth allowance is armed, so
+/// the send path does not consult one and no amount of traffic is held back:
+/// the default is the fastest path, unguarded. It was a 25,000 Mbit/s
+/// backstop in a 1 MiB bucket that refused a send while in debt -- a refill,
+/// a compare and a charge on every send, whatever the run was doing.
+/// RUSTERON_DPDK_TX_RATE_MBPS arms one; RUSTERON_DPDK_TX_PACE_SPIN_US=0 makes
+/// it refuse rather than wait, which is the behaviour the backstop had.
 #[test]
 #[serial]
-fn the_default_allowance_is_a_backstop_at_25000_mbps() {
+fn the_default_arms_no_allowance() {
     for unset in [
         "RUSTERON_DPDK_TX_RATE_MBPS",
         "RUSTERON_DPDK_TX_BUCKET_BYTES",
@@ -472,40 +426,104 @@ fn the_default_allowance_is_a_backstop_at_25000_mbps() {
         assert!(std::env::var_os(unset).is_none(), "the default: {unset} unset");
     }
     let mut h = Harness::new();
-    assert_the_backstop(&mut h, 1 << 20);
+    pin_clock_ns(1_000_000_000);
+    h.init_tx(SENDER_IP, 40000, None, 1472);
+    h.arp_seed(PEER_IP, PEER_MAC);
+    let dst = (PEER_IP, 40123);
+    let sent = || unsafe { rusteron_dpdk_fake_capture_count() };
+
+    // far past the old backstop's 1 MiB bucket and the debt an overdraw of it
+    // took to repay: 1.38 MiB on the wire in 22 vectors, every frame out.
+    // 22 keeps the run under the fake port's 1,024-frame capture buffer.
+    let mut frames = 0;
+    for _ in 0..22 {
+        frames += send_wire(&mut h, dst, 65_536);
+    }
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 0, "nothing held back");
+    assert_eq!(sent(), c_int::try_from(frames).unwrap());
+    assert_no_leak();
 }
 
-/// RUSTERON_DPDK_TX_BUCKET_BYTES set, with the rate unset, is the backstop's
-/// bucket: 128 KiB here, neither the backstop's 1 MiB nor the 64 KiB an
-/// operator-set rate takes by default.
+/// RUSTERON_DPDK_TX_BUCKET_BYTES on its own arms nothing: a bucket sizes an
+/// allowance, it is not an opt-in. (It used to be: a set bucket with the rate
+/// unset was the backstop's bucket.)
 #[test]
 #[serial]
-fn the_backstop_takes_a_bucket_the_operator_set() {
+fn a_bucket_without_a_rate_arms_nothing() {
     let _bucket = EnvGuard::set("RUSTERON_DPDK_TX_BUCKET_BYTES", "131072");
     let mut h = Harness::new();
-    assert_the_backstop(&mut h, 131_072);
+    pin_clock_ns(1_000_000_000);
+    h.init_tx(SENDER_IP, 40000, None, 1472);
+    h.arp_seed(PEER_IP, PEER_MAC);
+    let dst = (PEER_IP, 40123);
+    let mut frames = 0;
+    for _ in 0..22 {
+        frames += send_wire(&mut h, dst, 65_536);
+    }
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 0, "nothing held back");
+    assert_eq!(
+        unsafe { rusteron_dpdk_fake_capture_count() },
+        c_int::try_from(frames).unwrap()
+    );
+    assert_no_leak();
 }
 
-/// However long RUSTERON_DPDK_TX_PACE_SPIN_US allows (here a second, the
-/// most), the backstop never waits. The bucket is set to 64 KiB, as an
-/// operator-set rate's, so that only the spin limit is under test.
+/// RUSTERON_DPDK_TX_PACE_SPIN_US=0 with a rate the operator set refuses rather
+/// than waits: the behaviour the old default backstop had, now opt-in. The
+/// debt below is 20,001 ns at T0 and 20,000 ns at T0 + 1; the default spin
+/// limit of 20 µs lets the second wait, a zero limit refuses both after one
+/// clock read, never spinning.
 #[test]
 #[serial]
-fn the_backstop_never_waits_whatever_the_spin_limit() {
-    let _spin = EnvGuard::set("RUSTERON_DPDK_TX_PACE_SPIN_US", "1000000");
-    let _bucket = EnvGuard::set("RUSTERON_DPDK_TX_BUCKET_BYTES", "65536");
+fn a_zero_spin_limit_refuses_instead_of_waiting() {
+    let _rate = EnvGuard::set("RUSTERON_DPDK_TX_RATE_MBPS", "25000");
+    let _spin = EnvGuard::set("RUSTERON_DPDK_TX_PACE_SPIN_US", "0");
+    const T0: u64 = 1_000_000_000;
     let mut h = Harness::new();
-    assert_the_backstop(&mut h, 65_536);
+    pin_clock_ns(T0); // after the harness's reset: the first send finds the bucket full
+    h.init_tx(SENDER_IP, 40000, None, 1472);
+    h.arp_seed(PEER_IP, PEER_MAC);
+    let dst = (PEER_IP, 40123);
+    let sent = || unsafe { rusteron_dpdk_fake_capture_count() };
+
+    assert_eq!(send_wire(&mut h, dst, 65_536), 44, "the whole bucket: 0 left");
+    assert_eq!(
+        send_wire(&mut h, dst, 62_504),
+        42,
+        "a bucket not in debt may be overdrawn"
+    );
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 0, "neither held back");
+    let burst = sent();
+
+    step_pinned_clock_ns(1_000);
+    for at in [T0, T0 + 1] {
+        pin_clock_ns(at);
+        assert_eq!(h.send_to(dst, &[b"x"]).0, 0, "in debt: deferred, sends nothing");
+        assert_eq!(
+            unsafe { rusteron_dpdk_clock_ns() },
+            at + 1_000,
+            "the send's one clock read, no wait"
+        );
+    }
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 2, "each deferral is tx-paced");
+    assert_eq!(sent(), burst);
+
+    pin_clock_ns(T0 + 20_001);
+    assert_eq!(h.send_to(dst, &[b"y"]).0, 1, "repaid: sent");
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 2, "not held back");
+    assert_eq!(sent(), burst + 1);
+    assert_no_leak();
 }
 
-/// A route allowance (RUSTERON_DPDK_TX_ROUTE_MBPS) under the backstop keeps
-/// its 64 KiB default bucket and its wait: a send the route alone holds back
-/// waits the route's debt out within RUSTERON_DPDK_TX_PACE_SPIN_US (default
-/// 20). The backstop's own debt never causes a wait: while it lasts a send
-/// sends nothing, whatever the route owes.
+/// With no NIC rate only a route allowance (RUSTERON_DPDK_TX_ROUTE_MBPS)
+/// paces: a destination on a slow route waits that route's debt out within
+/// RUSTERON_DPDK_TX_PACE_SPIN_US (default 20), and a destination the route
+/// does not cover is never held back at all. It used to be that an unset
+/// RUSTERON_DPDK_TX_RATE_MBPS put every destination under a 25,000 Mbit/s
+/// backstop that refused whatever the route allowed.
 #[test]
 #[serial]
-fn under_the_backstop_only_a_route_allowance_waits() {
+fn with_no_nic_rate_only_a_route_allowance_paces() {
     let _routes = EnvGuard::set("RUSTERON_DPDK_TX_ROUTE_MBPS", "10.0.0.5/32=8"); // a byte a microsecond
     const T0: u64 = 1_000_000_000;
     let mut h = Harness::new();
@@ -513,45 +531,29 @@ fn under_the_backstop_only_a_route_allowance_waits() {
     h.init_tx(SENDER_IP, 40000, None, 1472);
     h.arp_seed(PEER_IP, PEER_MAC);
     h.arp_seed([10, 0, 0, 6], [0x02, 0, 0, 0, 0, 0x60]);
-    let slow = (PEER_IP, 40123); // 10.0.0.5: over the 8 Mbit/s route, and the NIC
-    let fast = ([10, 0, 0, 6], 40123); // the NIC alone
+    let slow = (PEER_IP, 40123); // 10.0.0.5: over the 8 Mbit/s route
+    let fast = ([10, 0, 0, 6], 40123); // no route, no NIC rate
     let sent = || unsafe { rusteron_dpdk_fake_capture_count() };
 
     // the route's 64 KiB bucket less 40 bytes, then 12 bytes past it: 12 µs owed
     assert_eq!(send_wire(&mut h, slow, 65_496), 44);
     assert_eq!(send_wire(&mut h, slow, 52), 1, "a route not in debt may be overdrawn");
-    // the backstop's 1 MiB less those 65,548 bytes, then 1,000 past it: 320 ns owed
-    for _ in 0..14 {
+    // far past the old backstop's 1 MiB bucket: the fast destination is free.
+    // 22 keeps the run under the fake port's 1,024-frame capture buffer.
+    for _ in 0..22 {
         assert_eq!(send_wire(&mut h, fast, 65_536), 44);
     }
-    assert_eq!(
-        send_wire(&mut h, fast, 66_524),
-        44,
-        "a backstop not in debt may be overdrawn"
-    );
     assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 0, "nothing held back");
-    assert_eq!(sent(), 705);
+    assert_eq!(sent(), 45 + 22 * 44);
 
-    // From here the pinned clock moves 1 µs a read, so a wait spun on it ends
-    // after a few reads instead of at the spin bound.
+    // The route still owes 12 µs. The fast destination goes at once; the slow
+    // one waits the route's debt out. The pinned clock moves 1 µs a read, so
+    // the wait ends after a few reads instead of at the spin bound.
     step_pinned_clock_ns(1_000);
-    for (dst, owed) in [
-        (slow, "the backstop 320 ns and the route 12 µs owed"),
-        (fast, "the backstop 320 ns owed"),
-    ] {
-        pin_clock_ns(T0);
-        assert_eq!(h.send_to(dst, &[b"x"]).0, 0, "{owed}: deferred, sends nothing");
-        assert_eq!(
-            unsafe { rusteron_dpdk_clock_ns() },
-            T0 + 1_000,
-            "{owed}: the send's one clock read, no wait"
-        );
-    }
-    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 2, "each deferral is tx-paced");
-    assert_eq!(sent(), 705);
-
-    // 320 ns on: the backstop is repaid; the route still owes 11,680 ns
-    pin_clock_ns(T0 + 320);
+    pin_clock_ns(T0);
+    assert_eq!(h.send_to(fast, &[b"x"]).0, 1, "no route: never held back");
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 0, "still nothing paced");
+    pin_clock_ns(T0);
     assert_eq!(
         h.send_to(slow, &[b"y"]).0,
         1,
@@ -560,15 +562,15 @@ fn under_the_backstop_only_a_route_allowance_waits() {
     step_pinned_clock_ns(0);
     assert_eq!(
         unsafe { rusteron_dpdk_clock_ns() },
-        T0 + 320 + 13 * 1_000,
+        T0 + 13 * 1_000,
         "the send's clock read and 12 µs of reads in the wait"
     );
-    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 3, "a wait is counted too");
-    assert_eq!(sent(), 706);
+    assert_eq!(h.counter(TYPE_TX_EAGAIN, TX_PACED), 1, "a wait is counted too");
+    assert_eq!(sent(), 45 + 22 * 44 + 2);
     assert_no_leak();
 }
 
-/// An allowance the operator set, even to the backstop's 25000 Mbit/s, keeps
+/// An allowance the operator set, even to 25000 Mbit/s, keeps
 /// the 64 KiB default bucket and waits: a send that finds it overdrawn waits
 /// the debt out if that takes at most the default
 /// RUSTERON_DPDK_TX_PACE_SPIN_US of 20. The debt is set so that the first

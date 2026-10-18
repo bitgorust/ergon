@@ -1325,17 +1325,14 @@ static int rusteron_dpdk_transport_send(
      * overdraw them; while either is in debt the next send waits the few
      * microseconds the debt takes to repay, or, past
      * RUSTERON_DPDK_TX_PACE_SPIN_US, sends nothing (a zero result Aeron
-     * retries whole: no partial send, so no duplicates). Above a link's
-     * capacity the network drops packets unseen and Aeron falls into
-     * retransmission; this keeps each below its own. The NIC's is on by
-     * default as a backstop (RUSTERON_DPDK_TX_RATE_MBPS_DEFAULT, in a bucket
-     * larger than a ring of 1,450-byte frames) that never waits: while it is
-     * in debt a send sends nothing, whatever a route allows. So every send
-     * pays for it: a refill (a subtraction, a compare and a multiply) on the
-     * clock read above, a sum of the vector's lengths and a charge. No clock
-     * read, syscall, lock, allocation or division of its own; a division by
-     * the rate, the backstop's compare and the clock reads of a wait only in
-     * debt. */
+     * retries whole: no partial send, so no duplicates;
+     * RUSTERON_DPDK_TX_PACE_SPIN_US=0 always refuses instead of waiting).
+     * Above a link's capacity the network drops packets unseen and Aeron
+     * falls into retransmission; this keeps each below its own. Neither is
+     * armed by default, so the whole block is skipped and no send pays for a
+     * refill, a sum or a charge. Within it: no clock read, syscall, lock,
+     * allocation or division of its own; a division by the rate and the
+     * clock reads of a wait only in debt. */
     rusteron_dpdk_pacer_t *route = NULL;
     int charged = 0;
     if (0 != native->tx_route_count)
@@ -1395,8 +1392,8 @@ static int rusteron_dpdk_transport_send(
         if (0 != wait_ns)
         {
             rusteron_dpdk_counters_add(counters, RD_COUNTER_TX_PACED, 1);
-            /* the backstop's own debt never waits: the send goes later, whole */
-            if (wait_ns > native->tx_pace_spin_ns || rusteron_dpdk_pacer_defers(&port->tx_pacer))
+            /* Past the spin limit the send goes later, whole. */
+            if (wait_ns > native->tx_pace_spin_ns)
             {
                 return 0;
             }

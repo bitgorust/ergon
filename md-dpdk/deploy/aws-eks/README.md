@@ -438,11 +438,8 @@ cluster placement group). An Aeron channel is one flow whatever its stream
 ids, so one channel carries at most about 0.7 M msgs/s of 1,344 B or 15 M of
 32 B. Spread a heavier stream over several channels on different ports and
 divide the traffic in the application. The transport's transmit cap
-(`RUSTERON_DPDK_TX_RATE_MBPS`) is per NIC, not per flow: it cannot raise this.
-Unset, it is a 25 Gbit/s backstop per NIC that defers rather than waits; on
-an instance whose NIC carries more than that over several flows
-(c7i.metal-24xl, c7i.48xlarge) raise it or set 0. `BENCHMARKS.md` has the
-measurements.
+(`RUSTERON_DPDK_TX_RATE_MBPS`) is per NIC, not per flow: it cannot raise this,
+and it is off unless you set it. `BENCHMARKS.md` has the measurements.
 
 ## 4. Entrypoint
 

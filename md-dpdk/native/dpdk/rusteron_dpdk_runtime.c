@@ -1241,12 +1241,11 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
         }
         native->tx_retry_ns = us * 1000ULL;
     }
-    /* The bandwidth allowance per NIC, megabits per second of frames (0 =
-     * none; unset, the backstop RUSTERON_DPDK_TX_RATE_MBPS_DEFAULT), its
-     * bucket (RUSTERON_DPDK_TX_BUCKET_BYTES, default 64 KiB, the backstop's
-     * RUSTERON_DPDK_TX_BACKSTOP_BUCKET_BYTES) and the longest wait to repay a
-     * send's overdraft (default 20 us; the backstop never waits). */
-    uint64_t rate = RUSTERON_DPDK_TX_RATE_MBPS_DEFAULT, bucket = 65536, pace_spin_us = 20;
+    /* The bandwidth allowance per NIC, megabits per second of frames (unset
+     * or 0: none, the fastest path), its bucket
+     * (RUSTERON_DPDK_TX_BUCKET_BYTES, default 64 KiB) and the longest wait to
+     * repay a send's overdraft (default 20 us). */
+    uint64_t rate = 0, bucket = 65536, pace_spin_us = 20;
     const struct { const char *name; uint64_t *value; uint64_t max; } pacing[] = {
         { "RUSTERON_DPDK_TX_RATE_MBPS", &rate, 400000ULL },
         { "RUSTERON_DPDK_TX_BUCKET_BYTES", &bucket, 1ULL << 30 },
@@ -1273,21 +1272,11 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
     native->tx_pace_spin_ns = pace_spin_us * 1000ULL;
     const char *pace_spin_env = getenv("RUSTERON_DPDK_TX_PACE_SPIN_US");
     native->tx_pace_spin_set = NULL != pace_spin_env && '\0' != pace_spin_env[0];
-    /* An allowance the operator set: the default is a backstop above every
-     * link measured, not a link's capacity to share out, so only this can put
-     * low-priority streams below the rest. */
+    /* An allowance the operator set is a link's capacity to share out (and the
+     * only thing that can put low-priority streams below the rest). Unset or
+     * 0 arms none: the send path skips the whole block. */
     const char *rate_env = getenv("RUSTERON_DPDK_TX_RATE_MBPS");
     const int rate_set = NULL != rate_env && '\0' != rate_env[0] && 0 != rate;
-    /* No rate set: the NIC's allowance is the backstop. It bounds a sustained
-     * rate and never shapes a burst: its bucket holds more than the NIC's
-     * ring of 1,450-byte frames (not of jumbo frames) unless
-     * RUSTERON_DPDK_TX_BUCKET_BYTES says otherwise, and it never makes the
-     * agent wait. A route allowance keeps the bucket and the wait. */
-    const int backstop = NULL == rate_env || '\0' == rate_env[0];
-    const char *bucket_env = getenv("RUSTERON_DPDK_TX_BUCKET_BYTES");
-    const uint64_t nic_bucket = backstop && (NULL == bucket_env || '\0' == bucket_env[0])
-        ? RUSTERON_DPDK_TX_BACKSTOP_BUCKET_BYTES
-        : bucket;
     /* RUSTERON_DPDK_TX_ROUTE_MBPS="<a.b.c.d>/<len>=<Mbit/s>,...": a slower link
      * on the way to those destinations (a direct link to another site, say),
      * each with its own allowance; the longest matching prefix applies. */
@@ -1399,8 +1388,7 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
         if (!rate_set && 0 == native->tx_route_count)
         {
             rusteron_dpdk_set_error("RUSTERON_DPDK_TX_LOW_STREAMS needs an allowance to hold them back: set "
-                                    "RUSTERON_DPDK_TX_RATE_MBPS (its default is only a backstop) or "
-                                    "RUSTERON_DPDK_TX_ROUTE_MBPS");
+                                    "RUSTERON_DPDK_TX_RATE_MBPS or RUSTERON_DPDK_TX_ROUTE_MBPS");
             return -1;
         }
     }
@@ -1408,10 +1396,10 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
     rusteron_dpdk_port_t *paced[2] = { &native->sender, &native->receiver };
     for (int p = 0; p < 2; p++)
     {
-        rusteron_dpdk_pacer_init(&paced[p]->tx_pacer, rate, (int64_t)nic_bucket, backstop, pacer_now);
+        rusteron_dpdk_pacer_init(&paced[p]->tx_pacer, rate, (int64_t)bucket, pacer_now);
         for (uint32_t r = 0; r < native->tx_route_count; r++)
         {
-            rusteron_dpdk_pacer_init(&paced[p]->route_pacers[r], route_rate[r], (int64_t)bucket, 0, pacer_now);
+            rusteron_dpdk_pacer_init(&paced[p]->route_pacers[r], route_rate[r], (int64_t)bucket, pacer_now);
         }
     }
     /* RUSTERON_DPDK_LOCAL_UNWATCH=0 keeps hot sockets on the local-I/O

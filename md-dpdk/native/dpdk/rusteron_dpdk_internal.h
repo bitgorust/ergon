@@ -105,24 +105,6 @@ typedef struct rusteron_dpdk_rx_stats_stct
  * refused frames a NIC can hold queued, one vector's worth. */
 #define RUSTERON_DPDK_TX_VECTOR_MAX 256
 #define RUSTERON_DPDK_MAX_TX_LOW 16 /* RUSTERON_DPDK_TX_LOW_STREAMS ranges */
-/* Each NIC's allowance while RUSTERON_DPDK_TX_RATE_MBPS is unset, megabits per
- * second of frames: a backstop, which bounds a sustained rate and never
- * shapes a burst. 25000 is AWS's highest documented rate for one flow
- * (25 Gbit/s, ENA Express) and above every per-NIC rate measured (about
- * 12 Gbit/s, DPDK flat out at 32 B on Azure), so no sustained rate measured
- * reaches it; it holds back a runaway sender. Its bucket is
- * RUSTERON_DPDK_TX_BACKSTOP_BUCKET_BYTES unless RUSTERON_DPDK_TX_BUCKET_BYTES
- * is set, and it never makes the agent wait: a send it would delay sends
- * nothing (a zero result Aeron retries whole), whatever
- * RUSTERON_DPDK_TX_PACE_SPIN_US allows. It is per NIC: a NIC that carries
- * more over several flows needs a higher RUSTERON_DPDK_TX_RATE_MBPS, or 0
- * (off). */
-#define RUSTERON_DPDK_TX_RATE_MBPS_DEFAULT 25000ULL
-/* The backstop's bucket: more than a full ENA TX ring of 1,450-byte frames
- * (512 x 1,450 = 742,400 bytes; MANA's ring holds 256), so no burst of such
- * frames the NIC can hold meets it. Jumbo frames (9,002 bytes) fill it at
- * 117, under a quarter of an ENA ring. */
-#define RUSTERON_DPDK_TX_BACKSTOP_BUCKET_BYTES 1048576ULL
 
 /* Aeron's threading modes (aeron_threading_mode_t, aeronmd.h: asserted equal
  * in rusteron_dpdk_transport.c), which decide which agent busy-spins on which
@@ -140,13 +122,13 @@ typedef struct rusteron_dpdk_rx_stats_stct
  * (plain arithmetic, no atomics); it may go negative (debt). It counts
  * millibits: a megabit a second is a millibit a nanosecond, so a refill
  * credits all the time since the last, with no division and no fraction of a
- * byte dropped however often it runs.
+ * byte dropped however often it runs. `rate_mbps` 0 is no allowance: the
+ * helpers below are then all no-ops and the send path skips the block.
  * Aligned so it never straddles two cache lines: every send touches it. */
 #define RUSTERON_DPDK_MILLIBITS_PER_BYTE 8000LL
 typedef struct rusteron_dpdk_pacer_stct
 {
     uint32_t rate_mbps;       /* megabits per second of frames, at most 400000; 0 = no allowance */
-    uint32_t never_waits;     /* the backstop: a send its debt would delay sends nothing */
     int64_t bucket_millibits; /* the most it holds: the burst allowed at once */
     int64_t millibits;
     uint64_t last_ns;         /* last refill */
@@ -473,14 +455,6 @@ static inline uint64_t rusteron_dpdk_pacer_wait(const rusteron_dpdk_pacer_t *p)
     return 0 == p->rate_mbps || p->millibits >= 0 ? 0 : (uint64_t)(-p->millibits) / p->rate_mbps;
 }
 
-/* Whether an allowance that never waits (the backstop) holds a send back: its
- * wait would not be 0, a nanosecond or more of debt; no division. Only a
- * NIC's allowance with a rate is ever one. */
-static inline int rusteron_dpdk_pacer_defers(const rusteron_dpdk_pacer_t *p)
-{
-    return p->never_waits && p->millibits <= -(int64_t)p->rate_mbps;
-}
-
 /* Charge `wire` bytes on the wire to an allowance (negative: refund them). */
 static inline void rusteron_dpdk_pacer_charge(rusteron_dpdk_pacer_t *p, int64_t wire)
 {
@@ -499,13 +473,12 @@ static inline int rusteron_dpdk_pacer_spare(const rusteron_dpdk_pacer_t *p, int6
         p->millibits >= p->bucket_millibits;
 }
 
-/* `rate_mbps` at most 400000; `bucket` in bytes, at most 1 GiB: in
- * millibits, far inside an int64. `never_waits`: the backstop. */
+/* `rate_mbps` at most 400000, 0 for no allowance; `bucket` in bytes, at most
+ * 1 GiB: in millibits, far inside an int64. */
 static inline void rusteron_dpdk_pacer_init(rusteron_dpdk_pacer_t *p, uint64_t rate_mbps, int64_t bucket,
-                                            int never_waits, uint64_t now_ns)
+                                            uint64_t now_ns)
 {
     p->rate_mbps = (uint32_t)rate_mbps;
-    p->never_waits = 0 != never_waits && 0 != rate_mbps;
     p->bucket_millibits = bucket * RUSTERON_DPDK_MILLIBITS_PER_BYTE;
     p->millibits = p->bucket_millibits;
     p->last_ns = now_ns;

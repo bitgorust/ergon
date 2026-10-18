@@ -766,9 +766,9 @@ fn local_io_mode_is_validated() {
 }
 
 /// Low-priority streams: non-negative stream ids or ranges, under an
-/// allowance the operator set to hold them back (the NIC's or a route's: the
-/// NIC's built-in default is only a backstop), with a reserve smaller than
-/// the bucket; anything else fails creation, naming the variable.
+/// allowance the operator set to hold them back (the NIC's or a route's), with
+/// a reserve smaller than the bucket; anything else fails creation, naming
+/// the variable.
 #[test]
 #[serial]
 fn low_priority_streams_are_validated() {
@@ -778,8 +778,8 @@ fn low_priority_streams_are_validated() {
         (Some("8000"), None, "3003", None, true),
         (Some("8000"), None, " 3003 , 5000-5999 ", Some("1000"), true),
         (None, Some("10.0.0.0/8=100"), "3003", None, true),
-        (Some("25000"), None, "3003", None, true), // set, even to the default's value
-        (None, None, "3003", None, false),         // the default rate does not count
+        (Some("25000"), None, "3003", None, true), // any rate the operator set
+        (None, None, "3003", None, false),         // no rate set: nothing to hold them back
         (Some("0"), None, "3003", None, false),    // the NIC's allowance off
         (Some(""), None, "3003", None, false),     // empty: unset
         (Some("8000"), None, "5999-5000", None, false),
@@ -953,8 +953,8 @@ fn extra_address_lists_are_never_cut_short() {
 }
 
 /// RUSTERON_DPDK_TX_RATE_MBPS, the NIC's allowance, takes 0 (none) up to
-/// 400000 Mbit/s (unset or empty: 25000); anything else fails creation,
-/// naming the variable.
+/// 400000 Mbit/s (unset or empty: none, the default); anything else fails
+/// creation, naming the variable.
 #[test]
 #[serial]
 fn nic_rate_is_validated() {
