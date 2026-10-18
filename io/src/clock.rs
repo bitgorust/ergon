@@ -1,9 +1,9 @@
 //! Clocks, CPU pinning and per-thread accounting.
 //!
-//! Kernel receive timestamps (`SO_TIMESTAMPING`) are `CLOCK_REALTIME`, so
-//! [`realtime_ns`] (vDSO, no syscall on a TSC clocksource) is the clock to compare
-//! them with. [`rdtsc`] is cheaper but in another clock domain; use it for
-//! durations only.
+//! - [`realtime_ns`]: `CLOCK_REALTIME` through the vDSO (no syscall on a TSC
+//!   or `arch_sys_counter` clocksource). Compare kernel receive timestamps
+//!   (`SO_TIMESTAMPING`) with this.
+//! - [`rdtsc`]: cheaper, but another clock domain: durations only.
 #![allow(unsafe_code)]
 
 /// `CLOCK_REALTIME` in nanoseconds.
@@ -29,6 +29,14 @@ fn clock_ns(id: libc::clockid_t) -> i64 {
 }
 
 /// Raw counter: `rdtsc` on x86-64, `cntvct_el0` on aarch64, 0 elsewhere.
+///
+/// On aarch64 an `isb` precedes the read, as in the kernel's own
+/// `arch_timer_read_cntvct_el0` (`arch/arm64/include/asm/arch_timer.h`): the
+/// architecture lets a `CNTVCT_EL0` read run speculatively and out of order,
+/// so without it two reads could come back in the wrong order and a
+/// difference wrap to an enormous value. It costs about 10 ns a read on
+/// Apple M-series (a plain `mrs` pipelines at under 1 ns), about what
+/// `rdtsc` costs on x86.
 #[must_use]
 #[inline]
 pub fn rdtsc() -> u64 {
@@ -40,8 +48,11 @@ pub fn rdtsc() -> u64 {
     #[cfg(target_arch = "aarch64")]
     {
         let v: u64;
-        // SAFETY: CNTVCT_EL0 is readable from EL0 on Linux and macOS.
-        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack)) };
+        // SAFETY: ISB has no preconditions; CNTVCT_EL0 is readable from EL0 on
+        // Linux and macOS.
+        unsafe {
+            core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack));
+        };
         v
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -50,13 +61,42 @@ pub fn rdtsc() -> u64 {
     }
 }
 
-/// [`rdtsc`] ticks per microsecond, measured once against `CLOCK_MONOTONIC` over
-/// 20 ms and cached. Call it before any timed loop so the first call does not land
-/// inside one.
+/// The raw counter's architected rate in Hz, where it has one.
+///
+/// `CNTFRQ_EL0` on aarch64 (what the kernel's `arch_sys_counter` clocksource
+/// itself runs on). `None` where the rate is not architected: x86-64, whose
+/// TSC rate is measured.
+#[must_use]
+#[allow(clippy::missing_const_for_fn)] // const only where the body is compiled out
+pub fn counter_frequency_hz() -> Option<u64> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let hz: u64;
+        // SAFETY: CNTFRQ_EL0 is readable from EL0 on Linux and macOS.
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) hz, options(nomem, nostack)) };
+        // Only the low 32 bits are defined; 0 means firmware never set it.
+        Some(hz & 0xFFFF_FFFF).filter(|&hz| hz > 0)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        None
+    }
+}
+
+/// [`rdtsc`] ticks per microsecond, cached.
+///
+/// The architected rate where there is one ([`counter_frequency_hz`],
+/// aarch64), otherwise measured once against `CLOCK_MONOTONIC` over 20 ms (the
+/// TSC). Call it before any timed loop so the first call does not land inside
+/// one.
 #[must_use]
 pub fn ticks_per_us() -> f64 {
     static TPU: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *TPU.get_or_init(|| {
+        if let Some(hz) = counter_frequency_hz() {
+            #[allow(clippy::cast_precision_loss)]
+            return hz as f64 / 1e6;
+        }
         let (m0, t0) = (monotonic_ns(), rdtsc());
         while monotonic_ns() - m0 < 20_000_000 {
             std::hint::spin_loop();

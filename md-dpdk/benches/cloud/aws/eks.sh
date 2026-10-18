@@ -5,7 +5,7 @@
 # or Linux with the aws CLI signed in (`aws login`), kubectl, docker (buildx)
 # and python3; no eksctl or helm.
 #
-#   md-dpdk/benches/cloud/aws/eks.sh                          2 x c7i.4xlarge, Kubernetes 1.35
+#   md-dpdk/benches/cloud/aws/eks.sh                          2 x c7i.4xlarge, Kubernetes 1.36
 #   EKS_KEEP=1 EKS_REPS=0 md-dpdk/benches/cloud/aws/eks.sh     deploy and check, then keep it for work by hand
 #   EKS_DELETE=eks-<stamp> md-dpdk/benches/cloud/aws/eks.sh    delete a run (a kept one, or one whose
 #                                                              teardown never ran: the laptop slept)
@@ -26,7 +26,8 @@
 # the caller admin through bootstrapClusterCreatorAdminPermissions); a launch
 # template whose user data is node/userdata.sh's (first boot: kernel command
 # line, igb_uio, the per-boot DPDK unit, one reboot; kubelet with the static
-# CPU manager); a cluster placement group; and two $EKS_TYPE nodes in it, each
+# CPU manager, its CPU quota setting left on, so every pod's CPU limit holds);
+# a cluster placement group; and two $EKS_TYPE nodes in it, each
 # with two more ENIs on the data subnet 10.31.1.0/24 (device 1 the driver's
 # sender port, 2 its receiver: a .4/.5, b .6/.7), tagged
 # node.k8s.amazonaws.com/no_manage=true so the VPC CNI leaves them alone.
@@ -49,9 +50,11 @@
 #
 #   EKS_REGION (us-east-1) EKS_TYPE (c7i.4xlarge; x86, 5+ cores; *.metal too, e.g.
 #   c7i.metal-24xl: igb_uio through iommu=pt, no C-state cap, a longer join wait)
-#   EKS_K8S (1.35)
+#   EKS_K8S (1.36; 1.36 or later: the kubelet sets no CPU quota on a container
+#   with exclusive CPUs from 1.33, and 1.36 is the floor for latency nodes)
 #   EKS_REPS (5) EKS_MAX_MINUTES (150) EKS_HUGEPAGES (2048 2 MiB pages a node)
-#   EKS_POD_CPUS (8: the driver pod's vCPUs, 4 whole cores)
+#   EKS_POD_CPUS (4: the driver pod's CPUs, 4 physical cores; SMT is off on
+#   every latency node, so one CPU is one core)
 #   EKS_KEEP=1 keeps everything (delete it with EKS_DELETE=<stamp> eks.sh);
 #   EKS_REPS=0 with EKS_KEEP=1 stops after the checks, for work by hand.
 #   LAB_KEEP and LAB_DELETE are not read: one exported for lab.sh must never
@@ -75,11 +78,11 @@ deploy=$EKS_SNAPSHOT/aws-eks
 self=$repo/md-dpdk/benches/cloud/aws/eks.sh # for messages: the checkout's path, not the snapshot's
 region=${EKS_REGION:-us-east-1}
 type=${EKS_TYPE:-c7i.4xlarge}
-k8s=${EKS_K8S:-1.35}
+k8s=${EKS_K8S:-1.36}
 reps=${EKS_REPS:-5}
 max_minutes=${EKS_MAX_MINUTES:-150}
 hugepages=${EKS_HUGEPAGES:-2048}
-pod_cpus=${EKS_POD_CPUS:-8}
+pod_cpus=${EKS_POD_CPUS:-4}
 keep=${EKS_KEEP:-}
 delete=${EKS_DELETE:-}
 rtt_messages=${RTT_MESSAGES:-300000}
@@ -90,6 +93,14 @@ rtt_seconds=${RTT_SECONDS:-20}
 # IOMMU passes igb_uio's DMA through (iommu=pt), as in the metal lab.
 if [[ ${type%%.*} =~ ^[a-z]+[0-9]+g ]]; then
     echo "EKS_TYPE $type is a Graviton (Arm) type: the benchmarks run on x86 only" >&2
+    exit 2
+fi
+# Kubernetes 1.36 or later. The node keeps kubelet's CPU quota setting on, so
+# every pod's CPU limit holds; the driver gets no quota only because kubelet
+# 1.33+ sets none on a container with exclusive CPUs. A delete runs whatever
+# EKS_K8S says.
+if [[ -z $delete ]] && { [[ ! $k8s =~ ^1\.([0-9]+)$ ]] || ((BASH_REMATCH[1] < 36)); }; then
+    echo "EKS_K8S $k8s: want Kubernetes 1.36 or later (1.MINOR), the floor for latency nodes" >&2
     exit 2
 fi
 # An eks- stamp, never a lab.sh one (both tag owner=ergon-lab, run=<stamp>):
@@ -491,16 +502,25 @@ read -r vcpus cores tpc arch <<<"$(ec2 describe-instance-types --instance-types 
     --output text 2>/dev/null)"
 [[ -n ${arch:-} && $arch != None ]] || die "cannot describe $type in $region"
 [[ $arch == x86_64 ]] || die "$type is $arch: the benchmarks run on x86 only"
-# AWS numbers SMT twins N and N+cores; the node's reserved CPUs (0 and its
-# twin) and the checks below rely on it. (On metal the firmware numbers them:
-# provision-node.sh refuses reserved CPUs that are not whole cores, so other
-# numbering stops the node joining, never a measurement.)
-((tpc == 2)) || die "$type has $tpc thread(s) per core; the node layout needs 2"
+# SMT (hyper-threading) is off on every latency node: CpuOptions
+# ThreadsPerCore=1 in the launch template (node/launch-template.py) where EC2
+# accepts it, and nosmt with provision-node.sh on bare metal (no CPU options
+# there). One Kubernetes CPU is then one physical core, the same as on
+# Graviton, and the node has $cores CPUs numbered 0..cores-1.
+# provision-node.sh refuses a housekeeping CPU that will not run with SMT
+# off, so other numbering stops the node joining, never a measurement.
+# Threads per core the nodes get: 1 where EC2 takes the change (and where the
+# type already has 1), the type's default only on bare metal.
+if [[ $type == *metal* ]] || ((tpc < 2)); then
+    node_tpc=$tpc
+else
+    node_tpc=1
+fi
 # a reserved core, then the driver pod's: housekeeping and conductor, sender, receiver, the client
 ((cores >= 5)) || die "$type has $cores cores; the node needs 5 or more (system, housekeeping, sender, receiver, app)"
-((pod_cpus % 2 == 0 && pod_cpus / 2 >= 4 && pod_cpus / 2 < cores)) ||
-    die "EKS_POD_CPUS=$pod_cpus: the driver pod needs whole cores, at least 4, and fewer than the node's $cores"
-reserved="0,$cores"
+((pod_cpus >= 4 && pod_cpus < cores)) ||
+    die "EKS_POD_CPUS=$pod_cpus: the driver pod needs at least 4 CPUs and fewer than the node's $cores"
+reserved="0"
 docker info >/dev/null 2>&1 || die "docker is not running"
 docker buildx version >/dev/null 2>&1 || die "docker buildx is not installed"
 
@@ -558,7 +578,7 @@ quota=${quota%.*}
 used=$(ec2 describe-instances --filters Name=instance-state-name,Values=pending,running \
     --query 'Reservations[].Instances[].[InstanceType,CpuOptions.CoreCount,CpuOptions.ThreadsPerCore]' --output text |
     awk '$1 ~ /^([acdhmrtz]|i|im|is)[0-9]/ {s += $2 * $3} END {print s + 0}') || die "cannot count the running vCPUs"
-need=$((2 * vcpus))
+need=$((2 * cores * node_tpc))
 if ((used + need > quota)); then
     die "the on-demand standard vCPU quota (L-1216C47A) in $region is $quota, $used in use: 2 x $type needs $need more. Stop what runs or raise the quota (Service Quotas)."
 fi
@@ -755,26 +775,13 @@ eks create-access-entry --cluster-name "$N" --principal-arn "$node_role_arn" --t
 RUSTERON_DPDK_DEVICE_NUMBERS="1 2" RUSTERON_HUGEPAGES=$hugepages \
     bash "$deploy/node/userdata.sh" "$N" "$endpoint" "$ca" "$svc" "$reserved" >"$out/userdata.gz" ||
     die "node/userdata.sh failed (over the 16 KiB user-data limit?)"
-python3 - "$ami" "$type" "$profile_arn" "$out/userdata.gz" "$stamp" "$N" >"$out/launch-template.json" <<'PY' || die "launch template data"
-import base64, json, sys
-ami, itype, profile, userdata, stamp, name = sys.argv[1:7]
-def tags(rtype, what, extra=()):
-    base = [("owner", "ergon-lab"), ("run", stamp), ("Name", f"{name}-{what}")]
-    return {"ResourceType": rtype, "Tags": [{"Key": k, "Value": v} for k, v in base + list(extra)]}
-print(json.dumps({
-    "ImageId": ami,
-    "InstanceType": itype,
-    "IamInstanceProfile": {"Arn": profile},
-    "BlockDeviceMappings": [{"DeviceName": "/dev/xvda",
-                             "Ebs": {"VolumeSize": 40, "VolumeType": "gp3", "DeleteOnTermination": True}}],
-    "MetadataOptions": {"HttpTokens": "required", "HttpEndpoint": "enabled", "HttpPutResponseHopLimit": 2},
-    # a node shutting itself down (the dead-man's switch below) is deleted
-    "InstanceInitiatedShutdownBehavior": "terminate",
-    "UserData": base64.b64encode(open(userdata, "rb").read()).decode(),
-    "TagSpecifications": [tags("instance", "node", [(f"kubernetes.io/cluster/{name}", "owned")]),
-                          tags("volume", "disk"), tags("network-interface", "primary-eni")],
-}))
-PY
+# The launch template: CpuOptions ThreadsPerCore=1 on x86 where EC2 accepts
+# it (node/launch-template.py turns SMT off, so one CPU is one physical core).
+python3 "$deploy/node/launch-template.py" "$ami" "$type" "$profile_arn" "$out/userdata.gz" "$stamp" "$N" \
+    "$vcpus" "$cores" "$tpc" "$arch" >"$out/launch-template.json" || die "launch template data"
+grep -q '"ThreadsPerCore": 1' "$out/launch-template.json" &&
+    log "launch template: CpuOptions CoreCount=$cores ThreadsPerCore=1 (SMT off)" ||
+    log "launch template: no CpuOptions ($type takes none: SMT is off already or bare metal turns it off at boot)"
 ec2 create-launch-template --launch-template-name "$lt" --launch-template-data "file://$out/launch-template.json" \
     --tag-specifications "$(tags launch-template lt)" >/dev/null || die "launch template"
 
@@ -1010,10 +1017,15 @@ hkset=" $(expand "$hk")"
 iso=
 for c in $(expand "$(cat /sys/devices/system/cpu/online)"); do [[ $hkset == *" $c "* ]] || iso+="$c "; done
 cmdline=" $(cat /proc/cmdline) "
+# SMT (hyper-threading) off: one Kubernetes CPU is one physical core, the same
+# as on Graviton (CpuOptions ThreadsPerCore=1 in the launch template; nosmt
+# and provision-node.sh on bare metal).
+v=$(cat /sys/devices/system/cpu/smt/active 2>/dev/null || echo 0)
+if [[ $v == 0 ]]; then ok "SMT off (smt/active=0)"; else bad "smt/active=$v (want 0: one CPU is one physical core)"; fi
 # the C-state cap on a VM only (provision-node.sh): on metal it did not help
 vm=
 grep -m1 '^flags' /proc/cpuinfo | grep -qw hypervisor && vm=1
-args="isolcpus= nohz_full= rcu_nocbs= irqaffinity= iommu=pt transparent_hugepage=never hugepagesz=2M hugepages="
+args="nosmt isolcpus= nohz_full= rcu_nocbs= irqaffinity= iommu=pt transparent_hugepage=never hugepagesz=2M hugepages="
 [[ -n $vm ]] && args+=" intel_idle.max_cstate=1 processor.max_cstate=1"
 for arg in $args; do
     if [[ $cmdline == *" $arg"* ]]; then ok "cmdline has $arg"; else bad "cmdline lacks $arg"; fi
@@ -1096,20 +1108,48 @@ done
 SH
 }
 
+# pod_cpu_max <a|b> <pod> <container>: "pod <cpu.max>" and "container <cpu.max>"
+# of the pod's cgroup and the container's, read on the host (a container with
+# its own cgroup namespace cannot see its pod's cgroup). The systemd cgroup
+# driver: kubepods.slice/kubepods[-<qos>]-pod<uid, _ for ->.slice, and in it
+# cri-containerd-<id>.scope.
+pod_cpu_max() {
+    local uid id
+    uid=$(k get pod "$2" -o jsonpath='{.metadata.uid}')
+    id=$(k get pod "$2" -o jsonpath="{.status.containerStatuses[?(@.name==\"$3\")].containerID}")
+    [[ -n $uid && -n $id ]] || { echo "no uid or container id for $2/$3"; return 1; }
+    on_host "$1" "$uid" "${id#containerd://}" <<'SH'
+pod=$(find /sys/fs/cgroup/kubepods.slice -maxdepth 2 -type d -name "kubepods*-pod${1//-/_}.slice" | head -1)
+[[ -n $pod ]] || { echo "no cgroup for pod $1 under /sys/fs/cgroup/kubepods.slice"; exit 1; }
+echo "pod $(cat "$pod/cpu.max")"
+echo "container $(cat "$pod/cri-containerd-$2.scope/cpu.max")"
+SH
+}
+
 # Kubelet, node and pod: the CPU manager's settings, what the node offers, and
-# where the driver's threads run. Prints ok/FAIL lines.
+# where the driver's threads run. The CPU quota: kubelet's setting stays on, so
+# every pod's CPU limit holds (the device plugin's 100m limit is the witness),
+# and the driver, a Guaranteed pod on whole CPUs, gets none because kubelet
+# 1.33+ sets none on a container with exclusive CPUs, nor on its pod
+# (DisableCPUQuotaWithExclusiveCPUs). Prints ok/FAIL lines.
 cluster_checks() {
-    local n=$1 node
+    local n=$1 node plugin
     node=$(nv node "$n")
+    plugin=$(pod_on rusteron-dpdk-device-plugin "$node")
     k get --raw "/api/v1/nodes/$node/proxy/configz" >"$out/$n-configz.json" 2>&1
+    k get --raw "/api/v1/nodes/$node/proxy/metrics" >"$out/$n-kubelet-metrics.txt" 2>&1 ||
+        echo "# kubectl get --raw .../metrics failed" >>"$out/$n-kubelet-metrics.txt"
     k get node "$node" -o json >"$out/$n-node.json" 2>&1
     k get pod "$(nv drv "$n")" -o json >"$out/$n-driver-pod.json" 2>&1
+    k get pod "$plugin" -o json >"$out/$n-plugin-pod.json" 2>&1
     driver_cpus "$n" >"$out/$n-cpuset.txt" 2>&1
     driver_cgroup "$n" cpu.max >"$out/$n-cpu.max" 2>&1
+    pod_cpu_max "$n" "$(nv drv "$n")" media-driver >"$out/$n-driver-cgroups.txt" 2>&1
+    pod_cpu_max "$n" "$plugin" device-plugin >"$out/$n-plugin-cgroups.txt" 2>&1
     driver_threads "$n" >"$out/$n-threads.txt" 2>&1
-    python3 - "$out" "$n" "$reserved" "$((vcpus - tpc))" "$hugepages" "$cores" "$pod_cpus" \
+    python3 - "$out" "$n" "$reserved" "$((cores - 1))" "$hugepages" "$cores" "$pod_cpus" \
         "$(nv hk "$n")" "$(nv snd "$n")" "$(nv rcv "$n")" <<'PY'
-import json, os, sys
+import json, os, re, sys
 out, n, reserved, cpus, pages, cores, pod_cpus, hk, snd, rcv = sys.argv[1:11]
 cores, pod_cpus = int(cores), int(pod_cpus)
 def check(good, what): print(("ok   " if good else "FAIL ") + what)
@@ -1140,21 +1180,66 @@ if cz:
     check(cpuset(k.get("reservedSystemCPUs", "")) == cpuset(reserved),
           f"kubelet reservedSystemCPUs {k.get('reservedSystemCPUs')!r} (want {reserved})")
     check(k.get("topologyManagerPolicy") == "single-numa-node", f"kubelet topologyManagerPolicy {k.get('topologyManagerPolicy')}")
+    check(k.get("cpuCFSQuota", True) is True,
+          f"kubelet cpuCFSQuota {k.get('cpuCFSQuota')} (want true or absent, the default: false removes every pod's CPU limit)")
     check(not k.get("kubeReservedCgroup") and not k.get("systemReservedCgroup"),
           f"kubelet reserved cgroups {k.get('kubeReservedCgroup')!r} {k.get('systemReservedCgroup')!r} (want none)")
 node = load("node.json")
+ver = None
 if node:
+    kv = node["status"].get("nodeInfo", {}).get("kubeletVersion", "")
+    m = re.match(r"v?(\d+)\.(\d+)", kv)
+    ver = (int(m[1]), int(m[2])) if m else None
+    check(ver is not None and ver >= (1, 36), f"kubelet version {kv!r} (want 1.36 or later)")
     a = node["status"]["allocatable"]
     check(a.get("cpu") == cpus, f"allocatable cpu {a.get('cpu')} (want {cpus})")
     check(mib(a.get("hugepages-2Mi", "0")) == 2 * int(pages), f"allocatable hugepages-2Mi {a.get('hugepages-2Mi')} (want {2 * int(pages)}Mi)")
     check(a.get("rusteron.io/dpdk-ena-pair") == "1", f"allocatable rusteron.io/dpdk-ena-pair {a.get('rusteron.io/dpdk-ena-pair')}")
+# DisableCPUQuotaWithExclusiveCPUs: its kubernetes_feature_enabled line where
+# kubelet has one (1 = on), else the version (on by default from 1.33, locked
+# on in 1.37, removed with the behaviour kept in 1.38).
+gate = "DisableCPUQuotaWithExclusiveCPUs"
+metrics = open(os.path.join(out, f"{n}-kubelet-metrics.txt")).read()
+lines = [l for l in metrics.splitlines() if l.startswith("kubernetes_feature_enabled{") and f'name="{gate}"' in l]
+if "# kubectl get --raw" in metrics:
+    check(False, f"kubelet metrics unreadable ({n}-kubelet-metrics.txt)")
+elif lines:
+    check(lines[0].split()[-1] in ("1", "1.0"), f"kubelet feature gate {gate}: {lines[0]} (want 1)")
+else:
+    check(ver is not None and ver >= (1, 33), f"kubelet feature gate {gate}: no metric line, kubelet {ver} (on from 1.33)")
 pod = load("driver-pod.json")
 if pod:
     check(pod["status"].get("qosClass") == "Guaranteed", f"driver pod QoS {pod['status'].get('qosClass')}")
+    lim = [c["resources"]["limits"].get("cpu", "") for c in pod["spec"]["containers"] if c["name"] == "media-driver"]
+    check(lim == [str(pod_cpus)], f"driver CPU limit {lim} (want a whole {pod_cpus}: exclusive CPUs)")
+def cgroups(name):
+    got = {}
+    for l in open(os.path.join(out, f"{n}-{name}-cgroups.txt")):
+        w = l.split()
+        if len(w) >= 2 and w[0] in ("pod", "container"):
+            got[w[0]] = w[1:]
+    return got
+def milli(q):
+    return int(q[:-1]) if q.endswith("m") else int(float(q) * 1000)
+cg = cgroups("driver")
+check(cg.get("pod", [""])[0] == "max" and cg.get("container", [""])[0] == "max",
+      f"driver cgroups on the host: pod cpu.max {cg.get('pod')}, container {cg.get('container')} (want max: exclusive CPUs, no quota)")
+# The witness: a pod with a fractional CPU limit on the same node keeps its quota.
+plugin = load("plugin-pod.json")
+if plugin:
+    lim = [c["resources"].get("limits", {}).get("cpu") for c in plugin["spec"]["containers"] if c["name"] == "device-plugin"]
+    cg = cgroups("plugin")
+    period = cg.get("container", [])[1:2]
+    want = str(milli(lim[0]) * int(period[0]) // 1000) if lim and lim[0] and period and period[0].isdigit() else None
+    check(want is not None and cg.get("container", [""])[0] == want and cg.get("pod", [""])[0] == want,
+          f"device plugin (CPU limit {lim}) cgroups on the host: pod cpu.max {cg.get('pod')}, container {cg.get('container')} "
+          f"(want quota {want}: a pod's CPU limit holds)")
 cs = cpuset(open(os.path.join(out, f"{n}-cpuset.txt")).read())
-twin = lambda c: c + cores if c < cores else c - cores
-whole = len(cs) == pod_cpus and all(twin(c) in cs for c in cs) and not cs & cpuset(reserved)
-check(whole, f"driver cpuset {sorted(cs)}: {pod_cpus} CPUs, whole cores, none reserved")
+# SMT is off: every CPU is one physical core, so whole cores come for free.
+# The pod needs its CPUs, under the node's cores, and none of the reserved one.
+whole = (len(cs) == pod_cpus and not cs & cpuset(reserved)
+         and all(0 <= c < cores for c in cs))
+check(whole, f"driver cpuset {sorted(cs)}: {pod_cpus} CPUs under {cores}, none reserved")
 cpumax = open(os.path.join(out, f"{n}-cpu.max")).read().split()
 check(cpumax[:1] == ["max"], f"driver cpu.max {' '.join(cpumax)} (no CFS quota)")
 threads = [l.strip().split("|") for l in open(os.path.join(out, f"{n}-threads.txt")) if l.count("|") == 2]

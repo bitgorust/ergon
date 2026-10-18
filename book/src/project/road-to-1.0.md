@@ -54,7 +54,9 @@ Cluster may remain `0.x` after sbe 1.0.
 - External pilot: [External Schema Pilot](external-pilot.md).
 - Cluster compatibility: [Cluster Compatibility](../cluster/compatibility.md).
 - API baseline manifest: `api/public-api-baseline.toml`. `scripts/check-public-api.sh`
-  runs cargo-semver-checks on the two publishable crates.
+  runs cargo-semver-checks on each published crate it lists (`ergo-aeron-cluster`
+  only with `CLUSTER_SEMVER_CHECKS=1`; a crate first published after the
+  baseline once the baseline reaches that release).
   `scripts/check-generated-public-api.sh` diffs generated codec surfaces
   against `api/generated/*.txt`.
 - Benchmark evidence: `just bench` + `just bench-cluster` write

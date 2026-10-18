@@ -1,5 +1,5 @@
-//! The receive side every protocol shares: one contiguous buffer, TLS records
-//! decrypted in place, and a plaintext parse window.
+//! The receive side every protocol shares: one buffer, TLS records decrypted
+//! in place, and a plaintext parse window.
 //!
 //! Buffer layout (`head <= tail`):
 //!
@@ -7,17 +7,20 @@
 //! [ .. | leftover plaintext p_start..p_end | gap | ciphertext head..tail | free tail.. ]
 //! ```
 //!
-//! The kernel writes into the free tail (the only copy). `open_next`
-//! decrypts the record at `head` in place. If the window is empty, the record's
-//! plaintext *becomes* the window, with no copy. Only when a message spans two
-//! records is the new plaintext moved down next to the leftover
-//! (`span_copy_bytes`), and the buffer is compacted only when the free tail runs
-//! low (`compact_bytes`). Both are counted, so the copy claim is measured.
+//! - The kernel writes into the free tail: the only copy.
+//! - `open_next` decrypts the record at `head` in place. With an empty
+//!   window, the record's plaintext becomes the window: no copy.
+//! - A message that spans two records moves the new plaintext next to the
+//!   leftover (counted in `span_copy_bytes`).
+//! - The buffer is compacted only when the free tail runs low (counted in
+//!   `compact_bytes`).
 
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 
+use crate::endpoint::sealed::RouteSlot;
 use crate::error::Result;
+use crate::route::RouteCheck;
 use crate::tls::{self, MAX_RECORD, Opened, RecordLayer};
 
 /// Receive-side counters.
@@ -44,6 +47,7 @@ pub(crate) struct TlsStream {
     tls: RecordLayer,
     txq: Vec<u8>,
     stats: StreamStats,
+    route: RouteSlot,
 }
 
 impl TlsStream {
@@ -72,6 +76,7 @@ impl TlsStream {
                 span_copy_bytes: 0,
                 compact_bytes: 0,
             },
+            route: RouteSlot::Ready(RouteCheck::NotChecked),
         }
     }
 
@@ -81,6 +86,20 @@ impl TlsStream {
 
     pub(crate) const fn stats(&self) -> &StreamStats {
         &self.stats
+    }
+
+    /// What the route check found, or [`RouteCheck::Pending`] until
+    /// ergon-io's warning thread has made it.
+    pub(crate) fn route(&self) -> &RouteCheck {
+        self.route.get()
+    }
+
+    pub(crate) const fn route_state(&self) -> &RouteSlot {
+        &self.route
+    }
+
+    pub(crate) fn set_route(&mut self, route: RouteSlot) {
+        self.route = route;
     }
 
     #[inline]

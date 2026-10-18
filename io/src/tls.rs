@@ -1,13 +1,14 @@
-//! TLS 1.3: rustls does the handshake; this module then owns the record layer and
-//! decrypts each record **in place** in the caller's receive buffer.
+//! TLS 1.3: rustls does the handshake; this module then owns the record
+//! layer and decrypts each record **in place** in the receive buffer.
 //!
-//! rustls 0.23's own read paths (buffered and unbuffered) both pop every decrypted
-//! record out of an internal `ChunkVecBuffer` (one allocation and one copy per
-//! record). To keep exactly one copy per byte (kernel to our buffer) we use the
-//! kTLS-style API: drive `UnbufferedClientConnection` until the handshake reaches
-//! `WriteTraffic`, call `dangerous_into_kernel_connection`, and run AES-GCM /
-//! ChaCha20-Poly1305 ourselves with ring. The returned `KernelConnection` is still
-//! used for post-handshake messages (session tickets and key updates).
+//! - Why: rustls 0.23's read paths copy every record into an internal buffer
+//!   (one allocation and one copy per record). In place keeps one copy per
+//!   byte: kernel to our buffer.
+//! - How: drive `UnbufferedClientConnection` to `WriteTraffic`, call
+//!   `dangerous_into_kernel_connection` (the kTLS-style API), then run
+//!   AES-GCM or ChaCha20-Poly1305 with ring.
+//! - The returned `KernelConnection` still handles post-handshake messages
+//!   (session tickets, key updates).
 
 use std::io::{Read, Write};
 use std::sync::Arc;

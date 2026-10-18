@@ -129,7 +129,11 @@ impl App for Recorder {
 
 /// Ping-pong client: one message outstanding, sent at a fixed rate (or back to
 /// back when `interval_ns == 0`); each echo becomes a record whose
-/// `user_ns - src_ns` is the round trip.
+/// `user_ns - src_ns` is the round trip. With an order connection set
+/// ([`PingPong::with_order`]) the loop's other connections are market-data
+/// feeds: their messages are decoded (sequence and send time read) and
+/// counted, as an application would, and only the order connection's echoes
+/// are round trips.
 pub struct PingPong {
     variant: u8,
     interval_ns: i64,
@@ -139,7 +143,12 @@ pub struct PingPong {
     /// When the outstanding message was due on the paced schedule (0 when
     /// unpaced).
     due_ns: i64,
-    payload_len: usize,
+    /// The message to send, allocated once at construction so the send path
+    /// does not allocate and the size sent is exactly the size configured. A
+    /// fixed stack buffer used to be silently clamped to 1024 bytes while the
+    /// run metadata still reported the requested size, so a `--payload 16000`
+    /// native run sent 1024 and a mio run sent 16000.
+    payload: Vec<u8>,
     /// Round-trip records: `src_ns` is when the message was sent, `src2_ns`
     /// when it was due on the schedule (0 when unpaced). A stall delays the
     /// messages due during it, and the schedule never slips, so the time from
@@ -147,6 +156,12 @@ pub struct PingPong {
     pub records: Vec<Record>,
     /// Round trips not recorded because the vector was full.
     pub dropped: u64,
+    /// The order connection (None: the first connection, and no feeds).
+    order: Option<ConnId>,
+    /// Feed messages decoded.
+    pub feed_messages: u64,
+    /// The last feed message's sequence number and send time (the decode).
+    pub feed_last: (i64, i64),
     closed: Option<Error>,
 }
 
@@ -161,11 +176,21 @@ impl PingPong {
             seq: 0,
             outstanding: false,
             due_ns: 0,
-            payload_len: payload_len.max(16),
+            payload: vec![0u8; payload_len.max(16)],
             records: Vec::with_capacity(capacity),
             dropped: 0,
+            order: None,
+            feed_messages: 0,
+            feed_last: (0, 0),
             closed: None,
         }
+    }
+
+    /// Round trips on `order`; every other connection is a feed.
+    #[must_use]
+    pub const fn with_order(mut self, order: ConnId) -> Self {
+        self.order = Some(order);
+        self
     }
 }
 
@@ -179,6 +204,12 @@ impl WsHandler for PingPong {
     fn on_message(&mut self, conn: ConnId, _opcode: u8, payload: &[u8], meta: &RxMeta, pos: u16) {
         let now = realtime_ns();
         if payload.len() < 16 {
+            return;
+        }
+        if self.order.is_some_and(|o| o != conn) {
+            // A feed message: decoded, not timed.
+            self.feed_last = (read_i64(payload, 0), read_i64(payload, 8));
+            self.feed_messages += 1;
             return;
         }
         if self.records.len() < self.records.capacity() {
@@ -219,19 +250,20 @@ impl App for PingPong {
         if now < self.next_send {
             return Ok(());
         }
-        let mut buf = [0u8; 1024];
-        let len = self.payload_len.min(buf.len());
         self.seq += 1;
-        buf[..8].copy_from_slice(&self.seq.to_le_bytes());
+        self.payload[..8].copy_from_slice(&self.seq.to_le_bytes());
         let t = realtime_ns();
-        buf[8..16].copy_from_slice(&t.to_le_bytes());
-        let Some(conn) = driver.iter().next().map(|(id, _)| id) else {
+        self.payload[8..16].copy_from_slice(&t.to_le_bytes());
+        let Some(conn) = self
+            .order
+            .or_else(|| driver.iter().next().map(|(id, _)| id))
+        else {
             return Err(Error::Closed);
         };
         driver
             .get_mut(conn)
             .ok_or(Error::Closed)?
-            .send_frame(ws::OP_BINARY, &buf[..len])?;
+            .send_frame(ws::OP_BINARY, &self.payload)?;
         self.outstanding = true;
         if self.interval_ns == 0 {
             self.due_ns = 0;

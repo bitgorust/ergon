@@ -82,10 +82,10 @@ enum rusteron_dpdk_counter_kind
     RD_COUNTER_UNSUPPORTED_PROTOCOL, /* 94   RX unsupported IP protocol */
     RD_COUNTER_POLLER,               /* 87   frames processed per poll */
     RD_COUNTER_MEMPOOL_AVAILABLE,    /* 91   free mbufs (1 Hz) */
-    RD_COUNTER_CLOCK,                /* 80   transport clock: 1 TSC, 0 monotonic */
+    RD_COUNTER_CLOCK,                /* 80   transport clock: 1 TSC, 2 CNTVCT_EL0, 0 monotonic */
     RD_COUNTER_RX_HW_DELAY_MAX,      /* 81   max NIC arrival -> dispatch, ns */
     RD_COUNTER_RX_HW_DELAY_SUM,      /* 81   sum of those delays, ns */
-    RD_COUNTER_RX_HW_TIMESTAMPED,    /* 81   frames with a NIC RX timestamp */
+    RD_COUNTER_RX_HW_TIMESTAMPED,    /* 81   frames in that sum (NIC-stamped, not after dispatch) */
     RD_COUNTER_RX_POLL_GAP_MAX,      /* 87   longest gap before a poll that found frames, ns */
     RD_COUNTER_RX_POLL_GAPS_100US,   /* 87   such gaps of 100 µs or more */
     RD_COUNTER_RX_BURST_FULL,        /* 87   polls that drained a full burst (a backlog) */
@@ -108,6 +108,9 @@ enum rusteron_dpdk_counter_kind
     RD_COUNTER_TX_QUEUED,            /* 78   frames the TX ring refused, queued to go first next */
     RD_COUNTER_RX_BACKLOG_MAX,       /* 87   most frames one poll drained */
     RD_COUNTER_RX_RING_FULL_SUSPECTED, /* 87 polls that drained within a burst of a full ring */
+    RD_COUNTER_NIC_RESET_REQUESTED,  /* 79   device resets the PMD asked for (RTE_ETH_EVENT_INTR_RESET; housekeeping) */
+    RD_COUNTER_RX_HW_DELAY_MIN,      /* 81   min NIC arrival -> dispatch, ns (meaningless while the count is 0) */
+    RD_COUNTER_RX_HW_DELAY_NEGATIVE, /* 81   NIC stamps later than the host clock after dispatch: PHC/host clock skew */
     RD_COUNTER_COUNT
 };
 
@@ -156,6 +159,22 @@ static inline void rusteron_dpdk_counters_add(rusteron_dpdk_counters_t *c, int k
 static inline void rusteron_dpdk_counters_max(rusteron_dpdk_counters_t *c, int kind, int64_t v)
 {
     if (NULL != c && NULL != c->addr[kind] && v > __atomic_load_n(c->addr[kind], __ATOMIC_RELAXED))
+    {
+        __atomic_store_n(c->addr[kind], v, __ATOMIC_RELAXED);
+    }
+}
+
+/* Lower a counter to `v` if it is smaller, or set it when the counter `count`
+ * (the samples behind it) is still 0, so a fresh minimum needs no sentinel:
+ * it reads 0 until its first sample. Single writer, as for the max. */
+static inline void rusteron_dpdk_counters_min_counted(rusteron_dpdk_counters_t *c, int kind, int64_t v, int count)
+{
+    if (NULL == c || NULL == c->addr[kind])
+    {
+        return;
+    }
+    const int first = NULL == c->addr[count] || 0 == __atomic_load_n(c->addr[count], __ATOMIC_RELAXED);
+    if (first || v < __atomic_load_n(c->addr[kind], __ATOMIC_RELAXED))
     {
         __atomic_store_n(c->addr[kind], v, __ATOMIC_RELAXED);
     }

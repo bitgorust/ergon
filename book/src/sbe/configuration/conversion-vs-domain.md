@@ -120,3 +120,12 @@ Only `Debug`. The generated `Display`/`Debug` bodies format domain values with
 `{:?}`, so a plain `#[derive(Debug)]` struct works — `Display` is never
 required. Note that `TryFromSbe::Error` / `TryToSbe::Error` is a separate
 associated type and *does* need `Debug + Display`; `&'static str` satisfies it.
+
+### Option C — generated mappings for enums and composites
+
+When the application type mirrors the SBE type — an enum with the same
+variants, a struct with the same members — `with_enum_mapping` and
+`with_composite_mapping` generate the `TryFromSbe` / `TryToSbe` impls
+(exhaustive, with renames) and register the domain type in one call. The
+accessors look exactly like Option B's. See
+[App Types on Composites](../recipes/app-types-composites.md#generated-mappings).

@@ -3,10 +3,13 @@
 //! ```text
 //! analyse [--warmup-s 10] results/<stamp>/res/lab-... results/<stamp>/res/live-... > tables.md
 //! analyse --matrix results/flags-<cloud>-<stamp>/res > tables.md
+//! analyse --fair results/fair-<cloud>-<arch>-<stamp>/res > fair.md
 //! ```
 //!
 //! `--matrix` prints the settings-matrix tables (`io_bench::matrix`) and then
-//! the detailed tables of every run.
+//! the detailed tables of every run. `--fair` prints the fair mode's
+//! comparison (`io_bench::fair`): each backend against the others per
+//! connection count, with the run id and the environment.
 //!
 //! Headline metric: the paired `Δuser` (same message, two loops, one clock). In
 //! lab runs it is corrected for the replay server's alternating write order.
@@ -30,15 +33,33 @@ fn main() -> ExitCode {
     let mut warmup_s = 10i64;
     let mut dirs: Vec<String> = Vec::new();
     let mut matrix_root: Option<String> = None;
+    let mut fair_root: Option<String> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         if a == "--warmup-s" {
             warmup_s = it.next().and_then(|v| v.parse().ok()).unwrap_or(10);
         } else if a == "--matrix" {
             matrix_root = it.next();
+        } else if a == "--fair" {
+            fair_root = it.next();
         } else {
             dirs.push(a);
         }
+    }
+    if let Some(root) = &fair_root {
+        return match io_bench::matrix::load(Path::new(root), warmup_s) {
+            Ok((tags, skipped)) => {
+                print!(
+                    "{}",
+                    io_bench::fair::report(Path::new(root), &tags, &skipped)
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{root}: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
     let mut head = String::new();
     if let Some(root) = &matrix_root {
@@ -397,7 +418,7 @@ fn stall_section(dir: &Path, out: &mut String, name: &str) -> BoxResult<Vec<Loop
 /// The ten slowest round trips of a ping-pong run, each matched to stalls of
 /// the client's loop and of the server (`server-*.txt`, written by
 /// `replay_server --stalls-dir`). Server stalls are matched on the wall clock
-/// with 50 µs of slack for the hosts' clock offset.
+/// with the hosts' clock bound as slack (`stalls::server_slack_ns`).
 fn slowest_round_trips(
     dir: &Path,
     recs: &[&Record],
@@ -416,14 +437,22 @@ fn slowest_round_trips(
     }
     let mut slow: Vec<&&Record> = recs.iter().collect();
     slow.sort_by_key(|r| std::cmp::Reverse(r.user_ns - r.src_ns));
+    let bound = stalls::clock_bound_ns(dir);
+    let slack = stalls::server_slack_ns(bound);
     let _ = writeln!(
         out,
-        "#### Slowest round trips: {name} (median {})\n\n| # | round trip µs | over median µs | client stall µs | client cause | server stall µs | server cause | not explained by either µs | verdict |\n|---|---|---|---|---|---|---|---|---|",
-        us(p50)
+        "#### Slowest round trips: {name} (median {})\n\nServer stalls are matched on the server's clock within ±{} µs ({}).\n\n| # | round trip µs | over median µs | client stall µs | client cause | server stall µs | server cause | not explained by either µs | verdict |\n|---|---|---|---|---|---|---|---|---|",
+        us(p50),
+        us(slack),
+        if bound.is_some() {
+            "the two hosts' clock bound, from chrony"
+        } else {
+            "no chrony log: the default for an unknown bound"
+        }
     );
     for (i, r) in slow.iter().take(10).enumerate() {
         let rtt = r.user_ns - r.src_ns;
-        let c = stalls::round_trip_cause(&client, &server, r.src_ns, r.user_ns, p50);
+        let c = stalls::round_trip_cause(&client, &server, r.src_ns, r.user_ns, p50, slack);
         let _ = writeln!(
             out,
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",

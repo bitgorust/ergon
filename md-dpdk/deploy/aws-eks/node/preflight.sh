@@ -14,6 +14,8 @@
 #         vfio_iommu_type1 (never unsafe no-IOMMU mode), and
 #         RUSTERON_DPDK_VFIO_WC=1 to confirm the vfio-pci in use maps the
 #         prefetchable BAR write-combined, which mainline vfio-pci does not.
+#         The driver pod's ConfigMap carries the same confirmation to the
+#         transport, whose LLQ start check cannot see a vfio-pci mapping.
 #   * 2 MiB hugepages are reserved and mounted at /dev/hugepages.
 #   * NUMA topology is present (hugepage/node locality matters on Nitro).
 #   * At least three ENA PCI functions exist (primary, sender, receiver),

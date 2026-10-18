@@ -4,7 +4,8 @@
  * Implements the port-ops table with libdpdk: resolves a PCI BDF to a port id,
  * verifies the net_ena PMD and IPv4/UDP checksum offloads, configures a single
  * RX/TX queue pair, creates a per-port mbuf pool, applies the L3 MTU, starts
- * the device and waits for the link.
+ * the device and waits for the link; runs the PMDs' timers (ENA's watchdog)
+ * and counts device-reset requests for the housekeeping thread.
  *
  * This is the only translation unit (besides the EAL seam) that references
  * libdpdk; test builds replace the whole table with a fake via
@@ -13,16 +14,20 @@
 #include "rusteron_dpdk_internal.h"
 #include "rusteron_dpdk_port_ops.h"
 
+#include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
+#include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mbuf_dyn.h>
 #include <rte_mbuf_pool_ops.h>
 #include <rte_memory.h>
 #include <rte_mempool.h>
+#include <rte_timer.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,10 +72,11 @@ static int rusteron_dpdk_port_dev_info(
     uint16_t port_id, const char *pci_bdf,
     uint8_t mac[RUSTERON_DPDK_ETH_ADDR_LEN],
     char *driver_name, size_t driver_name_len,
-    int *csum_offload_ok, int *ena_llq_available, int *rx_timestamp_ok, uint16_t *max_mtu,
+    int *csum_offload_ok, int *ena_llq, int *rx_timestamp_ok, uint16_t *max_mtu,
     uint16_t desc_lim[4])
 {
-    (void)pci_bdf; /* capabilities are read by port id once probed */
+    /* capabilities are read by port id once probed; pci_bdf names the device
+     * in sysfs, for the LLQ BAR's mapping */
     struct rte_eth_dev_info info;
     memset(&info, 0, sizeof(info));
     if (rte_eth_dev_info_get(port_id, &info) < 0)
@@ -97,9 +103,12 @@ static int rusteron_dpdk_port_dev_info(
     int rx_ok = rx_need == (info.rx_offload_capa & rx_need);
     *csum_offload_ok = (tx_ok && rx_ok) ? 1 : 0;
 
-    /* ENA exposes low-latency queues through the private API; we only record
-     * the capability here so the runtime can be configured accordingly. */
-    *ena_llq_available = 0;
+    /* An ENA's low-latency queue placement is the PMD's own (no ethdev API or
+     * xstat reports it); what the process can see is how BAR 2, the LLQ BAR,
+     * is mapped: write-combined (resource2_wc), which LLQ needs, or not.
+     * Mapped at probe, before this. */
+    *ena_llq = 0 == strcmp(driver, "net_ena") ? rusteron_dpdk_ena_llq_mapping("/proc/self/maps", pci_bdf)
+                                              : RUSTERON_DPDK_ENA_LLQ_NA;
 
     /* ENA delivers the Nitro PHC's RX timestamps from DPDK 25.11, in a
      * precision-time placement group on supporting instances. */
@@ -171,12 +180,22 @@ static void *rusteron_dpdk_port_mempool_create(const char *name, uint32_t n, uin
     {
         /* Surface the underlying rte error (e.g. ENOMEM on hugepage
          * exhaustion) — runtime.c only records a generic fallback if no
-         * error was already set here. */
+         * error was already set here. What it asked for says how many
+         * hugepages it needs: jumbo frames make each mbuf about 9 KiB. */
         char detail[512];
-        snprintf(detail, sizeof(detail), "mempool %s: %s", name, rte_strerror(rte_errno));
+        snprintf(detail, sizeof(detail), "mempool %s (%u mbufs of %u bytes of data room): %s", name, n,
+                 (unsigned)data_room, rte_strerror(rte_errno));
         rusteron_dpdk_set_error_code(detail, rte_errno);
     }
     return pool;
+}
+
+/* What rte_pktmbuf_init gives each mbuf after the headroom: the pool's data
+ * room less RTE_PKTMBUF_HEADROOM, the tailroom of a fresh one. */
+static uint32_t rusteron_dpdk_port_mbuf_room(void *mempool)
+{
+    const uint16_t room = rte_pktmbuf_data_room_size(mempool);
+    return room > RTE_PKTMBUF_HEADROOM ? (uint32_t)(room - RTE_PKTMBUF_HEADROOM) : 0;
 }
 
 static int rusteron_dpdk_port_rx_queue_setup(
@@ -319,28 +338,23 @@ static uint16_t rusteron_dpdk_port_tx_burst(
     return rte_eth_tx_burst(port_id, tx_queue_id, mbufs, nb);
 }
 
+/* The decode of those verdicts is pure and lives in rusteron_dpdk_packet.c so
+ * the test archive can exercise it; only the shift positions come from DPDK.
+ * Assert here that the positions rusteron_dpdk_packet.h hardcodes still match
+ * the DPDK this is compiled against. */
+_Static_assert(RUSTERON_DPDK_CKSUM_IP_SHIFT == 5, "RTE_MBUF_F_RX_IP_CKSUM_BAD moved");
+_Static_assert(RUSTERON_DPDK_CKSUM_L4_SHIFT == 7, "RTE_MBUF_F_RX_L4_CKSUM_BAD moved");
+_Static_assert(
+    (1ULL << RUSTERON_DPDK_CKSUM_IP_SHIFT) == RTE_MBUF_F_RX_IP_CKSUM_BAD &&
+        (1ULL << (RUSTERON_DPDK_CKSUM_IP_SHIFT + 1)) == RTE_MBUF_F_RX_IP_CKSUM_GOOD &&
+        (1ULL << RUSTERON_DPDK_CKSUM_L4_SHIFT) == RTE_MBUF_F_RX_L4_CKSUM_BAD &&
+        (1ULL << (RUSTERON_DPDK_CKSUM_L4_SHIFT + 1)) == RTE_MBUF_F_RX_L4_CKSUM_GOOD,
+    "the DPDK checksum verdicts are no longer two-bit enums at bits 5 and 7");
+
 /* Map the DPDK RX offload verdicts onto the view flags (plan §7.6). */
 static uint32_t rusteron_dpdk_port_rx_ol_flags(const struct rte_mbuf *mbuf)
 {
-    uint32_t flags = 0;
-    uint64_t ol = mbuf->ol_flags;
-    if (0 != (ol & RTE_MBUF_F_RX_IP_CKSUM_GOOD))
-    {
-        flags |= RUSTERON_DPDK_MBUF_F_RX_IPV4_CKSUM_GOOD;
-    }
-    if (0 != (ol & RTE_MBUF_F_RX_IP_CKSUM_BAD))
-    {
-        flags |= RUSTERON_DPDK_MBUF_F_RX_IPV4_CKSUM_BAD;
-    }
-    if (0 != (ol & RTE_MBUF_F_RX_L4_CKSUM_GOOD))
-    {
-        flags |= RUSTERON_DPDK_MBUF_F_RX_UDP_CKSUM_GOOD;
-    }
-    if (0 != (ol & RTE_MBUF_F_RX_L4_CKSUM_BAD))
-    {
-        flags |= RUSTERON_DPDK_MBUF_F_RX_UDP_CKSUM_BAD;
-    }
-    return flags;
+    return rusteron_dpdk_rx_ol_flags_from_dpdk(mbuf->ol_flags);
 }
 
 static uint16_t rusteron_dpdk_port_rx_burst(
@@ -450,6 +464,66 @@ static int rusteron_dpdk_port_basic_stats(uint16_t port_id, uint64_t *ierrors, u
     return 0;
 }
 
+/* rte_timer_alt_manage's callback: the timer's own. */
+static void rusteron_dpdk_port_timer_run(struct rte_timer *tim)
+{
+    tim->f(tim, tim->arg);
+}
+
+/* The PMDs' due timers. rte_timer_manage runs only the calling lcore's, and
+ * the ENA PMD arms its watchdog (ena_start: rte_timer_reset on rte_lcore_id())
+ * on the lcore that started the port: the main lcore, the thread that created
+ * the transport and initialised the EAL, which never comes back to run it.
+ * rte_timer_alt_manage runs another lcore's list from this one, and re-arms a
+ * periodic timer on this one's, so both lists are run. Timers armed by
+ * rte_timer_reset are in the default timer data, id 0. The calling thread
+ * must have an lcore id (registered); the call never blocks. */
+static int rusteron_dpdk_port_timer_service(void)
+{
+    const unsigned int self = rte_lcore_id();
+    if (self >= RTE_MAX_LCORE)
+    {
+        return -1; /* no lcore: the timer lists would be indexed past their end */
+    }
+    unsigned int lcores[2] = { rte_get_main_lcore(), self };
+    const int rc = rte_timer_alt_manage(0, lcores, self == lcores[0] ? 1 : 2, rusteron_dpdk_port_timer_run);
+    /* -EINVAL: no PMD initialised the timer subsystem (no ENA), so no timers */
+    return -EINVAL == rc ? 0 : rc;
+}
+
+/* RTE_ETH_EVENT_INTR_RESET: the PMD asks for a device reset (ENA, from its
+ * watchdog). Raised on the thread that found it (the housekeeping thread's
+ * timer service for ENA, an interrupt thread for others), so only an atomic
+ * count; housekeeping reports it. */
+static int rusteron_dpdk_port_on_reset(uint16_t port_id, enum rte_eth_event_type event, void *cb_arg, void *ret_param)
+{
+    (void)port_id;
+    (void)event;
+    (void)ret_param;
+    __atomic_add_fetch((uint64_t *)cb_arg, 1, __ATOMIC_RELAXED);
+    return 0;
+}
+
+static int rusteron_dpdk_port_watch_reset(uint16_t port_id, uint64_t *resets)
+{
+    return rte_eth_dev_callback_register(port_id, RTE_ETH_EVENT_INTR_RESET, rusteron_dpdk_port_on_reset, resets);
+}
+
+/* -EAGAIN while the callback runs on another thread: wait it out (a second
+ * at most), as `resets` goes with the transport. */
+static void rusteron_dpdk_port_unwatch_reset(uint16_t port_id, uint64_t *resets)
+{
+    for (int tries = 0; tries < 1000; tries++)
+    {
+        if (-EAGAIN != rte_eth_dev_callback_unregister(
+                           port_id, RTE_ETH_EVENT_INTR_RESET, rusteron_dpdk_port_on_reset, resets))
+        {
+            return;
+        }
+        rte_delay_ms(1);
+    }
+}
+
 rusteron_dpdk_port_ops_t *rusteron_dpdk_port_ops_real(void)
 {
     static rusteron_dpdk_port_ops_t ops = {
@@ -457,6 +531,7 @@ rusteron_dpdk_port_ops_t *rusteron_dpdk_port_ops_real(void)
         .dev_info = rusteron_dpdk_port_dev_info,
         .dev_configure = rusteron_dpdk_port_dev_configure,
         .mempool_create = rusteron_dpdk_port_mempool_create,
+        .mbuf_room = rusteron_dpdk_port_mbuf_room,
         .rx_queue_setup = rusteron_dpdk_port_rx_queue_setup,
         .tx_queue_setup = rusteron_dpdk_port_tx_queue_setup,
         .dev_set_mtu = rusteron_dpdk_port_dev_set_mtu,
@@ -474,6 +549,9 @@ rusteron_dpdk_port_ops_t *rusteron_dpdk_port_ops_real(void)
         .xstats_get = rusteron_dpdk_port_xstats_get,
         .mempool_avail = rusteron_dpdk_port_mempool_avail,
         .basic_stats = rusteron_dpdk_port_basic_stats,
+        .timer_service = rusteron_dpdk_port_timer_service,
+        .watch_reset = rusteron_dpdk_port_watch_reset,
+        .unwatch_reset = rusteron_dpdk_port_unwatch_reset,
     };
     return &ops;
 }

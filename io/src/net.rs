@@ -3,12 +3,14 @@
 
 use std::io::{ErrorKind, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use rustls::ClientConfig;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::error::{Error, Result};
+use crate::route::RouteCheck;
 use crate::tls::{RecordLayer, TlsHandshake};
 
 /// Where to connect.
@@ -19,7 +21,7 @@ pub struct Target {
     pub host: String,
     /// TCP port.
     pub port: u16,
-    /// Request path including the query (`/ws`, `/api/v3/order?...`).
+    /// Request path including the query (`/ws`, `/api/v3/ticker?...`).
     pub path: String,
     /// Extra request headers, e.g. `X-MBX-APIKEY`.
     pub headers: Vec<(String, String)>,
@@ -101,6 +103,8 @@ pub fn connect_finished(sock: &TcpStream) -> Result<bool> {
 enum Stage {
     Idle,
     Tcp(TcpStream),
+    /// TCP is connected; the TLS handshake waits for the route check.
+    Gated(TcpStream),
     Tls(TcpStream, Box<TlsHandshake>),
     Done,
 }
@@ -110,6 +114,11 @@ pub(crate) struct TlsDial {
     cfg: Arc<ClientConfig>,
     sni: String,
     stage: Stage,
+    /// Stop at TCP connect until the route is checked
+    /// ([`TlsDial::gate_route`]).
+    gate: bool,
+    /// The route check's outcome, for the connection.
+    route: Option<RouteCheck>,
 }
 
 impl TlsDial {
@@ -119,12 +128,38 @@ impl TlsDial {
             cfg,
             sni,
             stage: Stage::Idle,
+            gate: false,
+            route: None,
         })
     }
 
     pub(crate) fn start(&mut self, addr: SocketAddr) -> Result<()> {
         self.stage = Stage::Tcp(connect_nonblocking(addr)?);
         Ok(())
+    }
+
+    /// From now on, stop once TCP is connected, before the TLS handshake,
+    /// until [`TlsDial::route_checked`].
+    pub(crate) const fn gate_route(&mut self) {
+        self.gate = true;
+    }
+
+    /// The socket, while the dial waits for its route check.
+    pub(crate) fn awaiting_route(&self) -> Option<RawFd> {
+        match &self.stage {
+            Stage::Gated(sock) => Some(sock.as_raw_fd()),
+            _ => None,
+        }
+    }
+
+    /// The route check's outcome: the next [`TlsDial::step`] starts TLS.
+    pub(crate) fn route_checked(&mut self, check: RouteCheck) {
+        self.route = Some(check);
+    }
+
+    /// The route check's outcome, once, for the connection.
+    pub(crate) const fn take_route(&mut self) -> Option<RouteCheck> {
+        self.route.take()
     }
 
     /// `Some` once TLS is established: the socket, the record layer and bytes
@@ -139,6 +174,13 @@ impl TlsDial {
                 Stage::Tcp(sock) => {
                     if !connect_finished(&sock)? {
                         self.stage = Stage::Tcp(sock);
+                        return Ok(None);
+                    }
+                    self.stage = Stage::Gated(sock);
+                }
+                Stage::Gated(sock) => {
+                    if self.gate && self.route.is_none() {
+                        self.stage = Stage::Gated(sock);
                         return Ok(None);
                     }
                     let hs = Box::new(TlsHandshake::new(self.cfg.clone(), &self.sni)?);

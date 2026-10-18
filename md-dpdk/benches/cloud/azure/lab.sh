@@ -34,8 +34,18 @@
 #   own app CPU. Against one flow's maximum it shows whether a ceiling is per flow, as AWS's
 #   8 Gbit/s appears to be, or per NIC or instance; a run whose flows' measured windows
 #   overlapped less than 0.9 of the shortest is left out of it (analyse.py)
+#   LAB_NO_FLATOUT=1: no phase that sends as fast as it can (no 32 B throughput run,
+#   no sustained maximum, no several flows): each LAB_LOAD_SIZES size needs its
+#   LAB_LOAD_LADDER rates. Modes take the settings of ../modes.sh (threading modes,
+#   INVOKER cross-host only, PUB_PARAMS and SUB_PARAMS, CONDUCTOR=own and NAPI_BUSY=spare
+#   on sizes with a fifth core, Standard_D16s_v6 and up, the DPDK transport's values
+#   within MANA's 256-descriptor rings); JUMBO and IRQ are AWS's only
 #   LAB_MAX_HOURS (8): Azure deallocates both VMs that long after creation,
 #   should this machine never delete the group (asleep, offline)
+#   LAB_WARMUP_SECONDS (0: none) and LAB_WARMUP_RATE: a warm-up load of that many
+#   seconds at that rate before each mode's first load ladder, in each rep, at its
+#   first size, recorded nowhere (Aeron's own harness warms 30 s at 25,000 msgs/s);
+#   refused without LAB_LOAD_SIZES, where it would never run
 #   LAB_RTT_ALIGN (none; e.g. 58): start each round-trip run at that second of the
 #   minute, so every mode misses (or meets) a host event recurring once a minute alike
 #   LAB_BASE (none; a git revision of this checkout): also built on both VMs, into
@@ -56,11 +66,28 @@ here=$(cd "$(dirname "$0")" && pwd)
 repo=${LAB_REPO:-$(cd "$here/../../../.." && pwd)}
 # Run from a snapshot of these scripts: bash reads a script as it runs, so an
 # edit to the checkout mid-run would otherwise break this run (and its teardown).
+# In $TMPDIR, by template: macOS's mktemp -d without one ignores TMPDIR.
 if [[ -z ${LAB_SNAPSHOT:-} ]]; then
-    snapshot=$(mktemp -d)
-    cp -R "$here/.." "$snapshot/cloud"
+    snapshot=$(mktemp -d "${TMPDIR:-/tmp}/ergon-lab.XXXXXX") || { echo "lab.sh: no snapshot directory in ${TMPDIR:-/tmp}" >&2; exit 1; }
+    if ! cp -R "$here/.." "$snapshot/cloud"; then
+        [[ -n $snapshot && -d $snapshot ]] && rm -rf -- "$snapshot"
+        echo "lab.sh: cannot snapshot $here/.. into $snapshot" >&2
+        exit 1
+    fi
     LAB_SNAPSHOT=$snapshot LAB_REPO=$repo exec bash "$snapshot/cloud/${here##*/}/${0##*/}" "$@"
 fi
+# remove_snapshot: the snapshot this run executes from, removed as it exits:
+# the EXIT trap's last step (the teardown, which runs from it, first), so
+# runs leave no copy behind in $TMPDIR. Only by its own path, checked: a
+# directory under $TMPDIR named as mktemp made it, holding this very script
+remove_snapshot() {
+    local s=${LAB_SNAPSHOT:-}
+    [[ -n $s && $s == "${TMPDIR:-/tmp}"/ergon-lab.* && ${s##*/} =~ ^ergon-lab\.[A-Za-z0-9]{6}$ && -d $s &&
+        -f $s/cloud/${here##*/}/${0##*/} ]] || return 0
+    rm -rf -- "$s"
+}
+# until the teardown's own trap (below) takes over, which calls it last
+trap remove_snapshot EXIT
 group=${LAB_GROUP:-ergon-lab-md-dpdk}
 region=${LAB_REGION:-northcentralus}
 size=${LAB_SIZE:-Standard_D8s_v6}
@@ -93,6 +120,8 @@ mix_seconds=${LAB_MIX_SECONDS:-10}
 # a sustained maximum over several flows at once (lib.sh multi_flow_max): how
 # many flows; unset, 0 or 1, none
 tput_flows=${LAB_TPUT_FLOWS:-}
+# the cost guard: no phase that sends as fast as it can (lib.sh)
+no_flatout=${LAB_NO_FLATOUT:-}
 read -ra states <<<"${LAB_STATES:-pinned isolated}"
 rtt_messages=${RTT_MESSAGES:-300000}
 rtt_warmup=${RTT_WARMUP:-50000}
@@ -100,6 +129,10 @@ rtt_align=${LAB_RTT_ALIGN:-}
 base=${LAB_BASE:-}
 # both VMs deallocate themselves this long after creation (hours)
 max_hours=${LAB_MAX_HOURS:-8}
+# a warm-up load before each mode's first ladder, unrecorded (lib.sh
+# load_sweep): its seconds and messages a second; none by default
+warmup_seconds=${LAB_WARMUP_SECONDS:-0}
+warmup_rate=${LAB_WARMUP_RATE:-0}
 tput_seconds=${TPUT_SECONDS:-5}
 user=azureuser
 out=$repo/target/md-dpdk-bench/$(date +%Y%m%d-%H%M%S)
@@ -117,6 +150,36 @@ if [[ -n $base ]] && ! git -C "$repo" rev-parse --verify -q "$base^{commit}" >/d
     die "LAB_BASE $base: not a commit in $repo"
 fi
 [[ -z $tput_flows || $tput_flows =~ ^[0-9]+$ ]] || die "LAB_TPUT_FLOWS $tput_flows: not a number of flows"
+# every mode's settings, as aws/lab.sh checks them (modes.sh mode_check: a
+# comma would split every results.csv row of it, an Aeron threading mode or
+# URI parameter Aeron does not know runs as if it were not there, INVOKER
+# cannot run on one host, jumbo frames are AWS's), before any az call
+. "$here/../modes.sh"
+for m in "${modes[@]}"; do
+    why=$(mode_check "$m" remote x86_64 azure "" 2>&1) || die "$why"
+    # the layout's fifth core on both sizes (vm.sh ready would find it missing
+    # only after the build)
+    why=$(spare_types_check "$m" azure "$size_a" "$size_b" 2>&1) || die "$why"
+done
+for m in ${local_modes:-}; do
+    why=$(mode_check "$m" local x86_64 azure "" 2>&1) || die "$why"
+done
+[[ -z $no_flatout || $no_flatout == 1 ]] || die "LAB_NO_FLATOUT is 1 or unset"
+[[ $warmup_seconds =~ ^[0-9]{1,6}$ ]] || die "LAB_WARMUP_SECONDS is a whole number of seconds (0: no warm-up), not $warmup_seconds"
+[[ $warmup_rate =~ ^[0-9]{1,9}$ ]] || die "LAB_WARMUP_RATE is a whole number of messages a second, not $warmup_rate"
+((10#$warmup_seconds == 0 || 10#$warmup_rate > 0)) ||
+    die "LAB_WARMUP_SECONDS=$warmup_seconds needs LAB_WARMUP_RATE, its messages a second (Aeron's own harness warms 30 s at 25,000)"
+# the warm-up runs before each mode's first load ladder (lib.sh load_sweep):
+# with no load sizes there is none, and it would never run
+((10#$warmup_seconds == 0)) || [[ -n ${load_sizes// /} ]] ||
+    die "LAB_WARMUP_SECONDS=$warmup_seconds without LAB_LOAD_SIZES: the warm-up runs before each mode's first load ladder, so it would never run (give LAB_LOAD_SIZES, or no warm-up)"
+if [[ $no_flatout == 1 ]]; then
+    [[ ${tput_flows:-0} -lt 2 ]] || die "LAB_TPUT_FLOWS runs several flows flat out: not with LAB_NO_FLATOUT=1"
+    for size in $load_sizes; do
+        [[ " $load_ladder " == *" $size:"* ]] ||
+            die "LAB_NO_FLATOUT=1: size $size has no LAB_LOAD_LADDER rates (LAB_LOAD_FRACTIONS are fractions of the flat-out maximum, which does not run)"
+    done
+fi
 command -v az >/dev/null || die "az is not on PATH"
 az account show -o none 2>/dev/null || die "az is not logged in (az login)"
 mkdir -p "$out"
@@ -141,6 +204,8 @@ teardown() {
         log "LAB_KEEP: resource group $group kept; delete it with: az group delete -n $group --yes"
     fi
     log "results: $out"
+    # last: the snapshot this ran from
+    remove_snapshot
     exit "$rc"
 }
 trap teardown EXIT

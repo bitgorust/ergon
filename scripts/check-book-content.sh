@@ -63,6 +63,46 @@ then
     rc=1
 fi
 
+# Every {{#include}} / {{#rustdoc_include}} must name a file that exists and,
+# for a named anchor, an ANCHOR / ANCHOR_END pair in it. mdbook renders a
+# missing one as an empty block and still exits 0, and the SBE fence harness
+# skips `rust,ignore` and non-Rust fences, so a renamed anchor or moved file
+# would otherwise blank a book example silently.
+if ! python3 - "$book_src" <<'PY'
+import pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+directive = re.compile(r"(?<!\\)\{\{#(?:include|rustdoc_include)\s+([^}\s]+)\s*\}\}")
+lines_only = re.compile(r"\d*(:\d*)?")
+failed = False
+for page in sorted(root.rglob("*.md")):
+    for number, line in enumerate(page.read_text(errors="replace").splitlines(), 1):
+        for match in directive.finditer(line):
+            target, _, anchor = match.group(1).partition(":")
+            source = page.parent / target
+            where = f"{page}:{number}: {{{{#include {match.group(1)}}}}}"
+            if not source.is_file():
+                print(f"  FAIL: {where}: {source} does not exist")
+                failed = True
+                continue
+            if not anchor or lines_only.fullmatch(anchor):
+                continue
+            name = re.escape(anchor)
+            text = source.read_text(errors="replace").splitlines()
+            start = [i for i, l in enumerate(text) if re.search(rf"ANCHOR:\s*{name}(?![\w-])", l)]
+            end = [i for i, l in enumerate(text) if re.search(rf"ANCHOR_END:\s*{name}(?![\w-])", l)]
+            if not start:
+                print(f"  FAIL: {where}: anchor '{anchor}' not found in {source}")
+                failed = True
+            elif not [e for e in end if e > start[0]]:
+                print(f"  FAIL: {where}: anchor '{anchor}' has no ANCHOR_END after it in {source}")
+                failed = True
+sys.exit(1 if failed else 0)
+PY
+then
+    rc=1
+fi
+
 # CString::new in code fences — must use c"…" literals
 check_pattern 'CString::new' \
     'CString::new is forbidden — use c"…" literals or cformat!'

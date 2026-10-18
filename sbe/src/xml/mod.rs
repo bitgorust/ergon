@@ -1,4 +1,4 @@
-//! SBE XML → token [`Ir`](crate::Ir).
+//! SBE XML → token [`Ir`].
 //!
 //! | Function | Use when |
 //! |----------|----------|

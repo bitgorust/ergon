@@ -118,3 +118,12 @@ For enums and other types, the `NullVal` variant remains the default.
 `with_null_as_option` (above) is the opt-in `Option<T>` mapping; the
 wire encoding is identical either way.
 
+
+## Generated enum mappings
+
+`with_enum_mapping` maps an SBE enum onto an application enum that has no
+`NullVal` (see [App Types](../recipes/app-types-composites.md#nullval-and-unknown-values)).
+There, `NullVal` is never turned into a variant: it decodes as
+`sbe_rt::MappingError::NullEnum`, or as `None` when the enum is also under
+`with_null_as_option`. Because the decoder folds an undeclared discriminant
+into `NullVal`, an unknown value reaches the mapping as that same `NullVal`.

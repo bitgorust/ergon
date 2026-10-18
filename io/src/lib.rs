@@ -1,41 +1,47 @@
-//! Busy-spin network I/O for low-latency exchange clients.
+#![doc = include_str!("../README.md")]
 //!
-//! - `Driver` owns connections and moves bytes with a [`Backend`] chosen at run
-//!   time, e.g. `Config::parse("recv-busy")` or `"uring-sqpoll,sqpoll_cpu=3"`
-//!   (see [`Config::parse`]).
-//!   `Driver::poll` does one non-blocking iteration and returns, so the
-//!   caller's loop stays in control. See [`backend`] for which backend suits
-//!   which use.
-//! - [`WsConn`]: TLS 1.3 WebSocket client. rustls does the handshake, then
-//!   [`tls::RecordLayer`] decrypts records in place, the WebSocket frames are
-//!   parsed in place, and each payload reaches [`WsHandler::on_message`] as a
-//!   slice of the one receive buffer the kernel wrote into: one copy per byte.
-//! - [`HttpConn`]: HTTP/1.1 client for order entry: each request written into
-//!   one TLS record, responses parsed in place, Binance-style request signing
-//!   ([`Signer`]: HMAC-SHA256 or Ed25519) without allocation.
-//! - `HttpClient`: a pool of warm connections behind one API, with the
-//!   implementation chosen by configuration: native (the fast path) or libcurl
-//!   (feature `curl`) when its extra features are needed.
-//! - Connections open without blocking (`Driver::connect`: DNS, TCP, TLS and
-//!   any upgrade advanced a step per poll), or entirely on a helper thread
-//!   (`Driver::connect_background`) so the loop spends no handshake CPU.
+//! ## Modules
 //!
-//! Resources are owned: sockets close when their connection drops, a
-//! connection that fails is closed and reported through [`Handler::on_closed`],
-//! and dropping a `Driver` cancels in-flight `io_uring` operations before
-//! freeing the buffers they point at.
+//! - [`backend`]: [`Backend`] and [`Config`] ([`Config::parse`] takes
+//!   `backend[,key=value...]`).
+//! - [`ws_conn`]: [`WsConn`], [`WsDial`], [`WsOptions`], [`WsHandler`];
+//!   [`ws`] is the frame codec.
+//! - [`reconnect`]: [`Reconnect`] and its backoff policy, [`Retry`].
+//! - [`http`]: [`HttpConn`], [`HttpDial`], [`HttpHandler`]. On Linux,
+//!   `client` pools connections as `HttpClient`.
+//! - [`tls`]: the TLS 1.3 client configuration ([`tls::client_config`]) and
+//!   the in-place record layer.
+//! - [`auth`]: request signing ([`Signer`]).
+//! - [`endpoint`]: [`Handler`] (`on_open`, `on_closed`), [`ConnId`], and
+//!   what a `Driver` takes ([`Endpoint`], [`Dial`]).
+//! - [`checks`] and [`route`]: the host, NIC and quick-ACK route checks,
+//!   built on [`tune`].
+//! - [`placement`]: where the helper threads run (the connect helper, the
+//!   warning thread, `SQPOLL`), inside the process's cpuset.
+//! - [`limit`]: the send budget for venue rate limits ([`Budget`]).
+//! - [`outcome`]: what became of a request ([`Sent`], [`Verdict`]) and
+//!   `Retry-After` parsing.
+//! - [`net`] ([`Target`]), [`dns`], [`stream`], [`any`] ([`AnyConn`]:
+//!   WebSocket and HTTP on one driver), [`clock`], [`error`].
 //!
-//! The driver is Linux-only; the protocol layers build everywhere.
+//! `Driver`, `HttpClient`, `sys` and `warnings` are Linux-only, so they are
+//! named here without links.
 
 pub mod any;
 pub mod auth;
 pub mod backend;
+pub mod checks;
 pub mod clock;
 pub mod dns;
 pub mod endpoint;
 pub mod error;
 pub mod http;
+pub mod limit;
 pub mod net;
+pub mod outcome;
+pub mod placement;
+pub mod reconnect;
+pub mod route;
 pub mod stream;
 pub mod tls;
 pub mod ws;
@@ -49,6 +55,19 @@ mod curl_client;
 mod driver;
 #[cfg(target_os = "linux")]
 pub mod sys;
+#[cfg(target_os = "linux")]
+mod warn;
+
+/// ergon-io's warning thread (see [`checks`]): waiting for it to catch up.
+#[cfg(target_os = "linux")]
+pub mod warnings {
+    pub use crate::warn::flush;
+    #[doc(hidden)]
+    pub use crate::warn::{forget_seen, keep_lines, take_lines};
+}
+
+/// The host and NIC checks ergon-io runs ([`checks`]), and their findings.
+pub use ergon_tune as tune;
 
 pub use any::{AnyConn, AnyDial};
 pub use auth::{SignatureKind, Signer};
@@ -60,8 +79,13 @@ pub use driver::Driver;
 pub use endpoint::{ConnId, ConnMut, Dial, DriverStats, Endpoint, Handler, Receive};
 pub use error::{Error, Result};
 pub use http::{HttpConn, HttpDial, HttpHandler, HttpOptions, HttpStats, Response};
+pub use limit::{
+    BucketId, BucketSpec, BucketStats, Budget, Charge, Class, Limited, Resend, Ticket, Why,
+};
 pub use net::Target;
-pub use ws_conn::{WsConn, WsDial, WsHandler, WsStats};
+pub use outcome::{Now, Sent, Verdict};
+pub use reconnect::{Reconnect, Retry};
+pub use ws_conn::{WsConn, WsDial, WsHandler, WsOptions, WsStats};
 
 /// Receive metadata for one read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

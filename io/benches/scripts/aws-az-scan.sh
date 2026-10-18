@@ -71,7 +71,10 @@ VPC=$(ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].Vp
 SG=$(ec2 create-security-group --group-name "$NAME" --description "ergon-lab az scan $STAMP" --vpc-id "$VPC" \
   --tag-specifications "$(tags security-group)" --query GroupId --output text)
 ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 22 --cidr "$MYIP/32" > /dev/null
-AMI=$(aws --region "$REGION" ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id --query Parameter.Value --output text)
+# Ubuntu for TYPE's architecture (arm64 for Graviton types).
+ARCH=$(ec2 describe-instance-types --instance-types "$TYPE" --query 'InstanceTypes[0].ProcessorInfo.SupportedArchitectures[0]' --output text)
+[[ $ARCH == arm64 ]] || ARCH=amd64
+AMI=$(aws --region "$REGION" ssm get-parameter --name "/aws/service/canonical/ubuntu/server/24.04/stable/current/$ARCH/hvm/ebs-gp3/ami-id" --query Parameter.Value --output text)
 declare -A ID IP
 for az in $(ec2 describe-availability-zones --query 'AvailabilityZones[?State==`available`].ZoneId' --output text); do
   subnet=$(ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC" "Name=availability-zone-id,Values=$az" Name=default-for-az,Values=true \

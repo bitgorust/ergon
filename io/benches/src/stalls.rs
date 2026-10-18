@@ -638,9 +638,106 @@ pub fn server_stall_files(dir: &Path) -> Vec<std::path::PathBuf> {
     v
 }
 
-/// Slack for matching the server's stalls on the wall clock (the two hosts'
-/// clock offset).
+/// The least slack for matching the server's stalls on the wall clock.
 pub const SERVER_SLACK_NS: i64 = 50_000;
+
+/// The slack when the run kept no chrony log: the two hosts' clocks are then
+/// only known to be within the AWS runs' typical bounds of UTC (99–228 µs
+/// each, from their env files' `chronyc tracking`), so twice the largest,
+/// rounded up.
+pub const UNKNOWN_CLOCK_SLACK_NS: i64 = 500_000;
+
+/// The bound chrony gives on its host's clock against UTC in one
+/// `chronyc tracking` output: |System time| + ½ Root delay + Root
+/// dispersion (chronyc(1)), in ns; the largest when `text` holds several.
+/// `None` when no complete capture is there (no daemon, a cut capture).
+///
+/// It is chrony's own estimate, at its default `maxclockerror` of 1 ppm,
+/// so optimistic.
+#[must_use]
+pub fn chrony_bound_ns(text: &str) -> Option<i64> {
+    let secs = |line: &str| -> Option<f64> {
+        line.split_once(':')?
+            .1
+            .split_whitespace()
+            .next()?
+            .parse::<f64>()
+            .ok()
+    };
+    let mut best: Option<i64> = None;
+    let (mut system, mut delay) = (None, None);
+    for line in text.lines() {
+        let key = line.split(':').next().unwrap_or_default().trim();
+        match key {
+            "System time" => {
+                system = secs(line).map(f64::abs);
+                delay = None;
+            }
+            "Root delay" => delay = secs(line),
+            "Root dispersion" => {
+                if let (Some(sys), Some(d), Some(disp)) = (system, delay, secs(line)) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ns = ((sys + d / 2.0 + disp) * 1e9).round() as i64;
+                    best = Some(best.map_or(ns, |b| b.max(ns)));
+                }
+                (system, delay) = (None, None);
+            }
+            _ => {}
+        }
+    }
+    best
+}
+
+/// The bound on the offset between the two hosts' clocks during the run in
+/// `dir`: the sum of each host's [`chrony_bound_ns`], the larger of its
+/// captures. From the run's own chrony logs (`clock-before.txt`,
+/// `clock-after.txt` from the receiver; `clock-before-sender.txt`,
+/// `clock-after-sender.txt` from the sender, written by
+/// `scripts/lib-matrix.sh`), else from the `env-rcv*.txt` / `env-snd*.txt`
+/// of the results directory above it (one capture per host, at set-up).
+/// `None` when either host's is missing.
+#[must_use]
+pub fn clock_bound_ns(dir: &Path) -> Option<i64> {
+    let largest = |files: &[std::path::PathBuf]| {
+        files
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .filter_map(|t| chrony_bound_ns(&t))
+            .max()
+    };
+    let own = |names: [&str; 2]| largest(&names.map(|n| dir.join(n)));
+    if let (Some(r), Some(s)) = (
+        own(["clock-before.txt", "clock-after.txt"]),
+        own(["clock-before-sender.txt", "clock-after-sender.txt"]),
+    ) {
+        return Some(r + s);
+    }
+    dir.ancestors().skip(1).take(4).find_map(|up| {
+        let env = |prefix: &str| -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(up)
+                .map(|d| {
+                    d.filter_map(Result::ok)
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".txt"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Some(largest(&env("env-rcv"))? + largest(&env("env-snd"))?)
+    })
+}
+
+/// The slack for matching the server's stalls on the wall clock: at least
+/// the two hosts' clock bound ([`clock_bound_ns`]), never below
+/// [`SERVER_SLACK_NS`]; [`UNKNOWN_CLOCK_SLACK_NS`] when it is not known.
+#[must_use]
+pub fn server_slack_ns(clock_bound: Option<i64>) -> i64 {
+    clock_bound.map_or(UNKNOWN_CLOCK_SLACK_NS, |b| b.max(SERVER_SLACK_NS))
+}
 
 /// Why one round trip took long: the time each loop stalled inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -649,7 +746,8 @@ pub struct RoundTripCause {
     pub client_ns: i64,
     /// Cause of the longest client stall involved.
     pub client_cause: String,
-    /// Server stall time inside it (window widened by [`SERVER_SLACK_NS`]), ns.
+    /// Server stall time inside it (window widened by the slack, see
+    /// [`server_slack_ns`]), ns.
     pub server_ns: i64,
     /// Cause of the longest server stall involved.
     pub server_cause: String,
@@ -680,6 +778,8 @@ fn stall_overlap(a: &[Attribution], from: i64, to: i64) -> (i64, String) {
 /// `median_ns`: each loop's stall time inside it, summed, and the rest. The
 /// verdict names whichever side explains at least half of the excess, else
 /// says neither did (the network, the hypervisor, or something no trace saw).
+/// The server's stalls are on its own clock, so its window is widened by
+/// `slack_ns` ([`server_slack_ns`]).
 #[must_use]
 pub fn round_trip_cause(
     client: &[Attribution],
@@ -687,10 +787,10 @@ pub fn round_trip_cause(
     from: i64,
     to: i64,
     median_ns: i64,
+    slack_ns: i64,
 ) -> RoundTripCause {
     let (client_ns, client_cause) = stall_overlap(client, from, to);
-    let (server_ns, server_cause) =
-        stall_overlap(server, from - SERVER_SLACK_NS, to + SERVER_SLACK_NS);
+    let (server_ns, server_cause) = stall_overlap(server, from - slack_ns, to + slack_ns);
     let excess = (to - from - median_ns).max(0);
     let unexplained_ns = (excess - client_ns - server_ns).max(0);
     let verdict = if client_ns * 2 >= excess && client_ns >= server_ns && client_ns > 0 {

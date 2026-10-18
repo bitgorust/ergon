@@ -359,8 +359,9 @@ pub use build::{
 };
 pub use codegen::{GenerateError, GeneratedModule, GeneratedModuleSet, Generator};
 pub use config::{
-    ConversionSelector, DomainImpl, DomainVarData, EnumVariantInfo, FieldInfo, FieldKind,
-    GenerationConfig, GenerationProfile, ItemContext, ItemKind, SetChoiceInfo,
+    CompositeMapping, ConversionSelector, DomainImpl, DomainVarData, EnumMapping, EnumVariantInfo,
+    FieldInfo, FieldKind, GenerationConfig, GenerationProfile, ItemContext, ItemKind,
+    SetChoiceInfo,
 };
 pub use ir::{ByteOrder, Encoding, Ir, Presence, PrimitiveType, Signal, Token};
 pub use resolve::{ResolveError, resolve_schema};

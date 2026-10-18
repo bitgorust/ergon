@@ -551,16 +551,49 @@ impl Generator {
                 reason: format!("exceeds schema version {}", schema.version),
             });
         }
-        if version < schema.version
-            && (self.config.domain_objects
-                || !self.config.conversions.is_empty()
-                || !self.config.domain_types.is_empty())
+        if version >= schema.version {
+            return Ok(());
+        }
+        let reason = if self.config.domain_objects
+            || !self.config.conversions.is_empty()
+            || !self.config.domain_types.is_empty()
         {
-            return Err(GenerateError::InvalidConfiguration {
-                option: "encode_version".into(),
-                value: version.to_string(),
-                reason: "cannot drop members while generating domain objects or conversions".into(),
-            });
+            "cannot drop members while generating domain objects or conversions"
+        } else if self.config.source_traits {
+            "cannot drop members while generating source traits"
+        } else {
+            return Ok(());
+        };
+        Err(GenerateError::InvalidConfiguration {
+            option: "encode_version".into(),
+            value: version.to_string(),
+            reason: reason.into(),
+        })
+    }
+
+    /// Source trait names must not collide with a schema type, or the
+    /// generated module would define the name twice.
+    fn validate_source_traits(&self, schema: &Schema) -> Result<(), GenerateError> {
+        if !self.config.source_traits {
+            return Ok(());
+        }
+        let elements = partition_tokens(&schema.ir.tokens);
+        let occupied = occupied_type_names(&elements);
+        let multi = elements.messages.len() > 1;
+        for tokens in &elements.messages {
+            let msg = parse_message_structure(tokens, &elements);
+            for name in source_trait_names(&msg, multi) {
+                if occupied.contains(&name) {
+                    return Err(GenerateError::InvalidConfiguration {
+                        option: "source_traits".into(),
+                        value: name.clone(),
+                        reason: format!(
+                            "the generated trait `{name}` collides with the schema type of \
+                             that name"
+                        ),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -608,9 +641,11 @@ impl Generator {
         let effective = self.effective_domain_types(&[(schema, "")]);
         self.with_config_scope(|| {
             self.validate_header_values(schema)?;
+            validate_type_mappings(&self.config, &[&partition_tokens(&schema.ir.tokens)])?;
             self.validate_conversions(schema)?;
             self.validate_paths()?;
             self.validate_encode_version(schema)?;
+            self.validate_source_traits(schema)?;
             let mut modules = GeneratedModuleSet::default();
             let src = self.gen_schema(schema, &HashSet::new(), false, true, &effective)?;
             modules.push(GeneratedModule {
@@ -641,6 +676,7 @@ impl Generator {
             self.validate_paths()?;
             for (schema, _) in schemas {
                 self.validate_encode_version(schema)?;
+                self.validate_source_traits(schema)?;
             }
             self.generate_multi_inner(schemas, &effective)
         })
@@ -814,6 +850,9 @@ impl Generator {
             for (schema, _) in schemas.iter() {
                 union_elements.push((schema, partition_tokens(&schema.ir.tokens)));
             }
+            let elements: Vec<&crate::structured_ir::SchemaElements> =
+                union_elements.iter().map(|(_, e)| e).collect();
+            validate_type_mappings(&self.config, &elements)?;
             self.validate_conversions_union(&union_elements)?;
         }
 
@@ -1209,6 +1248,14 @@ impl Generator {
                 continue;
             }
             generate_enum(&mut src, enum_tokens);
+            if let Some(mapping) = self
+                .config
+                .enum_mappings
+                .iter()
+                .find(|m| m.sbe_enum == enum_tokens[0].name)
+            {
+                src.push_str(&enum_mapping_impl_tokens(enum_tokens, mapping).to_string());
+            }
             if self.config.has_hooks() {
                 let ctx = Self::build_enum_ctx(enum_tokens, schema);
                 self.run_hooks(&ctx, &mut src);
@@ -1234,6 +1281,22 @@ impl Generator {
             }
             let comp_byte_order = ir.byte_order;
             generate_composite(&mut src, composite_tokens, comp_byte_order);
+            if let Some(mapping) = self
+                .config
+                .composite_mappings
+                .iter()
+                .find(|m| m.composite == composite_tokens[0].name)
+            {
+                src.push_str(
+                    &composite_mapping_impl_tokens(
+                        composite_tokens,
+                        mapping,
+                        &self.config.enum_mappings,
+                        &self.config.composite_mappings,
+                    )
+                    .to_string(),
+                );
+            }
             if self.config.has_hooks() {
                 let ctx = Self::build_composite_ctx(composite_tokens, schema);
                 self.run_hooks(&ctx, &mut src);
@@ -1336,6 +1399,18 @@ impl Generator {
                     self.config.all_enums_as_option,
                 );
                 src.push_str(&converter_ts);
+            }
+            if self.config.source_traits {
+                let source_ts = generate_source_traits(
+                    msg,
+                    &elements,
+                    ir.byte_order,
+                    multi,
+                    &ir.header_type,
+                    &conv_sels,
+                    domain_types,
+                );
+                src.push_str(&source_ts.to_string());
             }
             src.push('\n');
             if self.config.enable_meta_attributes {

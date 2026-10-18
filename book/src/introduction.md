@@ -58,7 +58,14 @@ Quote a bench result by run id, not a number copied here. See
 | `sbe/` | `ergo-sbe` | Schema parser and codec generator |
 | `sbe/benchmarks/` | `ergo-sbe-benchmarks` | Unpublished parity benches |
 | `cluster/` | `ergo-aeron-cluster` | Experimental Aeron Cluster client |
+| `io/` | `ergon-io` | Busy-spin network I/O: epoll / `io_uring` backends, in-place TLS 1.3, WebSocket, HTTP ([chapter](io/overview.md)) |
+| `clock/` | `ergon-clock` | Calibrated hardware-counter clock ([chapter](clock/overview.md)) |
+| `tune/` | `ergon-tune` | Start-up and housekeeping checks of a host's low-latency settings ([chapter](tune/overview.md)) |
+| `md-dpdk/` | `ergon-md-dpdk` | DPDK transport for the Aeron media driver: a proof of concept, not for production ([chapter](md-dpdk/overview.md)) |
 | `samples/` | seven teaching crates | Unpublished playgrounds (`publish = false`) |
+
+How to set up hosts and Kubernetes for these crates on AWS and Azure, x86 and
+Graviton, with the measurements behind it: [Deployment](deploy/overview.md).
 
 Rust 1.88+. Clone setup, `just` recipes, and project boundaries:
 [repository README](https://github.com/mimran1980/ergon/blob/main/README.md).

@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/socket.h> /* struct mmsghdr (see above) */
+#include <time.h>       /* struct timespec: media receive timestamps */
 
 #include "media/aeron_udp_transport_poller.h" /* full poller struct + entry type */
 #include "aeron_alloc.h"
@@ -418,7 +419,9 @@ static void rusteron_dpdk_rx_count(
 /* Dispatch one parsed frame. The target transport is chosen by the endpoint map
  * (endpoints != NULL) or matched against only_transport's own local endpoint.
  * Rejected frames are counted and dropped; accepted frames invoke recv_func
- * with the UDP payload and a reconstructed source sockaddr_in and return 1. */
+ * with the UDP payload, a reconstructed source sockaddr_in and the media
+ * receive timestamp (NULL when no channel on the NIC asks for one; Aeron's
+ * image writes it only into a channel that does) and return 1. */
 static int rusteron_dpdk_dispatch_frame(
     rusteron_dpdk_client_t *client,
     aeron_udp_channel_transport_t *only_transport,
@@ -428,7 +431,8 @@ static int rusteron_dpdk_dispatch_frame(
     struct mmsghdr *msgvec,
     int64_t *bytes_rcved,
     aeron_udp_transport_recv_func_t recv_func,
-    void *clientd)
+    void *clientd,
+    struct timespec *media_timestamp)
 {
     aeron_udp_channel_transport_t *target = NULL;
 
@@ -511,7 +515,7 @@ static int rusteron_dpdk_dispatch_frame(
         (uint8_t *)frame->payload,
         frame->payload_len,
         addr,
-        NULL);
+        media_timestamp);
 
     *bytes_rcved += (int64_t)frame->payload_len;
     client->port->rx_stats.accepted++;
@@ -590,9 +594,19 @@ int rusteron_dpdk_poller_receive(
     int work_count = 0;
     int64_t rx_bytes = 0;
     int64_t sw_csum = 0;
-    int64_t hw_sum = 0, hw_count = 0, hw_max = INT64_MIN;
-    uint64_t realtime_ns = 0; /* read once, at the first NIC-timestamped frame */
-    int observed = 0;         /* the first datagram's source checked against ARP */
+    /* NIC arrival to dispatch, over the frames the NIC stamped no later than
+     * the host clock read after their burst; one stamped later is clock skew
+     * between the NIC's PTP hardware clock and CLOCK_REALTIME, counted apart. */
+    int64_t hw_sum = 0, hw_count = 0, hw_max = INT64_MIN, hw_min = INT64_MAX, hw_negative = 0;
+    int observed = 0; /* the first datagram's source checked against ARP */
+    /* A channel on this NIC asking for media receive timestamps
+     * (media-rcv-ts-offset): Aeron's kernel transport has the kernel stamp each
+     * datagram (SO_TIMESTAMPNS, CLOCK_REALTIME at its receive); here each burst
+     * reads CLOCK_REALTIME once, and a frame the NIC stamped
+     * (RUSTERON_DPDK_RX_HW_TIMESTAMP=1) carries its arrival instead. Without
+     * one, nothing is read and every frame passes NULL: one branch a burst. */
+    const int media_ts = 0 != __atomic_load_n(&port->media_ts_transports, __ATOMIC_RELAXED);
+    struct timespec burst_ts;
     const uint32_t on_link_mask = rusteron_dpdk_ipv4_mask(port->prefix_len);
     /* A full burst means the ring may hold more: keep draining, a burst at a
      * time up to rx_max_bursts, so a backlog a stall left clears in this duty
@@ -603,6 +617,19 @@ int rusteron_dpdk_poller_receive(
     for (uint32_t burst = 0; burst < native->rx_max_bursts; burst++)
     {
         const uint16_t received = ops->rx_burst(port->port_id, port->rx_queue_id, batch, (uint16_t)limit);
+        /* CLOCK_REALTIME, read at most once a burst, after the NIC handed the
+         * burst over (every frame of it arrived before): at once for media
+         * timestamps, else at the burst's first NIC-timestamped frame. Never
+         * once a poll: a later burst's frames arrived after that read. */
+        uint64_t realtime_ns = 0;
+        struct timespec *burst_media_ts = NULL;
+        if (media_ts && received > 0)
+        {
+            realtime_ns = rusteron_dpdk_realtime_ns();
+            burst_ts.tv_sec = (time_t)(realtime_ns / 1000000000ULL);
+            burst_ts.tv_nsec = (long)(realtime_ns % 1000000000ULL);
+            burst_media_ts = &burst_ts;
+        }
         for (uint16_t i = 0; i < received; i++)
         {
             rusteron_dpdk_mbuf_t *m = &views[i];
@@ -623,6 +650,8 @@ int rusteron_dpdk_poller_receive(
                     }
                     observed = 1;
                 }
+                struct timespec *media_timestamp = burst_media_ts;
+                struct timespec nic_ts;
                 if (0 != m->hw_rx_ns)
                 {
                     /* NIC arrival to dispatch: the NIC stamps with its PTP
@@ -632,12 +661,30 @@ int rusteron_dpdk_poller_receive(
                         realtime_ns = rusteron_dpdk_realtime_ns();
                     }
                     const int64_t delay = (int64_t)(realtime_ns - m->hw_rx_ns);
-                    hw_sum += delay;
-                    hw_count++;
-                    hw_max = delay > hw_max ? delay : hw_max;
+                    if (delay < 0)
+                    {
+                        hw_negative++;
+                    }
+                    else
+                    {
+                        hw_sum += delay;
+                        hw_count++;
+                        hw_max = delay > hw_max ? delay : hw_max;
+                        hw_min = delay < hw_min ? delay : hw_min;
+                    }
+                    /* The media timestamp is the NIC's arrival: the PHC counts
+                     * UTC nanoseconds since the epoch, CLOCK_REALTIME's scale,
+                     * what the kernel's SO_TIMESTAMPNS reports. */
+                    if (NULL != media_timestamp)
+                    {
+                        nic_ts.tv_sec = (time_t)(m->hw_rx_ns / 1000000000ULL);
+                        nic_ts.tv_nsec = (long)(m->hw_rx_ns % 1000000000ULL);
+                        media_timestamp = &nic_ts;
+                    }
                 }
                 const int dispatched = rusteron_dpdk_dispatch_frame(
-                    client, only_transport, endpoints, m, &frame, msgvec, bytes_rcved, recv_func, clientd);
+                    client, only_transport, endpoints, m, &frame, msgvec, bytes_rcved, recv_func, clientd,
+                    media_timestamp);
                 work_count += dispatched;
                 rx_bytes += dispatched ? (int64_t)frame.payload_len : 0;
             }
@@ -675,8 +722,9 @@ int rusteron_dpdk_poller_receive(
     {
         rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_POLLER, (int64_t)total);
         rusteron_dpdk_counters_max(&port->counters, RD_COUNTER_RX_BACKLOG_MAX, (int64_t)total);
-        /* drained within a burst of the ring's size: it may have overflowed */
-        if (total + limit >= native->config.rx_descriptors)
+        /* drained within a burst of the ring's size: it may have overflowed
+         * (never on an ENA, which counts its drops: rx_ring_full_at) */
+        if (total >= port->rx_ring_full_at)
         {
             rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_RX_RING_FULL_SUSPECTED, 1);
         }
@@ -691,9 +739,15 @@ int rusteron_dpdk_poller_receive(
         }
         if (hw_count > 0)
         {
+            rusteron_dpdk_counters_min_counted(
+                &port->counters, RD_COUNTER_RX_HW_DELAY_MIN, hw_min, RD_COUNTER_RX_HW_TIMESTAMPED);
             rusteron_dpdk_counters_max(&port->counters, RD_COUNTER_RX_HW_DELAY_MAX, hw_max);
             rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_RX_HW_DELAY_SUM, hw_sum);
             rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_RX_HW_TIMESTAMPED, hw_count);
+        }
+        if (hw_negative > 0)
+        {
+            rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_RX_HW_DELAY_NEGATIVE, hw_negative);
         }
     }
 

@@ -3,7 +3,8 @@
  *
  * Owns the process-lifetime EAL singleton and drives both role ports through
  * the injectable port-ops seam: probe -> dev_info (net_ena + offloads) ->
- * dev_configure -> mempool -> rx/tx queue -> set_mtu -> start -> link. Any
+ * dev_configure -> mempool -> rx/tx queue -> set_mtu -> watch resets -> start
+ * -> link. Any
  * failure cleans up prior resources in reverse initialization order and the
  * error is recorded for rusteron_dpdk_last_error()/last_error_code().
  *
@@ -28,7 +29,9 @@
 #include <netinet/in.h>
 #include <sys/random.h>
 #include <errno.h>
+#include <strings.h>
 #include <time.h>
+#include <unistd.h>
 
 #define RUSTERON_DPDK_IP_UDP_OVERHEAD 28 /* IPv4 + UDP headers above the payload */
 #define RUSTERON_DPDK_LINK_TIMEOUT_MS 5000
@@ -44,129 +47,85 @@ void rusteron_dpdk_test_set_eal_mode(int mode)
     rusteron_dpdk_test_eal_mode = mode;
 }
 
-/* Transport clock. The hot path reads the invariant TSC and scales it to
- * nanoseconds with a 32.32 fixed-point factor calibrated once against
- * CLOCK_MONOTONIC, anchored so the two clocks agree at calibration. Without an
- * invariant TSC (constant_tsc + nonstop_tsc) it falls back to CLOCK_MONOTONIC.
- * Tests pin it, which routes every read through the slow path. */
-#define RUSTERON_DPDK_CLOCK_CALIBRATION_NS 50000000ULL /* 50 ms, once per process */
-#ifndef CLOCK_MONOTONIC_RAW
-#define CLOCK_MONOTONIC_RAW 4 /* Linux */
-#endif
-
-rusteron_dpdk_clock_t rusteron_dpdk_clock = { .mode = RUSTERON_DPDK_CLOCK_UNCALIBRATED };
-static int rusteron_dpdk_clock_calibrated_source = RUSTERON_DPDK_CLOCK_MONOTONIC;
-static int rusteron_dpdk_clock_allow_tsc = 1; /* the setting the calibration used */
+/* Transport clock: ergon-clock's calibration, adopted at create from the
+ * config (made once in Rust: src/clock.rs). Nothing here measures a clock. The
+ * hot path (rusteron_dpdk_clock_now) reads the counter and converts it inline;
+ * ergon-clock's fallback and a test pin go through the slow path. Until a
+ * transport adopts a calibration the clock is the fallback with a factor of
+ * one: CLOCK_MONOTONIC as it reads. */
+rusteron_dpdk_clock_t rusteron_dpdk_clock = {
+    .mode = RUSTERON_DPDK_CLOCK_MONOTONIC, .base_ticks = 0, .base_ns = 0, .mult = 1ULL << 32
+};
+/* The adopted clock's mode, which a test pin hides until reset. */
+static int rusteron_dpdk_clock_adopted_mode = RUSTERON_DPDK_CLOCK_MONOTONIC;
 static uint64_t rusteron_dpdk_test_clock_ns_value = 0;
 /* How far each of this thread's reads moves a pinned clock on: the test's
  * own, so the local-I/O thread's reads never move it under the test. */
 static _Thread_local uint64_t rusteron_dpdk_test_clock_step_ns = 0;
 
-static uint64_t rusteron_dpdk_clock_read_ns(clockid_t clock);
-
 static uint64_t rusteron_dpdk_monotonic_ns(void)
 {
-    return rusteron_dpdk_clock_read_ns(CLOCK_MONOTONIC);
-}
-
-static inline uint64_t rusteron_dpdk_tsc(void)
-{
-#if defined(__x86_64__)
-    return __rdtsc();
-#else
-    return 0;
-#endif
-}
-
-/* Whether the first "flags" line of /proc/cpuinfo lists both constant_tsc
- * and nonstop_tsc: the TSC then ticks at a fixed rate through frequency and
- * idle-state changes, so it can stand in for CLOCK_MONOTONIC. */
-static int rusteron_dpdk_cpu_has_invariant_tsc(void)
-{
-#if defined(__x86_64__)
-    FILE *f = fopen("/proc/cpuinfo", "r");
-    if (NULL == f)
-    {
-        return 0;
-    }
-    char line[8192];
-    int invariant = 0;
-    while (NULL != fgets(line, sizeof(line), f))
-    {
-        if (0 == strncmp(line, "flags", 5))
-        {
-            invariant = NULL != strstr(line, " constant_tsc") && NULL != strstr(line, " nonstop_tsc");
-            break;
-        }
-    }
-    fclose(f);
-    return invariant;
-#else
-    return 0;
-#endif
-}
-
-static uint64_t rusteron_dpdk_clock_read_ns(clockid_t clock)
-{
     struct timespec ts;
-    clock_gettime(clock, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-/* The tightest of a few bracketed samples: a read of `clock` and the TSC
- * midpoint around it. A sample the thread was interrupted in has a wide
- * bracket, so the narrowest one pins the read to within a few ns. */
-static void rusteron_dpdk_clock_sample(clockid_t clock, uint64_t *tsc, uint64_t *ns)
+int rusteron_dpdk_clock_params_check(const rusteron_dpdk_clock_params_t *params)
 {
-    uint64_t best = UINT64_MAX;
-    for (int i = 0; i < 16; i++)
+    char message[256];
+    const char *why = NULL;
+    if (RUSTERON_DPDK_CLOCK_PARAMS_VERSION != params->version)
     {
-        const uint64_t t0 = rusteron_dpdk_tsc();
-        const uint64_t at = rusteron_dpdk_clock_read_ns(clock);
-        const uint64_t t1 = rusteron_dpdk_tsc();
-        if (t1 - t0 < best)
-        {
-            best = t1 - t0;
-            *tsc = t0 + (t1 - t0) / 2;
-            *ns = at;
-        }
+        snprintf(message, sizeof(message),
+                 "clock params version %u, not ergon-clock's %u: the config must carry ergon-clock's calibration",
+                 params->version, RUSTERON_DPDK_CLOCK_PARAMS_VERSION);
+        rusteron_dpdk_set_error(message);
+        return -1;
     }
+    if (RUSTERON_DPDK_CLOCK_KIND_COUNTER != params->kind && RUSTERON_DPDK_CLOCK_KIND_MONOTONIC != params->kind)
+    {
+        why = "kind must be 1 (the counter) or 0 (the monotonic fallback)";
+    }
+    else if (0 != params->domain)
+    {
+        why = "domain must be 0, monotonic: the transport's clock times intervals";
+    }
+    else if (0 != params->reserved)
+    {
+        why = "reserved must be 0";
+    }
+    else if (0 == params->mult || params->mult >= (1ULL << 63))
+    {
+        why = "mult (ns per tick, 32.32) must be in (0, 2^63)";
+    }
+    if (NULL != why)
+    {
+        snprintf(message, sizeof(message), "clock params: %s (kind %u, domain %u, reserved %u, mult %llu)", why,
+                 params->kind, params->domain, params->reserved, (unsigned long long)params->mult);
+        rusteron_dpdk_set_error(message);
+        return -1;
+    }
+    return 0;
 }
 
-/* Measure the TSC rate; 0 when TSC is not to be used. The rate is measured
- * against CLOCK_MONOTONIC_RAW, the unslewed hardware rate: CLOCK_MONOTONIC
- * may be mid-slew (chrony after boot) and would bake that into the factor.
- * The ns base is anchored to CLOCK_MONOTONIC. */
-static uint64_t rusteron_dpdk_clock_measure_tsc(void)
+int rusteron_dpdk_clock_adopt(const rusteron_dpdk_clock_params_t *params)
 {
-    uint64_t tsc0, raw0, tsc1, raw1;
-    rusteron_dpdk_clock_sample(CLOCK_MONOTONIC_RAW, &tsc0, &raw0); /* warms the code and the vDSO page */
-    rusteron_dpdk_clock_sample(CLOCK_MONOTONIC_RAW, &tsc0, &raw0);
-    do
+    if (rusteron_dpdk_clock_params_check(params) < 0)
     {
-        rusteron_dpdk_clock_sample(CLOCK_MONOTONIC_RAW, &tsc1, &raw1);
+        return -1;
     }
-    while (raw1 - raw0 < RUSTERON_DPDK_CLOCK_CALIBRATION_NS);
-    if (tsc1 <= tsc0)
-    {
-        return 0;
-    }
-    rusteron_dpdk_clock_sample(CLOCK_MONOTONIC, &rusteron_dpdk_clock.tsc_base, &rusteron_dpdk_clock.ns_base);
-    return (uint64_t)(((unsigned __int128)(raw1 - raw0) << 32) / (tsc1 - tsc0));
-}
-
-/* Choose and calibrate the clock. A test pin stays in force. */
-static void rusteron_dpdk_clock_calibrate(int allow_tsc)
-{
-    rusteron_dpdk_clock_allow_tsc = allow_tsc;
-    uint64_t mult = allow_tsc && rusteron_dpdk_cpu_has_invariant_tsc() ? rusteron_dpdk_clock_measure_tsc() : 0;
-    int source = 0 != mult ? RUSTERON_DPDK_CLOCK_TSC : RUSTERON_DPDK_CLOCK_MONOTONIC;
-    rusteron_dpdk_clock.tsc_mult = mult;
-    rusteron_dpdk_clock_calibrated_source = source;
+    const int mode = RUSTERON_DPDK_CLOCK_KIND_COUNTER == params->kind
+        ? RUSTERON_DPDK_CLOCK_COUNTER
+        : RUSTERON_DPDK_CLOCK_MONOTONIC;
+    rusteron_dpdk_clock.base_ticks = params->base_ticks;
+    rusteron_dpdk_clock.base_ns = params->base_ns;
+    rusteron_dpdk_clock.mult = params->mult;
+    rusteron_dpdk_clock_adopted_mode = mode;
     if (RUSTERON_DPDK_CLOCK_PINNED != rusteron_dpdk_clock.mode)
     {
-        rusteron_dpdk_clock.mode = source;
+        rusteron_dpdk_clock.mode = mode;
     }
+    return 0;
 }
 
 uint64_t rusteron_dpdk_clock_ns_slow(void)
@@ -180,12 +139,8 @@ uint64_t rusteron_dpdk_clock_ns_slow(void)
         }
         return now;
     }
-    if (RUSTERON_DPDK_CLOCK_UNCALIBRATED == rusteron_dpdk_clock.mode)
-    {
-        rusteron_dpdk_clock_calibrate(1);
-        return rusteron_dpdk_clock_now();
-    }
-    return rusteron_dpdk_monotonic_ns();
+    /* ergon-clock's fallback: CLOCK_MONOTONIC as its ticks */
+    return rusteron_dpdk_clock_ns_at(rusteron_dpdk_monotonic_ns());
 }
 
 uint64_t rusteron_dpdk_clock_ns(void)
@@ -193,23 +148,43 @@ uint64_t rusteron_dpdk_clock_ns(void)
     return rusteron_dpdk_clock_now();
 }
 
-void rusteron_dpdk_clock_init(void)
-{
-    if (RUSTERON_DPDK_CLOCK_UNCALIBRATED == rusteron_dpdk_clock.mode)
-    {
-        rusteron_dpdk_clock_calibrate(1);
-    }
-}
-
 int rusteron_dpdk_clock_source(void)
 {
-    rusteron_dpdk_clock_init();
-    return rusteron_dpdk_clock_calibrated_source;
+    return rusteron_dpdk_clock_adopted_mode;
+}
+
+uint64_t rusteron_dpdk_test_clock_ns_at(uint64_t ticks)
+{
+    return rusteron_dpdk_clock_ns_at(ticks);
+}
+
+/* Move the transport's allowances onto a newly pinned clock: a pin is a
+ * timeline of its own, and an allowance last refilled on the real clock
+ * would credit nothing until the pin passed that time. */
+static void rusteron_dpdk_test_pacers_onto(uint64_t ns)
+{
+    rusteron_dpdk_transport_t *native = rusteron_dpdk_active_runtime();
+    if (NULL == native)
+    {
+        return;
+    }
+    rusteron_dpdk_port_t *ports[2] = { &native->sender, &native->receiver };
+    for (int p = 0; p < 2; p++)
+    {
+        ports[p]->tx_pacer.last_ns = ns;
+        for (uint32_t r = 0; r < RUSTERON_DPDK_MAX_TX_ROUTES; r++)
+        {
+            ports[p]->route_pacers[r].last_ns = ns;
+        }
+    }
 }
 
 void rusteron_dpdk_test_set_clock_ns(uint64_t ns)
 {
-    rusteron_dpdk_clock_init();
+    if (RUSTERON_DPDK_CLOCK_PINNED != rusteron_dpdk_clock.mode)
+    {
+        rusteron_dpdk_test_pacers_onto(ns);
+    }
     rusteron_dpdk_test_clock_ns_value = ns;
     rusteron_dpdk_clock.mode = RUSTERON_DPDK_CLOCK_PINNED;
 }
@@ -217,12 +192,6 @@ void rusteron_dpdk_test_set_clock_ns(uint64_t ns)
 void rusteron_dpdk_test_set_clock_step_ns(uint64_t ns)
 {
     rusteron_dpdk_test_clock_step_ns = ns;
-}
-
-int rusteron_dpdk_test_clock_recalibrate(int allow_tsc)
-{
-    rusteron_dpdk_clock_calibrate(allow_tsc);
-    return 0;
 }
 
 /* Whether runtime init starts the housekeeping thread: production yes; the
@@ -235,13 +204,18 @@ void rusteron_dpdk_test_set_housekeeping_thread(int enabled)
 }
 
 static uint64_t rusteron_dpdk_test_realtime_ns_value = 0;
+static uint64_t rusteron_dpdk_test_realtime_step_ns = 0;
 static int rusteron_dpdk_test_realtime_pinned = 0;
+static uint64_t rusteron_dpdk_test_realtime_read_count = 0;
 
 uint64_t rusteron_dpdk_realtime_ns(void)
 {
     if (rusteron_dpdk_test_realtime_pinned)
     {
-        return rusteron_dpdk_test_realtime_ns_value;
+        rusteron_dpdk_test_realtime_read_count++;
+        const uint64_t now = rusteron_dpdk_test_realtime_ns_value;
+        rusteron_dpdk_test_realtime_ns_value += rusteron_dpdk_test_realtime_step_ns;
+        return now;
     }
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -254,21 +228,52 @@ void rusteron_dpdk_test_set_realtime_ns(uint64_t ns)
     rusteron_dpdk_test_realtime_pinned = 1;
 }
 
-/* Clear a test pin, keeping the calibration (it is process-lifetime). */
+void rusteron_dpdk_test_set_realtime_step_ns(uint64_t ns)
+{
+    rusteron_dpdk_test_realtime_step_ns = ns;
+}
+
+uint64_t rusteron_dpdk_test_realtime_reads(void)
+{
+    return rusteron_dpdk_test_realtime_read_count;
+}
+
+/* A test's stand-in for every port's sysfs driver link, until reset. */
+static char rusteron_dpdk_test_pci_kernel_driver_value[64] = "";
+
+void rusteron_dpdk_test_set_pci_kernel_driver(const char *driver)
+{
+    snprintf(rusteron_dpdk_test_pci_kernel_driver_value, sizeof(rusteron_dpdk_test_pci_kernel_driver_value), "%s",
+             NULL != driver ? driver : "");
+}
+
+/* The local-I/O mode a created runtime selected (RUSTERON_DPDK_LOCAL_IO_*,
+ * -1 for no runtime). Every explicit RUSTERON_DPDK_LOCAL_IO value selects its
+ * own mode and an unset one selects ADAPTIVE; reading it back is what proves
+ * the selection, because an accepted environment value alone does not. */
+int rusteron_dpdk_test_local_io_mode(const rusteron_dpdk_transport_t *native)
+{
+    return NULL != native ? native->local_io_mode : -1;
+}
+
+/* Clear a test pin, keeping the adopted calibration (it is process-lifetime). */
 static void rusteron_dpdk_test_clock_unpin(void)
 {
     if (RUSTERON_DPDK_CLOCK_PINNED == rusteron_dpdk_clock.mode)
     {
-        rusteron_dpdk_clock.mode = rusteron_dpdk_clock_calibrated_source;
+        rusteron_dpdk_clock.mode = rusteron_dpdk_clock_adopted_mode;
     }
     rusteron_dpdk_test_clock_ns_value = 0;
     rusteron_dpdk_test_clock_step_ns = 0;
     rusteron_dpdk_test_realtime_ns_value = 0;
+    rusteron_dpdk_test_realtime_step_ns = 0;
     rusteron_dpdk_test_realtime_pinned = 0;
+    rusteron_dpdk_test_realtime_read_count = 0;
 }
 
 void rusteron_dpdk_test_reset(void)
 {
+    rusteron_dpdk_test_pci_kernel_driver_value[0] = '\0';
     rusteron_dpdk_test_eal_mode = RUSTERON_DPDK_EAL_REAL;
     rusteron_dpdk_eal_ever_initialized = 0;
     rusteron_dpdk_port_ops_override = NULL;
@@ -343,6 +348,99 @@ static int rusteron_dpdk_runtime_eal_up(rusteron_dpdk_transport_t *native)
     return 0;
 }
 
+/* The kernel driver `bdf` is bound to (its sysfs driver link), or "-". */
+static void rusteron_dpdk_pci_kernel_driver(const char *bdf, char *out, size_t len)
+{
+    if ('\0' != rusteron_dpdk_test_pci_kernel_driver_value[0])
+    {
+        snprintf(out, len, "%s", rusteron_dpdk_test_pci_kernel_driver_value);
+        return;
+    }
+    char path[96], target[256];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/driver", bdf);
+    const ssize_t n = readlink(path, target, sizeof(target) - 1);
+    if (n <= 0)
+    {
+        snprintf(out, len, "-");
+        return;
+    }
+    target[n] = '\0';
+    const char *slash = strrchr(target, '/');
+    snprintf(out, len, "%s", NULL != slash ? slash + 1 : target);
+}
+
+/* An ENA port's low-latency queue (LLQ): without it, or with its BAR mapped
+ * uncached, every send costs about 100 times as much (Aeron Premium's DPDK
+ * notes; DPDK 24.11.0 and .1 turned it off by default). The transport names
+ * the LLQ policy in the port's device arguments (rusteron_dpdk_ena_devargs);
+ * no DPDK API or xstat reports the placement the PMD chose, so what is checked
+ * is that the operator did not turn it off and that the process maps the
+ * port's LLQ BAR write-combined (dev_info's ena_llq, from /proc/self/maps, as
+ * benches/cloud/host.sh's ena_llq_check). vfio-pci maps the BAR through its
+ * device file, which the map shows as neither, so a port bound to vfio-pci
+ * whose mapping is unseen starts on RUSTERON_DPDK_VFIO_WC=1: the operator's
+ * confirmation of a write-combining vfio-pci, which deploy/aws-eks's preflight
+ * requires before the bootstrap binds one. Every other port is checked as
+ * before. Start fails naming the port unless RUSTERON_DPDK_ENA_LLQ_REQUIRED=0,
+ * which starts it with a warning. */
+static int rusteron_dpdk_ena_llq_check(const rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *p)
+{
+    char devargs[RUSTERON_DPDK_ENA_DEVARGS_MAX + 32];
+    int llq_off = 0;
+    if (rusteron_dpdk_ena_devargs(devargs, sizeof(devargs), &llq_off) < 0)
+    {
+        return -1;
+    }
+    if (llq_off)
+    {
+        p->ena_llq = RUSTERON_DPDK_ENA_LLQ_DISABLED;
+    }
+    char kdrv[64];
+    rusteron_dpdk_pci_kernel_driver(p->pci, kdrv, sizeof(kdrv));
+    char why[512];
+    switch (p->ena_llq)
+    {
+        case RUSTERON_DPDK_ENA_LLQ_WC:
+            return 0;
+        case RUSTERON_DPDK_ENA_LLQ_DISABLED:
+            snprintf(why, sizeof(why), "RUSTERON_DPDK_ENA_DEVARGS turns its low-latency queue (LLQ) off (%s)", devargs);
+            break;
+        case RUSTERON_DPDK_ENA_LLQ_UNCACHED:
+            snprintf(why, sizeof(why),
+                     "its low-latency queue (LLQ) BAR, BAR 2, is mapped uncached (resource2, not resource2_wc; bound "
+                     "to %s): load igb_uio with wc_activate=1", kdrv);
+            break;
+        case RUSTERON_DPDK_ENA_LLQ_UNSEEN:
+            if (native->vfio_wc && 0 == strcmp(kdrv, "vfio-pci"))
+            {
+                return 0;
+            }
+            snprintf(why, sizeof(why),
+                     "no write-combined mapping of its low-latency queue (LLQ) BAR (BAR 2, resource2_wc) in "
+                     "/proc/self/maps (bound to %s): vfio-pci maps it through its device file, which shows neither; "
+                     "on a write-combining vfio-pci (Amazon's patch) set RUSTERON_DPDK_VFIO_WC=1, as "
+                     "deploy/aws-eks's preflight requires, else bind it to igb_uio (wc_activate=1)", kdrv);
+            break;
+        default:
+            snprintf(why, sizeof(why),
+                     "/proc/self/maps cannot be read, so its low-latency queue (LLQ) BAR's write-combined mapping "
+                     "cannot be confirmed");
+            break;
+    }
+    char message[768];
+    snprintf(message, sizeof(message),
+             "ENA %s (port %u): %s. Without LLQ a send costs about 100 times as much; "
+             "RUSTERON_DPDK_ENA_LLQ_REQUIRED=0 starts it anyway, for diagnosis",
+             p->pci, (unsigned)p->port_id, why);
+    if (native->ena_llq_required)
+    {
+        rusteron_dpdk_set_error(message);
+        return -1;
+    }
+    fprintf(stderr, "WARNING ergon-md-dpdk: %s: starting anyway (RUSTERON_DPDK_ENA_LLQ_REQUIRED=0)\n", message);
+    return 0;
+}
+
 static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *p)
 {
     const rusteron_dpdk_port_ops_t *ops = native->ops;
@@ -360,7 +458,8 @@ static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_d
         else
         {
             snprintf(message, sizeof(message),
-                     "device %s is not probed by DPDK (allow-listed ENA must be bound via VFIO)", p->pci);
+                     "device %s is not probed by DPDK (allow-listed ENA must be bound via VFIO or igb_uio, and its "
+                     "PMD must accept its device arguments: the LLQ policy and RUSTERON_DPDK_ENA_DEVARGS)", p->pci);
         }
         rusteron_dpdk_set_error(message);
         return -1;
@@ -369,7 +468,7 @@ static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_d
     char driver[64] = "";
     uint16_t desc_lim[4] = { 0, 0, 0, 0 };
     if (ops->dev_info(p->port_id, p->pci, p->mac, driver, sizeof(driver),
-                      &p->csum_offload_ok, &p->ena_llq_available, &p->rx_timestamp_ok, &p->max_mtu, desc_lim) < 0)
+                      &p->csum_offload_ok, &p->ena_llq, &p->rx_timestamp_ok, &p->max_mtu, desc_lim) < 0)
     {
         snprintf(message, sizeof(message),
                  "cannot read capabilities of device %s (port %u)", p->pci, p->port_id);
@@ -385,15 +484,44 @@ static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_d
     }
     /* Keep the PMD name for the port-info counter label (plan §9). */
     memcpy(p->driver, driver, sizeof(p->driver));
+    const int pci = rusteron_dpdk_selector_is_pci(p->pci);
+    const int ena = pci && 0 == strcmp(driver, "net_ena");
+    /* Azure: net_netvsc (the recommended path) drives the NIC's synthetic
+     * channel and the MANA VF beneath it; net_mana is the VF alone. */
+    const int azure = pci && (0 == strcmp(driver, "net_mana") || 0 == strcmp(driver, "net_netvsc"));
+    /* The receive ring: as configured, else RUSTERON_DPDK_RX_DESCRIPTORS_DEFAULT
+     * or the NIC's maximum where lower: MANA's 256, which netvsc sets its VF
+     * up with whatever it reports itself. A power of two, as ENA's and MANA's
+     * rings must be. AWS measured 4096 against ENA's 1024 (BENCHMARKS.md,
+     * round 6): no first-point rx-missed loss, a higher loss-free rate. */
+    p->rx_descriptors = cfg->rx_descriptors;
+    if (0 == p->rx_descriptors)
+    {
+        unsigned rx = RUSTERON_DPDK_RX_DESCRIPTORS_DEFAULT;
+        if (azure && rx > RUSTERON_DPDK_MANA_MAX_DESCRIPTORS)
+        {
+            rx = RUSTERON_DPDK_MANA_MAX_DESCRIPTORS;
+        }
+        if (0 != desc_lim[1] && desc_lim[1] < rx)
+        {
+            rx = desc_lim[1];
+        }
+        while (0 != (rx & (rx - 1)))
+        {
+            rx &= rx - 1;
+        }
+        p->rx_descriptors = (uint16_t)rx;
+    }
+    /* Azure's MANA overflows its ring without counting a drop, so a poll that
+     * drains within a burst of a full ring is suspected of it; an ENA counts
+     * the drops itself (imissed: nic-rx-missed), and has no suspicion. */
+    p->rx_ring_full_at = ena ? UINT32_MAX
+        : p->rx_descriptors > cfg->burst_size ? (uint32_t)p->rx_descriptors - cfg->burst_size : 0;
     /* The PCI-device guarantees (a supported PMD, IPv4/UDP checksum offload)
      * are required for a PCI NIC but not for a virtual/TAP device: vdev PMDs
      * report their own driver name and may software-checksum (plan §11.2). */
-    if (rusteron_dpdk_selector_is_pci(p->pci))
+    if (pci)
     {
-        int ena = 0 == strcmp(driver, "net_ena");
-        /* Azure: net_netvsc (the recommended path) drives the NIC's synthetic
-         * channel and the MANA VF beneath it; net_mana is the VF alone. */
-        int azure = 0 == strcmp(driver, "net_mana") || 0 == strcmp(driver, "net_netvsc");
         if (!ena && !azure)
         {
             snprintf(message, sizeof(message),
@@ -412,14 +540,14 @@ static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_d
             rusteron_dpdk_set_error(message);
             return -1;
         }
-        if (azure && (cfg->rx_descriptors > RUSTERON_DPDK_MANA_MAX_DESCRIPTORS ||
+        if (azure && (p->rx_descriptors > RUSTERON_DPDK_MANA_MAX_DESCRIPTORS ||
                       cfg->tx_descriptors > RUSTERON_DPDK_MANA_MAX_DESCRIPTORS))
         {
             /* netvsc sets up its MANA VF's queues with the same sizes. */
             snprintf(message, sizeof(message),
                      "%s queues (a MANA VF) hold at most %d descriptors (rx %u, tx %u): set "
                      "RUSTERON_DPDK_RX_DESCRIPTORS and RUSTERON_DPDK_TX_DESCRIPTORS to %d",
-                     driver, RUSTERON_DPDK_MANA_MAX_DESCRIPTORS, cfg->rx_descriptors, cfg->tx_descriptors,
+                     driver, RUSTERON_DPDK_MANA_MAX_DESCRIPTORS, p->rx_descriptors, cfg->tx_descriptors,
                      RUSTERON_DPDK_MANA_MAX_DESCRIPTORS);
             rusteron_dpdk_set_error(message);
             return -1;
@@ -436,6 +564,10 @@ static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_d
             snprintf(message, sizeof(message),
                      "device %s lacks the required IPv4/UDP checksum offloads", p->pci);
             rusteron_dpdk_set_error(message);
+            return -1;
+        }
+        if (ena && rusteron_dpdk_ena_llq_check(native, p) < 0)
+        {
             return -1;
         }
     }
@@ -467,7 +599,7 @@ static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_d
      * the port it leaves half set up cannot be closed (see port_teardown). */
     for (int tx = 0; tx < 2; tx++)
     {
-        const unsigned n = tx ? cfg->tx_descriptors : cfg->rx_descriptors;
+        const unsigned n = tx ? cfg->tx_descriptors : p->rx_descriptors;
         const unsigned lo = desc_lim[2 * tx], hi = desc_lim[2 * tx + 1];
         if (n < lo || (0 != hi && n > hi))
         {
@@ -478,6 +610,24 @@ static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_d
             rusteron_dpdk_set_error(message);
             return -1;
         }
+    }
+    /* The pool holds both rings, four bursts and what two lcores' mempool
+     * caches may keep (the port's agent, and the EAL main lcore, which starts
+     * and stops the port), each up to DPDK's flush threshold of 1.5 times the
+     * cache: fewer and the receive ring, refilled first, starves the sends. */
+    const uint64_t caches = 3ULL * cfg->mempool_cache;
+    const uint64_t need = (uint64_t)p->rx_descriptors + cfg->tx_descriptors + 4ULL * cfg->burst_size + caches;
+    if ((uint64_t)cfg->mbufs_per_port < need)
+    {
+        snprintf(message, sizeof(message),
+                 "mbufs_per_port (RUSTERON_DPDK_MBUFS_PER_PORT) %u is below the %llu %s needs: a receive ring of %u%s, "
+                 "a transmit ring of %u, four bursts of %u and two mempool caches of up to %llu: raise it, or set "
+                 "RUSTERON_DPDK_RX_DESCRIPTORS lower",
+                 cfg->mbufs_per_port, (unsigned long long)need, p->pci, p->rx_descriptors,
+                 0 == cfg->rx_descriptors ? " (RUSTERON_DPDK_RX_DESCRIPTORS unset: min(4096, the NIC's maximum))" : "",
+                 cfg->tx_descriptors, cfg->burst_size, (unsigned long long)(caches / 2));
+        rusteron_dpdk_set_error(message);
+        return -1;
     }
     /* Checksum offloads only when the NIC offers both IPv4 and UDP (a vdev may
      * not: then both sides are done in software, never a half-done UDP sum). */
@@ -522,8 +672,27 @@ static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_d
         }
         return -1;
     }
+    /* Every frame must fit one mbuf, a jumbo one included: one split over two
+     * is dropped on receive (multi-segment) and a send of one is refused as
+     * oversized, so a pool that gives less than asked would lose every
+     * full-size frame. Read from the pool, taking none of its mbufs. */
+    const uint32_t frame_max = RUSTERON_DPDK_ETH_HDR_LEN + (uint32_t)l3_mtu;
+    const uint32_t room = ops->mbuf_room(p->mempool);
+    if (room < frame_max)
+    {
+        snprintf(message, sizeof(message),
+                 "%s's mbufs hold %u bytes of frame, below the %u bytes of a frame of max_aeron_mtu %zu "
+                 "(Ethernet, IPv4 and UDP headers with it): it would arrive in two mbufs and be dropped; "
+                 "lower RUSTERON_DPDK_MAX_AERON_MTU to at most %u",
+                 p->pci, room, frame_max, cfg->max_aeron_mtu,
+                 room > RUSTERON_DPDK_ETH_HDR_LEN + RUSTERON_DPDK_IP_UDP_OVERHEAD
+                     ? (unsigned)((room - RUSTERON_DPDK_ETH_HDR_LEN - RUSTERON_DPDK_IP_UDP_OVERHEAD) / 32 * 32)
+                     : 0U);
+        rusteron_dpdk_set_error(message);
+        return -1;
+    }
 
-    if (ops->rx_queue_setup(p->port_id, 0, cfg->rx_descriptors, p->mempool) < 0)
+    if (ops->rx_queue_setup(p->port_id, 0, p->rx_descriptors, p->mempool) < 0)
     {
         snprintf(message, sizeof(message), "rx queue setup failed on %s", p->pci);
         rusteron_dpdk_set_error(message);
@@ -546,6 +715,21 @@ static int rusteron_dpdk_init_port(rusteron_dpdk_transport_t *native, rusteron_d
                  "device %s rejected L3 MTU %u (max_aeron_mtu %zu)", p->pci, l3_mtu, cfg->max_aeron_mtu);
         rusteron_dpdk_set_error(message);
         return -1;
+    }
+
+    /* Device-reset requests (ENA raises one when its watchdog, run by the
+     * housekeeping thread's timer service, finds the device unwell), from
+     * before the port starts until before it closes. */
+    if (NULL != ops->watch_reset)
+    {
+        if (ops->watch_reset(p->port_id, &p->nic_resets) < 0)
+        {
+            snprintf(message, sizeof(message), "cannot watch %s (port %u) for device-reset requests", p->pci,
+                     p->port_id);
+            rusteron_dpdk_set_error(message);
+            return -1;
+        }
+        p->reset_watched = 1;
     }
 
     if (ops->dev_start(p->port_id) < 0)
@@ -622,6 +806,110 @@ static int rusteron_dpdk_append_arg(char *out, size_t len, size_t *used, const c
     return 0;
 }
 
+int rusteron_dpdk_ena_devargs(char *out, size_t len, int *llq_off)
+{
+    /* DPDK 24.11 replaced ENA's enable_llq (on by default) with llq_policy,
+     * whose default 24.11.0 and .1 left at 0, disabled ("net/ena: fix missing
+     * default LLQ policy", 24.11.2): so the transport always names it, as the
+     * device's recommended policy (1). */
+    int year = 0, month = 0;
+    rusteron_dpdk_eal_version(&year, &month);
+    const int policy = year > 24 || (24 == year && month >= 11);
+    const char *key = policy ? "llq_policy" : "enable_llq";
+    const size_t key_len = strlen(key);
+    /* The key's value must be a decimal in the PMD's range: ENA reads
+     * llq_policy with strtoul, so 0x3, 0.5 or 4294967296 would be policy 0
+     * (LLQ off) with the BAR still mapped write-combined at probe. */
+    const unsigned most = policy ? 3U : 1U;
+    const char *extra = getenv("RUSTERON_DPDK_ENA_DEVARGS");
+    if (NULL == extra)
+    {
+        extra = "";
+    }
+    *llq_off = 0;
+    int named = 0;
+    const size_t extra_len = strlen(extra);
+    int malformed = extra_len > RUSTERON_DPDK_ENA_DEVARGS_MAX;
+    for (const char *item = extra; !malformed && '\0' != *item;)
+    {
+        const char *end = strchr(item, ',');
+        const size_t n = NULL != end ? (size_t)(end - item) : strlen(item);
+        const char *eq = memchr(item, '=', n);
+        malformed = NULL == eq || eq == item || eq + 1 == item + n;
+        for (size_t i = 0; !malformed && i < n; i++)
+        {
+            const char c = item[i];
+            malformed = !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                          '_' == c || '.' == c || ':' == c || '-' == c || ('=' == c && item + i == eq));
+        }
+        if (!malformed && (size_t)(eq - item) == key_len && 0 == strncmp(item, key, key_len))
+        {
+            named = 1;
+            /* 0 turns LLQ off under either key */
+            unsigned value = 0;
+            for (const char *c = eq + 1; !malformed && c < item + n; c++)
+            {
+                malformed = *c < '0' || *c > '9' || (value = value * 10U + (unsigned)(*c - '0')) > most;
+            }
+            *llq_off = 0 == value;
+        }
+        item = NULL != end ? end + 1 : item + n;
+        malformed = malformed || (NULL != end && '\0' == *item); /* a trailing comma */
+    }
+    if (malformed)
+    {
+        char message[384];
+        snprintf(message, sizeof(message),
+                 "RUSTERON_DPDK_ENA_DEVARGS must be key=value device arguments separated by commas "
+                 "([A-Za-z0-9_.:-]), at most %d bytes, and %s a decimal %s, e.g. %s=1",
+                 RUSTERON_DPDK_ENA_DEVARGS_MAX, key, policy ? "from 0 to 3" : "0 or 1", key);
+        rusteron_dpdk_set_error(message);
+        return -1;
+    }
+    const int n = named ? snprintf(out, len, "%s", extra)
+                        : snprintf(out, len, "%s=1%s%s", key, '\0' != extra[0] ? "," : "", extra);
+    if (n < 0 || (size_t)n >= len)
+    {
+        rusteron_dpdk_set_error("RUSTERON_DPDK_ENA_DEVARGS does not fit the EAL argument buffer");
+        return -1;
+    }
+    return 0;
+}
+
+int rusteron_dpdk_ena_llq_mapping(const char *maps_path, const char *bdf)
+{
+    FILE *maps = fopen(maps_path, "r");
+    if (NULL == maps)
+    {
+        return RUSTERON_DPDK_ENA_LLQ_UNKNOWN;
+    }
+    /* sysfs names the device in lower case; the configured BDF may not be */
+    char wc[64], uc[64];
+    snprintf(wc, sizeof(wc), "/%s/resource2_wc", bdf);
+    snprintf(uc, sizeof(uc), "/%s/resource2", bdf);
+    const size_t wc_len = strlen(wc), uc_len = strlen(uc);
+    int seen_wc = 0, seen_uc = 0;
+    char line[4352]; /* the fields and a PATH_MAX path */
+    while (NULL != fgets(line, sizeof(line), maps))
+    {
+        size_t n = strlen(line);
+        while (n > 0 && ('\n' == line[n - 1] || ' ' == line[n - 1]))
+        {
+            line[--n] = '\0';
+        }
+        if (n >= wc_len && 0 == strcasecmp(line + n - wc_len, wc))
+        {
+            seen_wc = 1;
+        }
+        else if (n >= uc_len && 0 == strcasecmp(line + n - uc_len, uc))
+        {
+            seen_uc = 1;
+        }
+    }
+    fclose(maps);
+    return seen_wc ? RUSTERON_DPDK_ENA_LLQ_WC : seen_uc ? RUSTERON_DPDK_ENA_LLQ_UNCACHED : RUSTERON_DPDK_ENA_LLQ_UNSEEN;
+}
+
 int rusteron_dpdk_eal_allow_args(const rusteron_dpdk_config_t *cfg, char *out, size_t len)
 {
     if (NULL == cfg || NULL == out || 0 == len)
@@ -633,16 +921,26 @@ int rusteron_dpdk_eal_allow_args(const rusteron_dpdk_config_t *cfg, char *out, s
     size_t used = 0;
     const char *sel[2] = { cfg->sender_pci, cfg->receiver_pci };
     const char *mac[2] = { cfg->sender_mac, cfg->receiver_mac };
+    /* A PCI port selected without a MAC is an ENA (MANA ports need one): its
+     * device arguments name the LLQ policy (rusteron_dpdk_ena_devargs). */
+    char ena[RUSTERON_DPDK_ENA_DEVARGS_MAX + 32];
+    int llq_off = 0;
+    if (((rusteron_dpdk_selector_is_pci(sel[0]) && '\0' == mac[0][0]) ||
+         (rusteron_dpdk_selector_is_pci(sel[1]) && '\0' == mac[1][0])) &&
+        rusteron_dpdk_ena_devargs(ena, sizeof(ena), &llq_off) < 0)
+    {
+        return -1;
+    }
     for (int i = 0; i < 2; i++)
     {
-        char arg[96];
+        char arg[96 + sizeof(ena)];
         if (!rusteron_dpdk_selector_is_pci(sel[i]))
         {
             snprintf(arg, sizeof(arg), "--vdev=%s", sel[i]);
         }
         else if ('\0' == mac[i][0])
         {
-            snprintf(arg, sizeof(arg), "%s", sel[i]);
+            snprintf(arg, sizeof(arg), "%s,%s", sel[i], ena);
         }
         else if (1 == i && '\0' != mac[0][0] && 0 == strcmp(sel[0], sel[1]))
         {
@@ -885,7 +1183,14 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
         {
             native->local_io_mode = RUSTERON_DPDK_LOCAL_IO_ADAPTIVE;
         }
-        else if (0 != strcmp(local_io, "epoll"))
+        else if (0 == strcmp(local_io, "epoll"))
+        {
+            /* Every explicit choice assigns its own mode: "epoll" used to fall
+             * through and leave the default ADAPTIVE, so an explicit epoll run
+             * measured adaptive and the two modes were not comparable. */
+            native->local_io_mode = RUSTERON_DPDK_LOCAL_IO_EPOLL;
+        }
+        else
         {
             rusteron_dpdk_set_error("RUSTERON_DPDK_LOCAL_IO must be epoll, adaptive or spin");
             return -1;
@@ -908,16 +1213,9 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
     }
     /* How many bursts one poll drains while they come back full: by default
      * as many as fill the receive ring, at most 8, so a backlog a stall left
-     * clears in one duty cycle. */
-    native->rx_max_bursts = native->config.burst_size > 0 ? native->config.rx_descriptors / native->config.burst_size : 1;
-    if (native->rx_max_bursts > 8)
-    {
-        native->rx_max_bursts = 8;
-    }
-    if (native->rx_max_bursts < 1)
-    {
-        native->rx_max_bursts = 1;
-    }
+     * clears in one duty cycle; 0 until the ports, whose rings it sizes from,
+     * are up (rusteron_dpdk_runtime_init). */
+    native->rx_max_bursts = 0;
     const char *max_bursts = getenv("RUSTERON_DPDK_RX_MAX_BURSTS");
     if (NULL != max_bursts && '\0' != max_bursts[0])
     {
@@ -973,6 +1271,8 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
         }
     }
     native->tx_pace_spin_ns = pace_spin_us * 1000ULL;
+    const char *pace_spin_env = getenv("RUSTERON_DPDK_TX_PACE_SPIN_US");
+    native->tx_pace_spin_set = NULL != pace_spin_env && '\0' != pace_spin_env[0];
     /* An allowance the operator set: the default is a backstop above every
      * link measured, not a link's capacity to share out, so only this can put
      * low-priority streams below the rest. */
@@ -1221,6 +1521,42 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
         }
     }
 
+    /* An ENA port whose low-latency queue is not verified fails start unless
+     * RUSTERON_DPDK_ENA_LLQ_REQUIRED=0 (or false), for diagnosis. */
+    native->ena_llq_required = 1;
+    const char *llq_required = getenv("RUSTERON_DPDK_ENA_LLQ_REQUIRED");
+    if (NULL != llq_required && '\0' != llq_required[0])
+    {
+        const int on = 0 == strcmp(llq_required, "1") || 0 == strcmp(llq_required, "true");
+        if (!on && 0 != strcmp(llq_required, "0") && 0 != strcmp(llq_required, "false"))
+        {
+            rusteron_dpdk_set_error("RUSTERON_DPDK_ENA_LLQ_REQUIRED must be 0, 1, false or true");
+            return -1;
+        }
+        native->ena_llq_required = on;
+    }
+    /* RUSTERON_DPDK_VFIO_WC=1: a write-combining vfio-pci, as preflight reads
+     * it (0, the default, or 1). */
+    native->vfio_wc = 0;
+    const char *vfio_wc = getenv("RUSTERON_DPDK_VFIO_WC");
+    if (NULL != vfio_wc && '\0' != vfio_wc[0])
+    {
+        native->vfio_wc = 0 == strcmp(vfio_wc, "1");
+        if (!native->vfio_wc && 0 != strcmp(vfio_wc, "0"))
+        {
+            rusteron_dpdk_set_error("RUSTERON_DPDK_VFIO_WC must be 0 or 1 (1: the ports' vfio-pci maps BARs "
+                                    "write-combined, as the node's preflight confirmed)");
+            return -1;
+        }
+    }
+    /* Malformed ENA device arguments fail here whatever the ports are. */
+    char ena_devargs[RUSTERON_DPDK_ENA_DEVARGS_MAX + 32];
+    int llq_off = 0;
+    if (rusteron_dpdk_ena_devargs(ena_devargs, sizeof(ena_devargs), &llq_off) < 0)
+    {
+        return -1;
+    }
+
     /* A 0.0.0.0 receive bind also listens on the host's own interfaces unless
      * RUSTERON_DPDK_WILDCARD_LOCAL=0 (or false): it costs nothing while idle. */
     native->wildcard_local = 1;
@@ -1238,10 +1574,97 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
     return 0;
 }
 
+/* Aeron's distinct error log, from the driver library when it is linked. */
+extern int aeron_distinct_error_log_record(aeron_distinct_error_log_t *log, int error_code, const char *description)
+    __attribute__((weak));
+
+/* An error housekeeping found, which no Aeron call returns, goes to standard
+ * error at error level, with this prefix. */
+#define RUSTERON_DPDK_LOG_ERROR "ERROR ergon-md-dpdk: "
+static void rusteron_dpdk_housekeeping_log(const char *message)
+{
+    fprintf(stderr, RUSTERON_DPDK_LOG_ERROR "%s\n", message);
+}
+
+/* How often the PMDs' timers are run: AWS's recommended cadence for
+ * rte_timer_manage with the ENA PMD, whose watchdog timer is periodic at a
+ * second and checks no more often. */
+#define RUSTERON_DPDK_TIMER_SERVICE_NS 1000000000ULL
+
+/* Run the PMDs' due DPDK timers, at most once a second. ENA's watchdog is
+ * one (device keep-alive, admin queue, missing transmit completions; a
+ * failed check asks for a device reset), and nothing else runs it. The
+ * service needs an lcore id, so this thread registers with DPDK first (a
+ * no-op once it has). A failure is reported once, until it next succeeds. */
+static void rusteron_dpdk_timer_service(rusteron_dpdk_transport_t *native, uint64_t now_ns)
+{
+    if (NULL == native->ops->timer_service ||
+        (0 != native->timer_service_ns && now_ns >= native->timer_service_ns &&
+         now_ns - native->timer_service_ns < RUSTERON_DPDK_TIMER_SERVICE_NS))
+    {
+        return;
+    }
+    native->timer_service_ns = now_ns;
+    const int registered = rusteron_dpdk_eal_thread_register() >= 0;
+    const int rc = registered ? native->ops->timer_service() : -1;
+    if (rc >= 0)
+    {
+        native->timer_service_failing = 0;
+        return;
+    }
+    if (!native->timer_service_failing)
+    {
+        native->timer_service_failing = 1;
+        char message[384];
+        snprintf(message, sizeof(message),
+                 "DPDK transport: the PMDs' timer service (ENA's health checks: device keep-alive, admin queue, "
+                 "missing transmit completions) %s (rc %d); retried every second",
+                 registered ? "failed" : "cannot run: the housekeeping thread cannot register with DPDK", rc);
+        rusteron_dpdk_housekeeping_log(message);
+    }
+}
+
+/* Device resets `p`'s PMD asked for since the last pass: kept on the port's
+ * counter (while a transport is open) and in the driver's distinct error log,
+ * and returned for logging once the lock is released. Caller holds
+ * housekeeping_lock. The transport does not reset the device: its agents
+ * poll the queues a reset would rebuild. */
+static uint64_t rusteron_dpdk_reset_requests(rusteron_dpdk_port_t *p, char *message, size_t len)
+{
+    const uint64_t resets = __atomic_load_n(&p->nic_resets, __ATOMIC_RELAXED);
+    if (p->open_transports > 0 && NULL != p->counters.addr[RD_COUNTER_NIC_RESET_REQUESTED])
+    {
+        __atomic_store_n(p->counters.addr[RD_COUNTER_NIC_RESET_REQUESTED], (int64_t)resets, __ATOMIC_RELAXED);
+    }
+    if (resets == p->nic_resets_seen)
+    {
+        return 0;
+    }
+    const uint64_t fresh = resets - p->nic_resets_seen;
+    p->nic_resets_seen = resets;
+    snprintf(message, len,
+             "DPDK transport: NIC %s (port %u, %s) asked for a device reset (RTE_ETH_EVENT_INTR_RESET): its PMD's "
+             "health checks failed (ENA: device keep-alive, admin queue or missing transmit completions) and its "
+             "queues may have stopped; the transport does not reset it: restart the media driver "
+             "(counter nic-reset-requested)",
+             p->pci, (unsigned)p->port_id, '\0' != p->driver[0] ? p->driver : "-");
+    if (p->open_transports > 0 && NULL != p->error_log && NULL != aeron_distinct_error_log_record)
+    {
+        aeron_distinct_error_log_record(p->error_log, EIO, message);
+    }
+    return fresh;
+}
+
 void rusteron_dpdk_housekeeping_tick(rusteron_dpdk_transport_t *native, uint64_t now_ns)
 {
+    rusteron_dpdk_timer_service(native, now_ns);
+
+    char messages[2][512];
+    uint64_t fresh[2];
     /* Only ports with open transports: counters belong to transports' lifetimes. */
     pthread_mutex_lock(&native->housekeeping_lock);
+    fresh[0] = rusteron_dpdk_reset_requests(&native->sender, messages[0], sizeof(messages[0]));
+    fresh[1] = rusteron_dpdk_reset_requests(&native->receiver, messages[1], sizeof(messages[1]));
     if (native->sender.open_transports > 0)
     {
         rusteron_dpdk_counters_sample(&native->sender.counters, &native->sender, native->ops, now_ns, native->nic_stats_ns);
@@ -1251,6 +1674,13 @@ void rusteron_dpdk_housekeeping_tick(rusteron_dpdk_transport_t *native, uint64_t
         rusteron_dpdk_counters_sample(&native->receiver.counters, &native->receiver, native->ops, now_ns, native->nic_stats_ns);
     }
     pthread_mutex_unlock(&native->housekeeping_lock);
+    for (int i = 0; i < 2; i++)
+    {
+        if (0 != fresh[i])
+        {
+            fprintf(stderr, RUSTERON_DPDK_LOG_ERROR "%s [%llu new]\n", messages[i], (unsigned long long)fresh[i]);
+        }
+    }
 }
 
 void rusteron_dpdk_test_housekeeping_tick(rusteron_dpdk_transport_t *native)
@@ -1258,8 +1688,10 @@ void rusteron_dpdk_test_housekeeping_tick(rusteron_dpdk_transport_t *native)
     rusteron_dpdk_housekeeping_tick(native, rusteron_dpdk_clock_now());
 }
 
-/* Every 100 ms: the 1 Hz gate inside the sample keeps the rate. Pinned to the
- * housekeeping CPU, away from the agents' cores. */
+/* Every 100 ms: the 1 Hz gates inside the sample and the timer service keep
+ * their rates. Pinned to the housekeeping CPU, away from the agents' cores.
+ * The timer service registers the thread with DPDK; its lcore goes back as
+ * it ends. */
 static void *rusteron_dpdk_housekeeping_main(void *arg)
 {
     rusteron_dpdk_transport_t *native = arg;
@@ -1269,6 +1701,7 @@ static void *rusteron_dpdk_housekeeping_main(void *arg)
         rusteron_dpdk_housekeeping_tick(native, rusteron_dpdk_clock_now());
         nanosleep(&step, NULL);
     }
+    rusteron_dpdk_eal_thread_unregister();
     return NULL;
 }
 
@@ -1283,6 +1716,30 @@ static int rusteron_dpdk_agent_cpu(const char *name)
     char *end = NULL;
     long v = strtol(env, &end, 10);
     return '\0' == *end && v >= 0 && v < CPU_SETSIZE ? (int)v : -1;
+}
+
+/* AERON_THREADING_MODE as Aeron reads it (exact names; anything else is
+ * DEDICATED, Aeron's default). */
+static int rusteron_dpdk_threading_mode_env(void)
+{
+    const char *mode = getenv("AERON_THREADING_MODE");
+    if (NULL == mode)
+    {
+        return RUSTERON_DPDK_THREADING_DEDICATED;
+    }
+    if (0 == strcmp(mode, "SHARED_NETWORK"))
+    {
+        return RUSTERON_DPDK_THREADING_SHARED_NETWORK;
+    }
+    if (0 == strcmp(mode, "SHARED"))
+    {
+        return RUSTERON_DPDK_THREADING_SHARED;
+    }
+    if (0 == strcmp(mode, "INVOKER"))
+    {
+        return RUSTERON_DPDK_THREADING_INVOKER;
+    }
+    return RUSTERON_DPDK_THREADING_DEDICATED;
 }
 
 /* Whether an idle strategy name busy-spins (Aeron's names and aliases). */
@@ -1343,10 +1800,16 @@ static void rusteron_dpdk_clear_core(cpu_set_t *set, int cpu)
  * pinned and does not busy-spin; else the EAL's main lcore CPU unless a
  * spinning agent is there; else the CPUs the creating thread may use (taken
  * at create; the calling thread's when `native` is NULL) minus the spinning
- * agents' cores, SMT siblings included. The agents' CPUs and the conductor's
- * idle strategy come from the driver context once installed, else from
- * AERON_*_CPU_AFFINITY and AERON_CONDUCTOR_IDLE_STRATEGY. Returns 1 with
- * `set` filled, 0 to leave the thread unpinned, -1 when the env is bad. */
+ * agents' cores, SMT siblings included. Which agents spin where is the
+ * threading mode's: the sender's and the receiver's CPUs under DEDICATED, the
+ * sender's (the network agent's) under SHARED_NETWORK, and the conductor's
+ * when its idle strategy busy-spins; under SHARED and INVOKER the
+ * conductor's, whose one thread (the shared agent, the application's) runs
+ * everything, whatever the conductor's own strategy. The mode, the agents'
+ * CPUs and the conductor's idle strategy come from the driver context once
+ * installed, else from AERON_THREADING_MODE, AERON_*_CPU_AFFINITY and
+ * AERON_CONDUCTOR_IDLE_STRATEGY. Returns 1 with `set` filled, 0 to leave the
+ * thread unpinned, -1 when the env is bad. */
 int rusteron_dpdk_housekeeping_affinity(const rusteron_dpdk_transport_t *native, cpu_set_t *set)
 {
     CPU_ZERO(set);
@@ -1364,14 +1827,23 @@ int rusteron_dpdk_housekeeping_affinity(const rusteron_dpdk_transport_t *native,
         return 1;
     }
     const int installed = NULL != native && native->agent_cpus_known;
+    const int mode = installed ? native->threading_mode : rusteron_dpdk_threading_mode_env();
     const int conductor = installed ? native->agent_cpus[0] : rusteron_dpdk_agent_cpu("AERON_CONDUCTOR_CPU_AFFINITY");
+    const int sender = installed ? native->agent_cpus[1] : rusteron_dpdk_agent_cpu("AERON_SENDER_CPU_AFFINITY");
+    const int receiver = installed ? native->agent_cpus[2] : rusteron_dpdk_agent_cpu("AERON_RECEIVER_CPU_AFFINITY");
     const int conductor_spins =
         installed ? native->conductor_spins : rusteron_dpdk_idle_spins(getenv("AERON_CONDUCTOR_IDLE_STRATEGY"));
-    const int spinners[] = {
-        installed ? native->agent_cpus[1] : rusteron_dpdk_agent_cpu("AERON_SENDER_CPU_AFFINITY"),
-        installed ? native->agent_cpus[2] : rusteron_dpdk_agent_cpu("AERON_RECEIVER_CPU_AFFINITY"),
-        conductor_spins ? conductor : -1,
-    };
+    int spinners[3] = { sender, receiver, conductor_spins ? conductor : -1 };
+    if (RUSTERON_DPDK_THREADING_SHARED_NETWORK == mode)
+    {
+        spinners[1] = -1; /* no receiver agent: the network agent is on the sender's CPU */
+    }
+    else if (RUSTERON_DPDK_THREADING_SHARED == mode || RUSTERON_DPDK_THREADING_INVOKER == mode)
+    {
+        spinners[0] = -1;
+        spinners[1] = -1;
+        spinners[2] = conductor;
+    }
     const size_t spinner_count = sizeof(spinners) / sizeof(spinners[0]);
 
     /* The candidates, minus every spinning agent's core. */
@@ -1515,29 +1987,18 @@ int rusteron_dpdk_runtime_init(rusteron_dpdk_transport_t *native)
         return -1;
     }
 
-    /* RUSTERON_DPDK_CLOCK: tsc (default) or monotonic, which forces the
-     * CLOCK_MONOTONIC fallback (for comparing the two). */
-    const char *clock = getenv("RUSTERON_DPDK_CLOCK");
-    int allow_tsc = 1;
-    if (NULL != clock && '\0' != clock[0])
-    {
-        if (0 == strcmp(clock, "monotonic"))
-        {
-            allow_tsc = 0;
-        }
-        else if (0 != strcmp(clock, "tsc"))
-        {
-            rusteron_dpdk_set_error("RUSTERON_DPDK_CLOCK must be tsc or monotonic");
-            return -1;
-        }
-    }
-    if (RUSTERON_DPDK_CLOCK_UNCALIBRATED == rusteron_dpdk_clock.mode || allow_tsc != rusteron_dpdk_clock_allow_tsc)
-    {
-        rusteron_dpdk_clock_calibrate(allow_tsc);
-    }
-
     if (rusteron_dpdk_runtime_eal_up(native) < 0)
     {
+        return -1;
+    }
+
+    /* The clock: ergon-clock's calibration the config carries (made in Rust,
+     * as RUSTERON_DPDK_CLOCK chose; checked with the config). Adopted only once
+     * the EAL guard has passed, so a second transport refused while one runs
+     * never touches the clock its agents read. */
+    if (rusteron_dpdk_clock_adopt(&native->config.clock) < 0)
+    {
+        rusteron_dpdk_runtime_cleanup(native);
         return -1;
     }
 
@@ -1550,6 +2011,14 @@ int rusteron_dpdk_runtime_init(rusteron_dpdk_transport_t *native)
     {
         rusteron_dpdk_runtime_cleanup(native);
         return -1;
+    }
+    if (0 == native->rx_max_bursts)
+    {
+        const uint32_t ring = native->sender.rx_descriptors < native->receiver.rx_descriptors
+            ? native->sender.rx_descriptors
+            : native->receiver.rx_descriptors;
+        const uint32_t bursts = ring / native->config.burst_size; /* burst_size validated 1..=256 */
+        native->rx_max_bursts = bursts > 8 ? 8 : bursts < 1 ? 1 : bursts;
     }
 
     if (rusteron_dpdk_housekeeping_enabled && rusteron_dpdk_housekeeping_start(native) < 0)
@@ -1578,6 +2047,11 @@ int rusteron_dpdk_runtime_init(rusteron_dpdk_transport_t *native)
 static void rusteron_dpdk_port_teardown(rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *p)
 {
     const rusteron_dpdk_port_ops_t *ops = native->ops;
+    if (p->reset_watched)
+    {
+        ops->unwatch_reset(p->port_id, &p->nic_resets);
+        p->reset_watched = 0;
+    }
     if (p->started)
     {
         ops->dev_stop(p->port_id);
@@ -1738,11 +2212,110 @@ void rusteron_dpdk_transport_test_rx_stats(
     }
 }
 
-/* The driver context is known (install): take its agents' CPUs, however
- * they were set, and move the housekeeping and local-I/O threads off them. */
-void rusteron_dpdk_runtime_agents_known(
-    rusteron_dpdk_transport_t *native, int conductor, int sender, int receiver, const char *conductor_idle)
+/* Nothing else of the transport's may share a busy-spinning network agent's
+ * core (SMT siblings included). Under DEDICATED those are the sender's and
+ * the receiver's; under SHARED_NETWORK, SHARED and INVOKER the one thread
+ * with all of the network work. The EAL's own threads (interrupts, alarms),
+ * confined to its main lcore's CPU, must be off every one of them, in every
+ * mode. In the three shared modes so must the housekeeping and local-I/O
+ * threads, which rusteron_dpdk_housekeeping_affinity found no CPU off that
+ * core when `pin` is 0, as when the thread creating the transport may run
+ * only there (an application that pinned the thread it runs an INVOKER
+ * driver on before starting it). Either refuses the install (-1), saying how
+ * to give them another; an agent without a known CPU (an install the Rust
+ * side did not validate) is left as it is. */
+static int rusteron_dpdk_agent_core_check(const rusteron_dpdk_transport_t *native, int pin)
 {
+    const char *mode;
+    const char *names[2] = { "network agent", NULL };
+    int spinners[2] = { -1, -1 };
+    switch (native->threading_mode)
+    {
+        case RUSTERON_DPDK_THREADING_DEDICATED:
+            mode = "DEDICATED";
+            names[0] = "sender";
+            names[1] = "receiver";
+            spinners[0] = native->agent_cpus[1];
+            spinners[1] = native->agent_cpus[2];
+            break;
+        case RUSTERON_DPDK_THREADING_SHARED_NETWORK:
+            mode = "SHARED_NETWORK";
+            spinners[0] = native->agent_cpus[1];
+            break;
+        case RUSTERON_DPDK_THREADING_SHARED:
+            mode = "SHARED";
+            spinners[0] = native->agent_cpus[0];
+            break;
+        case RUSTERON_DPDK_THREADING_INVOKER:
+            mode = "INVOKER";
+            spinners[0] = native->agent_cpus[0];
+            break;
+        default:
+            return 0;
+    }
+    char message[512];
+    const int main_cpu = rusteron_dpdk_eal_main_cpu();
+    for (int i = 0; i < 2; i++)
+    {
+        const int spinner = spinners[i];
+        if (spinner < 0 || spinner >= CPU_SETSIZE)
+        {
+            continue;
+        }
+        cpu_set_t off_core;
+        CPU_ZERO(&off_core);
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+        {
+            CPU_SET(cpu, &off_core);
+        }
+        rusteron_dpdk_clear_core(&off_core, spinner);
+        if (main_cpu >= 0 && main_cpu < CPU_SETSIZE && !CPU_ISSET(main_cpu, &off_core))
+        {
+            snprintf(message, sizeof(message),
+                     "AERON_THREADING_MODE %s: the EAL's main lcore (CPU %d) is on the core the %s busy-spins on "
+                     "(CPU %d), and the EAL's own threads (interrupts, alarms) run there: create the transport "
+                     "from a thread confined to other CPUs, or give the main lcore another with "
+                     "RUSTERON_DPDK_EAL_ARGS (-l <cpu>)",
+                     mode, main_cpu, names[i], spinner);
+            rusteron_dpdk_set_error(message);
+            return -1;
+        }
+        if (0 == pin && RUSTERON_DPDK_THREADING_DEDICATED != native->threading_mode)
+        {
+            snprintf(message, sizeof(message),
+                     "AERON_THREADING_MODE %s: the housekeeping and local-I/O threads have no CPU off the core the "
+                     "network agent busy-spins on (CPU %d), the only one the thread creating the transport may run "
+                     "on: create it from a thread allowed others (an INVOKER application pins its thread once the "
+                     "driver has started, as Aeron does then), or set RUSTERON_DPDK_HOUSEKEEPING_CPU",
+                     mode, spinner);
+            rusteron_dpdk_set_error(message);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* The driver context is known (install): take its threading mode and its
+ * agents' CPUs, however they were set, and move the housekeeping and
+ * local-I/O threads off the spinning ones. */
+int rusteron_dpdk_runtime_agents_known(
+    rusteron_dpdk_transport_t *native, int threading_mode, int conductor, int sender, int receiver,
+    const char *conductor_idle)
+{
+    if (RUSTERON_DPDK_THREADING_DEDICATED != threading_mode)
+    {
+        /* One thread sends and receives: a pacing wait would stall its
+         * receive half, so none, and an operator's non-zero one is refused. */
+        if (native->tx_pace_spin_set && 0 != native->tx_pace_spin_ns)
+        {
+            rusteron_dpdk_set_error(
+                "RUSTERON_DPDK_TX_PACE_SPIN_US must be 0 or unset under AERON_THREADING_MODE SHARED_NETWORK, "
+                "SHARED or INVOKER: a send waiting out a pacing debt would stall the receive half of its agent");
+            return -1;
+        }
+        native->tx_pace_spin_ns = 0;
+    }
+    native->threading_mode = threading_mode;
     /* The context may still name its `backoff` default when the environment
      * chose the strategy (ffi.rs effective_idle_strategy): either counts. */
     native->conductor_spins =
@@ -1752,9 +2325,14 @@ void rusteron_dpdk_runtime_agents_known(
     native->agent_cpus[2] = receiver;
     native->agent_cpus_known = 1;
     cpu_set_t set;
-    if (rusteron_dpdk_housekeeping_affinity(native, &set) <= 0)
+    const int pin = rusteron_dpdk_housekeeping_affinity(native, &set);
+    if (rusteron_dpdk_agent_core_check(native, pin) < 0)
     {
-        return;
+        return -1;
+    }
+    if (pin <= 0)
+    {
+        return 0;
     }
     if (native->housekeeping_running)
     {
@@ -1764,4 +2342,5 @@ void rusteron_dpdk_runtime_agents_known(
     {
         pthread_setaffinity_np(native->local_io_thread, sizeof(set), &set);
     }
+    return 0;
 }

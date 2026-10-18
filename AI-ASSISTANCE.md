@@ -672,7 +672,7 @@ expecting to find DeepSeek behind this when I traced the history. I was wrong.
 One coding agent left a six-line comment in the code generator that nearly
 broke byte-identical wire parity across every big-endian schema:
 
-```rust
+```rust,ignore
 // SBE spec §4.1: MessageHeader is ALWAYS little-endian on the wire,
 // regardless of the schema's declared byteOrder. The body follows
 // the schema byteOrder; the header composite must use LE.

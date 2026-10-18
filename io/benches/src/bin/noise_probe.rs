@@ -11,7 +11,7 @@
 use std::process::ExitCode;
 
 use io_bench::args::Args;
-use io_bench::clock::{monotonic_ns, pin_current_thread};
+use io_bench::clock::{counter_meta, monotonic_ns, pin_current_thread};
 use io_bench::stalls::StallLog;
 
 fn main() -> ExitCode {
@@ -56,12 +56,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let meta = format!(
         "mode=noise\nvariants=noise-probe\ncpu={cpu}\nduration_s={duration_s}\nmlockall={locked}\n\
          loop.0.spins={}\nloop.0.gap_max_us={:.1}\nloop.0.gaps_over_5us={}\n\
-         loop.0.gaps_over_20us={}\nloop.0.gaps_over_100us={}\n",
+         loop.0.gaps_over_20us={}\nloop.0.gaps_over_100us={}\narch={}\n{}",
         log.iterations,
         log.max_us(),
         log.over[0],
         log.over[1],
-        log.over[2]
+        log.over[2],
+        std::env::consts::ARCH,
+        counter_meta()
     );
     std::fs::write(out.join("meta.txt"), &meta)?;
     print!("{meta}");

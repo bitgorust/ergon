@@ -7,7 +7,7 @@
 //! host. Every test is `#[serial]` (as with the other DPDK test files): the EAL
 //! is process-lifetime, so the init/failure sequences must never overlap.
 //!
-//! Linux x86_64 only, and requires libdpdk >= 23.11 (the `dpdk` feature).
+//! Linux x86_64 or aarch64, and requires libdpdk >= 23.11 (the `dpdk` feature).
 #![allow(
     missing_docs,
     unsafe_code,
@@ -17,19 +17,22 @@
     clippy::nursery,
     clippy::restriction
 )]
-#![cfg(all(feature = "dpdk", target_os = "linux", target_arch = "x86_64"))]
+#![cfg(all(
+    feature = "dpdk",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 mod common;
 use common::{
-    EnvGuard, TestEnv, close, cpu_has_invariant_tsc, create, dump, last_error, last_error_code, rusteron_dpdk_clock_ns,
-    rusteron_dpdk_clock_source, rusteron_dpdk_config_t, rusteron_dpdk_fake_set_desc_limits,
-    rusteron_dpdk_fake_set_max_mtu, rusteron_dpdk_test_clock_recalibrate,
+    EnvGuard, TestEnv, assert_no_leak, close, counter_clock, create, dump, expected_counter_source, last_error,
+    last_error_code, rusteron_dpdk_clock_source, rusteron_dpdk_config_t, rusteron_dpdk_fake_allocated,
+    rusteron_dpdk_fake_set_desc_limits, rusteron_dpdk_fake_set_max_mtu, rusteron_dpdk_fake_set_mbuf_room_cap,
 };
 use serial_test::serial;
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
-use std::time::{Duration, Instant};
 
 // rusteron_dpdk_runtime_probe_device is an internal seam (declared in
 // rusteron_dpdk_internal.h); the test build links the core archive which
@@ -40,6 +43,7 @@ unsafe extern "C" {
     // no-op stubs; the real rte_lcore_id-gated impl runs in production builds.
     fn rusteron_dpdk_eal_thread_register() -> c_int;
     fn rusteron_dpdk_eal_thread_unregister() -> c_int;
+    fn rusteron_dpdk_test_local_io_mode(transport: *const c_void) -> c_int;
 }
 
 /// Index of the first log entry containing `needle`, or -1.
@@ -239,56 +243,6 @@ fn thread_registration_seam_is_safe_noop() {
     assert_eq!(close(transport), 0);
 }
 
-/// Advance of the transport clock against `Instant` (`CLOCK_MONOTONIC`) over a
-/// 50 ms busy wait, as (transport ns, monotonic ns).
-fn clock_advance_over_50ms() -> (u64, u64) {
-    let (c0, i0) = (unsafe { rusteron_dpdk_clock_ns() }, Instant::now());
-    while i0.elapsed() < Duration::from_millis(50) {
-        std::hint::spin_loop();
-    }
-    let (c1, i1) = (unsafe { rusteron_dpdk_clock_ns() }, Instant::now());
-    (c1 - c0, u64::try_from((i1 - i0).as_nanos()).unwrap())
-}
-
-fn assert_tracks_monotonic((clock, mono): (u64, u64)) {
-    let err = clock.abs_diff(mono);
-    assert!(
-        err * 1000 <= mono,
-        "transport clock advanced {clock} ns against {mono} ns monotonic (more than 0.1% apart)"
-    );
-}
-
-/// The transport clocks with the calibrated TSC exactly when the CPU has an
-/// invariant TSC, and either way it is a nanosecond clock that tracks
-/// `CLOCK_MONOTONIC` within 0.1%.
-#[serial]
-#[test]
-fn clock_uses_invariant_tsc_and_tracks_monotonic() {
-    let _env = TestEnv::new();
-    assert_eq!(unsafe { rusteron_dpdk_test_clock_recalibrate(1) }, 0);
-    assert_eq!(
-        unsafe { rusteron_dpdk_clock_source() },
-        c_int::from(cpu_has_invariant_tsc()),
-        "TSC exactly when constant_tsc and nonstop_tsc are both present"
-    );
-    assert_tracks_monotonic(clock_advance_over_50ms());
-}
-
-/// Without an invariant TSC the clock falls back to `CLOCK_MONOTONIC` in
-/// nanoseconds, still monotonic and still tracking real time.
-#[serial]
-#[test]
-fn clock_falls_back_to_monotonic_without_invariant_tsc() {
-    let _env = TestEnv::new();
-    assert_eq!(unsafe { rusteron_dpdk_test_clock_recalibrate(0) }, 0);
-    assert_eq!(unsafe { rusteron_dpdk_clock_source() }, 0, "monotonic fallback");
-    let a = unsafe { rusteron_dpdk_clock_ns() };
-    let b = unsafe { rusteron_dpdk_clock_ns() };
-    assert!(b >= a, "monotonic: {a} then {b}");
-    assert_tracks_monotonic(clock_advance_over_50ms());
-    assert_eq!(unsafe { rusteron_dpdk_test_clock_recalibrate(1) }, 0);
-}
-
 /// Requesting NIC receive timestamps on a port whose driver does not offer
 /// them fails initialization, naming the device and driver.
 #[serial]
@@ -339,37 +293,34 @@ fn rx_hw_timestamp_must_be_a_flag() {
     assert!(err.contains("rx_hw_timestamp"), "got: {err}");
 }
 
-/// `RUSTERON_DPDK_CLOCK=monotonic` makes the transport clock with
-/// `CLOCK_MONOTONIC` even on an invariant TSC (benchmark comparisons); `tsc`
-/// or unset is the default; anything else fails initialization.
+/// `RUSTERON_DPDK_CLOCK` is the Rust install's to read (`clock`): the
+/// native transport takes the clock its configuration carries (here a
+/// counter clock), whatever the variable says, so a stale native reading of
+/// it cannot override the calibration handed over.
 #[serial]
 #[test]
-fn clock_env_selects_monotonic_and_rejects_unknown_values() {
+fn the_native_transport_does_not_read_the_clock_variable() {
+    let counter = counter_clock();
+    let source = if cfg!(target_arch = "aarch64") { 2 } else { 1 };
+    for value in ["monotonic", "hpet"] {
+        let env = TestEnv::new();
+        env.eal_skip();
+        let _guard = EnvGuard::set("RUSTERON_DPDK_CLOCK", value);
+        let mut config = rusteron_dpdk_config_t::valid();
+        config.clock = counter.params();
+        let transport = create(&config).unwrap_or_else(|e| panic!("{value}: {e}"));
+        assert_eq!(
+            unsafe { rusteron_dpdk_clock_source() },
+            source,
+            "{value}: the configuration's counter"
+        );
+        assert_eq!(close(transport), 0);
+    }
     let env = TestEnv::new();
     env.eal_skip();
-    let config = rusteron_dpdk_config_t::valid();
-
-    let _guard = EnvGuard::set("RUSTERON_DPDK_CLOCK", "monotonic");
-    let transport = create(&config).unwrap_or_else(|e| panic!("create failed: {e}"));
-    assert_eq!(unsafe { rusteron_dpdk_clock_source() }, 0, "monotonic forced");
+    let transport = create(&rusteron_dpdk_config_t::valid()).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(unsafe { rusteron_dpdk_clock_source() }, expected_counter_source());
     assert_eq!(close(transport), 0);
-
-    let env = TestEnv::new();
-    env.eal_skip();
-    let _guard = EnvGuard::set("RUSTERON_DPDK_CLOCK", "tsc");
-    let transport = create(&config).unwrap_or_else(|e| panic!("create failed: {e}"));
-    assert_eq!(
-        unsafe { rusteron_dpdk_clock_source() },
-        c_int::from(cpu_has_invariant_tsc()),
-        "tsc when invariant"
-    );
-    assert_eq!(close(transport), 0);
-
-    let env = TestEnv::new();
-    env.eal_skip();
-    let _guard = EnvGuard::set("RUSTERON_DPDK_CLOCK", "hpet");
-    let err = create(&config).unwrap_err();
-    assert!(err.contains("RUSTERON_DPDK_CLOCK"), "got: {err}");
 }
 
 /// max_aeron_mtu must fit the NIC: an L3 MTU above the PMD's maximum fails
@@ -420,6 +371,89 @@ fn descriptor_counts_outside_the_nics_limits_fail_start() {
     assert_eq!(close(t), 0);
 }
 
+/// Unset (0 natively), each port's receive ring is min(4096, the NIC's
+/// maximum), a power of two as ENA's and MANA's rings must be; an explicit
+/// count is used as given.
+#[serial]
+#[test]
+fn the_default_receive_ring_is_4096_or_the_nics_maximum() {
+    let env = TestEnv::new();
+    for (nic_max, rx) in [
+        (0u16, 4096u16),
+        (8192, 4096),
+        (16384, 4096),
+        (2048, 2048),
+        (512, 512),
+        (3000, 2048),
+    ] {
+        env.reset();
+        env.eal_skip();
+        unsafe { rusteron_dpdk_fake_set_desc_limits(64, nic_max, 0, 0) };
+        let mut config = rusteron_dpdk_config_t::valid();
+        config.rx_descriptors = 0;
+        let t = create(&config).unwrap_or_else(|e| panic!("NIC maximum {nic_max}: {e}"));
+        for port in 0..2 {
+            assert!(
+                log_index_containing(&env, &format!("rx {port} (q=0 desc={rx})")) >= 0,
+                "NIC maximum {nic_max}: port {port} wants {rx}"
+            );
+        }
+        assert_eq!(close(t), 0);
+    }
+    env.reset();
+    env.eal_skip();
+    unsafe { rusteron_dpdk_fake_set_desc_limits(64, 8192, 0, 0) };
+    let mut config = rusteron_dpdk_config_t::valid();
+    config.rx_descriptors = 512;
+    let t = create(&config).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        log_index_containing(&env, "rx 0 (q=0 desc=512)") >= 0,
+        "explicit: as given"
+    );
+    assert_eq!(close(t), 0);
+}
+
+/// The pool must hold the ring the port took, the transmit ring, four bursts
+/// and two lcores' mempool caches: start fails, naming the variables, before
+/// any queue is configured, when it cannot; the same pool serves a NIC whose
+/// maximum makes the ring smaller.
+#[serial]
+#[test]
+fn a_pool_too_small_for_the_receive_ring_fails_start() {
+    let env = TestEnv::new();
+    env.eal_skip();
+    unsafe { rusteron_dpdk_fake_set_desc_limits(64, 8192, 0, 0) };
+    let mut config = rusteron_dpdk_config_t::valid(); // tx 1024, burst 64, cache 256
+    config.rx_descriptors = 0;
+    config.mbufs_per_port = 6143; // 4096 + 1024 + 256 + 768 = 6144
+    let err = create(&config).unwrap_err();
+    assert!(
+        err.contains("RUSTERON_DPDK_MBUFS_PER_PORT")
+            && err.contains("6143")
+            && err.contains("6144")
+            && err.contains("a receive ring of 4096 (RUSTERON_DPDK_RX_DESCRIPTORS unset"),
+        "{err}"
+    );
+    assert!(
+        log_index_containing(&env, "configure") < 0,
+        "configured before the check"
+    );
+
+    env.reset();
+    env.eal_skip();
+    unsafe { rusteron_dpdk_fake_set_desc_limits(64, 8192, 0, 0) };
+    config.mbufs_per_port = 6144;
+    let t = create(&config).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(close(t), 0);
+
+    env.reset();
+    env.eal_skip();
+    unsafe { rusteron_dpdk_fake_set_desc_limits(64, 1024, 0, 0) };
+    config.mbufs_per_port = 3072; // 1024 + 1024 + 256 + 768
+    let t = create(&config).unwrap_or_else(|e| panic!("a 1024 ring: {e}"));
+    assert_eq!(close(t), 0);
+}
+
 /// A port whose queues were not all set up is never closed: DPDK's ENA close
 /// releases every configured queue without checking it was set up
 /// (ena_tx_queue_release, DPDK 24.11), which crashed the driver on AWS. The
@@ -453,6 +487,78 @@ fn jumbo_mtu_accepted_when_the_nic_allows_it() {
     let mut config = rusteron_dpdk_config_t::valid();
     config.max_aeron_mtu = 8960;
     let t = create(&config).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(close(t), 0);
+}
+
+/// Each port takes max_aeron_mtu plus IPv4 and UDP as its L3 MTU, and mbufs
+/// whose data room holds the whole Ethernet frame of that MTU, so every
+/// frame is one segment: 8960 (an AWS 9001-byte VPC) needs 8988 and 9002,
+/// 8448 (an 8500-byte path, such as inter-region VPC peering) 8476 and 8490.
+/// The room is never below DPDK's default 2048.
+#[serial]
+#[test]
+fn ports_take_the_l3_mtu_and_mbuf_room_of_max_aeron_mtu() {
+    for (aeron_mtu, l3, room) in [(8960usize, 8988u32, 9002u32), (8448, 8476, 8490), (1408, 1436, 2048)] {
+        let env = TestEnv::new();
+        env.eal_skip();
+        let mut config = rusteron_dpdk_config_t::valid();
+        config.max_aeron_mtu = aeron_mtu;
+        let t = create(&config).unwrap_or_else(|e| panic!("{aeron_mtu}: {e}"));
+        for needle in [
+            format!("mtu 0 ({l3})"),
+            format!("mtu 1 ({l3})"),
+            format!("pool rusteron_sender_pool (8192, room {room})"),
+            format!("pool rusteron_receiver_pool (8192, room {room})"),
+        ] {
+            assert!(log_index_containing(&env, &needle) >= 0, "{aeron_mtu}: no {needle:?}");
+        }
+        assert_eq!(close(t), 0);
+    }
+}
+
+/// A pool whose mbufs cannot hold the largest frame whole fails start, naming
+/// the sizes: such a frame would arrive split over two mbufs and be dropped,
+/// and a send of one would be refused, so the transport would lose every
+/// full-size frame. It names the largest max_aeron_mtu those mbufs carry:
+/// 9001 bytes less 42 of headers, rounded down to Aeron's 32-byte frames.
+#[serial]
+#[test]
+fn mbufs_too_small_for_the_largest_frame_fail_start() {
+    let env = TestEnv::new();
+    env.eal_skip();
+    unsafe { rusteron_dpdk_fake_set_mbuf_room_cap(9001) };
+    let mut config = rusteron_dpdk_config_t::valid();
+    config.max_aeron_mtu = 8960;
+    let err = create(&config).unwrap_err();
+    assert!(
+        err.contains("9001") && err.contains("9002") && err.contains("8960"),
+        "names the room, the frame and the MTU: {err}"
+    );
+    assert!(err.contains("at most 8928"), "and the largest that fits: {err}");
+    assert_no_leak();
+
+    env.reset();
+    env.eal_skip();
+    unsafe { rusteron_dpdk_fake_set_mbuf_room_cap(9002) };
+    let t = create(&config).unwrap_or_else(|e| panic!("room for the frame: {e}"));
+    assert_eq!(close(t), 0);
+    assert_no_leak();
+}
+
+/// Start reads each pool's mbuf room from the pool and takes no mbuf from
+/// it: on DPDK, one mbuf taken and returned by the creating thread (the EAL's
+/// main lcore) fills that lcore's mempool cache with a cache's worth (257 of
+/// a 256-mbuf cache, measured on DPDK 23.11) that no agent ever reaches and
+/// the mempool counter still counts as free.
+#[serial]
+#[test]
+fn start_takes_no_mbuf_from_the_pools() {
+    let env = TestEnv::new();
+    env.eal_skip();
+    let mut config = rusteron_dpdk_config_t::valid();
+    config.max_aeron_mtu = 8960;
+    let t = create(&config).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(unsafe { rusteron_dpdk_fake_allocated() }, 0, "start took an mbuf");
     assert_eq!(close(t), 0);
 }
 
@@ -617,27 +723,46 @@ fn housekeeping_threads_join_the_conductor_and_avoid_spinning_agents() {
 }
 
 /// RUSTERON_DPDK_LOCAL_IO picks how agents read host-local kernel sockets:
-/// `epoll` (default) or `spin`; anything else fails creation.
+/// `epoll`, `adaptive` or `spin`; anything else fails creation. Every explicit
+/// value must select its own mode: an accepted value that silently left the
+/// default in place made epoll runs measure adaptive.
 #[test]
 #[serial]
 fn local_io_mode_is_validated() {
+    const EPOLL: c_int = 0;
+    const SPIN: c_int = 1;
+    const ADAPTIVE: c_int = 2;
     let env = TestEnv::new();
     env.eal_skip();
-    for (value, ok) in [("epoll", true), ("adaptive", true), ("spin", true), ("busy", false)] {
-        let _mode = EnvGuard::set("RUSTERON_DPDK_LOCAL_IO", value);
+    for (value, want) in [
+        (Some("epoll"), Some(EPOLL)),
+        (Some("adaptive"), Some(ADAPTIVE)),
+        (Some("spin"), Some(SPIN)),
+        (Some("busy"), None),
+    ] {
+        let _mode = match value {
+            Some(v) => EnvGuard::set("RUSTERON_DPDK_LOCAL_IO", v),
+            None => EnvGuard::unset("RUSTERON_DPDK_LOCAL_IO"),
+        };
         match create(&rusteron_dpdk_config_t::valid()) {
             Ok(native) => {
-                assert!(ok, "{value} accepted");
+                let got = unsafe { rusteron_dpdk_test_local_io_mode(native) };
+                assert_eq!(Some(got), want, "RUSTERON_DPDK_LOCAL_IO={value:?} selected {got}");
                 close(native);
             }
             Err(e) => {
-                assert!(!ok, "{value}: {e}");
+                assert!(want.is_none(), "{value:?} must be accepted: {e}");
                 assert!(e.contains("RUSTERON_DPDK_LOCAL_IO"), "{e}");
             }
         }
         env.reset();
         env.eal_skip();
     }
+    // Unset falls back to adaptive.
+    let _mode = EnvGuard::unset("RUSTERON_DPDK_LOCAL_IO");
+    let native = create(&rusteron_dpdk_config_t::valid()).expect("unset must be accepted");
+    assert_eq!(unsafe { rusteron_dpdk_test_local_io_mode(native) }, ADAPTIVE);
+    close(native);
 }
 
 /// Low-priority streams: non-negative stream ids or ranges, under an

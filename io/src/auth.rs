@@ -1,17 +1,16 @@
-//! Request signing for exchange REST APIs, Binance style: the request's
-//! parameters, a millisecond `timestamp`, and a `signature` over exactly those
-//! bytes, appended as `&signature=…`.
+//! Request signing for exchange REST APIs, Binance style: the parameters, a
+//! millisecond `timestamp`, and a `signature` over exactly those bytes,
+//! appended as `&signature=…`.
 //!
-//! [`Signer`] is chosen at run time (one branch per request; the signature
-//! itself dominates the cost):
-//!
-//! | kind | signature | encoding | typical use |
+//! | [`Signer`] | Signature | Encoding | Use it for |
 //! |---|---|---|---|
-//! | [`Signer::hmac_sha256`] | HMAC-SHA256 with the API secret | 64 hex digits | REST orders (cheapest) |
-//! | [`Signer::ed25519_pkcs8`] | Ed25519 with a private key whose public key is registered with the exchange | base64, percent-encoded | REST or WebSocket API log-on; the secret never leaves this machine |
+//! | [`Signer::hmac_sha256`] | HMAC-SHA256 with the API secret | 64 hex digits | signed REST requests |
+//! | [`Signer::ed25519_pkcs8`] | Ed25519 with a key whose public half is registered with the exchange | base64, percent-encoded | REST or WebSocket API log-on; the secret never leaves this machine |
 //!
-//! The API key itself is a plain header (`X-MBX-APIKEY`), set once with
-//! `Target::with_header`. Bearer or Basic authorisation is a header too.
+//! - Chosen at run time: one branch per request.
+//! - No allocation: the signature is written into the request buffer.
+//! - The API key is a plain header (`X-MBX-APIKEY`), set once with
+//!   `Target::with_header`. Bearer or Basic authorisation is a header too.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;

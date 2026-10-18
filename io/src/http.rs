@@ -1,38 +1,27 @@
-//! HTTP/1.1 client for request/response APIs such as order entry.
+//! HTTP/1.1 client: one keep-alive connection.
 //!
-//! [`HttpDial`] sets the connection up without blocking, [`HttpConn::request`] writes a request
-//! straight into one TLS record (one `send`, one TCP segment for small
-//! requests), and responses are parsed in place: a `Content-Length` body is a
-//! slice of the receive buffer.
-//!
-//! Keep-alive is the default. Responses are matched to requests in order.
-//!
-//! # One request in flight per connection
-//!
-//! By default a connection carries one request at a time
-//! ([`HttpOptions::max_in_flight`] is 1): it must receive the response before
-//! it can send the next request. A second [`HttpConn::request`] before then
-//! returns [`Error::Busy`] instead of queueing, so a slow reply is never hidden
-//! behind a growing queue.
-//!
-//! A request that passes [`HttpOptions::request_timeout_ms`] closes its whole
-//! connection ([`Handler::on_closed`] with [`Error::Timeout`]): HTTP/1.1 cannot
-//! abandon one request on a live connection, so anything else in flight on it
-//! fails too.
-//!
-//! Raising `max_in_flight` enables HTTP/1.1 pipelining, but it stays off by
-//! default because servers and proxies (Binance's REST API sits behind a CDN)
-//! do not all handle pipelined requests reliably, and one slow response then
-//! delays every request behind it.
-//!
-//! **To send several orders at once, keep a small pool of warm connections**,
-//! each opened with [`HttpDial`] ahead of time, and send each order on a
-//! connection with nothing in flight ([`HttpConn::in_flight`] is 0). A slow
-//! reply or a timeout then holds up only its own connection. Open a replacement
-//! when one closes (`Driver::connect_background` keeps the handshake off the
-//! polling thread). For order flow where per-request round trips matter, an
-//! exchange's WebSocket order API (one connection, many requests matched by id)
-//! is the alternative.
+//! - [`HttpDial`] sets the connection up without blocking.
+//! - [`HttpConn::request`] writes a request straight into one TLS record: one
+//!   `send`, one TCP segment for a small request.
+//! - Responses are parsed in place: a `Content-Length` body is a slice of the
+//!   receive buffer. Responses match requests in order.
+//! - One request in flight by default ([`HttpOptions::max_in_flight`] 1). A
+//!   second [`HttpConn::request`] before the response returns
+//!   [`Error::Busy`]: no hidden queue.
+//! - A request past [`HttpOptions::request_timeout_ms`] closes its connection
+//!   ([`Handler::on_closed`] with [`Error::Timeout`]): HTTP/1.1 cannot drop
+//!   one request on a live connection.
+//! - A connection that closes with requests in flight reports
+//!   [`Error::Unanswered`]: the cause, and the first request whose TLS
+//!   record never wholly reached the kernel (it, and every later one,
+//!   cannot have run). Cost: one add per `send`, one store per request.
+//! - Raising `max_in_flight` turns on pipelining. Off by default: not every
+//!   server or CDN handles it, and one slow response delays every request
+//!   behind it.
+//! - Several requests at once: keep a small pool of warm connections, each
+//!   with nothing in flight ([`HttpConn::in_flight`] 0), or use
+//!   `HttpClient`, which does this. A WebSocket API (many requests on one
+//!   connection, matched by id) is the other option.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -69,7 +58,7 @@ const RESERVED: [&str; 8] = [
 ];
 
 /// RFC 9110 token characters.
-const fn is_tchar(b: u8) -> bool {
+pub(crate) const fn is_tchar(b: u8) -> bool {
     b.is_ascii_alphanumeric()
         || matches!(
             b,
@@ -203,6 +192,9 @@ struct InFlight {
     id: u64,
     deadline_ns: i64,
     head: bool,
+    /// Bytes the connection must hand to the kernel before this request's
+    /// record is wholly handed (a count since the connection opened).
+    end: u64,
 }
 
 /// A connected HTTP/1.1 client connection. Hand it to a `Driver`; the socket
@@ -220,6 +212,8 @@ pub struct HttpConn {
     requests: u64,
     responses: u64,
     chunk_copy_bytes: u64,
+    /// Bytes handed to the kernel since the connection opened.
+    handed: u64,
 }
 
 impl HttpConn {
@@ -285,10 +279,12 @@ impl HttpConn {
         })?;
         let id = self.next_id;
         self.next_id += 1;
+        let queued = self.stream.tx_queue().len() as u64;
         self.in_flight.push_back(InFlight {
             id,
             deadline_ns: monotonic_ns() + i64::from(self.opts.request_timeout_ms) * 1_000_000,
             head: method == "HEAD",
+            end: self.handed + queued,
         });
         self.requests += 1;
         Ok(id)
@@ -363,6 +359,14 @@ impl HttpConn {
     #[must_use]
     pub fn raw_fd(&self) -> std::os::fd::RawFd {
         self.stream.fd()
+    }
+
+    /// What the quick-ACK route check found for this connection
+    /// ([`crate::route::RouteCheck::Pending`] while ergon-io's warning
+    /// thread is still looking it up).
+    #[must_use]
+    pub fn route(&self) -> &crate::route::RouteCheck {
+        self.stream.route()
     }
 
     #[inline]
@@ -693,8 +697,12 @@ impl DialIo for HttpDial {
             return Err(Error::Record("handshake leftover larger than the buffer"));
         }
         buf[..rest.len()].copy_from_slice(&rest);
+        let mut stream = TlsStream::new(sock, buf, 0, rest.len(), tls, Vec::with_capacity(1 << 16));
+        if let Some(check) = self.tls.take_route() {
+            stream.set_route(crate::endpoint::sealed::RouteSlot::Ready(check));
+        }
         Ok(Some(HttpConn {
-            stream: TlsStream::new(sock, buf, 0, rest.len(), tls, Vec::with_capacity(1 << 16)),
+            stream,
             fixed: self.fixed_headers(),
             in_flight: VecDeque::with_capacity(self.opts.max_in_flight),
             next_id: 0,
@@ -704,7 +712,20 @@ impl DialIo for HttpDial {
             requests: 0,
             responses: 0,
             chunk_copy_bytes: 0,
+            handed: 0,
         }))
+    }
+
+    fn gate_route(&mut self) {
+        self.tls.gate_route();
+    }
+
+    fn awaiting_route(&self) -> Option<std::os::fd::RawFd> {
+        self.tls.awaiting_route()
+    }
+
+    fn route_checked(&mut self, check: crate::route::RouteCheck) {
+        self.tls.route_checked(check);
     }
 }
 
@@ -757,11 +778,38 @@ impl Io for HttpConn {
     fn has_buffered_input(&self) -> bool {
         self.stream.has_buffered_input()
     }
+    fn set_route(&mut self, route: crate::endpoint::sealed::RouteSlot) {
+        self.stream.set_route(route);
+    }
+    fn route_state(&self) -> &crate::endpoint::sealed::RouteSlot {
+        self.stream.route_state()
+    }
     fn expire(&mut self, now_ns: i64) -> Result<()> {
         match self.in_flight.front() {
             Some(r) if r.deadline_ns <= now_ns => Err(Error::Timeout("http request")),
             _ => Ok(()),
         }
+    }
+    #[inline]
+    fn on_handed(&mut self, n: usize) {
+        self.handed += n as u64;
+    }
+    /// With requests in flight: [`Error::Unanswered`], naming the first whose
+    /// record the kernel never wholly took.
+    #[cold]
+    fn close_reason(&mut self, error: Error) -> Error {
+        if self.in_flight.is_empty() {
+            return error;
+        }
+        let first_unsent = self
+            .in_flight
+            .iter()
+            .find(|r| r.end > self.handed)
+            .map(|r| r.id);
+        Error::Unanswered(Box::new(crate::error::Unanswered {
+            cause: error,
+            first_unsent,
+        }))
     }
 }
 

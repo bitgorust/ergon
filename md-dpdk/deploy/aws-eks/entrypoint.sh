@@ -99,7 +99,7 @@ done
 mapfile -t CPUS < <(for key in "${!FIRST_OF_CORE[@]}"; do echo "${FIRST_OF_CORE[$key]}"; done | sort -n)
 
 if ((${#CPUS[@]} < REQUIRED_CPUS)); then
-    echo "rusteron entrypoint: cpuset ${CPUSET} yields ${#CPUS[@]} distinct physical core(s) (SMT siblings excluded), need >= $REQUIRED_CPUS (housekeeping + sender + receiver). Raise the DaemonSet cpu request (6 vCPUs is 3 whole cores on a 2-thread/core instance)." >&2
+    echo "rusteron entrypoint: cpuset ${CPUSET} yields ${#CPUS[@]} distinct physical core(s) (SMT siblings excluded), need >= $REQUIRED_CPUS (housekeeping + sender + receiver). Raise the DaemonSet cpu request (SMT is off on latency nodes, so one CPU is one core; on a 2-thread/core instance 6 vCPUs are 3 cores)." >&2
     exit 1
 fi
 

@@ -22,6 +22,15 @@ spinner on a spare CPU, a trace of the app and agent CPUs). A spike of at least
   the spinner does not share. For each round trip run the receive agents'
   poll gaps of 100 us or more (the jitter snapshots before and after) say
   whether an agent stalled: with none, an unexplained spike was in flight.
+  Where a host ran no spinner (no CPU outside its layout: a four-core
+  Graviton) or had it paused (an SMT=off mode takes its CPU offline), a host
+  stall there cannot be ruled out: such a spike's cause says so, and a note
+  names the host.
+
+The match across hosts is on their wall clocks: where chrony's tracking was
+logged around each mode (vm.sh timesync, <host>-timesync-*.log), a note gives
+each host's largest offset from its source and that source's own bound
+against UTC, and their sum, how far apart the two clocks may be.
 """
 import collections
 import csv
@@ -31,9 +40,14 @@ import os
 import re
 import sys
 
-BUSY = re.compile(r"^(sender|receiver|rtt|load|tput)")
+# the threads that busy-spin on traced CPUs: the dedicated agents, the shared
+# network agent ("[sender, receiver]", which the kernel cuts to 15 characters),
+# SHARED's one agent (the media driver's main thread; under the other modes the
+# conductor, on the untraced housekeeping CPU) and the clients
+BUSY = re.compile(r"^(sender|receiver|\[sender, |\[conductor, |media_driver|rtt|load|tput)")
 EVENT = re.compile(r"\[(\d+)\].*?\s(\d+\.\d+): (\w+): (.*)")
-SWITCH = re.compile(r"prev_comm=(\S+) prev_pid=\d+ prev_prio=\d+ prev_state=(\S+) ==> next_comm=(\S+)")
+# a thread name may hold spaces ("[sender, receiv")
+SWITCH = re.compile(r"prev_comm=(.+?) prev_pid=\d+ prev_prio=\d+ prev_state=(\S+) ==> next_comm=(.+?) next_pid=")
 
 
 def spike_files(folder):
@@ -92,6 +106,27 @@ def read_diag(path):
     return gaps, preempted
 
 
+def spinner_blind(path):
+    """[(start_s, end_s)] on the wall clock when the host's gap spinner did
+    not run (vm.sh diag-start's "# no spinner": the whole state; SMT=off's
+    "# paused <s>" to "# resumed <s>", or to the end)."""
+    blind, paused, section = [], None, None
+    for line in open(path, errors="replace"):
+        line = line.rstrip("\n")
+        if line.startswith("== "):
+            section = line[3:]
+        elif section == "gapspin" and line.startswith("# no spinner"):
+            blind.append((float("-inf"), float("inf")))
+        elif section == "gapspin" and line.startswith("# paused "):
+            paused = float(line.split()[2])
+        elif section == "gapspin" and line.startswith("# resumed ") and paused is not None:
+            blind.append((paused, float(line.split()[2])))
+            paused = None
+    if paused is not None:
+        blind.append((paused, float("inf")))
+    return blind
+
+
 BUCKETS = ("poll-cycle-gaps-20-50us", "poll-cycle-gaps-50-100us", "poll-cycle-gaps-over-100us")
 
 
@@ -122,16 +157,62 @@ def agent_gaps(dirs, run_tag):
     return out
 
 
+TRACKING = re.compile(r"^(System time|Root delay|Root dispersion)\s*:\s*([0-9.]+) seconds( (fast|slow))?")
+
+
+def clock_offsets(dirs):
+    """Per host, from chrony's tracking logged around each mode (vm.sh
+    timesync: <host>-timesync-*.log in the first of `dirs` holding any): the
+    largest system-time offset from its source, the largest bound of that
+    source against UTC (root dispersion and half the root delay), both in
+    seconds, and how many snapshots; {} without them."""
+    out = {}
+    for host in "ab":
+        paths = next((p for p in (sorted(glob.glob(os.path.join(d, f"{host}-timesync-*.log"))) for d in dirs) if p), [])
+        offset, bound, n = 0.0, 0.0, 0
+        for path in paths:
+            got = {}
+            for line in open(path, errors="replace"):
+                m = TRACKING.match(line)
+                if m:
+                    got[m.group(1)] = float(m.group(2))
+            if "System time" not in got:
+                continue
+            n += 1
+            offset = max(offset, got["System time"])
+            bound = max(bound, got.get("Root dispersion", 0.0) + got.get("Root delay", 0.0) / 2)
+        if n:
+            out[host] = (offset, bound, n)
+    return out
+
+
+def clocks_note(offsets):
+    """The note spikes.py prints from clock_offsets'."""
+    snaps = lambda n: f"{n} snapshot{'s' if n != 1 else ''}"
+    parts = []
+    for i, (host, (offset, bound, n)) in enumerate(sorted(offsets.items())):
+        if i == 0:
+            parts.append(f"{host}'s system time at most {offset * 1e6:.1f} µs from its source, that source within "
+                         f"{bound * 1e6:.1f} µs of UTC (root dispersion and half the root delay; {snaps(n)})")
+        else:
+            parts.append(f"{host}'s at most {offset * 1e6:.1f} µs, its source within {bound * 1e6:.1f} µs ({snaps(n)})")
+    total = sum(o + b for o, b, _ in offsets.values())
+    return ("Host clocks, from chrony's tracking around each mode (vm.sh timesync): " + "; ".join(parts)
+            + f". Spikes are matched to the other host's diagnostics across these clocks, which may differ by up to "
+            f"{total * 1e6:.1f} µs (the sum).")
+
+
 def main():
     folder = sys.argv[1]
     threshold = float(sys.argv[2]) if len(sys.argv) > 2 else 200.0
     state = os.path.basename(os.path.normpath(folder))
     run_dir = os.path.dirname(os.path.normpath(folder))
-    diag = {}
+    diag, blind = {}, {}
     for host in "ab":
         for path in (os.path.join(run_dir, f"{host}-diag-{state}.log"), os.path.join(folder, f"{host}-diag-{state}.log")):
             if os.path.exists(path):
                 diag[host] = read_diag(path)
+                blind[host] = spinner_blind(path)
                 break
     if not diag:
         sys.exit(f"no {state} diagnostics (a-diag-{state}.log) next to {folder}")
@@ -211,6 +292,10 @@ def main():
         hit = [e for e in errors if e[0] < t1 and e[1] > t0]
         if hit:
             return f"driver errors ({hit[0][2]}: {hit[0][3]} x{hit[0][4]:,})"
+        # a host whose spinner did not run then: its stall not ruled out
+        unseen = [h for h in sorted(blind) if any(b0 < t1 and b1 > t0 for b0, b1 in blind[h])]
+        if unseen:
+            return f"unexplained (no spinner on {', '.join(unseen)}: a host stall not ruled out)"
         return "unexplained"
 
     # load points past capacity (achieved below 98% of offered, or more than
@@ -304,7 +389,18 @@ def main():
         guest = sum(v for k, v in c.items() if k.startswith("guest"))
         rest = sum(v for k, v in c.items() if k.startswith("not attributed"))
         driver = sum(v for k, v in c.items() if k.startswith("driver"))
-        print(f"| {run} | {sum(c.values())} | {client} | {host} | {guest} | {driver} | {c['unexplained']} | {rest} |")
+        unexplained = sum(v for k, v in c.items() if k.startswith("unexplained"))
+        print(f"| {run} | {sum(c.values())} | {client} | {host} | {guest} | {driver} | {unexplained} | {rest} |")
+    offsets = clock_offsets((folder, run_dir))
+    if offsets:
+        print("\n" + clocks_note(offsets))
+    for h in sorted(blind):
+        if (float("-inf"), float("inf")) in blind[h]:
+            print(f"\nHost {h} ran no gap spinner (no CPU outside its layout): a host stall there cannot be told from "
+                  "an unexplained spike, whose cause says so.")
+        elif blind[h]:
+            print(f"\nHost {h}'s gap spinner was paused {len(blind[h])} time(s) (an SMT=off mode takes its CPU offline): "
+                  "a host stall there then cannot be told from an unexplained spike, whose cause says so.")
     for run, n in sorted(capped.items()):
         print(f"\n{run}: {n:,} more round trips over the client's spike threshold were counted but not written "
               "(past capacity, nearly every message queues).")

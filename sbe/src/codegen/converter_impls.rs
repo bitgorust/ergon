@@ -2,8 +2,8 @@
 //! decoders and encoders (including nested group entries).
 
 use super::conversion_helpers::{
-    DECODER_RESERVED, ENCODER_RESERVED, domain_accessor_ident, field_has_conversion_free,
-    find_domain_selector, find_domain_type,
+    DECODER_RESERVED, ENCODER_RESERVED, constant_converts, domain_accessor_ident,
+    field_has_conversion_free, find_domain_selector, find_domain_type,
 };
 use super::runtime::{to_pascal_case, to_snake_case};
 use crate::structured_ir::{FieldType, MessageField, MessageGroup, MessageStructure, rust_type};
@@ -166,11 +166,12 @@ pub(crate) fn generate_converter_impls(
     let mut encoder_methods = proc_macro2::TokenStream::new();
 
     for f in &msg.fields {
-        // A constant field has no wire storage: no `*_wire` setter and no
-        // raw getter to convert through, and it is excluded from the DTO. A
-        // selector that happens to match its type must not generate accessors
-        // against setters that do not exist.
-        if f.presence == crate::ir::Presence::Constant {
+        // A constant field has no wire storage and no setter, and it is
+        // excluded from the DTO, so it gets only the decoder side: the same
+        // domain getter (or `*_as`) a non-constant field has, converting what
+        // its constant `*_wire` getter returns.
+        let is_constant = f.presence == crate::ir::Presence::Constant;
+        if is_constant && !constant_converts(f) {
             continue;
         }
         // Determine if this field has a conversion, and what the wire type is.
@@ -211,7 +212,8 @@ pub(crate) fn generate_converter_impls(
             // reserved list, exactly as raw accessors do.
             let get_ident = domain_accessor_ident(&field_snake, DECODER_RESERVED);
             let set_ident = domain_accessor_ident(&field_snake, ENCODER_RESERVED);
-            let is_optional = is_optional_domain_field(f, null_as_option, all_enums_as_option);
+            let is_optional =
+                !is_constant && is_optional_domain_field(f, null_as_option, all_enums_as_option);
             // DomainImpl::Manual doc comment: a ready-to-paste starting point,
             // shown on both the decoder and encoder accessor (IDE hover /
             // `cargo doc`) so a missing-impl compile error has somewhere to
@@ -269,19 +271,21 @@ pub(crate) fn generate_converter_impls(
             // value in `Option` here produced a type mismatch on optional
             // primitives (`self.ts_wire(Option<u64>)` against `ts_wire(u64)`).
             // Absence is expressed on the raw path, not the domain setter.
-            encoder_methods.extend(quote::quote! {
-                #manual_impl_doc
-                #[inline]
-                pub fn #set_ident(
-                    &mut self,
-                    value: #dt_ty,
-                ) -> Result<&mut Self, <#dt_ty as TryToSbe<#wire_type_ident>>::Error> {
-                    let wire = <#dt_ty as TryToSbe<#wire_type_ident>>::try_to_sbe(&value)?;
-                    #encode_rescale
-                    self.#wire_setter(wire);
-                    Ok(self)
-                }
-            });
+            if !is_constant {
+                encoder_methods.extend(quote::quote! {
+                    #manual_impl_doc
+                    #[inline]
+                    pub fn #set_ident(
+                        &mut self,
+                        value: #dt_ty,
+                    ) -> Result<&mut Self, <#dt_ty as TryToSbe<#wire_type_ident>>::Error> {
+                        let wire = <#dt_ty as TryToSbe<#wire_type_ident>>::try_to_sbe(&value)?;
+                        #encode_rescale
+                        self.#wire_setter(wire);
+                        Ok(self)
+                    }
+                });
+            }
         } else {
             let as_ident = syn::Ident::new(&format!("{field_snake}_as"), span);
             let from_ident = syn::Ident::new(&format!("{field_snake}_from"), span);
@@ -289,7 +293,7 @@ pub(crate) fn generate_converter_impls(
             // Same `Option` rule as the domain accessor path: when the raw
             // getter yields `Option<W>` the converter must unwrap it, or the
             // generated body feeds `Option<W>` to `TryFromSbe<W>`.
-            decoder_methods.extend(if is_optional_domain_field(f, null_as_option, all_enums_as_option) {
+            decoder_methods.extend(if !is_constant && is_optional_domain_field(f, null_as_option, all_enums_as_option) {
                 quote::quote! {
                     #[inline]
                     #[must_use]
@@ -310,15 +314,17 @@ pub(crate) fn generate_converter_impls(
                 }
             });
 
-            encoder_methods.extend(quote::quote! {
-                #[inline]
-                #[must_use]
-                pub fn #from_ident<T: TryToSbe<#wire_type_ident>>(&mut self, value: &T) -> Result<&mut Self, T::Error> {
-                    let wire = value.try_to_sbe()?;
-                    self.#wire_setter(wire);
-                    Ok(self)
-                }
-            });
+            if !is_constant {
+                encoder_methods.extend(quote::quote! {
+                    #[inline]
+                    #[must_use]
+                    pub fn #from_ident<T: TryToSbe<#wire_type_ident>>(&mut self, value: &T) -> Result<&mut Self, T::Error> {
+                        let wire = value.try_to_sbe()?;
+                        self.#wire_setter(wire);
+                        Ok(self)
+                    }
+                });
+            }
         }
     }
 
@@ -341,11 +347,10 @@ pub(crate) fn generate_converter_impls(
         let mut dec_methods = proc_macro2::TokenStream::new();
         let mut enc_methods = proc_macro2::TokenStream::new();
         for f in &g.fields {
-            // A constant field has no wire storage: no `*_wire` setter and no
-            // raw getter to convert through, and it is excluded from the DTO. A
-            // selector that happens to match its type must not generate accessors
-            // against setters that do not exist.
-            if f.presence == crate::ir::Presence::Constant {
+            // A constant field gets only the decoder side, as at message
+            // level: it has no wire storage and no setter.
+            let is_constant = f.presence == crate::ir::Presence::Constant;
+            if is_constant && !constant_converts(f) {
                 continue;
             }
             if !field_has_conversion_free(f, conversions) {
@@ -371,7 +376,8 @@ pub(crate) fn generate_converter_impls(
                 // Group entries do not rename against a reserved list.
                 let get_ident = domain_accessor_ident(&field_snake, &[]);
                 let set_ident = get_ident.clone();
-                let is_optional = is_optional_domain_field(f, null_as_option, all_enums_as_option);
+                let is_optional = !is_constant
+                    && is_optional_domain_field(f, null_as_option, all_enums_as_option);
                 let DomainBodies {
                     decode,
                     decode_some,
@@ -404,22 +410,24 @@ pub(crate) fn generate_converter_impls(
                         }
                     });
                 }
-                enc_methods.extend(quote::quote! {
-                    #[inline]
-                    pub fn #set_ident(
-                        &mut self,
-                        value: #dt_ty,
-                    ) -> Result<&mut Self, <#dt_ty as TryToSbe<#wire_type_ident>>::Error> {
-                        let wire = <#dt_ty as TryToSbe<#wire_type_ident>>::try_to_sbe(&value)?;
-                        #encode_rescale
-                        self.#wire_setter(wire);
-                        Ok(self)
-                    }
-                });
+                if !is_constant {
+                    enc_methods.extend(quote::quote! {
+                        #[inline]
+                        pub fn #set_ident(
+                            &mut self,
+                            value: #dt_ty,
+                        ) -> Result<&mut Self, <#dt_ty as TryToSbe<#wire_type_ident>>::Error> {
+                            let wire = <#dt_ty as TryToSbe<#wire_type_ident>>::try_to_sbe(&value)?;
+                            #encode_rescale
+                            self.#wire_setter(wire);
+                            Ok(self)
+                        }
+                    });
+                }
             } else {
                 let as_ident = syn::Ident::new(&format!("{field_snake}_as"), span);
                 let from_ident = syn::Ident::new(&format!("{field_snake}_from"), span);
-                dec_methods.extend(if is_optional_domain_field(f, null_as_option, all_enums_as_option) {
+                dec_methods.extend(if !is_constant && is_optional_domain_field(f, null_as_option, all_enums_as_option) {
                     quote::quote! {
                         #[inline]
                         #[must_use]
@@ -439,15 +447,17 @@ pub(crate) fn generate_converter_impls(
                         }
                     }
                 });
-                enc_methods.extend(quote::quote! {
-                    #[inline]
-                    #[must_use]
-                    pub fn #from_ident<T: TryToSbe<#wire_type_ident>>(&mut self, value: &T) -> Result<&mut Self, T::Error> {
-                        let wire = value.try_to_sbe()?;
-                        let _ = self.#wire_setter(wire);
-                        Ok(self)
-                    }
-                });
+                if !is_constant {
+                    enc_methods.extend(quote::quote! {
+                        #[inline]
+                        #[must_use]
+                        pub fn #from_ident<T: TryToSbe<#wire_type_ident>>(&mut self, value: &T) -> Result<&mut Self, T::Error> {
+                            let wire = value.try_to_sbe()?;
+                            let _ = self.#wire_setter(wire);
+                            Ok(self)
+                        }
+                    });
+                }
             }
         }
         if !dec_methods.is_empty() {

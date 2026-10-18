@@ -341,6 +341,52 @@ fn a_run_reports_interrupt_rates_on_the_loop_cpu_and_the_receiving_cpu() -> R {
 }
 
 #[test]
+fn arm64_interrupt_rows_count_as_the_same_kinds() -> R {
+    // Graviton's /proc/interrupts: the tick is the `arch_timer` PPI and the
+    // IPIs are `IPIn:` rows named like x86's RES, CAL and IWI.
+    let root = std::env::temp_dir().join(format!("irqs-arm64-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("r1-base-0").join("pp-recv-busy-0");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        dir.join("meta.txt"),
+        "mode=pingpong\nduration_s=10\nvariants=recv-busy\narch=aarch64\n",
+    )?;
+    write_records(
+        &dir.join("records.bin"),
+        &[Record {
+            id: 1,
+            src_ns: T0,
+            user_ns: T0 + 45_000,
+            ..Record::default()
+        }],
+    )?;
+    let sum = StallSummary {
+        cpu: 2,
+        ..StallSummary::default()
+    };
+    std::fs::write(dir.join("stalls-0.txt"), format_stalls(&sum, &[]))?;
+    let snapshot = |timer: u64, res: u64, cal: u64, iwi: u64| {
+        format!(
+            "           CPU0       CPU1       CPU2       CPU3\n \
+             11:       9000       9000 {timer:>10}       9000     GICv3  27 Level     arch_timer\n \
+             14:          5          0          0          0     ITS-MSI 81920 Edge      ena-mgmnt@pci:0000:00:05.0\n\
+             IPI0:         1          1 {res:>10}          1       Rescheduling interrupts\n\
+             IPI1:         1          1 {cal:>10}          1       Function call interrupts\n\
+             IPI2:         0          0          0          0       CPU stop interrupts\n\
+             IPI5:         0          0 {iwi:>10}          0       IRQ work interrupts\n\
+             Err:          0\n"
+        )
+    };
+    std::fs::write(dir.join("irq-before.txt"), snapshot(100, 10, 20, 0))?;
+    std::fs::write(dir.join("irq-after.txt"), snapshot(1100, 30, 40, 500))?;
+    let r = matrix::load_run(&dir, 2)?;
+    assert_eq!(r.irqs, vec![(2, [100.0, 50.0, 2.0, 2.0, 0.0])]);
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
+
+#[test]
 fn market_data_runs_report_sender_to_decoded_as_well() -> R {
     let root = std::env::temp_dir().join(format!("oneway-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);

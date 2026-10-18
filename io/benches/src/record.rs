@@ -136,17 +136,27 @@ pub fn exists_maybe_compressed(path: &Path) -> bool {
 /// Reads all records from `path` (or `path.zst`).
 ///
 /// # Errors
-/// File I/O failure or a truncated file.
+/// File I/O failure or a truncated file. A clean end of file is only an empty
+/// read; a file that stops part-way through a record is corrupt and must not
+/// be summarised as a complete run.
 pub fn read_records(path: &Path) -> std::io::Result<Vec<Record>> {
     let mut r = BufReader::new(open_maybe_compressed(path)?);
     let mut out = Vec::new();
     let mut b = [0u8; RECORD_LEN];
     loop {
-        match r.read_exact(&mut b) {
-            Ok(()) => out.push(Record::decode(&b)),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(out),
-            Err(e) => return Err(e),
+        // Read one byte first: read_exact alone cannot tell "no more records"
+        // from "the file was cut inside a record".
+        match r.read(&mut b[..1])? {
+            0 => return Ok(out),
+            _ => {}
         }
+        r.read_exact(&mut b[1..]).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("truncated record after {} whole records: {e}", out.len()),
+            )
+        })?;
+        out.push(Record::decode(&b));
     }
 }
 

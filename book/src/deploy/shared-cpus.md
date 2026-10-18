@@ -27,11 +27,36 @@ manifests and the kind e2e, not from a live EKS node. **AKS cannot run it**
 | exclusive CPUs | the kubelet's static CPU manager, `cpu: N` |
 | shared CPUs | `ergon.io/shared-millicpus: M` adds `ceil(M/1000)` shared CPUs |
 | start affinity | PID 1 and every new thread start on the shared CPUs |
+| timer slack | 1 ns on every thread, inherited by every thread and child the program makes |
 | pinning | the app pins hot threads by index into `ERGON_ISOLATED_CPUS` |
 
 `M` is millicpus because extended resources are whole numbers and requests
 must equal limits. `250` is a quarter core of **scheduler accounting only**:
 the plugin still adds one whole shared CPU, and there is no hard cap.
+
+### Timer slack
+
+The kernel's default timer slack is 50,000 ns. It is added to every sleep and
+to every `epoll`/`io_uring` timeout, so a 100 µs wait can take 150 µs. The
+hook sets 1 ns, the kernel's floor, on every thread the container has when it
+starts. The kernel copies the value to every thread and child the program
+makes afterwards, so the whole tree inherits it. A container that cannot have
+it does not start.
+
+The hook writes `/proc/<tid>/timerslack_ns` for each thread and reads the
+result back. Access to that file is free only for a task reading or writing
+itself; any other task needs `CAP_SYS_NICE` over it and is refused with
+`EPERM`. There is no thread-group exception, so a thread reading
+`/proc/self/timerslack_ns` is reading its leader's file and hits the rule. The
+OCI hook has the capability (containerd runs hooks as root with full
+capabilities), and the plugin DaemonSet's `capabilities: drop: ["ALL"]`
+applies to the plugin process only. A program can always set its own slack
+with `prctl(PR_SET_TIMERSLACK)`, which needs no privilege.
+
+What the 1 ns slack is worth in latency is **not yet measured**. This
+environment cannot measure it: sleeps below 1 ms are quantised to about 1 ms
+here at both 50,000 ns and 1 ns slack. The mechanism is tested; the number is
+not, and is not claimed.
 
 ## Node setup
 
@@ -143,9 +168,19 @@ oversubscription: 1
 namespaces: ["trading"]  # who may opt in. Empty refuses every pod
 defaultAffinity: shared
 annotationOptIn: false
-seccomp.ioUring: "off"   # "allow" to widen the profile for io_uring_*
-schedFifo: "off"
-ptp: "off"
+
+# These three are "off" by default. A latency node turns the first two on.
+# Each one is a node-level permission: the pod still opts in by annotation,
+# and a pod that asks for a grant this field does not allow is refused.
+seccomp.ioUring: "allow"  # default "off". Without it, a pod asking for
+                          # seccomp.ergon.io/<ctr>: "io-uring" is refused, and
+                          # Aeron's conductor cannot use io_uring (RuntimeDefault
+                          # blocks it: containerd issue 9320)
+ptp: "auto"               # default "off". Without it, a pod asking for
+                          # ptp.ergon.io/<ctr>: "auto" is refused, and the app
+                          # has no NIC hardware clock. Use "auto" for the NIC's
+                          # PHC, or a /dev/ptp* path the node has
+schedFifo: "off"          # keep off: measured worse (see Latency Pods)
 ```
 
 Rules:
@@ -156,19 +191,53 @@ Rules:
 - Quote `off`, `on`, `yes`, `no`. YAML 1.1 turns unquoted ones into booleans.
 - An unknown field or an out-of-range value stops the plugin at start, and
   the message names the field.
+- **`off` is not harmless.** It is a refusal. A pod whose annotation asks for
+  a grant the ConfigMap does not allow does not start: the kubelet shows
+  `CreateContainerError` and the text names the field to change.
 
 ### 3. Build and load the image
 
+**Do not publish this to Docker Hub.** The plugin is root on the node and
+installs an executable at `/opt/ergon/bin`. A public image is a root shell on
+every node that pulls it, for whoever can push. Use one of these three.
+
+**a. kind, or a single node** — build and load it into the node's own store:
+
 ```sh
 docker build -t ergon-shared-cpus:dev .
-# then load it on every node, one of:
-kind load docker-image ergon-shared-cpus:dev            # kind
-ctr -n k8s.io images import <(docker save ergon-shared-cpus:dev)
-docker push <registry>/ergon-shared-cpus:dev            # then retag in the DaemonSet
+kind load docker-image ergon-shared-cpus:dev        # kind
+# anything else:
+docker save ergon-shared-cpus:dev | ctr -n k8s.io images import -
 ```
 
-The DaemonSet's image is `ergon-shared-cpus:dev` with
-`imagePullPolicy: IfNotPresent`. Change one or the other to match.
+**b. A private registry, for a real multi-node cluster** — the right default
+outside a lab. Push to a registry only your nodes can read, and pin the
+digest so a re-push cannot change what runs:
+
+```sh
+docker build -t <registry>/ergon-shared-cpus:<tag> .
+docker push <registry>/ergon-shared-cpus:<tag>
+docker inspect --format='{{index .RepoDigests 0}}' <registry>/ergon-shared-cpus:<tag>
+```
+
+Then in `deploy/daemonset.yaml` set the image to that digest
+(`<registry>/ergon-shared-cpus@sha256:…`), `imagePullPolicy: IfNotPresent`,
+and give the `ergon-system` namespace an `imagePullSecret`:
+
+```sh
+kubectl -n ergon-system create secret docker-registry regcred \
+  --docker-server=<registry> --docker-username=<user> --docker-password=<token>
+kubectl -n ergon-system patch serviceaccount default \
+  -p '{"imagePullSecrets":[{"name":"regcred"}]}'
+```
+
+**c. No registry at all** — `imagePullPolicy: Never` plus a DaemonSet init
+that expects the image to already be on the node (a config-management step, or
+the AMI). Only worth it where nodes cannot reach any registry.
+
+The DaemonSet ships `image: ergon-shared-cpus:dev` with
+`imagePullPolicy: IfNotPresent`, which matches (a). Change the image field to
+match whichever you chose.
 
 ### 4. Apply the three manifests
 
@@ -345,9 +414,13 @@ nohz_full=2-3 rcu_nocbs=2-3 isolcpus=managed_irq,domain,2-3 hugepagesz=2M hugepa
 **ConfigMap** (`sharedCpus: "0"`), **kubelet**
 (`reservedSystemCPUs: "0,1"`), and a namespace in the allowlist.
 
-**Pod.** The two grants that matter here are `hugepages.ergon.io/app` (a
-sized hugetlbfs for `AERON_DIR`) and `ergon.io/shared-millicpus` (the
-shared CPU for the conductor and the helpers):
+**Pod.** Three grants on top of the shared CPU: a sized hugetlbfs for
+`AERON_DIR`, io_uring seccomp, and the NIC PHC. The isolation of CPUs 2-3
+comes from the **boot line**, not from a grant: a media driver is one
+process with three threads, and a cpuset partition takes whole processes,
+so `cpu-partition` cannot take the sender and receiver while the
+conductor stays on the shared CPU. See
+[Latency Pods](latency-pods.md#2-isolated-partition).
 
 ```yaml
 apiVersion: v1
@@ -358,7 +431,9 @@ metadata:
   labels: { ergon.io/latency: "hot" }
   annotations:
     required-plugins.noderesource.dev: '["ergon-shared-cpus"]'
-    hugepages.ergon.io/app: "2M"
+    hugepages.ergon.io/app: "2M"          # sized hugetlbfs for AERON_DIR
+    seccomp.ergon.io/app: "io-uring"      # the conductor uses io_uring
+    ptp.ergon.io/app: "auto"              # the NIC's PHC
 spec:
   nodeSelector: { ergon.io/shared-cpus: "true" }
   priorityClassName: system-node-critical
@@ -389,6 +464,10 @@ spec:
 | `AERON_THREADING_MODE=DEDICATED` | sender, receiver and conductor on their own threads |
 | `hugepages.ergon.io/app: "2M"` + `hugepages-2Mi` | a **sized** hugetlbfs mounted at `/dev/hugepages` |
 | `AERON_DIR` on that hugetlbfs | the CnC file and the terms are 2 MiB pages, not 4 KiB |
+| `seccomp.ergon.io/app: "io-uring"` | the profile gains the `io_uring_*` calls the conductor needs; never `Unconfined` |
+| `ptp.ergon.io/app: "auto"` | the NIC's PHC, for clock work. x86 also gets `cpuqos` (`/dev/cpu_dma_latency`) to cap C-states |
+| `ergon.io/latency: "hot"` (pod label) | the admission policy refuses exec probes and `restartPolicy: Always` sidecars |
+| `isolcpus=managed_irq,domain,2-3` on the boot line | CPUs 2-3 leave the scheduler's load-balancing domains. This is what keeps the sender's and receiver's cores quiet; a cpuset partition cannot do it per-thread |
 
 **The app sets `AERON_DIR` itself.** The plugin exports
 `ERGON_HUGEPAGES_DIR` and `ERGON_HUGEPAGE_SIZE` and does not set `AERON_DIR`,

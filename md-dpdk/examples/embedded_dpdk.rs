@@ -7,8 +7,8 @@
 //! embedded deployment and an env-driven standalone deployment behave
 //! identically.
 //!
-//! Requires Linux `x86_64` with the `dpdk` feature (Amazon Linux 2023 / EKS
-//! Nitro). The PCI BDFs, IPs, and gateways below are placeholders for the two
+//! Requires Linux `x86_64` or `aarch64` (Graviton) with the `dpdk` feature
+//! (Amazon Linux 2023 / EKS Nitro). The PCI BDFs, IPs, and gateways below are placeholders for the two
 //! secondary ENAs provisioned on an EKS node; the context is
 //! configured to the transport's requirements (distinct sender/receiver CPUs, spin
 //! idle strategies, disjoint wildcard port ranges, bounded MTU).
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         file_prefix: "rusteron-ena".into(),
         test_vdev: false,
         hugepage_dir: "/dev/hugepages".into(),
-        rx_descriptors: 1024,
+        rx_descriptors: None, // min(4096, the NIC's maximum), per port at start
         tx_descriptors: 1024,
         mbufs_per_port: 65536,
         mempool_cache: 256,

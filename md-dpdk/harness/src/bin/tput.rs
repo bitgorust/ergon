@@ -12,11 +12,17 @@
 //! the window being the samples' span on the wall clock (`CLOCK_REALTIME`, ns
 //! since the epoch), so the lab can check that several subscribers' measured
 //! seconds overlapped (md-dpdk/benches/cloud/lib.sh multi_flow_max)
+//!
+//! `HARNESS_DRIVER=invoker` embeds the media driver instead (`lab.rs`): the
+//! measuring thread (xpub's main thread then, while another only times the
+//! run) also runs the client's conductor and the driver, every pass of its
+//! loop. `PUB_CHANNEL_PARAMS` is appended to the publication's channel,
+//! `SUB_CHANNEL_PARAMS` to the subscription's.
 
 #[path = "../lab.rs"]
 mod lab;
 
-use lab::{Clock, aeron_dir, cpu_arg, label, pin, retry_closing, sub_channel, wait_until};
+use lab::{Clock, Duty, External, Invoker, Lab, cpu_arg, label, pin, sub_channel};
 use rusteron_client::*;
 use std::ffi::{CStr, CString};
 use std::hint::spin_loop;
@@ -27,15 +33,8 @@ const STREAM_ID: i32 = 1001;
 const MESSAGE_LENGTH: usize = 32;
 const FRAGMENT_COUNT_LIMIT: usize = 256;
 
-fn client() -> Aeron {
-    let context = AeronContext::new().unwrap();
-    context.set_dir(&aeron_dir()).unwrap();
-    let aeron = Aeron::new(&context).unwrap();
-    aeron.start().unwrap();
-    aeron
-}
-
 fn main() {
+    lab::lock_memory();
     let mut args = std::env::args().skip(1);
     let mode = args.next().expect("xsub or xpub");
     let channel = CString::new(format!("aeron:udp?endpoint={}", args.next().expect("host:port"))).unwrap();
@@ -45,22 +44,38 @@ fn main() {
     match mode.as_str() {
         "xpub" => {
             let running = AtomicBool::new(true);
-            std::thread::scope(|scope| {
-                scope.spawn(|| publish(&running, &channel, cpu, size));
+            let stop_after = || {
                 std::thread::sleep(Duration::from_secs(seconds as u64));
                 running.store(false, Ordering::Release);
+            };
+            std::thread::scope(|scope| {
+                if lab::embedded() {
+                    // the driver's thread publishes, the main one, as a lab
+                    // client's measuring thread always is under INVOKER
+                    scope.spawn(stop_after);
+                    publish(&running, &channel, cpu, size);
+                } else {
+                    scope.spawn(|| publish(&running, &channel, cpu, size));
+                    stop_after();
+                }
             });
         }
         "xsub" => {
-            let aeron = client();
-            let subscription = retry_closing("subscription", || {
-                aeron
-                    .async_add_subscription(&sub_channel(&channel), STREAM_ID, Handlers::NONE, Handlers::NONE)
-                    .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
-            });
-            wait_until("publisher", 60, || subscription.image_at_index(0).is_some());
+            let lab = Lab::connect(cpu);
+            let subscription = lab.add_subscription(&sub_channel(&channel), STREAM_ID);
+            lab.wait_until("publisher", 60, || subscription.image_at_index(0).is_some());
             pin(cpu);
-            println!("{}", measure(&subscription, seconds).line(&label()));
+            let measured = match lab.invoker() {
+                Some(duty) => measure(
+                    &Driven {
+                        subscription: &subscription,
+                        duty: &duty,
+                    },
+                    seconds,
+                ),
+                None => measure(&subscription, seconds),
+            };
+            println!("{}", measured.line(&label()));
         }
         other => panic!("unknown mode {other}: xsub or xpub"),
     }
@@ -78,6 +93,22 @@ impl Poll for AeronSubscription {
     fn poll(&self, mut on_message: impl FnMut(&[u8])) -> i32 {
         self.poll_fn(|message, _header| on_message(message), FRAGMENT_COUNT_LIMIT)
             .unwrap()
+    }
+}
+
+/// The subscription with an embedded driver's duty, run before each poll: the
+/// messages read, plus the work the duty found, so an idle pass is one that
+/// found neither.
+struct Driven<'a> {
+    subscription: &'a AeronSubscription,
+    duty: &'a Invoker<'a>,
+}
+
+impl Poll for Driven<'_> {
+    #[inline(always)]
+    fn poll(&self, on_message: impl FnMut(&[u8])) -> i32 {
+        let work = self.duty.run();
+        Poll::poll(self.subscription, on_message) + work
     }
 }
 
@@ -119,15 +150,15 @@ impl Measured {
 fn measure(subscription: &impl Poll, seconds: usize) -> Measured {
     const SECOND_NS: u64 = 1_000_000_000;
     let clock = Clock::calibrate();
-    if !clock.is_tsc() {
-        eprintln!("tput: no invariant TSC, timing with CLOCK_MONOTONIC");
+    if !clock.is_counter() {
+        eprintln!("tput: no hardware counter (or BENCH_CLOCK=monotonic), timing with CLOCK_MONOTONIC");
     }
     let mut count = 0u64;
     // sequence numbers seen while measuring: the first, the highest, how many
     let (mut first, mut highest, mut received) = (u64::MAX, 0u64, 0u64);
     let mut measuring = false;
     let mut samples = Vec::with_capacity(seconds);
-    let mut window_start = clock.ticks();
+    let mut window_start = clock.now();
     let warmup_start = window_start;
     let mut warming = true;
     let mut start_realtime = 0;
@@ -144,17 +175,17 @@ fn measure(subscription: &impl Poll, seconds: usize) -> Measured {
         if fragments == 0 {
             spin_loop();
         }
-        let now = clock.ticks();
+        let now = clock.now();
         if warming {
-            if clock.ns(now - warmup_start) >= SECOND_NS {
+            if now - warmup_start >= SECOND_NS {
                 warming = false;
                 measuring = true;
                 count = 0;
                 window_start = now;
                 start_realtime = realtime_ns();
             }
-        } else if clock.ns(now - window_start) >= SECOND_NS {
-            samples.push(count as f64 * 1e9 / clock.ns(now - window_start) as f64);
+        } else if now - window_start >= SECOND_NS {
+            samples.push(count as f64 * 1e9 / (now - window_start) as f64);
             count = 0;
             window_start = now;
         }
@@ -180,14 +211,18 @@ fn realtime_ns() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
 }
 
+/// Publishes on the driver `HARNESS_DRIVER` picks until `running` clears.
 fn publish(running: &AtomicBool, channel: &CStr, cpu: Option<usize>, size: usize) {
-    let aeron = client();
-    let publication = retry_closing("publication", || {
-        aeron
-            .async_add_exclusive_publication(channel, STREAM_ID)
-            .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
-    });
-    wait_until("subscriber", 60, || publication.is_connected());
+    let lab = Lab::connect(cpu);
+    match lab.invoker() {
+        Some(duty) => publish_on(&lab, &duty, running, channel, cpu, size),
+        None => publish_on(&lab, &External, running, channel, cpu, size),
+    }
+}
+
+fn publish_on(lab: &Lab, duty: &impl Duty, running: &AtomicBool, channel: &CStr, cpu: Option<usize>, size: usize) {
+    let publication = lab.add_publication(channel, STREAM_ID);
+    lab.wait_until("subscriber", 60, || publication.is_connected());
     let max_payload = publication.max_payload_length().unwrap();
     assert!(
         size <= max_payload,
@@ -199,9 +234,15 @@ fn publish(running: &AtomicBool, channel: &CStr, cpu: Option<usize>, size: usize
     let mut seq = 0_u64;
     while running.load(Ordering::Relaxed) {
         message[..8].copy_from_slice(&seq.to_le_bytes());
+        // an embedded driver sends what was offered, every pass
+        let work = duty.run();
         match publication.offer(&message) {
             Ok(_) => seq += 1,
-            Err(e) if e.is_retryable() => spin_loop(),
+            Err(e) if e.is_retryable() => {
+                if work == 0 {
+                    spin_loop();
+                }
+            }
             Err(e) => panic!("offer: {e:?}"),
         }
     }

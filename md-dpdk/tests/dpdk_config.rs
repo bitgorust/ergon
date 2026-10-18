@@ -3,7 +3,7 @@
 //!
 //! Pure config/env/error behaviour runs on every platform with the default
 //! features; the full install/lifetime path is `#[cfg(feature = "dpdk")]`
-//! (Linux x86_64 in the Docker verification image).
+//! (Linux x86_64 or aarch64 in the Docker verification images).
 //!
 //! These tests mutate process-global env vars, so every test is `#[serial]`
 //! (file-locked across the whole workspace, as with the other DPDK test files).
@@ -91,7 +91,7 @@ fn canonical() -> DpdkTransportConfig {
         file_prefix: "rusteron-ena".into(),
         test_vdev: false,
         hugepage_dir: "/dev/hugepages".into(),
-        rx_descriptors: 1024,
+        rx_descriptors: Some(1024),
         tx_descriptors: 1024,
         mbufs_per_port: 65536,
         mempool_cache: 256,
@@ -412,7 +412,9 @@ fn validation_rejects_relative_hugepage_dir() {
 #[test]
 fn validation_rejects_rx_descriptors_out_of_range() {
     let mut c = canonical();
-    c.rx_descriptors = 63;
+    c.rx_descriptors = Some(63);
+    assert_invalid_config(&c, "rx_descriptors");
+    c.rx_descriptors = Some(8193);
     assert_invalid_config(&c, "rx_descriptors");
 }
 
@@ -455,13 +457,148 @@ fn validation_bounds_the_mempool_cache() {
     assert_invalid_config(&c, "mempool_cache");
 }
 
+/// The pool covers both rings, four bursts and two per-lcore mempool caches
+/// (the agent's and the EAL main lcore's), each up to DPDK's flush threshold
+/// of 1.5 times the cache size.
 #[serial]
 #[test]
 fn validation_rejects_undersized_mbuf_pool() {
     let mut c = canonical();
-    // rx + tx + 4*burst = 1024 + 1024 + 128 = 2176; one below is too small.
-    c.mbufs_per_port = 2175;
+    // rx + tx + 4*burst + 2 * 1.5 * cache = 1024 + 1024 + 128 + 768 = 2944.
+    c.mbufs_per_port = 2944;
+    c.validate().unwrap();
+    c.mbufs_per_port = 2943;
     assert_invalid_config(&c, "mbufs_per_port");
+    // No per-core cache, none to hold.
+    c.mempool_cache = 0;
+    c.mbufs_per_port = 2176;
+    c.validate().unwrap();
+}
+
+/// Unset, the receive ring takes min(4096, the NIC's maximum) at start, so
+/// the pool is sized for the most it can take: 4096.
+#[serial]
+#[test]
+fn validation_sizes_the_pool_for_the_default_receive_ring() {
+    let mut c = canonical();
+    c.rx_descriptors = None;
+    // 4096 + 1024 + 128 + 768 = 6016.
+    c.mbufs_per_port = 6016;
+    c.validate().unwrap();
+    c.mbufs_per_port = 6015;
+    let msg = c.validate().unwrap_err().to_string();
+    assert!(
+        msg.contains("mbufs_per_port 6015") && msg.contains("6016") && msg.contains("4096"),
+        "{msg}"
+    );
+    // The shipped defaults hold it with room to spare.
+    clear_env();
+    set_env_from_canonical();
+    remove_var("RUSTERON_DPDK_RX_DESCRIPTORS");
+    remove_var("RUSTERON_DPDK_TX_DESCRIPTORS");
+    remove_var("RUSTERON_DPDK_MBUFS_PER_PORT");
+    env::config_from_env().unwrap().validate().unwrap();
+    clear_env();
+}
+
+/// A NIC capped at 256 descriptors (Azure MANA) with the receive ring unset
+/// and a pool sized for its own ring: the validation, which sizes the pool
+/// for a 4096 ring, says to set `RUSTERON_DPDK_RX_DESCRIPTORS=256` or to
+/// enlarge the pool, naming both variables and what each needs.
+#[serial]
+#[test]
+fn an_unset_ring_and_a_pool_for_256_descriptors_name_both_fixes() {
+    let mut c = canonical();
+    mana(&mut c);
+    c.rx_descriptors = None;
+    c.tx_descriptors = 256;
+    // 256 + 256 + 128 + 768 = 1408 fits a MANA ring; 4096 + 256 + 128 + 768 = 5248 does not.
+    c.mbufs_per_port = 1408;
+    let msg = c.validate().unwrap_err().to_string();
+    for needle in [
+        "mbufs_per_port 1408",
+        "RUSTERON_DPDK_RX_DESCRIPTORS=256",
+        "RUSTERON_DPDK_MBUFS_PER_PORT",
+        "5248",
+        "4096",
+    ] {
+        assert!(msg.contains(needle), "{needle:?} in {msg}");
+    }
+    // and either fix validates
+    c.rx_descriptors = Some(256);
+    c.validate().unwrap();
+    c.rx_descriptors = None;
+    c.mbufs_per_port = 5248;
+    c.validate().unwrap();
+    // A pool short even of a 256 ring says what that ring needs too.
+    c.mbufs_per_port = 1000;
+    let msg = c.validate().unwrap_err().to_string();
+    assert!(
+        msg.contains("RUSTERON_DPDK_RX_DESCRIPTORS=256") && msg.contains("1408"),
+        "{msg}"
+    );
+    // An explicit ring names the pool's variable and the ring's.
+    c.rx_descriptors = Some(256);
+    let msg = c.validate().unwrap_err().to_string();
+    assert!(
+        msg.contains("RUSTERON_DPDK_MBUFS_PER_PORT") && msg.contains("RUSTERON_DPDK_RX_DESCRIPTORS"),
+        "{msg}"
+    );
+}
+
+/// The EKS ConfigMap (`deploy/aws-eks/media-driver-config.yaml`) leaves the
+/// receive ring unset, so each port takes min(4096, the NIC's maximum), and
+/// its pool holds that ring: its `RUSTERON_DPDK_*` values, with what the
+/// device plugin injects per pair, make a configuration that validates.
+#[serial]
+#[test]
+fn the_eks_config_map_leaves_the_receive_ring_to_the_nic_and_validates() {
+    let yaml = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/deploy/aws-eks/media-driver-config.yaml"
+    ))
+    .unwrap();
+    let data: Vec<(String, String)> = yaml
+        .lines()
+        .skip_while(|l| l.trim_end() != "data:")
+        .skip(1)
+        .filter_map(|l| {
+            let l = l.trim();
+            if l.starts_with('#') || l.is_empty() {
+                return None;
+            }
+            let (k, v) = l.split_once(':')?;
+            Some((k.trim().to_owned(), v.trim().trim_matches('"').to_owned()))
+        })
+        .collect();
+    assert!(
+        data.iter().any(|(k, _)| k == "RUSTERON_DPDK_MBUFS_PER_PORT"),
+        "{data:?}"
+    );
+    assert!(
+        !data.iter().any(|(k, _)| k == "RUSTERON_DPDK_RX_DESCRIPTORS"),
+        "the ConfigMap pins the receive ring: {data:?}"
+    );
+    clear_env();
+    for (k, v) in data.iter().filter(|(k, _)| k.starts_with("RUSTERON_DPDK_")) {
+        set_var(k, v);
+    }
+    // what the device plugin injects at Allocate
+    set_var("RUSTERON_DPDK_FILE_PREFIX", "rusteron-dpdk-dpdk-pair-0");
+    set_var("RUSTERON_DPDK_SENDER_PCI", "0000:00:06.0");
+    set_var("RUSTERON_DPDK_SENDER_IPV4_CIDR", "10.0.1.10/24");
+    set_var("RUSTERON_DPDK_SENDER_GATEWAY", "10.0.1.1");
+    set_var("RUSTERON_DPDK_RECEIVER_PCI", "0000:00:07.0");
+    set_var("RUSTERON_DPDK_RECEIVER_IPV4_CIDR", "10.0.2.10/24");
+    set_var("RUSTERON_DPDK_RECEIVER_GATEWAY", "10.0.2.1");
+    let config = env::config_from_env();
+    for (k, _) in &data {
+        remove_var(k);
+    }
+    clear_env();
+    let config = config.unwrap();
+    assert_eq!(config.rx_descriptors, None);
+    config.validate().unwrap();
 }
 
 #[serial]
@@ -480,6 +617,18 @@ fn validation_rejects_mtu_above_8960_and_accepts_jumbo() {
     assert_invalid_config(&c, "max_aeron_mtu");
     c.max_aeron_mtu = 8960; // an AWS 9001-byte VPC MTU less IPv4+UDP
     c.validate().unwrap();
+    c.max_aeron_mtu = 8448; // an 8500-byte path (inter-region VPC peering)
+    c.validate().unwrap();
+}
+
+/// 0 is 32-aligned, but carries nothing: refused here, before the native
+/// side would refuse it at create.
+#[serial]
+#[test]
+fn validation_rejects_a_zero_mtu() {
+    let mut c = canonical();
+    c.max_aeron_mtu = 0;
+    assert_invalid_config(&c, "max_aeron_mtu");
 }
 
 // --- Selector behaviour (plan §6.1) ------------------------------------------
@@ -599,12 +748,37 @@ fn env_defaults_match_plan() {
     }
     let c = env::config_from_env().unwrap();
     assert_eq!(c.hugepage_dir, std::path::PathBuf::from("/dev/hugepages"));
-    assert_eq!(c.rx_descriptors, 1024);
+    assert_eq!(
+        c.rx_descriptors, None,
+        "unset: min(4096, the NIC's maximum), per port at start"
+    );
     assert_eq!(c.tx_descriptors, 512); // an ENA's maximum
     assert_eq!(c.mbufs_per_port, 16384, "what the lab measured");
     assert_eq!(c.mempool_cache, 256);
     assert_eq!(c.burst_size, 32);
     assert_eq!(c.max_aeron_mtu, 1408);
+}
+
+/// An explicit `RUSTERON_DPDK_RX_DESCRIPTORS` is kept as given (validated,
+/// and start fails if the NIC cannot take it); one that does not parse is
+/// refused, naming the variable, never read as unset.
+#[serial]
+#[test]
+fn env_keeps_an_explicit_rx_descriptor_count() {
+    clear_env();
+    set_env_from_canonical();
+    set_var("RUSTERON_DPDK_RX_DESCRIPTORS", "256");
+    assert_eq!(env::config_from_env().unwrap().rx_descriptors, Some(256));
+    for bad in ["", "lots", "-1", "70000"] {
+        set_var("RUSTERON_DPDK_RX_DESCRIPTORS", bad);
+        let err = env::config_from_env().unwrap_err();
+        assert!(matches!(err, DpdkError::InvalidEnvironment(_)), "{bad:?}: {err:?}");
+        assert!(
+            err.to_string().contains("RUSTERON_DPDK_RX_DESCRIPTORS"),
+            "{bad:?}: {err}"
+        );
+    }
+    clear_env();
 }
 
 // --- Feature disabled (runs everywhere without `dpdk`) ------------------------
@@ -709,6 +883,91 @@ fn install_succeeds_on_configured_context() {
     let ctx = configured_context();
     let guard = DpdkTransport::install(&ctx, &canonical()).unwrap();
     drop(guard); // the last owner: closes the native transport
+}
+
+/// The install calibrates the transport's clock with ergon-clock (once a
+/// process) and hands it to the native transport: `RUSTERON_DPDK_CLOCK`
+/// unset, `counter` or `tsc` is ergon-clock's choice for this host,
+/// `monotonic` its fallback; the native clock reports and reads what the
+/// transport holds. Any other value refuses before any native work.
+#[cfg(feature = "dpdk")]
+#[serial]
+#[test]
+fn install_hands_the_native_transport_ergon_clocks_calibration() {
+    use ergon_md_dpdk::clock::{ClockChoice, transport_clock};
+    let counter = transport_clock(ClockChoice::Counter).unwrap().clock;
+    let source = |c: &ergon_clock::advanced::Clock| match (c.is_counter(), cfg!(target_arch = "aarch64")) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+    };
+    for (value, monotonic) in [
+        (None, false),
+        (Some("counter"), false),
+        (Some("tsc"), false),
+        (Some("monotonic"), true),
+    ] {
+        let env = TestEnv::new();
+        env.eal_skip();
+        match value {
+            Some(v) => set_var("RUSTERON_DPDK_CLOCK", v),
+            None => remove_var("RUSTERON_DPDK_CLOCK"),
+        }
+        let guard = DpdkTransport::install(&configured_context(), &canonical());
+        remove_var("RUSTERON_DPDK_CLOCK");
+        let guard = guard.unwrap_or_else(|e| panic!("{value:?}: {e}"));
+        let clock = guard.clock();
+        if monotonic {
+            assert!(!clock.is_counter(), "{value:?}");
+        } else {
+            assert_eq!(clock.params(), counter.params(), "{value:?}: the process's calibration");
+        }
+        assert_eq!(
+            unsafe { common::rusteron_dpdk_clock_source() },
+            source(&clock),
+            "{value:?}"
+        );
+        let (before, native, after) = (
+            clock.now_ns(),
+            unsafe { common::rusteron_dpdk_clock_ns() },
+            clock.now_ns(),
+        );
+        assert!(
+            native + 1_000 >= before && native <= after + 1_000,
+            "{value:?}: native {native} outside {before}..{after}"
+        );
+        drop(guard);
+    }
+    let env = TestEnv::new();
+    env.eal_skip();
+    set_var("RUSTERON_DPDK_CLOCK", "hpet");
+    let err = DpdkTransport::install(&configured_context(), &canonical()).unwrap_err();
+    remove_var("RUSTERON_DPDK_CLOCK");
+    assert!(
+        matches!(&err, DpdkError::InvalidEnvironment(m) if m.contains("RUSTERON_DPDK_CLOCK")),
+        "{err:?}"
+    );
+    assert_eq!(env.log_count(), 0, "no native work before the refusal");
+}
+
+/// A typed configuration leaving `rx_descriptors` unset reaches the native
+/// transport as the NIC's default: each port's ring is min(4096, its maximum).
+#[cfg(feature = "dpdk")]
+#[serial]
+#[test]
+fn install_hands_an_unset_receive_ring_to_the_nics_default() {
+    let env = TestEnv::new();
+    env.eal_skip();
+    unsafe { common::rusteron_dpdk_fake_set_desc_limits(64, 2048, 0, 0) };
+    let mut config = canonical();
+    config.rx_descriptors = None;
+    let guard = DpdkTransport::install(&configured_context(), &config).unwrap();
+    let log: Vec<String> = (0..env.log_count()).map(|i| env.log_at(i)).collect();
+    for port in 0..2 {
+        let want = format!("rx {port} (q=0 desc=2048)");
+        assert!(log.iter().any(|l| l.contains(&want)), "{want}: {log:?}");
+    }
+    drop(guard);
 }
 
 #[cfg(feature = "dpdk")]

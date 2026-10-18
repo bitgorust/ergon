@@ -36,6 +36,34 @@ extern "C" {
 /* Jumbo frames: an AWS 9001-byte VPC MTU less IPv4+UDP, 32-aligned. */
 #define RUSTERON_DPDK_MAX_AERON_MTU 8960
 
+/*
+ * The transport's clock: ergon-clock's calibration (its `Params`, the same
+ * layout), made once in Rust and adopted at create. Both kinds convert with
+ * ergon-clock's formula:
+ *
+ *   ns = base_ns + (int64_t)(((__int128)(int64_t)(ticks - base_ticks) * (int64_t)mult) >> 32)
+ *
+ * with `ticks` the hardware counter (kind 1: rdtsc on x86_64, CNTVCT_EL0 on
+ * aarch64) or CLOCK_MONOTONIC in nanoseconds (kind 0, the fallback, whose
+ * factor is 2^32 until its owner retunes it).
+ */
+#define RUSTERON_DPDK_CLOCK_PARAMS_VERSION 1 /* ergon-clock's PARAMS_VERSION */
+#define RUSTERON_DPDK_CLOCK_KIND_MONOTONIC 0
+#define RUSTERON_DPDK_CLOCK_KIND_COUNTER 1
+
+typedef struct rusteron_dpdk_clock_params_stct
+{
+    uint32_t version;    /* RUSTERON_DPDK_CLOCK_PARAMS_VERSION */
+    uint32_t kind;       /* RUSTERON_DPDK_CLOCK_KIND_{COUNTER,MONOTONIC} */
+    uint32_t domain;     /* 0: the monotonic domain, the only one the transport takes */
+    uint32_t reserved;   /* 0 */
+    uint64_t base_ticks; /* the ticks at the base */
+    uint64_t base_ns;    /* the time, ns, at the base */
+    uint64_t mult;       /* ns per tick, 32.32 fixed point, in (0, 2^63) */
+    uint64_t hz;         /* ticks a second (the rate mult stands for; not read) */
+}
+rusteron_dpdk_clock_params_t;
+
 typedef struct rusteron_dpdk_config_stct
 {
     /* defensive layout guard — must equal sizeof of this struct */
@@ -58,7 +86,7 @@ typedef struct rusteron_dpdk_config_stct
     char receiver_gateway[16];
 
     /* device tuning */
-    uint16_t rx_descriptors;   /* 64..=8192 */
+    uint16_t rx_descriptors;   /* 64..=8192, or 0: min(4096, the NIC's maximum), per port at start */
     uint16_t tx_descriptors;   /* 64..=8192 */
     uint32_t mbufs_per_port;
     uint16_t mempool_cache;
@@ -75,6 +103,11 @@ typedef struct rusteron_dpdk_config_stct
      * AWS ENA in a precision-time placement group); init fails on a port
      * without them. 0 leaves them off. */
     uint8_t rx_hw_timestamp;
+
+    /* The clock the transport reads (ARP freshness, the pacer, poll gaps):
+     * ergon-clock's calibration, checked at create and adopted for the
+     * process. */
+    rusteron_dpdk_clock_params_t clock;
 }
 rusteron_dpdk_config_t;
 

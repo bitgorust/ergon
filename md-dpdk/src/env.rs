@@ -50,8 +50,13 @@ pub fn selector() -> Result<Selector, DpdkError> {
 /// `RUSTERON_DPDK_{SENDER,RECEIVER}_EXTRA_IPV4`, `RUSTERON_DPDK_HOST_LOCAL`,
 /// `RUSTERON_DPDK_WILDCARD_LOCAL`, `RUSTERON_DPDK_LOCAL_IO`, `RUSTERON_DPDK_LOCAL_HOT_US`, `RUSTERON_DPDK_LOCAL_UNWATCH`, `RUSTERON_DPDK_TX_RETRY_US`, `RUSTERON_DPDK_NIC_STATS_MS`, `RUSTERON_DPDK_RX_MAX_BURSTS`, `RUSTERON_DPDK_TX_RATE_MBPS`, `RUSTERON_DPDK_TX_ROUTE_MBPS`,
 /// `RUSTERON_DPDK_TX_BUCKET_BYTES`, `RUSTERON_DPDK_TX_PACE_SPIN_US`, `RUSTERON_DPDK_TX_LOW_STREAMS`,
-/// `RUSTERON_DPDK_TX_LOW_RESERVE_BYTES`,
-/// `RUSTERON_DPDK_CLOCK` and `RUSTERON_DPDK_HOUSEKEEPING_CPU`.
+/// `RUSTERON_DPDK_TX_LOW_RESERVE_BYTES`, `RUSTERON_DPDK_HOUSEKEEPING_CPU`,
+/// `RUSTERON_DPDK_ENA_DEVARGS`, `RUSTERON_DPDK_ENA_LLQ_REQUIRED` and
+/// `RUSTERON_DPDK_VFIO_WC`. `RUSTERON_DPDK_CLOCK` is read by the install
+/// ([`crate::clock`]), whatever made the configuration.
+/// `RUSTERON_DPDK_RX_DESCRIPTORS` unset leaves
+/// [`DpdkTransportConfig::rx_descriptors`] `None`: each port then takes
+/// min(4096, the NIC's maximum) at start.
 ///
 /// `RUSTERON_DPDK_TEST_VDEV=1` enables the test-only virtual-device mode: sender/receiver PCI may then be DPDK vdev names (e.g. `net_tap0`)
 /// instead of ENA PCI BDFs. Production configurations never set it.
@@ -92,7 +97,7 @@ pub fn config_from_env() -> Result<DpdkTransportConfig, DpdkError> {
         file_prefix: required("RUSTERON_DPDK_FILE_PREFIX")?,
         test_vdev, // production selectors are PCI-only unless the test lever is set
         hugepage_dir: PathBuf::from(env::var("RUSTERON_DPDK_HUGE_DIR").unwrap_or_else(|_| "/dev/hugepages".into())),
-        rx_descriptors: num_or("RUSTERON_DPDK_RX_DESCRIPTORS", 1024)?,
+        rx_descriptors: num_opt("RUSTERON_DPDK_RX_DESCRIPTORS")?, // unset: min(4096, the NIC's maximum) at start
         tx_descriptors: num_or("RUSTERON_DPDK_TX_DESCRIPTORS", 512)?, // an ENA's maximum
         mbufs_per_port: num_or("RUSTERON_DPDK_MBUFS_PER_PORT", 16384)?, // as the lab measured
         mempool_cache: num_or("RUSTERON_DPDK_MEMPOOL_CACHE", 256)?,
@@ -151,6 +156,19 @@ fn parse_cidr(var: &str, value: &str) -> Result<(Ipv4Addr, u8), DpdkError> {
         )));
     }
     Ok((addr, prefix_len))
+}
+
+/// Parse an optional numeric environment value: `None` when absent.
+fn num_opt<T: FromStr>(name: &str) -> Result<Option<T>, DpdkError>
+where
+    T::Err: std::fmt::Display,
+{
+    env::var(name).map_or(Ok(None), |v| {
+        v.trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| DpdkError::InvalidEnvironment(format!("{name}={v:?} is not a valid number")))
+    })
 }
 
 /// Parse a numeric environment value, using `default` when absent.

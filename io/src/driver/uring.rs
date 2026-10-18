@@ -1,33 +1,35 @@
 //! `uring-spin`, `uring-napi` and `uring-sqpoll`.
 //!
-//! Every connection keeps one single-shot `IORING_OP_RECVMSG` armed, pointed at
-//! the free tail of its receive buffer, so the kernel copies straight into the
-//! buffer the TLS layer decrypts in place. A provided-buffer ring with multishot
-//! receive would save the re-arm but forces a copy to stitch TLS records that
-//! straddle ring buffers.
-//!
-//! - `uring-spin`: `SINGLE_ISSUER | DEFER_TASKRUN | TASKRUN_FLAG`. `poll` reads
-//!   the completion ring and the `IORING_SQ_TASKRUN` flag in shared memory and
-//!   enters the kernel only when it has submissions or the kernel flagged
-//!   deferred work. Idle polls make no syscalls.
-//! - `uring-napi`: the same ring plus NAPI busy poll (static NAPI ids). An idle
-//!   poll waits in `io_uring_enter(GETEVENTS, 1, wait_us)`: the kernel polls the
-//!   NIC, then sleeps until a completion or the timeout. Even with `wait_us = 0`
-//!   it schedules on an already-expired timer, so this backend can sleep; with
+//! - Each connection keeps one single-shot `IORING_OP_RECVMSG` armed at the
+//!   free tail of its receive buffer: the kernel copies straight into the
+//!   buffer the TLS layer decrypts in place. (Multishot with a provided-buffer
+//!   ring would save the re-arm but needs a copy to stitch TLS records that
+//!   straddle ring buffers.)
+//! - `uring-spin`: `SINGLE_ISSUER | DEFER_TASKRUN | TASKRUN_FLAG`. `poll`
+//!   reads the completion ring and the `IORING_SQ_TASKRUN` flag in shared
+//!   memory, and enters the kernel only with submissions or flagged work.
+//!   Idle polls make no syscalls.
+//! - `uring-napi`: the same ring plus NAPI busy poll (static NAPI ids). An
+//!   idle poll waits in `io_uring_enter(GETEVENTS, 1, wait_us)`: the kernel
+//!   polls the NIC, then sleeps until a completion or the timeout. Even with
+//!   `wait_us = 0` it schedules on an expired timer, so it can sleep; with
 //!   `wait_us = 0` the NAPI budget is 0 (one pass).
 //! - `uring-sqpoll`: an `SQPOLL` kernel thread (optionally pinned) submits,
 //!   completes and polls the NIC; `poll` only reads the completion ring.
 //!
-//! Lifetimes: the kernel holds pointers into each connection's `MsgSlot`, receive
-//! buffer and send buffer until the matching completion is reaped. Closing a
-//! connection cancels its requests and keeps it alive until both completions
-//! arrive; dropping the driver cancels everything and reaps before freeing.
+//! Safety of in-flight operations:
 //!
-//! Requests are tagged with the slot, its generation (bumped for every new
-//! connection in the slot) and the operation, and cancels match that exact tag,
-//! so a late cancel can never reach a later connection that reuses the slot or
-//! the descriptor. Submissions that do not fit in the queue wait in a backlog
-//! and go in on the next poll; they are never treated as failures.
+//! - The kernel holds pointers into each connection's `MsgSlot`, receive
+//!   buffer and send buffer until the matching completion is reaped.
+//! - Closing a connection cancels its requests and keeps it alive until both
+//!   completions arrive; dropping the driver cancels everything and reaps
+//!   before freeing.
+//! - Requests are tagged with the slot, its generation (bumped for each new
+//!   connection in the slot) and the operation; cancels match that exact
+//!   tag, so a late cancel never reaches a later connection in the same slot
+//!   or descriptor.
+//! - Submissions that do not fit in the queue wait in a backlog for the next
+//!   poll; they are never failures.
 #![allow(unsafe_code)]
 
 use std::collections::VecDeque;
@@ -98,14 +100,13 @@ impl Uring {
             b.setup_sqpoll(cfg.sqpoll_idle_ms);
             // The SQPOLL thread inherits its creator's affinity: with a pinned
             // polling thread it would spin on the poller's own core and steal
-            // whole time slices. Without an explicit CPU, put it on a
-            // housekeeping CPU instead.
-            let cpu = cfg.sqpoll_cpu.or_else(|| {
-                sys::housekeeping_cpus(sys::current_cpu())
-                    .first()
-                    .and_then(|&c| u32::try_from(c).ok())
-            });
-            if let Some(cpu) = cpu {
+            // whole time slices. `Driver::new` has set its CPU
+            // (`placement::sqpoll_cpu`: `sqpoll_cpu`, else the first helper
+            // CPU — except an explicit helper list, the shared-work CPUs,
+            // where it takes a CPU of the process's own outside that list;
+            // inside the cpuset, where `io_uring_setup` refuses any other
+            // with EINVAL).
+            if let Some(cpu) = cfg.sqpoll_cpu {
                 b.setup_sqpoll_cpu(cpu);
             }
             b.setup_single_issuer();
@@ -323,6 +324,10 @@ impl Uring {
         if !conns.is_open(i) {
             return;
         }
+        let err = match conns.at(i) {
+            Some(c) => c.close_reason(err),
+            None => err,
+        };
         self.close(conns, i);
         stats.closed += 1;
         handler.on_closed(id, err);
@@ -472,9 +477,13 @@ impl Uring {
             if q.is_empty() {
                 continue;
             }
+            let n = q.len();
             let s = &mut self.slots[i];
             std::mem::swap(&mut s.send_buf, q);
             s.send_off = 0;
+            // Counted as handed once queued for the kernel: an upper bound,
+            // so a close before the kernel takes it errs towards "maybe sent".
+            c.on_handed(n);
             self.push_send(conns, i, stats);
         }
     }
@@ -635,10 +644,15 @@ impl Uring {
             std::hint::spin_loop();
         }
         while std::time::Instant::now() < deadline {
+            // A None timeout is `tv_sec = tv_nsec = -1`: the kernel waits
+            // until something is cancelled, which can outlast the one second
+            // this shutdown promises and defeat the safe-leak fallback. Pass
+            // what is left of the bound.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let _ = self
                 .ring
                 .submitter()
-                .register_sync_cancel(None, CancelBuilder::any());
+                .register_sync_cancel(Some(remaining.into()), CancelBuilder::any());
             let _ = self.ring.submitter().submit_and_wait(0);
             for cqe in self.ring.completion() {
                 let (i, g, op) = untag(cqe.user_data());

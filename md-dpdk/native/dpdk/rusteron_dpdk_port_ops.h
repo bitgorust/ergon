@@ -30,6 +30,19 @@ extern "C" {
  * (plan §9). */
 #define RUSTERON_DPDK_XSTAT_NAME_LEN 64
 
+/* How an ENA's low-latency queue (LLQ) BAR, BAR 2, is mapped in the process
+ * (dev_info's ena_llq). DPDK maps an ENA's prefetchable BAR through sysfs
+ * (igb_uio, uio_pci_generic) as `<bdf>/resource2_wc`, write-combined, when it
+ * can, else as the uncached `resource2`; without write-combining every send
+ * pushes its descriptors and headers through uncached stores, about 100 times
+ * slower. vfio-pci maps it through its device file, which /proc/self/maps
+ * cannot attribute to the BAR, let alone show write-combined. */
+#define RUSTERON_DPDK_ENA_LLQ_NA 0       /* not an ENA (not checked) */
+#define RUSTERON_DPDK_ENA_LLQ_WC 1       /* resource2_wc mapped: write-combined */
+#define RUSTERON_DPDK_ENA_LLQ_UNCACHED 2 /* resource2 mapped, not resource2_wc */
+#define RUSTERON_DPDK_ENA_LLQ_UNSEEN 3   /* no sysfs mapping of BAR 2 (vfio-pci, or none) */
+#define RUSTERON_DPDK_ENA_LLQ_UNKNOWN 4  /* /proc/self/maps unreadable */
+
 typedef struct rusteron_dpdk_port_ops_stct
 {
     /* Resolve a PCI BDF (and, when `mac` is non-NULL, the port on it with that
@@ -37,8 +50,9 @@ typedef struct rusteron_dpdk_port_ops_stct
     int (*probe_port)(const char *pci_bdf, const uint8_t *mac, uint16_t *port_id);
 
     /*
-     * Read the device MAC, driver name, whether IPv4/UDP checksum offloads,
-     * ENA LLQ/write-combining and RX hardware timestamps are supported, and the
+     * Read the device MAC, driver name, whether IPv4/UDP checksum offloads
+     * and RX hardware timestamps are supported, how an ENA's LLQ BAR is
+     * mapped (RUSTERON_DPDK_ENA_LLQ_*; NA for any other driver), and the
      * descriptor counts a queue may have: desc_lim is RX minimum, RX maximum,
      * TX minimum, TX maximum (0: no limit reported). 0 on success.
      */
@@ -48,7 +62,7 @@ typedef struct rusteron_dpdk_port_ops_stct
         uint8_t mac[RUSTERON_DPDK_ETH_ADDR_LEN],
         char *driver_name, size_t driver_name_len,
         int *csum_offload_ok,
-        int *ena_llq_available,
+        int *ena_llq,
         int *rx_timestamp_ok,
         uint16_t *max_mtu,
         uint16_t desc_lim[4]);
@@ -63,6 +77,11 @@ typedef struct rusteron_dpdk_port_ops_stct
     /* Each mbuf holds `data_room` bytes after the headroom, so a frame of the
      * configured MTU always fits one segment. */
     void *(*mempool_create)(const char *name, uint32_t n, uint16_t cache_size, uint16_t data_room);
+    /* The bytes of frame one of the pool's mbufs holds (its data room after
+     * the headroom), read from the pool: no mbuf is taken, as one taken and
+     * returned by the creating thread would leave a cache's worth in that
+     * lcore's mempool cache, out of the agents' reach. */
+    uint32_t (*mbuf_room)(void *mempool);
 
     /* Queue 0 on each direction, backed by the role mempool for RX. */
     int (*rx_queue_setup)(
@@ -125,6 +144,17 @@ typedef struct rusteron_dpdk_port_ops_stct
     /* The NIC's basic receive drop counters (rte_eth_stats: ierrors, imissed,
      * rx_nombuf), read by the housekeeping thread. 0 on success. */
     int (*basic_stats)(uint16_t port_id, uint64_t *ierrors, uint64_t *imissed, uint64_t *rx_nombuf);
+
+    /* Health (housekeeping thread only, never an agent). Run the PMDs' DPDK
+     * timers that are due: ENA's watchdog (device keep-alive, admin queue,
+     * missing transmit completions) is one, and runs only through this. The
+     * calling thread must be registered with DPDK. 0 on success. */
+    int (*timer_service)(void);
+    /* Count the port's device-reset requests (RTE_ETH_EVENT_INTR_RESET) into
+     * *resets, atomically, from whichever thread the PMD raises them on;
+     * unwatch_reset stops it before the port closes. 0 on success. */
+    int (*watch_reset)(uint16_t port_id, uint64_t *resets);
+    void (*unwatch_reset)(uint16_t port_id, uint64_t *resets);
 } rusteron_dpdk_port_ops_t;
 
 /*

@@ -25,12 +25,19 @@
 #     watcher re-pins an ENA queue IRQ put back on its hint once a link event
 #     follows; the bootstrap starts the watcher and provisioning installs and
 #     enables it;
-#   * provision-node.sh computes the kernel command line from the topology
-#     (the C-state cap on VMs only), retries its network steps, holds kubelet
-#     back when it fails, and does nothing on an already provisioned node;
+#   * provision-node.sh turns SMT off where the node still has it (bare metal:
+#     no EC2 CPU options there) before it computes the CPU lists, so one
+#     Kubernetes CPU is one physical core as the launch template leaves it;
+#     it computes the kernel command line from that topology (nosmt, the
+#     C-state cap on VMs only), retries its network steps, holds kubelet back
+#     when it fails, and does nothing on an already provisioned node;
 #   * userdata.sh fits EC2's user-data limit gzipped with an incompressible
-#     CA, carries the kubelet settings (no Memory Manager) and embeds the node
+#     CA, carries the kubelet settings (no Memory Manager, CPU quota left at
+#     its default so every pod's CPU limit holds) and embeds the node
 #     scripts as their header and code, which pass the bootstrap's dry run;
+#   * launch-template.py puts CpuOptions ThreadsPerCore=1 (and the CoreCount
+#     EC2 requires with it) in an x86 latency node group's launch template,
+#     and none for Graviton or bare metal;
 #   * the entrypoint maps a 4-core cpuset to housekeeping, sender and
 #     receiver with no spinning conductor, taking the cpuset from
 #     Cpus_allowed_list, never from the cgroup files a privileged pod sees.
@@ -123,7 +130,9 @@ expect_fail() {
 }
 
 # --- fake sysfs -------------------------------------------------------------
-# A c7i.4xlarge: 16 CPUs, 8 cores, SMT twins N and N+8, one NUMA node.
+# A c7i.4xlarge as the launch template leaves it (CpuOptions ThreadsPerCore=1):
+# 8 CPUs, 8 cores, one thread per core, one NUMA node. The SMT-on twin world
+# of a bare metal first boot (16 CPUs, twins N and N+8) is section 5b.
 mkdir -p "$SYSFS/kernel/iommu_groups" \
     "$SYSFS/bus/pci/drivers/ena" "$SYSFS/bus/pci/drivers/igb_uio" "$SYSFS/bus/pci/drivers/vfio-pci" \
     "$SYSFS/module/uio" "$SYSFS/module/igb_uio" \
@@ -133,12 +142,14 @@ echo 2048 > "$SYSFS/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
 echo 2048 > "$SYSFS/kernel/mm/hugepages/hugepages-2048kB/free_hugepages"
 echo "always [madvise] never" > "$SYSFS/kernel/mm/transparent_hugepage/enabled"
 echo 1 > "$SYSFS/kernel/mm/ksm/run"
-mkdir -p "$SYSFS/devices/system/cpu"
-echo 0-15 > "$SYSFS/devices/system/cpu/online"
-for cpu in $(seq 0 15); do
+mkdir -p "$SYSFS/devices/system/cpu/smt"
+echo 0-7 > "$SYSFS/devices/system/cpu/online"
+for cpu in $(seq 0 7); do
     mkdir -p "$SYSFS/devices/system/cpu/cpu$cpu/topology"
-    echo "$((cpu % 8)),$((cpu % 8 + 8))" > "$SYSFS/devices/system/cpu/cpu$cpu/topology/thread_siblings_list"
+    echo "$cpu" > "$SYSFS/devices/system/cpu/cpu$cpu/topology/thread_siblings_list"
 done
+echo 0 > "$SYSFS/devices/system/cpu/smt/active"
+echo on > "$SYSFS/devices/system/cpu/smt/control"
 # An EBS NVMe controller: Amazon's vendor id too, but no ENA.
 mkdir -p "$SYSFS/bus/pci/devices/0000:00:04.0"
 echo "0x1d0f"   > "$SYSFS/bus/pci/devices/0000:00:04.0/vendor"
@@ -150,9 +161,9 @@ make_pci 0000:00:08.0 eth3 "$CNI_MAC"      0 ""     # VPC CNI ENI (excluded)
 
 # --- fake /proc -------------------------------------------------------------
 mkdir -p "$PROC/irq/24" "$PROC/irq/25" "$PROC/sys/kernel" "$PROC/sys/vm" "$PROC/sys/net/core"
-echo 0-15 > "$PROC/irq/24/smp_affinity_list"
-echo 0-15 > "$PROC/irq/25/smp_affinity_list"
-echo ffff > "$PROC/irq/default_smp_affinity"
+echo 0-7 > "$PROC/irq/24/smp_affinity_list"
+echo 0-7 > "$PROC/irq/25/smp_affinity_list"
+echo ff > "$PROC/irq/default_smp_affinity"
 echo 1 > "$PROC/sys/kernel/numa_balancing"
 echo 67584 > "$PROC/sys/vm/min_free_kbytes"
 echo 0 > "$PROC/sys/net/core/busy_poll"
@@ -164,9 +175,9 @@ printf 'MemTotal:       32000000 kB\nMemFree:        30000000 kB\n' > "$PROC/mem
 VM_CPUINFO="$(printf 'processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) Platinum 8488C\nflags\t\t: fpu tsc constant_tsc nonstop_tsc avx512f hypervisor waitpkg\n')"
 METAL_CPUINFO="${VM_CPUINFO/ hypervisor/}"
 echo "$VM_CPUINFO" > "$PROC/cpuinfo"
-ISO="1-7,9-15"
-# As provision-node.sh writes it: the C-state cap on a VM only.
-ISOLATION="isolcpus=nohz,domain,managed_irq,$ISO nohz_full=$ISO rcu_nocbs=$ISO irqaffinity=0,8"
+ISO="1-7"
+# As provision-node.sh writes it: nosmt always, the C-state cap on a VM only.
+ISOLATION="nosmt isolcpus=nohz,domain,managed_irq,$ISO nohz_full=$ISO rcu_nocbs=$ISO irqaffinity=0"
 COMMON_ARGS="clocksource=tsc tsc=reliable iommu=pt transparent_hugepage=never hugepagesz=2M hugepages=2048"
 PROVISIONED_CMDLINE="BOOT_IMAGE=(hd0,gpt1)/boot/vmlinuz root=UUID=x ro $ISOLATION intel_idle.max_cstate=1 processor.max_cstate=1 $COMMON_ARGS"
 METAL_CMDLINE="BOOT_IMAGE=(hd0,gpt1)/boot/vmlinuz root=UUID=x ro $ISOLATION $COMMON_ARGS"
@@ -286,9 +297,9 @@ grep -n -e 'unmanaged' -e 'would bind' "$TMP/bootstrap.err" | head -1 | grep -q 
     || die "the ENAs were bound before systemd-networkd was told to leave them alone"
 
 # Per-boot host tuning, written to the fixture files.
-assert_file "$PROC/irq/24/smp_affinity_list" "0,8"
-assert_file "$PROC/irq/25/smp_affinity_list" "0,8"
-assert_file "$PROC/irq/default_smp_affinity" "101"
+assert_file "$PROC/irq/24/smp_affinity_list" "0"
+assert_file "$PROC/irq/25/smp_affinity_list" "0"
+assert_file "$PROC/irq/default_smp_affinity" "1"
 assert_file "$SYSFS/kernel/mm/transparent_hugepage/enabled" "never"
 assert_file "$SYSFS/kernel/mm/ksm/run" "0"
 assert_file "$PROC/sys/kernel/numa_balancing" "0"
@@ -348,13 +359,13 @@ make_irq 27 0 0 ena-mgmnt@pci:0000:00:05.0
 # allocates vectors for every queue it could have) fires nowhere, wherever x86
 # parks it (the first online CPU, isolated when housekeeping is not CPU 0).
 mkdir -p "$PROC/irq/30"
-echo 0,8 > "$PROC/irq/30/smp_affinity_list"
+echo 0 > "$PROC/irq/30/smp_affinity_list"
 echo 3 > "$PROC/irq/30/effective_affinity_list"
 fixture_env "$IRQ_AFFINITY" pin 2>"$TMP/irq.err" || { cat "$TMP/irq.err" >&2; die "irq-affinity pin failed"; }
 cat "$TMP/irq.err"
-assert_file "$PROC/irq/26/smp_affinity_list" "0,8"
+assert_file "$PROC/irq/26/smp_affinity_list" "0"
 assert_file "$PROC/irq/27/smp_affinity_list" "0"
-assert_grep "IRQs on CPUs 0,8 (1 moved, 0 refused by the kernel)" "$TMP/irq.err"
+assert_grep "IRQs on CPUs 0 (1 moved, 0 refused by the kernel)" "$TMP/irq.err"
 assert_no_grep "isolated" "$TMP/irq.err"
 
 # x86 without interrupt remapping (an EC2 VM) moves an MSI only at its next
@@ -364,7 +375,7 @@ assert_no_grep "isolated" "$TMP/irq.err"
 make_irq 31 6 6 eth0-Tx-Rx-6
 fixture_env "$IRQ_AFFINITY" pin 2>"$TMP/irq.err" \
     || { cat "$TMP/irq.err" >&2; die "irq-affinity pin failed on an IRQ whose move waits for its next interrupt"; }
-assert_file "$PROC/irq/31/smp_affinity_list" "0,8"
+assert_file "$PROC/irq/31/smp_affinity_list" "0"
 assert_grep "IRQ 31 (eth0-Tx-Rx-6) on isolated CPUs 6 until its next interrupt" "$TMP/irq.err"
 fixture_env RUSTERON_DRY_RUN=1 "$BOOTSTRAP" 2>"$TMP/irq.err" \
     || { cat "$TMP/irq.err" >&2; die "bootstrap failed on an IRQ whose move waits for its next interrupt"; }
@@ -396,7 +407,7 @@ ln -s "$TMP/no-such-dir/smp_affinity_list" "$PROC/irq/29/smp_affinity_list"
 echo 6 > "$PROC/irq/29/effective_affinity_list"
 fixture_env "$IRQ_AFFINITY" pin 2>"$TMP/irq.err" || { cat "$TMP/irq.err" >&2; die "irq-affinity pin failed on a managed IRQ"; }
 assert_grep "IRQ 29 (nvme0q6) on isolated CPUs 6: the kernel refuses to move it" "$TMP/irq.err"
-assert_grep "IRQs on CPUs 0,8 (0 moved, 1 refused by the kernel)" "$TMP/irq.err"
+assert_grep "IRQs on CPUs 0 (0 moved, 1 refused by the kernel)" "$TMP/irq.err"
 fixture_env RUSTERON_DRY_RUN=1 "$BOOTSTRAP" 2>"$TMP/irq.err" \
     || { cat "$TMP/irq.err" >&2; die "bootstrap failed on a managed IRQ"; }
 assert_grep "IRQ 29 (nvme0q6) on isolated CPUs 6" "$TMP/irq.err"
@@ -414,8 +425,8 @@ EOF
 chmod +x "$TMP/link-monitor"
 expect_fail "irq-affinity watch, its link monitor ended" "link monitor" \
     fixture_env RUSTERON_LINK_MONITOR="$TMP/link-monitor" "$IRQ_AFFINITY" watch
-assert_file "$PROC/irq/26/smp_affinity_list" "0,8"
-assert_grep "moved IRQ 26 (eth0-Tx-Rx-3) from CPUs 3 to 0,8" "$TMP/err"
+assert_file "$PROC/irq/26/smp_affinity_list" "0"
+assert_grep "moved IRQ 26 (eth0-Tx-Rx-3) from CPUs 3 to 0" "$TMP/err"
 expect_fail "irq-affinity without a mode" "usage" fixture_env "$IRQ_AFFINITY"
 expect_fail "irq-affinity, housekeeping CPUs unparsed" "RUSTERON_HOUSEKEEPING_CPUS" \
     fixture_env RUSTERON_HOUSEKEEPING_CPUS="0;8" "$IRQ_AFFINITY" pin
@@ -460,7 +471,7 @@ expect_fail "bootstrap dry run on the host's networkd directory" "RUSTERON_DRY_R
 # A kernel command line without the isolation flags fails the boot's bootstrap.
 echo "BOOT_IMAGE=/boot/vmlinuz ro" > "$PROC/cmdline"
 expect_fail "bootstrap unprovisioned kernel" "isolcpus" fixture_env RUSTERON_DRY_RUN=1 "$BOOTSTRAP"
-echo "${PROVISIONED_CMDLINE/irqaffinity=0,8/irqaffinity=0}" > "$PROC/cmdline"
+echo "${PROVISIONED_CMDLINE/irqaffinity=0/irqaffinity=1}" > "$PROC/cmdline"
 expect_fail "bootstrap irqaffinity mismatch" "irqaffinity" fixture_env RUSTERON_DRY_RUN=1 "$BOOTSTRAP"
 # A VM is capped at C1; bare metal is not (C1 did not help there: AWS round 4).
 echo "$METAL_CMDLINE" > "$PROC/cmdline"
@@ -506,7 +517,7 @@ rmdir "$SYSFS/kernel/iommu_groups/"{11,12}
 # --- 5. provision-node.sh ----------------------------------------------------
 echo "== provision-node.sh (dry run) =="
 echo "BOOT_IMAGE=/boot/vmlinuz ro" > "$PROC/cmdline"
-printf 'RUSTERON_HOUSEKEEPING_CPUS=0,8\nRUSTERON_DPDK_DEVICE_NUMBERS="1 2"\nRUSTERON_HUGEPAGES=2048\n' > "$TMP/node.env"
+printf 'RUSTERON_HOUSEKEEPING_CPUS=0\nRUSTERON_DPDK_DEVICE_NUMBERS="1 2"\nRUSTERON_HUGEPAGES=2048\n' > "$TMP/node.env"
 fixture_env RUSTERON_NODE_ENV="$TMP/node.env" RUSTERON_DRY_RUN=1 "$PROVISION" 2>"$TMP/provision.err" \
     || { cat "$TMP/provision.err" >&2; die "provision failed"; }
 cat "$TMP/provision.err"
@@ -520,6 +531,9 @@ assert_grep "rusteron-irq-affinity.service /etc/systemd/system/rusteron-irq-affi
 assert_grep "dry-run: would run: systemctl enable rusteron-dpdk-ena.service rusteron-irq-affinity.service" "$TMP/provision.err"
 assert_grep "dry-run: would run: systemctl reboot" "$TMP/provision.err"
 assert_no_grep "hold kubelet" "$TMP/provision.err"
+# SMT is already off here (the launch template's ThreadsPerCore=1): nothing to
+# write, and nosmt is still on the command line for every later boot.
+assert_no_grep "SMT" "$TMP/provision.err"
 # Bare metal (no hypervisor flag): no C-state cap, iommu=pt for igb_uio.
 echo "$METAL_CPUINFO" > "$PROC/cpuinfo"
 fixture_env RUSTERON_NODE_ENV="$TMP/node.env" RUSTERON_DRY_RUN=1 "$PROVISION" 2>"$TMP/provision.err" \
@@ -527,17 +541,17 @@ fixture_env RUSTERON_NODE_ENV="$TMP/node.env" RUSTERON_DRY_RUN=1 "$PROVISION" 2>
 assert_grep "dry-run: kernel args: $ISOLATION $COMMON_ARGS" "$TMP/provision.err"
 assert_no_grep "max_cstate" "$TMP/provision.err"
 echo "$VM_CPUINFO" > "$PROC/cpuinfo"
-# The housekeeping CPUs default to cpu0's core.
+# The housekeeping CPUs default to cpu0's core, one CPU (its only thread).
 fixture_env RUSTERON_DRY_RUN=1 "$PROVISION" 2>"$TMP/provision.err" \
     || { cat "$TMP/provision.err" >&2; die "provision with default housekeeping failed"; }
-assert_grep "irqaffinity=0,8 " "$TMP/provision.err"
-expect_fail "provision half a core" "whole cores" \
-    fixture_env RUSTERON_HOUSEKEEPING_CPUS=0 RUSTERON_DRY_RUN=1 "$PROVISION"
+assert_grep "irqaffinity=0 " "$TMP/provision.err"
+expect_fail "provision housekeeping CPU not online" "not online" \
+    fixture_env RUSTERON_HOUSEKEEPING_CPUS=8 RUSTERON_DRY_RUN=1 "$PROVISION"
 # A failed provision holds kubelet back, so the node never joins with the
 # DPDK label and taint.
 assert_grep "dry-run: would hold kubelet back" "$TMP/err"
 expect_fail "provision too few cores" "physical cores" \
-    fixture_env RUSTERON_HOUSEKEEPING_CPUS=0-4,8-12 RUSTERON_DRY_RUN=1 "$PROVISION"
+    fixture_env RUSTERON_HOUSEKEEPING_CPUS=0-4 RUSTERON_DRY_RUN=1 "$PROVISION"
 expect_fail "provision dry run on the host's /sys" "RUSTERON_DRY_RUN" \
     fixture_env RUSTERON_SYSFS_ROOT=/sys RUSTERON_DRY_RUN=1 "$PROVISION"
 cp "$PROC/cpuinfo" "$TMP/cpuinfo.intel"
@@ -553,13 +567,53 @@ assert_no_grep "would run" "$TMP/provision.err"
 assert_no_grep "hold kubelet" "$TMP/provision.err"
 echo "provision assertions PASSED"
 
+# --- 5b. provision turns SMT off (a bare metal first boot) -------------------
+# EC2's CpuOptions cover a VM only, so a bare metal node still has SMT when
+# this runs. The kernel keeps listing the offline twins in the topology after
+# nosmt, so the CPU lists come from one CPU per physical core (the lowest id),
+# and naming a twin fails: that CPU will not run.
+echo "== provision-node.sh (SMT on: a bare metal node) =="
+for cpu in $(seq 0 15); do
+    mkdir -p "$SYSFS/devices/system/cpu/cpu$cpu/topology"
+    echo "$((cpu % 8)),$((cpu % 8 + 8))" > "$SYSFS/devices/system/cpu/cpu$cpu/topology/thread_siblings_list"
+done
+echo 0-15 > "$SYSFS/devices/system/cpu/online"
+echo 1 > "$SYSFS/devices/system/cpu/smt/active"
+echo on > "$SYSFS/devices/system/cpu/smt/control"
+echo "BOOT_IMAGE=/boot/vmlinuz ro" > "$PROC/cmdline"
+printf 'RUSTERON_DPDK_DEVICE_NUMBERS="1 2"\nRUSTERON_HUGEPAGES=2048\n' > "$TMP/node.env"
+fixture_env RUSTERON_NODE_ENV="$TMP/node.env" RUSTERON_DRY_RUN=1 "$PROVISION" 2>"$TMP/smt.err" \
+    || { cat "$TMP/smt.err" >&2; die "provision with SMT on failed"; }
+cat "$TMP/smt.err"
+# The last resort before kubelet's first start, written to the fixture.
+assert_file "$SYSFS/devices/system/cpu/smt/control" "off"
+assert_grep "SMT turned off" "$TMP/smt.err"
+# Housekeeping is cpu0's core, one CPU; the isolated list is the other
+# physical cores, never the twins that SMT-off takes down.
+assert_grep "dry-run: kernel args: nosmt isolcpus=nohz,domain,managed_irq,1-7 nohz_full=1-7 rcu_nocbs=1-7 irqaffinity=0 " "$TMP/smt.err"
+assert_no_grep "irqaffinity=0,8" "$TMP/smt.err"
+assert_no_grep "9-15" "$TMP/smt.err"
+expect_fail "provision names an SMT twin" "will not run with SMT off" \
+    fixture_env RUSTERON_HOUSEKEEPING_CPUS=0,8 RUSTERON_DRY_RUN=1 "$PROVISION"
+assert_grep "hold kubelet back" "$TMP/err"
+# Back to the launch template's SMT-off world for the rest of the test.
+for cpu in $(seq 0 7); do
+    echo "$cpu" > "$SYSFS/devices/system/cpu/cpu$cpu/topology/thread_siblings_list"
+done
+for cpu in $(seq 8 15); do rm -rf "$SYSFS/devices/system/cpu/cpu$cpu"; done
+echo 0-7 > "$SYSFS/devices/system/cpu/online"
+echo 0 > "$SYSFS/devices/system/cpu/smt/active"
+echo on > "$SYSFS/devices/system/cpu/smt/control"
+echo "$PROVISIONED_CMDLINE" > "$PROC/cmdline"
+echo "SMT transition assertions PASSED"
+
 # --- 6. userdata.sh ----------------------------------------------------------
 echo "== userdata.sh =="
 # As long as an EKS cluster's CA data (base64 of a PEM certificate, about
 # 1.5 KB) and as incompressible: zeros would gzip to nothing and make the size
 # check meaningless.
 CA_B64="$(python3 -c 'import base64, random; print(base64.b64encode(random.Random(1).randbytes(1100)).decode())')"
-"$USERDATA" ergon-lab-test https://ABC.gr7.us-east-1.eks.amazonaws.com "$CA_B64" 172.20.0.0/16 0,8 > "$TMP/userdata.gz"
+"$USERDATA" ergon-lab-test https://ABC.gr7.us-east-1.eks.amazonaws.com "$CA_B64" 172.20.0.0/16 0 > "$TMP/userdata.gz"
 size="$(wc -c < "$TMP/userdata.gz" | tr -d ' ')"
 echo "user data: $size bytes gzipped"
 ((size <= 16384)) || die "user data is $size bytes, over EC2's 16384"
@@ -577,7 +631,7 @@ for needle in \
     'cidr: 172.20.0.0/16' \
     'cpuManagerPolicy: static' \
     'full-pcpus-only: "true"' \
-    'reservedSystemCPUs: "0,8"' \
+    'reservedSystemCPUs: "0"' \
     'kubeReservedCgroup: ""' \
     'systemReservedCgroup: ""' \
     'topologyManagerPolicy: single-numa-node' \
@@ -585,7 +639,7 @@ for needle in \
     'memoryManagerPolicy: None' \
     '--node-labels=rusteron-dpdk/ena=true' \
     '--register-with-taints=rusteron-dpdk=true:NoSchedule' \
-    'RUSTERON_HOUSEKEEPING_CPUS=0,8' \
+    'RUSTERON_HOUSEKEEPING_CPUS=0' \
     'RUSTERON_DPDK_DEVICE_NUMBERS="1 2"' \
     'RUSTERON_HUGEPAGES=2048' \
     'exec ./provision-node.sh' \
@@ -595,6 +649,13 @@ done
 # The Memory Manager stays off: every c7i size below metal-48xl has one NUMA
 # node, and Static would need reservedMemory to match the reservations exactly.
 for needle in 'memoryManagerPolicy: Static' reservedMemory 'kubeReserved:' 'systemReserved:' evictionHard; do
+    assert_no_grep "$needle" "$TMP/userdata.mime"
+done
+# The CPU quota setting stays at kubelet's default (true), so every pod's CPU
+# limit holds: kubelet 1.33+ drops the quota itself only for containers with
+# exclusive CPUs. `cpuCFSQuota: false` would remove the limit of every pod on
+# the node.
+for needle in cpuCFSQuota cpu-cfs-quota; do
     assert_no_grep "$needle" "$TMP/userdata.mime"
 done
 # The MIME document parses into the two parts, and the shell part writes each
@@ -630,6 +691,52 @@ expect_fail "userdata bad reserved CPUs" "reserved" \
     "$USERDATA" ergon-lab-test https://x "$CA_B64" 172.20.0.0/16 "0;8"
 expect_fail "userdata missing arguments" "usage" "$USERDATA" ergon-lab-test
 echo "userdata assertions PASSED"
+
+# --- 6b. launch-template.py --------------------------------------------------
+# CpuOptions ThreadsPerCore=1 (with the CoreCount EC2 requires alongside it)
+# turns SMT off on an x86 latency node group; Graviton and bare metal get none.
+echo "== launch-template.py =="
+LT="$NODE_DIR/launch-template.py"
+printf 'user data bytes' > "$TMP/lt-userdata"
+lt_json() { # out instance-type vcpus cores threads-per-core arch
+    python3 "$LT" ami-0123456789abcdef0 "$2" arn:aws:iam::123456789012:instance-profile/ergon-lab \
+        "$TMP/lt-userdata" 20261017 ergon-lab-test "$3" "$4" "$5" "$6" > "$1"
+}
+lt_json "$TMP/lt.json" c7i.4xlarge 16 8 2 x86_64
+python3 - "$TMP/lt.json" <<'PY' || die "launch-template c7i.4xlarge"
+import base64, json, sys
+data = json.load(open(sys.argv[1]))
+assert data["CpuOptions"] == {"CoreCount": 8, "ThreadsPerCore": 1}, data.get("CpuOptions")
+assert data["InstanceType"] == "c7i.4xlarge"
+assert base64.b64decode(data["UserData"]) == b"user data bytes"
+assert any(t["ResourceType"] == "instance" for t in data["TagSpecifications"])
+PY
+# Graviton is already one thread per core, and EC2 takes no CPU options there.
+lt_json "$TMP/lt.json" c8g.4xlarge 16 16 1 arm64
+python3 - "$TMP/lt.json" <<'PY' || die "launch-template c8g.4xlarge"
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert "CpuOptions" not in data, data["CpuOptions"]
+PY
+# Bare metal takes no CPU options at all (provision-node.sh turns SMT off).
+lt_json "$TMP/lt.json" c7i.metal-24xl 96 48 2 x86_64
+python3 - "$TMP/lt.json" <<'PY' || die "launch-template c7i.metal-24xl"
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert "CpuOptions" not in data, data["CpuOptions"]
+PY
+# C7a (like M7a and R7a) already runs one thread per core and takes no change.
+lt_json "$TMP/lt.json" c7a.4xlarge 8 8 1 x86_64
+python3 - "$TMP/lt.json" <<'PY' || die "launch-template c7a.4xlarge"
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert "CpuOptions" not in data, data["CpuOptions"]
+PY
+expect_fail "launch-template cores over vCPUs" "over" \
+    python3 "$LT" ami-1 c7i.4xlarge arn:x "$TMP/lt-userdata" s n 16 16 2 x86_64
+expect_fail "launch-template missing arguments" "usage" \
+    python3 "$LT" ami-1 c7i.4xlarge
+echo "launch-template assertions PASSED"
 
 # --- 7. entrypoint CPU layout ------------------------------------------------
 echo "== entrypoint (cpuset 1-4,9-12 on 16 CPUs) =="

@@ -1,4 +1,8 @@
 //! Compile `ClusterLauncher` against locally built Aeron jars.
+//!
+//! The JDK is `$JAVA_HOME` when set, else `javac` on `PATH`, as for Gradle.
+//! `ClusterLauncher` is compiled for Java 17 (`--release 17`), as Aeron's own
+//! classes are, so it runs on any JDK from 17 up whichever JDK compiled it.
 #![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::restriction)]
 
 use std::fs;
@@ -30,9 +34,13 @@ fn compile_test_harness_java(manifest_dir: &Path, aeron_dir: &Path, java_out: &P
                 ":aeron-samples:jar",
             ])
             .status()
-            .expect("failed to run Gradle — is Java 17+ installed?");
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", gradle.display()));
         if !status.success() {
-            panic!("Gradle jar build failed with exit code: {status}");
+            panic!(
+                "Gradle jar build failed ({status}). Aeron's Gradle wrapper (9.7.1 at Aeron 1.53.3) \
+                 runs on JDK 17 to 26, not 27 or newer: set JAVA_HOME to a JDK 25 and run \
+                 `just build-aeron-jars`"
+            );
         }
     }
 
@@ -52,18 +60,32 @@ fn compile_test_harness_java(manifest_dir: &Path, aeron_dir: &Path, java_out: &P
     .expect("Java classpath entries must be valid paths");
     eprintln!("Compiling ClusterLauncher into {}", java_out.display());
     let _ = fs::create_dir_all(java_out);
-    let status = std::process::Command::new("javac")
-        .args(["-encoding", "UTF-8", "-cp"])
+    let javac = match std::env::var_os("JAVA_HOME") {
+        Some(home) if !home.is_empty() => PathBuf::from(home).join("bin").join("javac"),
+        _ => PathBuf::from("javac"),
+    };
+    let status = std::process::Command::new(&javac)
+        .args(["--release", "17", "-encoding", "UTF-8", "-cp"])
         .arg(&cp)
         .arg("-d")
         .arg(java_out)
         .arg(&java_src)
         .status()
-        .expect("failed to run javac — is Java 17+ installed?");
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to run {}: {e}: set JAVA_HOME to a JDK 25 (17 or newer)",
+                javac.display()
+            )
+        });
     if !status.success() {
-        panic!("javac failed to compile ClusterLauncher");
+        panic!(
+            "{} failed to compile ClusterLauncher ({status}); `release version 17 not \
+             supported` above means a JDK older than 17: set JAVA_HOME to a JDK 25 (17 or newer)",
+            javac.display()
+        );
     }
 
     println!("cargo::rerun-if-changed=src/test_support/java/ClusterLauncher.java");
+    println!("cargo::rerun-if-env-changed=JAVA_HOME");
     println!("cargo::rerun-if-changed=../aeron/aeron-all/build/libs");
 }

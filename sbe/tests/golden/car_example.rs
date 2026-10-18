@@ -251,7 +251,8 @@ pub mod sbe_rt {
         },
         /// Checked arithmetic overflow in encoded length computation.
         EncodedLengthOverflow,
-        /// A domain-type conversion failed.
+        /// A domain-type conversion failed, as hand-written encode code
+        /// reports it. Generated encoders report `Conversion`.
         DomainConversionFailed {
             ///Generated field `field`.
             field: &'static str,
@@ -260,6 +261,51 @@ pub mod sbe_rt {
         },
         /// Nested decode failure during encode/verify paths.
         Decode(DecodeError),
+        /// `Some` of an optional field's null value (NaN for a float
+        /// without another `nullValue`), which reads back as `None`.
+        SomeNullValue {
+            ///Generated field `at`.
+            at: FieldPath,
+        },
+        /// A domain conversion refused the value at `at` (`None` from
+        /// a mapped setter's `?`).
+        Conversion {
+            ///Generated field `at`.
+            at: Option<FieldPath>,
+            ///Generated field `error`.
+            error: ConversionError,
+        },
+    }
+    impl EncodeError {
+        /// Add entry `index` of the group being encoded to the path.
+        #[cold]
+        #[must_use]
+        pub(crate) fn in_entry(self, index: usize) -> Self {
+            match self {
+                Self::SomeNullValue { at } => {
+                    Self::SomeNullValue {
+                        at: at.in_entry(index),
+                    }
+                }
+                Self::Conversion { at: Some(at), error } => {
+                    Self::Conversion {
+                        at: Some(at.in_entry(index)),
+                        error,
+                    }
+                }
+                other => other,
+            }
+        }
+    }
+    impl From<MappingError> for EncodeError {
+        /// A mapped setter's refusal, so `?` works in an encode closure.
+        #[inline]
+        fn from(error: MappingError) -> Self {
+            Self::Conversion {
+                at: None,
+                error: ConversionError::Mapping(error),
+            }
+        }
     }
     impl core::fmt::Display for EncodeError {
         #[cold]
@@ -319,6 +365,15 @@ pub mod sbe_rt {
                     write!(f, "domain conversion failed for field {field}: {reason}")
                 }
                 Self::Decode(e) => write!(f, "decode error: {e}"),
+                Self::SomeNullValue { at } => {
+                    write!(f, "field {at}: Some(null value) reads back as None")
+                }
+                Self::Conversion { at: Some(at), error } => {
+                    write!(f, "domain conversion failed for field {at}: {error}")
+                }
+                Self::Conversion { at: None, error } => {
+                    write!(f, "domain conversion failed: {error}")
+                }
             }
         }
     }
@@ -326,6 +381,107 @@ pub mod sbe_rt {
         fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
             match self {
                 Self::Decode(e) => Some(e),
+                Self::Conversion { error, .. } => Some(error),
+                _ => None,
+            }
+        }
+    }
+    /// Where an encoder refused a value: the field's schema path
+    /// (`fills.allocs.qty`) and its entry index in each group on the
+    /// way. `Display`: `fills[1].allocs[0].qty`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FieldPath {
+        field: &'static str,
+        entries: [u32; FieldPath::MAX_ENTRIES],
+        depth: u8,
+    }
+    impl FieldPath {
+        /// Entry indices kept, outermost first; deeper ones show as `[?]`.
+        pub const MAX_ENTRIES: usize = 3;
+        pub(crate) const fn new(field: &'static str) -> Self {
+            Self {
+                field,
+                entries: [0; Self::MAX_ENTRIES],
+                depth: 0,
+            }
+        }
+        /// The groups and the field, in schema names joined by `.`.
+        #[must_use]
+        pub const fn field(&self) -> &'static str {
+            self.field
+        }
+        /// The entry index in each group on the path, outermost first.
+        #[must_use]
+        pub fn entries(&self) -> &[u32] {
+            &self.entries[..Self::MAX_ENTRIES.min(self.depth.into())]
+        }
+        fn in_entry(mut self, index: usize) -> Self {
+            self.entries.rotate_right(1);
+            self.entries[0] = u32::try_from(index).unwrap_or(u32::MAX);
+            self.depth = self.depth.saturating_add(1);
+            self
+        }
+    }
+    impl core::fmt::Display for FieldPath {
+        #[cold]
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut entries = self.entries().iter();
+            let mut segments = self.field.split('.').peekable();
+            while let Some(segment) = segments.next() {
+                f.write_str(segment)?;
+                if segments.peek().is_some() {
+                    match entries.next() {
+                        Some(index) => write!(f, "[{index}].")?,
+                        None => f.write_str("[?].")?,
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+    /// A domain conversion's refusal, `Copy` so `EncodeError` stays `Copy`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ConversionError {
+        /// A generated enum or composite mapping refused it.
+        Mapping(MappingError),
+        /// The conversion's `&'static str` error.
+        Reason(&'static str),
+        /// Any other error type, named; the domain setter returns it whole.
+        Custom {
+            ///Generated field `error_type`.
+            error_type: &'static str,
+        },
+    }
+    impl ConversionError {
+        #[cold]
+        #[inline(never)]
+        pub(crate) fn of<E: core::any::Any>(error: E) -> Self {
+            let any: &dyn core::any::Any = &error;
+            if let Some(mapping) = any.downcast_ref::<MappingError>() {
+                Self::Mapping(*mapping)
+            } else if let Some(reason) = any.downcast_ref::<&'static str>() {
+                Self::Reason(reason)
+            } else {
+                Self::Custom {
+                    error_type: core::any::type_name::<E>(),
+                }
+            }
+        }
+    }
+    impl core::fmt::Display for ConversionError {
+        #[cold]
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Self::Mapping(e) => write!(f, "{e}"),
+                Self::Reason(reason) => f.write_str(reason),
+                Self::Custom { error_type } => write!(f, "refused with a `{error_type}`"),
+            }
+        }
+    }
+    impl core::error::Error for ConversionError {
+        fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+            match self {
+                Self::Mapping(e) => Some(e),
                 _ => None,
             }
         }
@@ -335,6 +491,184 @@ pub mod sbe_rt {
         fn from(e: DecodeError) -> Self {
             Self::Decode(e)
         }
+    }
+    /// Why a generated enum or composite mapping refused a value; it
+    /// never substitutes a default.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MappingError {
+        /// `NullVal` (the null value, or an undeclared discriminant the
+        /// decoder folds into it) has no application value.
+        NullEnum {
+            ///Generated field `enum_name`.
+            enum_name: &'static str,
+        },
+        /// `Some` of an optional member's null value, which reads back
+        /// as `None`.
+        SomeNullValue {
+            ///Generated field `composite`.
+            composite: &'static str,
+            ///Generated field `member`.
+            member: &'static str,
+        },
+    }
+    impl core::fmt::Display for MappingError {
+        #[cold]
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Self::NullEnum { enum_name } => {
+                    write!(f, "{enum_name}::NullVal has no application value")
+                }
+                Self::SomeNullValue { composite, member } => {
+                    write!(
+                        f, "{composite}.{member}: Some(null value) reads back as None"
+                    )
+                }
+            }
+        }
+    }
+    impl core::error::Error for MappingError {}
+    /// A region reserved for one frame (an Aeron `try_claim`, a ring
+    /// slot, an [`OfferClaim`]). [`send_frame`] encodes into it, then
+    /// commits it or, on any error or panic, aborts it.
+    pub trait Claim {
+        /// What the transport reports when it cannot publish.
+        type Error;
+        /// The claimed bytes, which the frame must fill exactly. Hand
+        /// them out zeroed: no encoder writes a block's padding.
+        fn frame_mut(&mut self) -> &mut [u8];
+        /// Publish the frame.
+        fn commit(self) -> Result<(), Self::Error>;
+        /// Give the region back unpublished.
+        fn abort(self);
+    }
+    /// Why [`send_frame`] published nothing; the claim was aborted
+    /// unless the transport refused the commit.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SendError<E> {
+        /// The encoder refused the frame.
+        Encode(EncodeError),
+        /// The frame's length is not the claim's.
+        LengthMismatch {
+            ///Generated field `claimed`.
+            claimed: usize,
+            ///Generated field `frame`.
+            frame: usize,
+        },
+        /// The frame does not start with the message's header.
+        HeaderMismatch,
+        /// The transport refused to publish.
+        Commit(E),
+    }
+    impl<E> From<EncodeError> for SendError<E> {
+        #[inline]
+        fn from(e: EncodeError) -> Self {
+            Self::Encode(e)
+        }
+    }
+    impl<E: core::fmt::Display> core::fmt::Display for SendError<E> {
+        #[cold]
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Self::Encode(e) => write!(f, "frame not sent: {e}"),
+                Self::LengthMismatch { claimed, frame } => {
+                    write!(f, "frame not sent: {frame} bytes for a {claimed}-byte claim")
+                }
+                Self::HeaderMismatch => {
+                    f.write_str("frame not sent: wrong message header")
+                }
+                Self::Commit(e) => write!(f, "frame not committed: {e}"),
+            }
+        }
+    }
+    impl<E: core::fmt::Debug + core::fmt::Display> core::error::Error for SendError<E> {
+        fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+            match self {
+                Self::Encode(e) => Some(e),
+                _ => None,
+            }
+        }
+    }
+    /// Aborts the claim on drop unless committed: an early return or
+    /// a panic gives the region back.
+    struct AbortOnDrop<C: Claim>(Option<C>);
+    impl<C: Claim> Drop for AbortOnDrop<C> {
+        #[inline]
+        fn drop(&mut self) {
+            if let Some(claim) = self.0.take() {
+                claim.abort();
+            }
+        }
+    }
+    /// Encode one frame into `claim` with `encode` (which returns its
+    /// length) and commit it, unless the length is not the claim's or
+    /// the frame does not start with `header` (the message's
+    /// `HEADER_TEMPLATE`): then, and if `encode` fails or panics, the
+    /// claim is aborted. The generated `send` and `send_fixed` use it.
+    ///
+    /// # Errors
+    ///
+    /// [`SendError`], one variant per reason nothing was sent.
+    #[inline]
+    pub fn send_frame<C, W>(
+        claim: C,
+        header: &[u8],
+        encode: W,
+    ) -> Result<(), SendError<C::Error>>
+    where
+        C: Claim,
+        W: FnOnce(&mut [u8]) -> Result<usize, EncodeError>,
+    {
+        let mut guard = AbortOnDrop(Some(claim));
+        if let Some(claim) = guard.0.as_mut() {
+            let buf = claim.frame_mut();
+            let claimed = buf.len();
+            let frame = encode(&mut *buf)?;
+            if frame != claimed {
+                return Err(SendError::LengthMismatch {
+                    claimed,
+                    frame,
+                });
+            }
+            if buf.get(..header.len()) != Some(header) {
+                return Err(SendError::HeaderMismatch);
+            }
+        }
+        match guard.0.take() {
+            Some(claim) => claim.commit().map_err(SendError::Commit),
+            None => Ok(()),
+        }
+    }
+    /// [`Claim`] for a transport that copies a finished frame (Aeron
+    /// `offer`): `commit` hands `buf` to `offer`; `abort` never calls it.
+    pub struct OfferClaim<'a, F> {
+        buf: &'a mut [u8],
+        offer: F,
+    }
+    impl<'a, F> OfferClaim<'a, F> {
+        /// Claim `buf`, exactly the frame's length, for `offer`. It is
+        /// zeroed, so a reused buffer never leaks an earlier frame into
+        /// the padding.
+        #[inline]
+        pub fn new(buf: &'a mut [u8], offer: F) -> Self {
+            buf.fill(0);
+            Self { buf, offer }
+        }
+    }
+    impl<F, E> Claim for OfferClaim<'_, F>
+    where
+        F: FnOnce(&[u8]) -> Result<(), E>,
+    {
+        type Error = E;
+        #[inline]
+        fn frame_mut(&mut self) -> &mut [u8] {
+            &mut *self.buf
+        }
+        #[inline]
+        fn commit(self) -> Result<(), E> {
+            (self.offer)(self.buf)
+        }
+        #[inline]
+        fn abort(self) {}
     }
     /// Zero-pad `src` into a fixed text field. `ascii` rejects a
     /// non-ASCII string before any byte is written.
@@ -2067,16 +2401,13 @@ impl<'m, 'a> CarDecoderMetadata<'m, 'a> {
         }
         Ok(&self.decoder.buf[start..end])
     }
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[must_use = "discarding this value is almost always a mistake"]
     #[inline]
     pub fn acting_version(&self) -> u16 {
         self.decoder.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[must_use = "discarding this value is almost always a mistake"]
     #[inline]
     pub fn acting_block_length(&self) -> usize {
@@ -2368,16 +2699,13 @@ impl<'a> CarDecoder<'a> {
             Self::wrap_unchecked(buf, offset, acting_block_length, acting_version)
         })
     }
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[must_use = "discarding this value is almost always a mistake"]
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[must_use = "discarding this value is almost always a mistake"]
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
@@ -3873,16 +4201,13 @@ pub struct FuelFiguresEntryDecoder<'a> {
     tail_end: core::cell::Cell<Option<usize>>,
 }
 impl<'a> FuelFiguresEntryDecoder<'a> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[must_use = "discarding this value is almost always a mistake"]
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[must_use = "discarding this value is almost always a mistake"]
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
@@ -4166,15 +4491,12 @@ pub struct FuelFiguresEntryDecoderComplete<'a> {
     pub(crate) acting_block_length: usize,
 }
 impl<'a> FuelFiguresEntryDecoderComplete<'a> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.acting_block_length
@@ -4355,15 +4677,12 @@ impl<'a> FuelFiguresEntryDecoder<'a> {
     }
 }
 impl<'a> sbe_rt::Ordered<FuelFiguresEntryDecoder<'a>> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.acting_block_length
@@ -4409,15 +4728,12 @@ impl<'a> sbe_rt::Ordered<FuelFiguresEntryDecoder<'a>> {
     }
 }
 impl<'a> sbe_rt::Ordered<FuelFiguresEntryDecoderComplete<'a>> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.acting_block_length
@@ -4865,16 +5181,13 @@ pub struct PerformanceFiguresEntryDecoder<'a> {
     tail_end: core::cell::Cell<Option<usize>>,
 }
 impl<'a> PerformanceFiguresEntryDecoder<'a> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[must_use = "discarding this value is almost always a mistake"]
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[must_use = "discarding this value is almost always a mistake"]
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
@@ -5498,16 +5811,13 @@ pub struct PerformanceFiguresAccelerationEntryDecoder<'a> {
     acting_block_length: usize,
 }
 impl<'a> PerformanceFiguresAccelerationEntryDecoder<'a> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[must_use = "discarding this value is almost always a mistake"]
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[must_use = "discarding this value is almost always a mistake"]
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
@@ -5662,15 +5972,12 @@ pub struct PerformanceFiguresEntryDecoderComplete<'a> {
     pub(crate) acting_block_length: usize,
 }
 impl<'a> PerformanceFiguresEntryDecoderComplete<'a> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.acting_block_length
@@ -5855,15 +6162,12 @@ impl<'a> PerformanceFiguresEntryDecoder<'a> {
     }
 }
 impl<'a> sbe_rt::Ordered<PerformanceFiguresEntryDecoder<'a>> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.acting_block_length
@@ -5913,15 +6217,12 @@ impl<'a> sbe_rt::Ordered<PerformanceFiguresEntryDecoder<'a>> {
     }
 }
 impl<'a> sbe_rt::Ordered<PerformanceFiguresEntryDecoderComplete<'a>> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.acting_block_length
@@ -5983,75 +6284,60 @@ pub struct CarDecoderComplete<'a> {
     pub(crate) acting_block_length: usize,
 }
 impl<'a> CarDecoderAfterFuelFigures<'a> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.acting_block_length
     }
 }
 impl<'a> CarDecoderAfterPerformanceFigures<'a> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.acting_block_length
     }
 }
 impl<'a> CarDecoderAfterManufacturer<'a> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.acting_block_length
     }
 }
 impl<'a> CarDecoderAfterModel<'a> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.acting_block_length
     }
 }
 impl<'a> CarDecoderComplete<'a> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.acting_block_length
@@ -6860,15 +7146,12 @@ pub struct CarDecoderFixedView<'v, 'a> {
     inner: &'v CarDecoder<'a>,
 }
 impl<'v, 'a> CarDecoderFixedView<'v, 'a> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.acting_block_length
@@ -6950,15 +7233,12 @@ impl<'a> sbe_rt::Ordered<CarDecoder<'a>> {
     }
 }
 impl<'a> sbe_rt::Ordered<CarDecoder<'a>> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.acting_block_length
@@ -6998,15 +7278,12 @@ impl<'a> sbe_rt::Ordered<CarDecoder<'a>> {
     }
 }
 impl<'a> sbe_rt::Ordered<sbe_rt::OrderedFixed<CarDecoder<'a>>> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.inner.acting_block_length
@@ -7047,15 +7324,12 @@ impl<'a> sbe_rt::Ordered<sbe_rt::OrderedFixed<CarDecoder<'a>>> {
     }
 }
 impl<'a> sbe_rt::Ordered<CarDecoderAfterFuelFigures<'a>> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.acting_block_length
@@ -7098,15 +7372,12 @@ impl<'a> sbe_rt::Ordered<CarDecoderAfterFuelFigures<'a>> {
     }
 }
 impl<'a> sbe_rt::Ordered<CarDecoderAfterPerformanceFigures<'a>> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.acting_block_length
@@ -7146,15 +7417,12 @@ impl<'a> sbe_rt::Ordered<CarDecoderAfterPerformanceFigures<'a>> {
     }
 }
 impl<'a> sbe_rt::Ordered<CarDecoderAfterManufacturer<'a>> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.acting_block_length
@@ -7194,15 +7462,12 @@ impl<'a> sbe_rt::Ordered<CarDecoderAfterManufacturer<'a>> {
     }
 }
 impl<'a> sbe_rt::Ordered<CarDecoderAfterModel<'a>> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.acting_block_length
@@ -7242,15 +7507,12 @@ impl<'a> sbe_rt::Ordered<CarDecoderAfterModel<'a>> {
     }
 }
 impl<'a> sbe_rt::Ordered<CarDecoderComplete<'a>> {
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.acting_block_length
@@ -7706,8 +7968,9 @@ impl CarDomain {
             .fuel_figures(
                 count,
                 |g| -> Result<(), sbe_rt::EncodeError> {
-                    for e in &self.fuel_figures {
-                        g.add(|entry| e.encode_into(entry))?;
+                    for (index, e) in self.fuel_figures.iter().enumerate() {
+                        g.add(|entry| e.encode_into(entry))
+                            .map_err(|error| error.in_entry(index))?;
                     }
                     Ok(())
                 },
@@ -7725,8 +7988,9 @@ impl CarDomain {
             .performance_figures(
                 count,
                 |g| -> Result<(), sbe_rt::EncodeError> {
-                    for e in &self.performance_figures {
-                        g.add(|entry| e.encode_into(entry))?;
+                    for (index, e) in self.performance_figures.iter().enumerate() {
+                        g.add(|entry| e.encode_into(entry))
+                            .map_err(|error| error.in_entry(index))?;
                     }
                     Ok(())
                 },
@@ -7966,15 +8230,12 @@ impl<'a> CarMemoizedDecoder<'a> {
     pub fn decode_cache_stats(&self) -> sbe_rt::DecodeCacheStats {
         self.cache.stats()
     }
-    /// Schema version from the message header (or wrap args), not the
-    /// compiled schema constant. Fields with `sinceVersion` and optional
-    /// presence depend on this value.
+    /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
     #[inline]
     pub const fn acting_version(&self) -> u16 {
         self.inner.acting_version
     }
-    /// Block length from the wire header / wrap args. Tail offsets use
-    /// this acting length, not only the compiled `BLOCK_LENGTH`.
+    /// Block length from the header or wrap args, which tail offsets use.
     #[inline]
     pub const fn acting_block_length(&self) -> usize {
         self.inner.acting_block_length
@@ -8734,6 +8995,24 @@ impl<'a> CarEncoder<'a> {
             _header: core::marker::PhantomData,
             _fields: core::marker::PhantomData,
         }
+    }
+    ///Encode one `Car` frame into `claim` and commit it, through [`sbe_rt::send_frame`]: `encode` gets the encoder wrapped on the claim and returns the finished frame, which must fill the claim.
+    #[inline]
+    pub fn send<C, W>(claim: C, encode: W) -> Result<(), sbe_rt::SendError<C::Error>>
+    where
+        C: sbe_rt::Claim,
+        W: for<'b> FnOnce(
+            CarEncoder<'b>,
+        ) -> Result<CarComplete<'b>, sbe_rt::EncodeError>,
+    {
+        sbe_rt::send_frame(
+            claim,
+            &Self::HEADER_TEMPLATE,
+            |buf| {
+                let enc = CarEncoder::try_wrap_and_apply_header(buf, 0)?;
+                Ok(encode(enc)?.encoded_length_with_header())
+            },
+        )
     }
     ///`SERIAL_NUMBER_ID` = 1.
     pub const SERIAL_NUMBER_ID: u16 = 1;
@@ -11421,6 +11700,447 @@ impl CarEncodedLengthComplete {
     #[inline]
     pub const fn encoded_length_with_header(&self) -> usize {
         self.state.len + 8 as usize
+    }
+}
+/// A `Car` message read by getters, so an application type can be encoded with [`CarEncoder::encode_from`]: no DTO, no allocation.
+///
+/// One getter per field in wire order. A schema that gains a field gains a getter, so every implementation stops compiling until it provides one.
+pub trait CarSource {
+    /// The `serialNumber` field.
+    fn serial_number(&self) -> u64;
+    /// The `modelYear` field.
+    fn model_year(&self) -> u16;
+    /// The `available` field.
+    fn available(&self) -> BooleanType;
+    /// The `code` field.
+    fn code(&self) -> Model;
+    /// The `someNumbers` field.
+    fn some_numbers(&self) -> [u32; 4];
+    /// The `vehicleCode` field.
+    fn vehicle_code(&self) -> [u8; 6];
+    /// The `extras` field.
+    fn extras(&self) -> OptionalExtras;
+    /// The `engine` field.
+    fn engine(&self) -> Engine;
+    /// The `fuelFigures` entries, in wire order. `len()` is the count the group header carries: an iterator that yields another number of entries is an encode error.
+    fn fuel_figures(&self) -> impl ExactSizeIterator<Item = impl FuelFiguresEntrySource>;
+    /// The `performanceFigures` entries, in wire order. `len()` is the count the group header carries: an iterator that yields another number of entries is an encode error.
+    fn performance_figures(
+        &self,
+    ) -> impl ExactSizeIterator<Item = impl PerformanceFiguresEntrySource>;
+    /// The `manufacturer` bytes.
+    fn manufacturer(&self) -> &[u8];
+    /// The `model` bytes.
+    fn model(&self) -> &[u8];
+    /// The `activationCode` bytes.
+    fn activation_code(&self) -> &[u8];
+}
+/// One `fuelFigures` entry read by getters, which `encode_from` writes through [`FuelFiguresEntryEncoder`].
+pub trait FuelFiguresEntrySource {
+    /// The `speed` field.
+    fn speed(&self) -> u16;
+    /// The `mpg` field.
+    fn mpg(&self) -> f32;
+    /// The `usageDescription` bytes.
+    fn usage_description(&self) -> &[u8];
+}
+impl<T: FuelFiguresEntrySource + ?Sized> FuelFiguresEntrySource for &T {
+    #[inline]
+    fn speed(&self) -> u16 {
+        (**self).speed()
+    }
+    #[inline]
+    fn mpg(&self) -> f32 {
+        (**self).mpg()
+    }
+    #[inline]
+    fn usage_description(&self) -> &[u8] {
+        (**self).usage_description()
+    }
+}
+#[inline]
+fn __encode_fuel_figures_entry_from<'b, S: FuelFiguresEntrySource + ?Sized>(
+    mut enc: FuelFiguresEntryEncoder<'b>,
+    src: &S,
+) -> Result<FuelFiguresEntryComplete<'b>, sbe_rt::EncodeError> {
+    {
+        let v = src.speed();
+        {
+            let __v = v as i128;
+            if __v < 0 || __v > 65534 {
+                return Err(sbe_rt::EncodeError::ValueOutOfRange {
+                    field: "speed",
+                    min: 0,
+                    max: 65534,
+                    actual: __v,
+                });
+            }
+        }
+        enc.speed(v);
+    }
+    {
+        let v = src.mpg();
+        enc.mpg(v);
+    }
+    let enc = enc.usage_description(src.usage_description())?;
+    Ok(enc)
+}
+#[inline]
+fn __fuel_figures_entry_length_from<S: FuelFiguresEntrySource + ?Sized>(
+    src: &S,
+) -> Result<usize, sbe_rt::EncodeError> {
+    let mut len: usize = 6;
+    let __data = src.usage_description();
+    if __data.len() > 1073741824 {
+        return Err(sbe_rt::EncodeError::VarDataTooLong {
+            field: "usageDescription",
+            max_length: 1073741824,
+            actual: __data.len(),
+        });
+    }
+    len = len.checked_add(4).ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+    len = len
+        .checked_add(__data.len())
+        .ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+    Ok(len)
+}
+/// One `performanceFigures` entry read by getters, which `encode_from` writes through [`PerformanceFiguresEntryEncoder`].
+pub trait PerformanceFiguresEntrySource {
+    /// The `octaneRating` field.
+    fn octane_rating(&self) -> u8;
+    /// The `acceleration` entries, in wire order. `len()` is the count the group header carries: an iterator that yields another number of entries is an encode error.
+    fn acceleration(
+        &self,
+    ) -> impl ExactSizeIterator<Item = impl PerformanceFiguresAccelerationEntrySource>;
+}
+impl<T: PerformanceFiguresEntrySource + ?Sized> PerformanceFiguresEntrySource for &T {
+    #[inline]
+    fn octane_rating(&self) -> u8 {
+        (**self).octane_rating()
+    }
+    #[inline]
+    fn acceleration(
+        &self,
+    ) -> impl ExactSizeIterator<Item = impl PerformanceFiguresAccelerationEntrySource> {
+        (**self).acceleration()
+    }
+}
+#[inline]
+fn __encode_performance_figures_entry_from<
+    'b,
+    S: PerformanceFiguresEntrySource + ?Sized,
+>(
+    mut enc: PerformanceFiguresEntryEncoder<'b>,
+    src: &S,
+) -> Result<PerformanceFiguresEntryComplete<'b>, sbe_rt::EncodeError> {
+    {
+        let v = src.octane_rating();
+        {
+            let __v = v as i128;
+            if __v < 90 || __v > 110 {
+                return Err(sbe_rt::EncodeError::ValueOutOfRange {
+                    field: "octaneRating",
+                    min: 90,
+                    max: 110,
+                    actual: __v,
+                });
+            }
+        }
+        enc.octane_rating(v);
+    }
+    let __entries = src.acceleration();
+    let __count = <u16>::try_from(__entries.len())
+        .map_err(|_| sbe_rt::EncodeError::ValueOutOfRange {
+            field: "acceleration",
+            min: 0,
+            max: u16::MAX as i128,
+            actual: __entries.len() as i128,
+        })?;
+    let enc = enc
+        .acceleration(
+            __count,
+            |__group| {
+                for (__index, __entry) in __entries.enumerate() {
+                    __group
+                        .add(|__enc| __encode_performance_figures_acceleration_entry_from(
+                            __enc,
+                            &__entry,
+                        ))
+                        .map_err(|__error| __error.in_entry(__index))?;
+                }
+                Ok(())
+            },
+        )?;
+    Ok(enc)
+}
+#[inline]
+fn __performance_figures_entry_length_from<S: PerformanceFiguresEntrySource + ?Sized>(
+    src: &S,
+) -> Result<usize, sbe_rt::EncodeError> {
+    let mut len: usize = 1;
+    let __entries = src.acceleration();
+    let _ = <u16>::try_from(__entries.len())
+        .map_err(|_| sbe_rt::EncodeError::ValueOutOfRange {
+            field: "acceleration",
+            min: 0,
+            max: u16::MAX as i128,
+            actual: __entries.len() as i128,
+        })?;
+    len = len.checked_add(4).ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+    for __entry in __entries {
+        len = len
+            .checked_add(__performance_figures_acceleration_entry_length_from(&__entry)?)
+            .ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+    }
+    Ok(len)
+}
+/// One `acceleration` entry read by getters, which `encode_from` writes through [`PerformanceFiguresAccelerationEntryEncoder`].
+pub trait PerformanceFiguresAccelerationEntrySource {
+    /// The `mph` field.
+    fn mph(&self) -> u16;
+    /// The `seconds` field.
+    fn seconds(&self) -> f32;
+}
+impl<
+    T: PerformanceFiguresAccelerationEntrySource + ?Sized,
+> PerformanceFiguresAccelerationEntrySource for &T {
+    #[inline]
+    fn mph(&self) -> u16 {
+        (**self).mph()
+    }
+    #[inline]
+    fn seconds(&self) -> f32 {
+        (**self).seconds()
+    }
+}
+#[inline]
+fn __encode_performance_figures_acceleration_entry_from<
+    S: PerformanceFiguresAccelerationEntrySource + ?Sized,
+>(
+    enc: &mut PerformanceFiguresAccelerationEntryEncoder<'_>,
+    src: &S,
+) -> Result<(), sbe_rt::EncodeError> {
+    {
+        let v = src.mph();
+        {
+            let __v = v as i128;
+            if __v < 0 || __v > 65534 {
+                return Err(sbe_rt::EncodeError::ValueOutOfRange {
+                    field: "mph",
+                    min: 0,
+                    max: 65534,
+                    actual: __v,
+                });
+            }
+        }
+        enc.mph(v);
+    }
+    {
+        let v = src.seconds();
+        enc.seconds(v);
+    }
+    Ok(())
+}
+#[inline]
+fn __performance_figures_acceleration_entry_length_from<
+    S: PerformanceFiguresAccelerationEntrySource + ?Sized,
+>(_src: &S) -> Result<usize, sbe_rt::EncodeError> {
+    Ok(6)
+}
+impl<'a, H: sbe_rt::HeaderState> CarEncoder<'a, H, sbe_rt::FieldsUnfixed> {
+    /// Write every field of `src` in wire order — fixed block, groups, var-data — and return the finished stage.
+    ///
+    /// An absent optional field writes its null value, as `fixed()` does. Errors are the encoder's own, plus `SomeNullValue` for `Some` of a field's null value (NaN for a float), `Conversion` for a value its domain conversion refused (with the field's path and the conversion's error), and `ValueOutOfRange` for a group longer than its count type or a value outside the schema range.
+    #[inline]
+    pub fn encode_from<S: CarSource + ?Sized>(
+        mut self,
+        src: &S,
+    ) -> Result<CarComplete<'a, H>, sbe_rt::EncodeError> {
+        {
+            let v = src.serial_number();
+            {
+                let __v = v as i128;
+                if __v < 0 || __v > 18446744073709551614 {
+                    return Err(sbe_rt::EncodeError::ValueOutOfRange {
+                        field: "serialNumber",
+                        min: 0,
+                        max: 18446744073709551614,
+                        actual: __v,
+                    });
+                }
+            }
+            self.serial_number(v);
+        }
+        {
+            let v = src.model_year();
+            {
+                let __v = v as i128;
+                if __v < 0 || __v > 65534 {
+                    return Err(sbe_rt::EncodeError::ValueOutOfRange {
+                        field: "modelYear",
+                        min: 0,
+                        max: 65534,
+                        actual: __v,
+                    });
+                }
+            }
+            self.model_year(v);
+        }
+        {
+            let v = src.available();
+            self.available(v);
+        }
+        {
+            let v = src.code();
+            self.code(v);
+        }
+        {
+            let v = src.some_numbers();
+            self.some_numbers(v);
+        }
+        {
+            let v = src.vehicle_code();
+            self.vehicle_code(v);
+        }
+        {
+            let v = src.extras();
+            self.extras(v);
+        }
+        {
+            let v = src.engine();
+            self.engine(v);
+        }
+        let enc = CarEncoder {
+            buf: self.buf,
+            msg_offset: self.msg_offset,
+            offset: self.offset,
+            _header: core::marker::PhantomData,
+            _fields: core::marker::PhantomData::<sbe_rt::FieldsFixed>,
+        };
+        let __entries = src.fuel_figures();
+        let __count = <u16>::try_from(__entries.len())
+            .map_err(|_| sbe_rt::EncodeError::ValueOutOfRange {
+                field: "fuelFigures",
+                min: 0,
+                max: u16::MAX as i128,
+                actual: __entries.len() as i128,
+            })?;
+        let enc = enc
+            .fuel_figures(
+                __count,
+                |__group| {
+                    for (__index, __entry) in __entries.enumerate() {
+                        __group
+                            .add(|__enc| __encode_fuel_figures_entry_from(
+                                __enc,
+                                &__entry,
+                            ))
+                            .map_err(|__error| __error.in_entry(__index))?;
+                    }
+                    Ok(())
+                },
+            )?;
+        let __entries = src.performance_figures();
+        let __count = <u16>::try_from(__entries.len())
+            .map_err(|_| sbe_rt::EncodeError::ValueOutOfRange {
+                field: "performanceFigures",
+                min: 0,
+                max: u16::MAX as i128,
+                actual: __entries.len() as i128,
+            })?;
+        let enc = enc
+            .performance_figures(
+                __count,
+                |__group| {
+                    for (__index, __entry) in __entries.enumerate() {
+                        __group
+                            .add(|__enc| __encode_performance_figures_entry_from(
+                                __enc,
+                                &__entry,
+                            ))
+                            .map_err(|__error| __error.in_entry(__index))?;
+                    }
+                    Ok(())
+                },
+            )?;
+        let enc = enc.manufacturer(src.manufacturer())?;
+        let enc = enc.model(src.model())?;
+        let enc = enc.activation_code(src.activation_code())?;
+        Ok(enc)
+    }
+}
+impl<'a> CarEncoder<'a> {
+    /// The exact frame length, header included, that [`CarEncoder::encode_from`] writes for `src`: the size of the claim or buffer to encode it into.
+    #[inline]
+    pub fn encoded_length_with_header_from<S: CarSource + ?Sized>(
+        src: &S,
+    ) -> Result<usize, sbe_rt::EncodeError> {
+        let mut len: usize = Self::HEADER_LENGTH + Self::BLOCK_LENGTH;
+        let __entries = src.fuel_figures();
+        let _ = <u16>::try_from(__entries.len())
+            .map_err(|_| sbe_rt::EncodeError::ValueOutOfRange {
+                field: "fuelFigures",
+                min: 0,
+                max: u16::MAX as i128,
+                actual: __entries.len() as i128,
+            })?;
+        len = len.checked_add(4).ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+        for __entry in __entries {
+            len = len
+                .checked_add(__fuel_figures_entry_length_from(&__entry)?)
+                .ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+        }
+        let __entries = src.performance_figures();
+        let _ = <u16>::try_from(__entries.len())
+            .map_err(|_| sbe_rt::EncodeError::ValueOutOfRange {
+                field: "performanceFigures",
+                min: 0,
+                max: u16::MAX as i128,
+                actual: __entries.len() as i128,
+            })?;
+        len = len.checked_add(4).ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+        for __entry in __entries {
+            len = len
+                .checked_add(__performance_figures_entry_length_from(&__entry)?)
+                .ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+        }
+        let __data = src.manufacturer();
+        if __data.len() > 1073741824 {
+            return Err(sbe_rt::EncodeError::VarDataTooLong {
+                field: "manufacturer",
+                max_length: 1073741824,
+                actual: __data.len(),
+            });
+        }
+        len = len.checked_add(4).ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+        len = len
+            .checked_add(__data.len())
+            .ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+        let __data = src.model();
+        if __data.len() > 1073741824 {
+            return Err(sbe_rt::EncodeError::VarDataTooLong {
+                field: "model",
+                max_length: 1073741824,
+                actual: __data.len(),
+            });
+        }
+        len = len.checked_add(4).ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+        len = len
+            .checked_add(__data.len())
+            .ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+        let __data = src.activation_code();
+        if __data.len() > 1073741824 {
+            return Err(sbe_rt::EncodeError::VarDataTooLong {
+                field: "activationCode",
+                max_length: 1073741824,
+                actual: __data.len(),
+            });
+        }
+        len = len.checked_add(4).ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+        len = len
+            .checked_add(__data.len())
+            .ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)?;
+        Ok(len)
     }
 }
 ///Generated module `car_field_meta`.

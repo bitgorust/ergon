@@ -29,6 +29,34 @@ fn record_round_trip() {
 }
 
 #[test]
+fn a_record_file_cut_mid_record_is_an_error_not_a_shorter_run() {
+    let r = Record { id: 7, ..Record::default() };
+    let dir = std::env::temp_dir().join(format!("io-bench-trunc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("r.bin");
+
+    // One whole record and one byte of the next: a corrupt file. It used to
+    // load as one complete record, so a truncated capture was summarised as a
+    // finished run.
+    let mut bytes = r.encode().to_vec();
+    bytes.push(0);
+    std::fs::write(&p, &bytes).unwrap();
+    let err = read_records(&p).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert!(err.to_string().contains("truncated record"), "{err}");
+
+    // An empty file is a clean end of file with no records, not an error.
+    std::fs::write(&p, []).unwrap();
+    assert_eq!(read_records(&p).unwrap(), vec![]);
+
+    // Whole records only.
+    write_records(&p, &[r]).unwrap();
+    assert_eq!(read_records(&p).unwrap(), vec![r]);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn capture_parse_ignores_truncated_tail() {
     let mut b = Vec::new();
     for (t, p) in [(10i64, &b"abc"[..]), (20, b"")] {

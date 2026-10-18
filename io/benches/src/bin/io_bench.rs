@@ -3,7 +3,7 @@
 //! ```text
 //! io-bench binance  --variants recv-busy,uring-spin,uring-sqpoll --cpus 2,4,6 --sqpoll-cpu 8 --duration 1200 --out DIR
 //! io-bench lab      --server IP:PORT --ca cert.pem --variants ... --cpus ... --duration S --out DIR
-//! io-bench pingpong --server IP:PORT --ca cert.pem --variant V --cpu N --rate MSGS_PER_S --duration S --out DIR
+//! io-bench pingpong --server IP:PORT --ca cert.pem --variant V --cpu N --rate MSGS_PER_S --duration S --out DIR [--feeds K]
 //! io-bench capture  --cpu N --duration 600 --out capture.bin
 //! io-bench clockcost
 //! ```
@@ -38,7 +38,9 @@ mod imp {
     use ergon_io::{Backend as Variant, Driver, Target, WsConn, WsStats};
     use io_bench::app::{Capture, Mode, PingPong, Recorder};
     use io_bench::args::Args;
-    use io_bench::clock::{monotonic_ns, pin_current_thread, read_costs, realtime_ns};
+    use io_bench::clock::{
+        counter_meta, counter_name, monotonic_ns, pin_current_thread, read_costs, realtime_ns,
+    };
     use io_bench::record::{Record, write_records};
     use io_bench::runner::{self, App, LoopStats, RunOpts};
     use io_bench::stalls::StallLog;
@@ -138,7 +140,11 @@ mod imp {
             "capture" => run_capture(&a),
             "clockcost" => {
                 let (rt, tsc) = read_costs(10_000_000);
-                println!("clock_gettime(CLOCK_REALTIME): {rt:.1} ns/read\nrdtsc: {tsc:.1} ns/read");
+                println!(
+                    "clock_gettime(CLOCK_REALTIME): {rt:.1} ns/read\n{}: {tsc:.1} ns/read\n{}",
+                    counter_name(),
+                    counter_meta().trim_end()
+                );
                 Ok(())
             }
             other => Err(format!("unknown command {other:?}; see the module docs").into()),
@@ -397,7 +403,9 @@ mod imp {
             read("/sys/devices/system/clocksource/clocksource0/current_clocksource")
         );
         let _ = writeln!(m, "clock_cost_realtime_ns={rt:.1}");
+        // The raw counter's read cost, whichever counter it is (`counter=`).
         let _ = writeln!(m, "clock_cost_rdtsc_ns={tsc:.1}");
+        m.push_str(&counter_meta());
         let _ = writeln!(
             m,
             "mlockall={}",
@@ -463,6 +471,9 @@ mod imp {
         let payload: usize = a.num_or("payload", 64)?;
         let busy_poll_us: u32 = a.num_or("busy-poll", 50)?;
         let wait_us: u32 = a.num_or("wait-us", 100)?;
+        // Feed connections on the same loop (`/slot/<j>` of a `replay_server
+        // --mode mixed`, which echoes the order connection).
+        let feeds: usize = a.num_or("feeds", 0)?;
         let out = PathBuf::from(a.str_or("out", "results"));
         std::fs::create_dir_all(&out)?;
         if let Some(c) = cpu {
@@ -471,12 +482,26 @@ mod imp {
         let (t, cfg) = lab_config(a)?;
         let mut dcfg = runner::config(variant, busy_poll_us, wait_us, sqpoll_cpu);
         runner::busy_poll_flags(&mut dcfg, a)?;
-        let mut driver = connect_all(&[t], &cfg, dcfg)?;
+        let mut driver = connect_all(std::slice::from_ref(&t), &cfg, dcfg)?;
+        let order = driver
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .ok_or("the order connection did not open")?;
+        for j in 0..feeds {
+            let ft = Target {
+                path: format!("/slot/{j}"),
+                ..t.clone()
+            };
+            let c = WsConn::connect(&ft, cfg.clone(), BUF).map_err(|e| format!("feed {j}: {e}"))?;
+            driver.add(c).map_err(|e| format!("feed {j}: {e}"))?;
+        }
         let interval = if rate <= 0 { 0 } else { 1_000_000_000 / rate };
         // Room for every round trip: the paced rate, or (back to back) well
         // above the 50k/s this path reaches. mlockall faults it all in.
         let per_s = if rate > 0 { rate } else { 100_000 };
-        let mut app = PingPong::new(0, interval, payload, (per_s * duration_s + 1_000) as usize);
+        let mut app = PingPong::new(0, interval, payload, (per_s * duration_s + 1_000) as usize)
+            .with_order(order);
         let mut stalls = stall_log(a)?;
         let (stats, sockets, conn_stats) = run_app(&mut driver, &mut app, duration_s, &mut stalls)?;
         stalls.write(&out.join("stalls-0.txt"))?;
@@ -486,7 +511,9 @@ mod imp {
         let _ = writeln!(meta, "rate={rate}");
         let _ = writeln!(meta, "payload={payload}");
         let _ = writeln!(meta, "wait_us={wait_us}");
-        let _ = writeln!(meta, "conns_per_variant=1");
+        let _ = writeln!(meta, "conns_per_variant={}", feeds + 1);
+        let _ = writeln!(meta, "feeds={feeds}");
+        let _ = writeln!(meta, "feed_messages={}", app.feed_messages);
         let r = ThreadResult {
             variant,
             sockets,

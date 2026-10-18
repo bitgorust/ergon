@@ -271,6 +271,70 @@ pub(crate) const ENCODER_RESERVED: &[&str] = &[
     "buffer_too_short",
 ];
 
+/// Inherent method names a message's encoder type gets from the message
+/// itself: every non-constant field's setters (raw, domain, `*_from`,
+/// `*_str`, `*_bool`) and the method its first group, else its first
+/// var-data, becomes. Later tails sit on later stage types.
+///
+/// These are what an encoder helper added beside them (`send`,
+/// `send_fixed`, `encode_from`, `encoded_length_with_header_from`) must not
+/// take, because a field setter and the helper would be duplicate
+/// definitions, and a first tail and the helper would make every
+/// `XEncoder::name` path ambiguous. The rule is [`tail_accessor_ident`]'s:
+/// the field or tail keeps the name it had before the helper existed and
+/// nothing is renamed; the helper is left out of that message (see
+/// [`encoder_helper_ident`]).
+pub(crate) fn encoder_inherent_names(
+    msg: &crate::structured_ir::MessageStructure,
+    conversions: &[crate::ConversionSelector],
+    domain_types: &[(crate::ConversionSelector, String)],
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for f in msg
+        .fields
+        .iter()
+        .filter(|f| f.presence != Presence::Constant)
+    {
+        let snake = to_snake_case(&f.name);
+        let converted = field_has_conversion_free(f, conversions);
+        let wire_name = converted.then(|| format!("{snake}_wire"));
+        let raw = resolve_field_ident(&snake, &wire_name, ENCODER_RESERVED).to_string();
+        let method_name = wire_name.clone().unwrap_or_else(|| snake.clone());
+        names.push(format!("{method_name}_str"));
+        names.push(format!("{snake}_bool"));
+        names.push(raw);
+        if converted {
+            if find_domain_type(f, domain_types).is_some() {
+                names.push(domain_accessor_ident(&snake, ENCODER_RESERVED).to_string());
+            } else {
+                names.push(format!("{snake}_from"));
+            }
+        }
+    }
+    names.extend(
+        msg.groups
+            .first()
+            .map(|g| to_snake_case(&g.name))
+            .or_else(|| msg.var_data.first().map(|vd| to_snake_case(&vd.name))),
+    );
+    names
+}
+
+/// The encoder helper `name`, or `None` when the message's own fields or
+/// first tail already own it ([`encoder_inherent_names`]): the helper is
+/// left out, the field or tail keeps its name.
+pub(crate) fn encoder_helper_ident(
+    name: &str,
+    msg: &crate::structured_ir::MessageStructure,
+    conversions: &[crate::ConversionSelector],
+    domain_types: &[(crate::ConversionSelector, String)],
+) -> Option<syn::Ident> {
+    named_accessor_ident(
+        name,
+        &encoder_inherent_names(msg, conversions, domain_types),
+    )
+}
+
 /// Placement utility names that live only on `get_metadata()` facets.
 /// Must never appear in [`DECODER_RESERVED`] / [`ENCODER_RESERVED`].
 #[cfg(test)]
@@ -311,7 +375,8 @@ pub(crate) fn resolve_field_ident(
 /// of `orders_count` reach the same `impl`.
 ///
 /// A domain-typed field owns its plain name too: the raw accessor moves to
-/// `*_wire` and the domain getter/setter takes the field name.
+/// `*_wire` and the domain getter/setter takes the field name. That holds
+/// for a constant field's domain getter as well ([`constant_converts`]).
 ///
 /// Pass `reserved` exactly as the owner's own emission site passes it:
 /// [`DECODER_RESERVED`] for message decoders and the memoized wrapper, and an
@@ -330,8 +395,8 @@ pub(crate) fn owner_accessor_names<'n>(
             let wire_name =
                 field_has_conversion_free(f, conversions).then(|| format!("{snake}_wire"));
             let raw = resolve_field_ident(&snake, &wire_name, reserved).to_string();
-            let domain = (f.presence != Presence::Constant
-                && find_domain_type(f, domain_types).is_some())
+            let domain = (find_domain_type(f, domain_types).is_some()
+                && (f.presence != Presence::Constant || constant_converts(f)))
             .then(|| domain_accessor_ident(&snake, reserved).to_string());
             core::iter::once(raw).chain(domain)
         })
@@ -341,6 +406,25 @@ pub(crate) fn owner_accessor_names<'n>(
                 .map(crate::codegen::runtime::to_snake_case),
         )
         .collect()
+}
+
+/// Whether a constant field gets the decoder-side conversion accessors (the
+/// domain getter, or `*_as`) a non-constant one has. They convert what the
+/// constant's `*_wire` getter returns, so a field whose constant getter does
+/// not return its wire type (a multi-character `char` constant, which is a
+/// `&'static str`) gets none. A constant never has a setter.
+pub(crate) fn constant_converts(f: &MessageField) -> bool {
+    f.presence == Presence::Constant
+        && match &f.field_type {
+            FieldType::Primitive(PrimitiveType::Char, None) => f
+                .constant_value
+                .as_ref()
+                .is_some_and(|value| value.len() <= 1),
+            FieldType::Primitive(_, None) | FieldType::Enum { .. } | FieldType::Set { .. } => {
+                f.constant_value.is_some()
+            }
+            FieldType::Primitive(_, Some(_)) | FieldType::Composite { .. } => false,
+        }
 }
 
 /// The domain-typed getter or setter for a field: the plain field name, renamed
@@ -397,9 +481,7 @@ pub(crate) fn acting_accessors(
 ) -> proc_macro2::TokenStream {
     let version = named_accessor_ident("acting_version", taken).map(|ident| {
         quote::quote! {
-            /// Schema version from the message header (or wrap args), not the
-            /// compiled schema constant. Fields with `sinceVersion` and optional
-            /// presence depend on this value.
+            /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
             #attrs
             #[inline]
             pub const fn #ident(&self) -> u16 {
@@ -409,8 +491,7 @@ pub(crate) fn acting_accessors(
     });
     let block_length = named_accessor_ident("acting_block_length", taken).map(|ident| {
         quote::quote! {
-            /// Block length from the wire header / wrap args. Tail offsets use
-            /// this acting length, not only the compiled `BLOCK_LENGTH`.
+            /// Block length from the header or wrap args, which tail offsets use.
             #attrs
             #[inline]
             pub const fn #ident(&self) -> usize {

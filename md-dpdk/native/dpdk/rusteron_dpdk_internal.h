@@ -17,8 +17,12 @@
  * their own macro and must not receive a -D from the build script. */
 #define _POSIX_C_SOURCE 200809L
 
+/* x86_64 or aarch64 (build.rs refuses any other target): the clock's counter
+ * and the spin hint below have one implementation for each. */
 #if defined(__x86_64__)
 #include <x86intrin.h>
+#elif !defined(__aarch64__)
+#error "the DPDK transport builds for x86_64 or aarch64 only"
 #endif
 #include <netinet/in.h>
 #include <pthread.h>
@@ -120,6 +124,18 @@ typedef struct rusteron_dpdk_rx_stats_stct
  * 117, under a quarter of an ENA ring. */
 #define RUSTERON_DPDK_TX_BACKSTOP_BUCKET_BYTES 1048576ULL
 
+/* Aeron's threading modes (aeron_threading_mode_t, aeronmd.h: asserted equal
+ * in rusteron_dpdk_transport.c), which decide which agent busy-spins on which
+ * CPU: under DEDICATED the sender and the receiver, each on its own; under
+ * SHARED_NETWORK one agent for both, on the sender's CPU; under SHARED one
+ * agent for everything, on the conductor's CPU; under INVOKER the
+ * application's thread that starts and runs the driver, which Aeron pins to
+ * the conductor's CPU. */
+#define RUSTERON_DPDK_THREADING_DEDICATED 0
+#define RUSTERON_DPDK_THREADING_SHARED_NETWORK 1
+#define RUSTERON_DPDK_THREADING_SHARED 2
+#define RUSTERON_DPDK_THREADING_INVOKER 3
+
 /* A transmit rate allowance: a token bucket, owned by one NIC's agent alone
  * (plain arithmetic, no atomics); it may go negative (debt). It counts
  * millibits: a megabit a second is a millibit a nanosecond, so a refill
@@ -171,7 +187,12 @@ typedef struct rusteron_dpdk_port_stct
     int queues_ready;             /* both queues set up: only then may the port be closed */
     int link_up;                  /* link_wait_ready succeeded */
     int csum_offload_ok;          /* dev_info: IPv4/UDP checksum offloads */
-    int ena_llq_available;        /* dev_info: ENA LLQ/write-combining */
+    int ena_llq;                  /* dev_info: an ENA's LLQ BAR mapping (RUSTERON_DPDK_ENA_LLQ_*) */
+    uint16_t rx_descriptors;      /* the receive ring's size: as configured, or the NIC's default */
+    /* A poll draining this many frames came within a burst of a full ring
+     * (rx-ring-full-suspected): the ring less a burst, or UINT32_MAX, never,
+     * on an ENA, which counts a full ring's drops itself (nic-rx-missed). */
+    uint32_t rx_ring_full_at;
     int rx_timestamp_ok;          /* dev_info: NIC RX hardware timestamps */
     uint16_t max_mtu;             /* dev_info: the NIC's largest L3 MTU (0: unknown) */
     uint8_t mac[RUSTERON_DPDK_ETH_ADDR_LEN]; /* dev_info MAC, byte order */
@@ -181,6 +202,22 @@ typedef struct rusteron_dpdk_port_stct
     uint64_t last_poll_ns;        /* clock at the end of the last receive poll, 0 before the first */
     int tx_udp_csum_offload;      /* NIC completes the UDP checksum; else software */
     int open_transports;          /* DPDK transports open on this NIC (housekeeping_lock) */
+    /* DPDK transports open on this NIC whose channel asks for media receive
+     * timestamps (media-rcv-ts-offset): changed by the conductor at init and
+     * close, read (relaxed) by the agent once a poll, so a NIC without one
+     * never reads the clock for them. */
+    int media_ts_transports;
+    /* The driver's distinct error log, from the transports opened on this NIC:
+     * read only while one is open (housekeeping_lock), as it goes with the
+     * driver. */
+    aeron_distinct_error_log_t *error_log;
+    /* Device resets the PMD asked for (RTE_ETH_EVENT_INTR_RESET), counted
+     * atomically by the port op's callback on whichever thread raises them;
+     * housekeeping counts, logs and reports each new one (nic_resets_seen is
+     * its own). */
+    uint64_t nic_resets;
+    uint64_t nic_resets_seen;
+    int reset_watched;            /* watch_reset took: unwatch before the port closes */
     uint64_t icmp_window_ns;      /* ICMP error rate limit: current one-second window */
     uint32_t icmp_sent_in_window;
     uint64_t icmp_echo_window_ns; /* ICMP echo rate limit: current one-second window */
@@ -279,6 +316,7 @@ typedef struct rusteron_dpdk_client_stct
     int route_index;                    /* its route (-1 none, -2 not looked up yet) */
     struct sockaddr_storage connected_address; /* owned copy for NULL-address sends */
     aeron_udp_channel_transport_params_t params; /* socket buffers for a kernel socket */
+    int media_ts;                       /* counted in its port's media_ts_transports */
     /* A DPDK transport's host-local send socket, opened by the local-I/O
      * thread on request (kernel.c), never by the agent: the agent writes
      * lazy_dst_ip, then publishes REQUESTED in lazy_state; the local-I/O
@@ -328,13 +366,17 @@ struct rusteron_dpdk_transport_stct
     int agent_cpus[3];
     int agent_cpus_known;
     int conductor_spins;                 /* its idle strategy busy-spins */
+    int threading_mode;                  /* RUSTERON_DPDK_THREADING_*, from the context at install */
     int local_io_mode;                   /* RUSTERON_DPDK_LOCAL_IO_* (RUSTERON_DPDK_LOCAL_IO) */
     uint64_t local_hot_ns;               /* adaptive: read every cycle this long after data */
     int local_unwatch;                   /* adaptive: hot sockets come off the epoll (RUSTERON_DPDK_LOCAL_UNWATCH) */
     uint64_t tx_retry_ns;                /* RUSTERON_DPDK_TX_RETRY_US: re-offer a refused tail this long */
     uint64_t nic_stats_ns;               /* RUSTERON_DPDK_NIC_STATS_MS: housekeeping's NIC statistics reads, 0 never */
     uint32_t rx_max_bursts;              /* RUSTERON_DPDK_RX_MAX_BURSTS: bursts one poll drains while they come back full */
+    int ena_llq_required;                /* RUSTERON_DPDK_ENA_LLQ_REQUIRED: an ENA without verified LLQ fails start */
+    int vfio_wc;                         /* RUSTERON_DPDK_VFIO_WC=1: a vfio-pci port's unseen LLQ BAR is write-combined */
     uint64_t tx_pace_spin_ns;            /* RUSTERON_DPDK_TX_PACE_SPIN_US: longest wait to repay pacing debt */
+    int tx_pace_spin_set;                /* RUSTERON_DPDK_TX_PACE_SPIN_US was given, not defaulted */
     /* RUSTERON_DPDK_TX_ROUTE_MBPS: destination prefixes with their own
      * allowance, longest first (network order); the pacers are per NIC. */
     uint32_t tx_route_net[RUSTERON_DPDK_MAX_TX_ROUTES];
@@ -354,6 +396,8 @@ struct rusteron_dpdk_transport_stct
     pthread_t housekeeping_thread;
     int housekeeping_running;
     volatile int housekeeping_stop;
+    uint64_t timer_service_ns;           /* the PMDs' timer service last ran (0: never; housekeeping) */
+    int timer_service_failing;           /* it failed last time, which was reported (housekeeping) */
 
     /* Cold: the per-NIC UDP port tables and the ephemeral range, resolved at
      * runtime init (RUSTERON_DPDK_EPHEMERAL_PORT_RANGE, else the netns's
@@ -389,9 +433,32 @@ _Static_assert(offsetof(struct rusteron_dpdk_transport_stct, tx_route_count) / 6
                    offsetof(struct rusteron_dpdk_transport_stct, tx_low_count) / 64,
                "the route and low-stream counts share one cache line");
 
-/* Credit an allowance's bucket for the time since its last refill. */
+/* The hint in a bounded spin-wait (the pacer's): pause on x86_64; isb on
+ * aarch64, which AWS's Graviton guide gives as pause's drop-in and Rust's
+ * spin_loop emits. yield, DPDK's rte_pause there, only yields to another
+ * hardware thread, and Graviton's Neoverse cores have none, so it does
+ * nothing; isb waits for the pipeline to drain, a short real delay as pause
+ * is. */
+static inline void rusteron_dpdk_spin_hint(void)
+{
+#if defined(__x86_64__)
+    _mm_pause();
+#else
+    __asm__ __volatile__("isb" ::: "memory");
+#endif
+}
+
+/* Credit an allowance's bucket for the time since its last refill. A read
+ * behind the last refill (a counter read a little behind on another core, a
+ * calibration adopted afresh) credits nothing and leaves last_ns at the furthest time
+ * credited, so no interval is ever credited twice; unguarded, the difference
+ * would wrap and refill the bucket. */
 static inline void rusteron_dpdk_pacer_refill(rusteron_dpdk_pacer_t *p, uint64_t now_ns)
 {
+    if (__builtin_expect(now_ns < p->last_ns, 0))
+    {
+        return;
+    }
     const uint64_t elapsed = now_ns - p->last_ns;
     p->last_ns = now_ns;
     /* millibits = ns * Mbit/s; elapsed is capped so the product cannot overflow */
@@ -543,11 +610,18 @@ uint16_t rusteron_dpdk_port_tx(
 int rusteron_dpdk_port_tx_flush(rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *port);
 /* Release the frames still queued: the NIC's last transport closed. */
 void rusteron_dpdk_port_tx_drop_queued(rusteron_dpdk_transport_t *native, rusteron_dpdk_port_t *port);
-void rusteron_dpdk_runtime_agents_known(
-    rusteron_dpdk_transport_t *native, int conductor, int sender, int receiver, const char *conductor_idle);
+/* The driver context is known (install): its threading mode
+ * (RUSTERON_DPDK_THREADING_*) and its agents' CPUs. In a shared mode one
+ * thread also receives, so a send never waits out a pacing debt: an unset
+ * RUSTERON_DPDK_TX_PACE_SPIN_US is 0 there, and a non-zero one fails (-1). */
+int rusteron_dpdk_runtime_agents_known(
+    rusteron_dpdk_transport_t *native, int threading_mode, int conductor, int sender, int receiver,
+    const char *conductor_idle);
 void rusteron_dpdk_local_io_open_requested(rusteron_dpdk_transport_t *native, uint64_t now_ns);
 
-/* One housekeeping pass: sample both ports' statistics (1 Hz gated). */
+/* One housekeeping pass: run the PMDs' due timers (ENA's watchdog; 1 Hz
+ * gated), report the ports' new device-reset requests, and sample both ports'
+ * statistics (1 Hz gated). */
 void rusteron_dpdk_housekeeping_tick(rusteron_dpdk_transport_t *native, uint64_t now_ns);
 /* Start/stop the housekeeping thread (runtime init/cleanup). */
 int rusteron_dpdk_housekeeping_start(rusteron_dpdk_transport_t *native);
@@ -581,8 +655,39 @@ int rusteron_dpdk_eal_is_initialized(void);
 int rusteron_dpdk_eal_thread_register(void);
 int rusteron_dpdk_eal_thread_unregister(void);
 
+/* The DPDK the transport is built against (RTE_VER_YEAR, RTE_VER_MONTH): its
+ * ENA PMD's device arguments changed in 24.11. Real in rusteron_dpdk_eal.c,
+ * settable in the fake EAL. */
+void rusteron_dpdk_eal_version(int *year, int *month);
+
 /* MANA's per-queue ring limit (MAX_RECEIVE/SEND_BUFFERS_PER_QUEUE in the PMD). */
 #define RUSTERON_DPDK_MANA_MAX_DESCRIPTORS 256
+
+/* The receive ring a port takes when rx_descriptors is 0: this, or fewer
+ * where the NIC's reported maximum (MANA's 256) is lower. */
+#define RUSTERON_DPDK_RX_DESCRIPTORS_DEFAULT 4096
+
+/* RUSTERON_DPDK_ENA_DEVARGS: comma-separated key=value device arguments
+ * (keys and values of [A-Za-z0-9_.:-]), at most this long. */
+#define RUSTERON_DPDK_ENA_DEVARGS_MAX 200
+
+/* An ENA port whose LLQ the operator's device arguments turn off (the port's
+ * ena_llq; beyond what dev_info reports, RUSTERON_DPDK_ENA_LLQ_*). */
+#define RUSTERON_DPDK_ENA_LLQ_DISABLED 5
+
+/* The ENA device arguments every ENA port gets (`-a <bdf>,<these>`): the
+ * operator's RUSTERON_DPDK_ENA_DEVARGS, and the PMD's LLQ setting unless
+ * those name it (`llq_policy=1`, the device's recommended LLQ policy, from
+ * DPDK 24.11, whose 24.11.0 and .1 otherwise disable LLQ; `enable_llq=1`
+ * before). *llq_off is set when the operator's arguments turn LLQ off. 0 on
+ * success; -1 (error set, naming the variable) when they are malformed,
+ * the LLQ key's value included unless a decimal in the PMD's range. */
+int rusteron_dpdk_ena_devargs(char *out, size_t len, int *llq_off);
+
+/* How `bdf`'s BAR 2 (an ENA's LLQ BAR) is mapped in the memory map at
+ * `maps_path` (a /proc/<pid>/maps): RUSTERON_DPDK_ENA_LLQ_WC, _UNCACHED,
+ * _UNSEEN, or _UNKNOWN when it cannot be read. DPDK-free (runtime.c). */
+int rusteron_dpdk_ena_llq_mapping(const char *maps_path, const char *bdf);
 
 /* Parse aa:bb:cc:dd:ee:ff (either case) into bytes. 0 on success. */
 int rusteron_dpdk_parse_mac(const char *text, uint8_t mac[RUSTERON_DPDK_ETH_ADDR_LEN]);
@@ -607,64 +712,125 @@ int rusteron_dpdk_runtime_probe_device(
 void rusteron_dpdk_test_reset(void);
 void rusteron_dpdk_test_set_eal_mode(int mode);
 void rusteron_dpdk_set_port_ops(const rusteron_dpdk_port_ops_t *ops);
+/* The kernel driver every PCI port reads as bound to, instead of its sysfs
+ * driver link ("" or NULL: sysfs again; reset clears it). */
+void rusteron_dpdk_test_set_pci_kernel_driver(const char *driver);
+
+/* The local-I/O mode a created runtime selected (RUSTERON_DPDK_LOCAL_IO_*,
+ * -1 for no runtime). Read back to prove which mode an environment value
+ * actually selected. */
+int rusteron_dpdk_test_local_io_mode(const rusteron_dpdk_transport_t *native);
 
 /* Test reset for the transport.c singleton (cleared by rusteron_dpdk_test_reset). */
 void rusteron_dpdk_transport_test_reset(void);
 
-/* Monotonic nanosecond clock (runtime.c): the invariant TSC calibrated against
- * CLOCK_MONOTONIC, or CLOCK_MONOTONIC itself when the TSC is not invariant.
- * Calibrated once per process by rusteron_dpdk_clock_init (runtime init), or
- * lazily on first use. Tests pin it with the setter so ARP rate limiting,
- * expiry and the counter sample gate are deterministic; reset clears the pin. */
+/* Monotonic nanosecond clock (runtime.c): ergon-clock's calibration, made in
+ * Rust and adopted at create (the config's `clock`, rusteron_dpdk_clock_adopt).
+ * No calibration runs here. The counter is the TSC on x86_64 and the generic
+ * timer's virtual counter, CNTVCT_EL0, on aarch64, converted with ergon-clock's
+ * arithmetic; ergon-clock's fallback is CLOCK_MONOTONIC through the same
+ * formula. Until a transport adopts one, the clock is that fallback with a
+ * factor of one. Tests pin it with the setter so ARP rate limiting, expiry and
+ * the counter sample gate are deterministic; reset clears the pin.
+ * The source values are what counter type 80 reports, so they never change:
+ * 0 CLOCK_MONOTONIC, 1 the TSC, 2 CNTVCT_EL0. */
 #define RUSTERON_DPDK_CLOCK_MONOTONIC 0
 #define RUSTERON_DPDK_CLOCK_TSC 1
-#define RUSTERON_DPDK_CLOCK_UNCALIBRATED (-1)
-#define RUSTERON_DPDK_CLOCK_PINNED 2
+#define RUSTERON_DPDK_CLOCK_CNTVCT 2
+#define RUSTERON_DPDK_CLOCK_PINNED 3
+/* This architecture's counter source. */
+#if defined(__x86_64__)
+#define RUSTERON_DPDK_CLOCK_COUNTER RUSTERON_DPDK_CLOCK_TSC
+#else
+#define RUSTERON_DPDK_CLOCK_COUNTER RUSTERON_DPDK_CLOCK_CNTVCT
+#endif
 
 /* The clock's state (runtime.c). Hidden, so the inlined fast path below reads
- * it RIP-relative rather than through the GOT. */
+ * it PC-relative rather than through the GOT. */
 typedef struct rusteron_dpdk_clock_stct
 {
-    int mode;          /* RUSTERON_DPDK_CLOCK_{TSC,MONOTONIC,UNCALIBRATED,PINNED} */
-    uint64_t tsc_base; /* TSC at calibration */
-    uint64_t ns_base;  /* CLOCK_MONOTONIC ns at calibration */
-    uint64_t tsc_mult; /* ns per tick, 32.32 fixed point */
+    int mode;            /* RUSTERON_DPDK_CLOCK_{COUNTER,MONOTONIC,PINNED} */
+    uint64_t base_ticks; /* ergon-clock's: the ticks at the base */
+    uint64_t base_ns;    /* the time, ns, at the base (monotonic domain) */
+    uint64_t mult;       /* ns per tick, 32.32 fixed point, in (0, 2^63) */
 } rusteron_dpdk_clock_t;
 extern rusteron_dpdk_clock_t rusteron_dpdk_clock __attribute__((visibility("hidden")));
-uint64_t rusteron_dpdk_clock_ns_slow(void);
+/* Out of line and cold, also where it could be inlined (runtime.c), so the
+ * fast path below takes no stack frame for the fallback's timespec. */
+__attribute__((noinline, cold)) uint64_t rusteron_dpdk_clock_ns_slow(void);
 
-/* The transport's clock read, inlined into the hot paths: the TSC scaled to
- * ns, or the slow path (CLOCK_MONOTONIC, a test pin, first calibration). */
-static inline uint64_t rusteron_dpdk_clock_now(void)
+/* One read of the hardware counter, as fast as it can be read: rdtsc on
+ * x86_64, mrs CNTVCT_EL0 on aarch64 (DPDK's rte_rdtsc on each, ergon-clock's
+ * unordered read). Neither waits for the instructions before it, which a few
+ * ns of skew in a freshness, pacing or loop-gap time never matters to. */
+static inline uint64_t rusteron_dpdk_counter(void)
 {
 #if defined(__x86_64__)
-    if (__builtin_expect(RUSTERON_DPDK_CLOCK_TSC == rusteron_dpdk_clock.mode, 1))
-    {
-        const uint64_t delta = __rdtsc() - rusteron_dpdk_clock.tsc_base;
-        return rusteron_dpdk_clock.ns_base +
-            (uint64_t)(((unsigned __int128)delta * rusteron_dpdk_clock.tsc_mult) >> 32);
-    }
+    return __rdtsc();
+#else
+    uint64_t ticks;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(ticks));
+    return ticks;
 #endif
+}
+
+/* `ticks` in ns through the adopted conversion: ergon-clock's formula to the
+ * bit (its Conversion::ns_at). The difference is signed, so a tick a little
+ * behind the base (an unordered read on another core, just after calibration)
+ * is a little before base_ns, never 2^64 ns later; one widening signed
+ * multiply (x86 imul, Arm mul and smulh). */
+static inline uint64_t rusteron_dpdk_clock_ns_at(uint64_t ticks)
+{
+    const int64_t delta = (int64_t)(ticks - rusteron_dpdk_clock.base_ticks);
+    return rusteron_dpdk_clock.base_ns +
+        (uint64_t)(int64_t)(((__int128)delta * (int64_t)rusteron_dpdk_clock.mult) >> 32);
+}
+
+/* The transport's clock read, inlined into the hot paths: the counter
+ * converted (a read, a subtraction, a multiply and an add), or the slow path
+ * (the CLOCK_MONOTONIC fallback, a test pin). */
+static inline uint64_t rusteron_dpdk_clock_now(void)
+{
+    if (__builtin_expect(RUSTERON_DPDK_CLOCK_COUNTER == rusteron_dpdk_clock.mode, 1))
+    {
+        return rusteron_dpdk_clock_ns_at(rusteron_dpdk_counter());
+    }
     return rusteron_dpdk_clock_ns_slow();
 }
 
 /* rusteron_dpdk_clock_now as an exported function (tests, benchmarks). */
 uint64_t rusteron_dpdk_clock_ns(void);
-void rusteron_dpdk_clock_init(void);
-/* RUSTERON_DPDK_CLOCK_TSC or RUSTERON_DPDK_CLOCK_MONOTONIC. */
+/* Whether `params` can be the transport's clock: ergon-clock's parameters of
+ * this version, in the monotonic domain, a factor in (0, 2^63). 0, or -1 with
+ * the error recorded naming the field. */
+int rusteron_dpdk_clock_params_check(const rusteron_dpdk_clock_params_t *params);
+/* Check and adopt `params` as the transport's clock, for the process (create
+ * does, with its config's). A test pin stays in force. 0 or -1. */
+int rusteron_dpdk_clock_adopt(const rusteron_dpdk_clock_params_t *params);
+/* RUSTERON_DPDK_CLOCK_COUNTER or RUSTERON_DPDK_CLOCK_MONOTONIC: the adopted
+ * clock's (a pin aside). */
 int rusteron_dpdk_clock_source(void);
+/* The adopted conversion applied to `ticks` (tests: against ergon-clock's). */
+uint64_t rusteron_dpdk_test_clock_ns_at(uint64_t ticks);
+/* Pin the clock at `ns`. Pinning a clock not pinned yet also moves the active
+ * transport's allowances onto it (their last refill becomes `ns`). */
 void rusteron_dpdk_test_set_clock_ns(uint64_t ns);
 /* Move the pinned clock on by `ns` at every read from the calling thread (0:
  * it stays put), so a wait spun on it ends; reset clears it. */
 void rusteron_dpdk_test_set_clock_step_ns(uint64_t ns);
-/* Recalibrate; allow_tsc == 0 forces the CLOCK_MONOTONIC fallback. */
-int rusteron_dpdk_test_clock_recalibrate(int allow_tsc);
 
 /* CLOCK_REALTIME in ns, the clock NIC RX timestamps are compared against
- * (chrony disciplines it to the NIC's PTP hardware clock). Read only when a
- * timestamped frame arrives. Tests pin it; reset clears the pin. */
+ * (chrony disciplines it to the NIC's PTP hardware clock), and the media
+ * receive timestamp of a channel asking for one (once a receive burst). Read
+ * only when a timestamped frame arrives or such a channel is open. Tests pin
+ * it; reset clears the pin. */
 uint64_t rusteron_dpdk_realtime_ns(void);
 void rusteron_dpdk_test_set_realtime_ns(uint64_t ns);
+/* Each read of the pinned realtime clock then advances it by `ns` (tests: a
+ * clock that moves between reads; 0 after a reset). */
+void rusteron_dpdk_test_set_realtime_step_ns(uint64_t ns);
+/* Reads of the pinned realtime clock since the pin (tests: what a poll costs). */
+uint64_t rusteron_dpdk_test_realtime_reads(void);
 
 /* The process-lifetime native runtime singleton (transport.c), or NULL when no
  * transport has been created. EAL can be initialized once, so there is at most

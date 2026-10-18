@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package cpuset
+
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
+// WriteKind is the kind of one ordered write in a partition plan.
+type WriteKind string
+
+const (
+	// WriteMkdir creates the child cgroup directory. Value is empty.
+	WriteMkdir WriteKind = "mkdir"
+	// WriteCpus writes cpuset.cpus.
+	WriteCpus WriteKind = "cpuset.cpus"
+	// WriteExclusive writes cpuset.cpus.exclusive, replacing whatever is
+	// there. Only the new child is ever written this way.
+	WriteExclusive WriteKind = "cpuset.cpus.exclusive"
+	// WriteExclusiveAdd unions Value into cpuset.cpus.exclusive rather than
+	// replacing it. Every directory this partition shares with another
+	// container's is written this way: cpuset.cpus.exclusive is a replace, so
+	// writing only this container's CPUs there drops the CPUs of every
+	// partition already under that ancestor, and a previously valid sibling
+	// partition loses its exclusive CPUs.
+	WriteExclusiveAdd WriteKind = "cpuset.cpus.exclusive+"
+	// WritePartition writes cpuset.cpus.partition.
+	WritePartition WriteKind = "cpuset.cpus.partition"
+)
+
+// Write is one filesystem write in a partition plan. Path is absolute; Value
+// is the file content (empty for WriteMkdir), except for WriteExclusiveAdd
+// where it is the CPU list to union into the current content.
+type Write struct {
+	Kind  WriteKind
+	Path  string
+	Value string
+}
+
+// Plan is the ordered setup that turns a child cgroup into an isolated
+// cpuset partition holding only the exclusive CPUs. The kernel owns the
+// order: cpuset.cpus.exclusive must be written down the hierarchy before the
+// partition write is accepted (cgroup-v2.rst, "remote partition").
+type Plan struct {
+	// Child is the absolute path of the child cgroup.
+	Child string
+	// Writes are in apply order.
+	Writes []Write
+}
+
+// PartitionPlan returns the child cgroup path and the ordered writes that
+// make it a "isolated" partition of exactly exclusive.
+//
+// cgroupRoot is the cgroup v2 mount point (it has no cpuset.cpus.exclusive).
+// containerCgroup is the container's own cgroup directory. exclusive is the
+// container's exclusive CPUs (ERGON_ISOLATED_CPUS); shared is the CPUs helpers
+// use (ERGON_SHARED_CPUS).
+//
+// The plan never writes "isolated" on a cgroup that holds shared CPUs: the
+// child's cpuset.cpus is exactly exclusive, and an exclusive/shared overlap is
+// refused, because an isolated shared CPU would take load balancing away from
+// the helpers.
+func PartitionPlan(cgroupRoot, containerCgroup string, exclusive, shared Set) (*Plan, error) {
+	if cgroupRoot == "" {
+		return nil, fmt.Errorf("partition: the cgroup root is empty")
+	}
+	if !filepath.IsAbs(cgroupRoot) {
+		return nil, fmt.Errorf("partition: the cgroup root %q is not absolute", cgroupRoot)
+	}
+	if containerCgroup == "" {
+		return nil, fmt.Errorf("partition: the container cgroup is empty")
+	}
+	if !filepath.IsAbs(containerCgroup) {
+		return nil, fmt.Errorf("partition: the container cgroup %q is not absolute", containerCgroup)
+	}
+	root := filepath.Clean(cgroupRoot)
+	dir := filepath.Clean(containerCgroup)
+	if dir == root {
+		return nil, fmt.Errorf("partition: the container cgroup is the cgroup root")
+	}
+	if !strings.HasPrefix(dir, root+"/") {
+		return nil, fmt.Errorf("partition: the container cgroup %q is not under the cgroup root %q", containerCgroup, cgroupRoot)
+	}
+	if exclusive.IsEmpty() {
+		return nil, fmt.Errorf("partition: the exclusive CPU list is empty")
+	}
+	if both := exclusive.Intersection(shared); !both.IsEmpty() {
+		return nil, fmt.Errorf("partition: CPU %s is both exclusive and shared; an isolated partition must not hold shared CPUs", both)
+	}
+
+	child := filepath.Join(dir, "ergon-isolated")
+	plan := &Plan{Child: child}
+	plan.Writes = append(plan.Writes, Write{Kind: WriteMkdir, Path: child})
+	plan.Writes = append(plan.Writes, Write{Kind: WriteCpus, Path: filepath.Join(child, "cpuset.cpus"), Value: exclusive.List()})
+
+	// cpuset.cpus.exclusive down the hierarchy, outermost first, so each
+	// level's exclusive.effective is non-empty before its child claims the
+	// CPUs. The cgroup root has no such file.
+	//
+	// Every level above the new child is shared with whatever else lives
+	// under it, so it is a union with what is already reserved there: two
+	// pods in different containers share kubepods.slice, and replacing that
+	// file with only this container's CPUs would take the exclusive CPUs away
+	// from the partition the first pod is already running in. The child is
+	// this container's alone, so it is written outright. Concurrent hooks
+	// update the shared levels under one lock in ApplyPartition.
+	for _, ancestor := range ancestors(root, dir) {
+		plan.Writes = append(plan.Writes, Write{
+			Kind:  WriteExclusiveAdd,
+			Path:  filepath.Join(ancestor, "cpuset.cpus.exclusive"),
+			Value: exclusive.List(),
+		})
+	}
+	// The child's own value is explicit rather than implicit, and it holds
+	// only this container's exclusive CPUs.
+	plan.Writes = append(plan.Writes, Write{
+		Kind:  WriteExclusive,
+		Path:  filepath.Join(child, "cpuset.cpus.exclusive"),
+		Value: exclusive.List(),
+	})
+
+	plan.Writes = append(plan.Writes, Write{
+		Kind:  WritePartition,
+		Path:  filepath.Join(child, "cpuset.cpus.partition"),
+		Value: "isolated",
+	})
+	return plan, nil
+}
+
+// ancestors returns every directory between cgroupRoot (exclusive) and dir
+// (inclusive), outermost first. That is the path a remote partition's
+// cpuset.cpus.exclusive has to be written down.
+func ancestors(root, dir string) []string {
+	var out []string
+	for cur := dir; cur != root; cur = filepath.Dir(cur) {
+		out = append(out, cur)
+	}
+	// Outermost first.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}

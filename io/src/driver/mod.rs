@@ -31,16 +31,27 @@
 //! itself returns an error only when the backend fails.
 
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::RawFd;
+use std::sync::{Arc, OnceLock};
 
 use crate::backend::{Backend, Config};
+use crate::checks::{self, DevContext, HostReport};
 use crate::clock::{monotonic_ns, rdtsc, ticks_per_us};
 use crate::dns::{DnsConfig, Lookup, Resolver};
+use crate::endpoint::sealed::RouteSlot;
 use crate::endpoint::{ConnId, ConnMut, Dial, DriverStats, Endpoint, Handler, Receive};
 use crate::error::{Error, Result};
+use crate::placement::{self, CpuError};
+use crate::route::{self, Flow, QuickAckCheck, QuickAckError, RouteCheck};
 use crate::{RxMeta, sys};
 
+use conn_checks::{ConnJob, RouteIn};
+
 mod background;
+mod conn_checks;
 mod epoll;
+#[cfg(test)]
+mod placement_tests;
 #[cfg(feature = "uring")]
 mod uring;
 
@@ -188,15 +199,21 @@ enum Imp {
     Uring(uring::Uring),
 }
 
-/// How often request deadlines are checked, in microseconds (one counter read
-/// per `poll`, only for endpoints with deadlines).
+/// How often deadlines and timers are checked, in microseconds (only for
+/// endpoints with deadlines).
 const EXPIRY_CHECK_US: u32 = 250;
+
+/// Polls between two counter reads for that check on backends that never
+/// sleep: a counter read costs more than a whole idle `uring-spin` poll, so
+/// most polls only count down.
+const EXPIRY_POLLS: u32 = 64;
 
 /// How often connections being set up are advanced, in microseconds.
 const SETUP_STEP_US: u32 = 20;
 
-/// Per-socket options every backend needs.
-#[derive(Clone, Copy)]
+/// Per-socket options every backend needs, and what the connection checks
+/// need from the driver.
+#[derive(Clone)]
 struct SockOpts {
     timestamps: bool,
     rcvbuf: Option<u32>,
@@ -205,10 +222,25 @@ struct SockOpts {
     /// and `io_uring` take theirs on the instance).
     prefer_busy_poll: bool,
     busy_poll_budget: Option<u16>,
+    quickack: QuickAckCheck,
+    backend: Backend,
+    /// TCP keepalive: idle, interval and count (idle 0: left alone), and
+    /// `TCP_USER_TIMEOUT` (0: left alone).
+    keepalive: (u32, u32, u32),
+    user_timeout_ms: u32,
+    /// The egress-device checks' context (the driver's hot CPUs).
+    ctx: Arc<DevContext>,
+}
+
+/// The route check's cost on the thread that set the connection up.
+#[derive(Clone, Copy, Default)]
+struct RouteCost {
+    lookups: u64,
+    ticks: u64,
 }
 
 impl SockOpts {
-    fn of(cfg: &Config) -> Self {
+    fn of(cfg: &Config, ctx: &Arc<DevContext>) -> Self {
         Self {
             timestamps: cfg.rx_timestamps,
             rcvbuf: cfg.rcvbuf,
@@ -222,10 +254,19 @@ impl SockOpts {
             busy_poll_budget: cfg
                 .busy_poll_budget
                 .filter(|_| cfg.backend == Backend::RecvBusy),
+            quickack: cfg.quickack_check,
+            backend: cfg.backend,
+            keepalive: (
+                cfg.keepalive_idle_s,
+                cfg.keepalive_interval_s,
+                cfg.keepalive_count,
+            ),
+            user_timeout_ms: cfg.tcp_user_timeout_ms,
+            ctx: Arc::clone(ctx),
         }
     }
 
-    fn apply(self, fd: std::os::fd::RawFd) -> Result<()> {
+    fn apply(&self, fd: RawFd) -> Result<()> {
         if self.timestamps {
             sys::enable_rx_timestamps(fd)?;
         }
@@ -233,6 +274,13 @@ impl SockOpts {
             sys::set_rcvbuf(fd, b)?;
         }
         sys::set_busy_poll(fd, self.busy_poll_us)?;
+        let (idle, interval, count) = self.keepalive;
+        if idle > 0 {
+            sys::set_tcp_keepalive(fd, idle, interval, count)?;
+        }
+        if self.user_timeout_ms > 0 {
+            sys::set_tcp_user_timeout(fd, self.user_timeout_ms)?;
+        }
         let privileged = |what: &str, e: std::io::Error| {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 Error::Config(format!("{what} needs CAP_NET_ADMIN"))
@@ -250,6 +298,89 @@ impl SockOpts {
         }
         Ok(())
     }
+
+    /// Socket options, then the connection's checks (see
+    /// [`crate::checks`]), once per connection, before it is registered, on
+    /// whichever thread sets it up (`on_loop`: the polling thread).
+    ///
+    /// `added`: a connection handed to `Driver::add`, whose socket options
+    /// are unknown: `TCP_NODELAY` is set and `TCP_CORK` reported (the
+    /// driver's own connects set `TCP_NODELAY` when they create the socket).
+    ///
+    /// The route: decided already (a dial gated under `require`), or looked
+    /// up here (`require`; `warn` off the polling thread), or under `warn` on
+    /// the polling thread queued to the warning thread, which fills in the
+    /// connection's [`RouteCheck`] later. Either way the warning thread then
+    /// checks the NAPI id and the egress device.
+    fn prepare<E: Endpoint>(
+        &self,
+        ep: &mut E,
+        id: ConnId,
+        added: bool,
+        on_loop: bool,
+    ) -> Result<RouteCost> {
+        let fd = ep.fd();
+        self.apply(fd)?;
+        if added && sys::tcp_nodelay_and_cork(fd)? == Some(true) {
+            crate::warn::emit(checks::cork_line(id));
+        }
+        if self.quickack == QuickAckCheck::Off {
+            return Ok(RouteCost::default());
+        }
+        let napi = if self.backend.polls_nic() {
+            sys::incoming_napi_id(fd).ok()
+        } else {
+            None
+        };
+        let t0 = rdtsc();
+        let mut lookups = 0;
+        let route = if ep.route_state().decided() {
+            RouteIn::Known(ep.route_state().get().clone())
+        } else if self.quickack == QuickAckCheck::Warn && on_loop {
+            let cell = Arc::new(OnceLock::new());
+            ep.set_route(RouteSlot::Pending(Arc::clone(&cell)));
+            RouteIn::Lookup(Flow::of_socket(fd), cell)
+        } else {
+            let found =
+                route::check_socket(self.quickack, fd).map_err(|e| Error::QuickAck(Box::new(e)))?;
+            lookups = 1;
+            ep.set_route(RouteSlot::Ready(found.clone()));
+            RouteIn::Known(found)
+        };
+        // A route known to lead to this host has no NIC to check (I4 and
+        // I-dev skip local routes): nothing to queue.
+        let local =
+            matches!(&route, RouteIn::Known(c) if c.route().is_none_or(route::Route::is_local));
+        if !local {
+            let job = ConnJob {
+                conn: id,
+                backend: self.backend,
+                ctx: Arc::clone(&self.ctx),
+                napi,
+                route,
+            };
+            crate::warn::run(move |st| job.run(st));
+        }
+        Ok(RouteCost {
+            lookups,
+            ticks: rdtsc().wrapping_sub(t0),
+        })
+    }
+}
+
+/// The route check of a dial gated under `require` (see `advance_one`):
+/// `route::check_socket`, which tests replace with a stand-in.
+fn require_route(fd: RawFd) -> std::result::Result<RouteCheck, QuickAckError> {
+    route::check_socket(QuickAckCheck::Require, fd)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn ticks_ns(ticks: u64, tpu: f64) -> u64 {
+    (ticks as f64 / tpu * 1000.0) as u64
 }
 
 /// A connection being set up.
@@ -282,6 +413,9 @@ pub struct Driver<E> {
     /// Counter value at which deadlines are next checked (`E::DEADLINES`).
     next_expiry: u64,
     expiry_ticks: u64,
+    /// Polls until the counter is read for that check, and the reset value.
+    expiry_countdown: u32,
+    expiry_polls: u32,
     /// Counter value at which connection set-up is next advanced.
     next_setup: u64,
     setup_ticks: u64,
@@ -290,6 +424,10 @@ pub struct Driver<E> {
     background: Option<background::Background<E>>,
     /// Resolver settings for the background thread's own resolver.
     dns: DnsConfig,
+    /// What `Driver::new` found about the host.
+    report: HostReport,
+    /// The egress-device checks' context, shared with queued checks.
+    ctx: Arc<DevContext>,
     /// A socket with receive timestamps enabled for the driver's lifetime. The
     /// first timestamping socket in a process enables a kernel static key (code
     /// patched on every CPU) and the last one to close disables it again; this
@@ -300,9 +438,21 @@ pub struct Driver<E> {
 impl<E: Endpoint> Driver<E> {
     /// A driver with no connections.
     ///
+    /// Also chooses the CPUs of ergon-io's helper threads
+    /// ([`crate::placement`]), reported in [`Driver::host_report`] and one
+    /// start-up line.
+    ///
     /// # Errors
     /// The backend is unavailable (`io_uring` without the `uring` feature, or a
     /// kernel without the needed features) or fails to initialise.
+    /// [`Error::Cpu`]: `Config::helper_cpus` or `ERGON_HELPER_CPUS` names a
+    /// CPU the process may not use (or only the polling CPU); `uring-sqpoll`
+    /// with `sqpoll_cpu` outside the process's cpuset, or without
+    /// `sqpoll_cpu` in a process that may use the polling CPU only (a pod
+    /// with one CPU: `SQPOLL` would spin there).
+    /// [`Error::HostCheck`]: `ERGON_HOST_CHECKS` is set to something other
+    /// than `off`, `on` or `require`, or it is `require` and a host check
+    /// warned (after its lines were printed).
     pub fn new(cfg: Config) -> Result<Self> {
         Self::with_dns(cfg, DnsConfig::system())
     }
@@ -313,7 +463,56 @@ impl<E: Endpoint> Driver<E> {
     /// # Errors
     /// As [`Driver::new`].
     pub fn with_dns(cfg: Config, dns: DnsConfig) -> Result<Self> {
+        Self::on_host(cfg, dns, &ergon_tune::Host::system())
+    }
+
+    /// [`Driver::with_dns`] with the host checks and the helper CPUs read
+    /// from `host` (a fixture tree in tests).
+    pub(crate) fn on_host(
+        mut cfg: Config,
+        dns: DnsConfig,
+        host: &ergon_tune::Host,
+    ) -> Result<Self> {
         cfg.validate()?;
+        // The one switch over every host-check warning (`ERGON_HOST_CHECKS`).
+        let policy = ergon_tune::HostCheckPolicy::from_env()?;
+        // I-host and I3 (see `crate::checks`), and where the helper threads
+        // go (`crate::placement`), on the thread creating the driver.
+        let report = checks::host_report(host, &cfg);
+        let helpers = report.helpers.clone()?;
+        if cfg.backend == Backend::UringSqpoll {
+            // Before the ring exists: `io_uring_setup` refuses a CPU outside
+            // the cpuset (EINVAL), and without one of its own SQPOLL would
+            // spin on the polling CPU.
+            cfg.sqpoll_cpu = Some(placement::sqpoll_cpu(&helpers, cfg.sqpoll_cpu)?);
+        }
+        // The warning thread, started now rather than on the polling thread
+        // at the first line: it writes every finding and runs the route
+        // lookups under `warn` and the egress-device checks.
+        crate::warn::prepare_on(
+            &helpers,
+            &placement::thread_cpus(&helpers, placement::sqpoll_of(&cfg)),
+        );
+        // Each line once per process, under the switch (`off` drops the
+        // warning lines).
+        for l in report
+            .lines_under(policy)
+            .into_iter()
+            .chain(report.helper_line())
+        {
+            crate::warn::once(l);
+        }
+        // `require`: a warning fails the start, its lines printed above.
+        if let Some(e) = report.refusal(policy) {
+            return Err(e.into());
+        }
+        if let Some(asked) = cfg.rcvbuf
+            && let Ok(granted) = sys::granted_rcvbuf(asked)
+            && let Some(l) = checks::rcvbuf_line(asked, granted)
+        {
+            crate::warn::once(l);
+        }
+        let ctx = Arc::new(DevContext::new(&cfg, report.hot.clone()));
         let tpu = ticks_per_us();
         let imp = match cfg.backend {
             Backend::EpollSpin | Backend::EpollBusy | Backend::RecvBusy => {
@@ -340,12 +539,21 @@ impl<E: Endpoint> Driver<E> {
             unreported: Vec::new(),
             resolver: Resolver::new(dns.clone()),
             dns,
+            report,
+            ctx,
             _timestamp_keeper: cfg.rx_timestamps.then(timestamp_keeper).flatten(),
             // Calibrated once here, not on the first connect.
             ticks_per_us: tpu,
             next_expiry: 0,
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             expiry_ticks: (f64::from(EXPIRY_CHECK_US) * tpu) as u64,
+            expiry_countdown: 1,
+            // A backend that sleeps has slow polls: read the counter on each.
+            expiry_polls: if cfg.backend.may_sleep() {
+                1
+            } else {
+                EXPIRY_POLLS
+            },
             next_setup: 0,
             background: None,
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -366,16 +574,30 @@ impl<E: Endpoint> Driver<E> {
         &self.stats
     }
 
+    /// What `Driver::new` found about the host: the loop's CPU and the
+    /// findings of the CPU, scheduling and THP checks (see
+    /// [`crate::checks`]); each was also printed once.
+    #[must_use]
+    pub const fn host_report(&self) -> &HostReport {
+        &self.report
+    }
+
     /// Takes over a connected, non-blocking endpoint. Sets its socket options
-    /// (receive timestamps, `SO_RCVBUF`, `SO_BUSY_POLL`) and starts receiving.
+    /// (receive timestamps, `SO_RCVBUF`, `SO_BUSY_POLL`, `TCP_NODELAY`, TCP
+    /// keepalive and `TCP_USER_TIMEOUT`; `TCP_CORK` left on is reported),
+    /// checks its route for quick ACK
+    /// (`Config::quickack_check`, see [`crate::route`]: under `warn` on
+    /// ergon-io's warning thread, under `require` here) and starts
+    /// receiving.
     ///
     /// # Errors
-    /// A socket option or the backend registration fails; the endpoint is
+    /// A socket option or the backend registration fails, or
+    /// [`Error::QuickAck`] under `quickack_check=require`; the endpoint is
     /// dropped (its socket closed).
     pub fn add(&mut self, ep: E) -> Result<ConnId> {
         let i = self.conns.reserve();
         let id = self.conns.id(i);
-        if let Err(e) = self.install(i, ep) {
+        if let Err(e) = self.install(i, ep, true) {
             self.conns.release(i);
             return Err(e);
         }
@@ -388,6 +610,13 @@ impl<E: Endpoint> Driver<E> {
     /// the `connect_timeout_ms` deadline. Sends queued before it opens are
     /// not possible (`get_mut` returns `None` until then).
     ///
+    /// Under `quickack_check=require` the route is checked on the polling
+    /// thread as soon as TCP is connected, before the TLS handshake, so a
+    /// refused route ([`Error::QuickAck`], to [`Handler::on_closed`]) costs
+    /// no handshake; [`DriverStats::route_check_ns`] counts the time. Under
+    /// `warn` the lookup runs on ergon-io's warning thread after the
+    /// connection opens (see [`crate::route`]).
+    ///
     /// # Errors
     /// The connect could not even be started (socket creation failed).
     pub fn connect<D: Dial<Conn = E> + 'static>(&mut self, dial: D) -> Result<ConnId> {
@@ -399,6 +628,10 @@ impl<E: Endpoint> Driver<E> {
             started: false,
             deadline_ns: monotonic_ns() + i64::from(self.cfg.connect_timeout_ms) * 1_000_000,
         };
+        if self.cfg.quickack_check == QuickAckCheck::Require {
+            // Checked at TCP connect, before the TLS handshake.
+            p.dial.gate_route();
+        }
         if let Some(addr) = p.dial.addr() {
             if let Err(e) = p.dial.start(addr) {
                 self.conns.release(i);
@@ -411,36 +644,66 @@ impl<E: Endpoint> Driver<E> {
     }
 
     /// Like [`Driver::connect`], but DNS (the helper's own non-blocking
-    /// resolver, built from the driver's `DnsConfig`), TCP, TLS and any
-    /// upgrade run on a helper thread the driver starts on first use, so the
-    /// polling thread spends no handshake CPU. `poll` only takes the finished
-    /// connection; [`Handler::on_open`] / [`Handler::on_closed`] report it as
-    /// for `connect`. Closing the id first, or dropping the driver, discards
+    /// resolver, built from the driver's `DnsConfig`), TCP, TLS, any
+    /// upgrade and the quick-ACK route check (under `require` before the TLS
+    /// handshake) run on a helper thread the driver starts on first use, so
+    /// the polling thread spends no handshake CPU and makes no route lookup.
+    /// `poll` only takes the finished connection; [`Handler::on_open`] /
+    /// [`Handler::on_closed`] report it as for `connect`. Closing the id first, or dropping the driver, discards
     /// the result and closes its socket.
     ///
+    /// The helper runs on `Config::connect_cpu`, else on the helper CPUs
+    /// `Driver::new` chose ([`crate::placement`]); never on the polling CPU
+    /// when it is known.
+    ///
     /// # Errors
-    /// The helper thread could not be started.
+    /// [`Error::Cpu`] at once, starting no thread:
+    /// [`CpuError::NoSpareCpu`] when the process may use the polling CPU
+    /// only (a pod with one CPU), where the helper would time-slice the
+    /// polling thread: use [`Driver::connect`], or set
+    /// `Config::inline_connect_fallback` to have this call do that, or give
+    /// the pod a second CPU; [`CpuError::Outside`] or
+    /// [`CpuError::PollingCpu`] for a `connect_cpu` outside the process's
+    /// cpuset, or that is the polling CPU. Otherwise: the helper thread
+    /// could not be started.
     pub fn connect_background<D>(&mut self, dial: D) -> Result<ConnId>
     where
         D: Dial<Conn = E> + Send + 'static,
         E: Send + 'static,
     {
         if self.background.is_none() {
-            self.background = Some(background::Background::start(
-                self.cfg.connect_cpu,
-                self.dns.clone(),
-            )?);
+            match self.background_cpus()? {
+                Some(cpus) => {
+                    let step = placement::dial_step(
+                        &cpus,
+                        placement::sqpoll_of(&self.cfg).and_then(|s| usize::try_from(s).ok()),
+                    );
+                    self.background = Some(background::Background::start(
+                        &cpus,
+                        self.dns.clone(),
+                        step,
+                    )?);
+                }
+                None => return self.connect(dial),
+            }
         }
         let i = self.conns.reserve();
         let id = self.conns.id(i);
         let timeout = std::time::Duration::from_millis(u64::from(self.cfg.connect_timeout_ms));
-        let opts = SockOpts::of(&self.cfg);
+        let opts = SockOpts::of(&self.cfg, &self.ctx);
+        let mut dial = dial;
+        if self.cfg.quickack_check == QuickAckCheck::Require {
+            // Checked on the helper thread at TCP connect, before TLS.
+            dial.gate_route();
+        }
         if let Some(bg) = self.background.as_mut()
             && let Err(e) = bg.submit(
                 i,
                 id.generation(),
                 Box::new(dial),
-                Box::new(move |c: &E| opts.apply(c.fd())),
+                Box::new(move |c: &mut E, id: ConnId| {
+                    opts.prepare(c, id, false, false).map(|_| ())
+                }),
                 timeout,
             )
         {
@@ -448,6 +711,32 @@ impl<E: Endpoint> Driver<E> {
             return Err(e);
         }
         Ok(id)
+    }
+
+    /// Where `connect_background` connects: `Some` CPUs for its helper
+    /// thread, or `None` on the polling thread (a process that may use the
+    /// polling CPU only, under `Config::inline_connect_fallback`). Reads no
+    /// file: `Driver::new` chose the CPUs.
+    fn background_cpus(&self) -> Result<Option<Vec<usize>>> {
+        let cpus = match &self.report.helpers {
+            Ok(p) => placement::dial_cpus(p, &self.cfg),
+            Err(e) => Err(e.clone()),
+        };
+        match cpus {
+            Ok(cpus) => Ok(Some(cpus)),
+            Err(CpuError::NoSpareCpu { .. }) if self.cfg.inline_connect_fallback => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// `Err` with [`Error::Cpu`] exactly when `connect_background` would
+    /// refuse for want of a CPU (see there), so a caller that can only ever
+    /// connect in the background fails at once rather than on every attempt.
+    pub(crate) fn background_ready(&self) -> Result<()> {
+        if self.background.is_none() {
+            self.background_cpus()?;
+        }
+        Ok(())
     }
 
     /// Frees the connections closed during the current call: on the helper
@@ -520,13 +809,26 @@ impl<E: Endpoint> Driver<E> {
         self.pending.len()
     }
 
-    /// Socket options, backend registration and the slot.
-    fn install(&mut self, i: usize, ep: E) -> Result<()> {
-        if let Err(e) = SockOpts::of(&self.cfg).apply(ep.fd()) {
-            self.conns.closed.push(ep);
-            return Err(e);
+    /// Socket options and the connection's checks on the polling thread
+    /// (`added`: handed to `Driver::add`), backend registration and the slot.
+    fn install(&mut self, i: usize, mut ep: E, added: bool) -> Result<()> {
+        let id = self.conns.id(i);
+        match SockOpts::of(&self.cfg, &self.ctx).prepare(&mut ep, id, added, true) {
+            Ok(cost) => self.count_route(cost),
+            Err(e) => {
+                self.conns.closed.push(ep);
+                return Err(e);
+            }
         }
         self.install_prepared(i, ep)
+    }
+
+    /// Adds a route check made on the polling thread to the counters.
+    fn count_route(&mut self, cost: RouteCost) {
+        let ns = ticks_ns(cost.ticks, self.ticks_per_us);
+        self.stats.route_lookups += cost.lookups;
+        self.stats.route_check_ns += ns;
+        self.stats.route_check_max_ns = self.stats.route_check_max_ns.max(ns);
     }
 
     /// Backend registration and the slot, for an endpoint whose socket options
@@ -565,6 +867,7 @@ impl<E: Endpoint> Driver<E> {
                 &mut self.stats,
                 now,
                 self.ticks_per_us,
+                &require_route,
             );
             let ep = match outcome {
                 Ok(None) => {
@@ -576,7 +879,7 @@ impl<E: Endpoint> Driver<E> {
             };
             let p = self.pending.swap_remove(k);
             let id = self.conns.id(p.slot);
-            let installed = ep.and_then(|ep| self.install(p.slot, ep));
+            let installed = ep.and_then(|ep| self.install(p.slot, ep, false));
             match installed {
                 Ok(()) => {
                     self.stats.connects += 1;
@@ -632,9 +935,11 @@ impl<E: Endpoint> Driver<E> {
         self.len() == 0
     }
 
-    /// Closes a connection; stale or unknown ids are ignored. With `io_uring` the
-    /// endpoint is dropped once the kernel has released its buffers (on a later
-    /// `poll`, or when the driver is dropped).
+    /// Closes a connection at once; stale or unknown ids are ignored. No
+    /// WebSocket Close is sent (for a close handshake use `WsConn::close`)
+    /// and [`Handler::on_closed`] is not called.
+    /// With `io_uring` the endpoint is dropped once the kernel has released
+    /// its buffers (on a later `poll`, or when the driver is dropped).
     pub fn close(&mut self, id: ConnId) {
         if let Some(i) = self.conns.lookup(id) {
             close_index(&mut self.imp, &mut self.conns, i);
@@ -725,13 +1030,19 @@ impl<E: Endpoint> Driver<E> {
         Ok(usize::try_from(self.stats.messages - before).unwrap_or(usize::MAX))
     }
 
+    /// Every `expiry_polls` polls, reads the counter; every 250 µs, runs
+    /// the endpoints' deadlines and timers.
     #[inline]
     fn check_deadlines<H: Handler>(&mut self, handler: &mut H) {
         if E::DEADLINES {
-            let t = rdtsc();
-            if t >= self.next_expiry {
-                self.next_expiry = t.wrapping_add(self.expiry_ticks);
-                self.expire_all(handler);
+            self.expiry_countdown -= 1;
+            if self.expiry_countdown == 0 {
+                self.expiry_countdown = self.expiry_polls;
+                let t = rdtsc();
+                if t >= self.next_expiry {
+                    self.next_expiry = t.wrapping_add(self.expiry_ticks);
+                    self.expire_all(handler);
+                }
             }
         }
     }
@@ -749,6 +1060,7 @@ impl<E: Endpoint> Driver<E> {
                 continue;
             };
             if let Err(e) = c.expire(now) {
+                let e = c.close_reason(e);
                 close_index(&mut self.imp, &mut self.conns, i);
                 self.stats.closed += 1;
                 handler.on_closed(id, e);
@@ -784,6 +1096,7 @@ impl<E: Endpoint> Driver<E> {
             match r {
                 Ok(n) => self.stats.messages += n as u64,
                 Err(e) => {
+                    let e = c.close_reason(e);
                     close_index(&mut self.imp, &mut self.conns, i);
                     self.stats.closed += 1;
                     handler.on_closed(id, e);
@@ -839,17 +1152,18 @@ impl<E: Endpoint> Driver<E> {
                     self.stats.send_calls += 1;
                     self.stats.sends += 1;
                     let fd = c.fd();
-                    let q = c.tx_queue();
-                    match sys::send(fd, q) {
+                    match sys::send(fd, c.tx_queue()) {
                         Ok(n) => {
-                            q.drain(..n);
+                            c.tx_queue().drain(..n);
+                            c.on_handed(n);
                         }
                         Err(err) => {
+                            let err = c.close_reason(err.into());
                             let id = self.conns.id(i);
                             e.remove(fd);
                             self.conns.remove(i);
                             self.stats.closed += 1;
-                            handler.on_closed(id, err.into());
+                            handler.on_closed(id, err);
                         }
                     }
                 }
@@ -902,6 +1216,7 @@ fn advance_one<E: Endpoint>(
     stats: &mut DriverStats,
     now: i64,
     tpu: f64,
+    check: &dyn Fn(RawFd) -> std::result::Result<RouteCheck, QuickAckError>,
 ) -> Result<Option<E>> {
     if now > p.deadline_ns {
         return Err(Error::Timeout("connect"));
@@ -918,13 +1233,21 @@ fn advance_one<E: Endpoint>(
     }
     let t0 = rdtsc();
     let r = p.dial.step();
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
-    let ns = (rdtsc().wrapping_sub(t0) as f64 / tpu * 1000.0) as u64;
+    let ns = ticks_ns(rdtsc().wrapping_sub(t0), tpu);
     stats.connect_step_max_ns = stats.connect_step_max_ns.max(ns);
+    if let (Ok(None), Some(fd)) = (&r, p.dial.awaiting_route()) {
+        // Under `require`: TCP is connected and the TLS handshake has not
+        // started, so a refused route costs no handshake. The next step
+        // starts it.
+        let t0 = rdtsc();
+        let found = check(fd);
+        let ns = ticks_ns(rdtsc().wrapping_sub(t0), tpu);
+        stats.route_lookups += 1;
+        stats.route_check_ns += ns;
+        stats.route_check_max_ns = stats.route_check_max_ns.max(ns);
+        p.dial
+            .route_checked(found.map_err(|e| Error::QuickAck(Box::new(e)))?);
+    }
     r
 }
 
@@ -956,5 +1279,122 @@ where
             stats.messages += conn.on_received(id, n, &meta, handler)? as u64;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::endpoint::sealed::DialIo;
+    use crate::http::{HttpConn, HttpDial, HttpOptions};
+    use crate::net::Target;
+    use crate::route::RouteError;
+
+    type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    /// A dial gated under `require`, connecting to a plain TCP listener (no
+    /// TLS server: the test reads what the client sends), and the accepted
+    /// server side.
+    fn gated() -> R<(Pending<HttpConn>, TcpStream)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let target = Target::new("localhost", addr.port(), "/").with_addr(addr);
+        let tls = crate::tls::client_config(rustls::RootCertStore::empty())?;
+        let mut dial = HttpDial::new(target, tls, HttpOptions::default())?;
+        dial.gate_route();
+        dial.start(addr)?;
+        let p = Pending {
+            slot: 0,
+            dial: Box::new(dial),
+            started: true,
+            deadline_ns: monotonic_ns() + 5_000_000_000,
+        };
+        let (server, _) = listener.accept()?;
+        Ok((p, server))
+    }
+
+    /// Steps `p` with `check` as the route check until it fails, finishes,
+    /// or `until` holds.
+    fn step(
+        p: &mut Pending<HttpConn>,
+        stats: &mut DriverStats,
+        check: &dyn Fn(RawFd) -> std::result::Result<RouteCheck, QuickAckError>,
+        until: &dyn Fn(&DriverStats) -> bool,
+    ) -> R<Result<Option<HttpConn>>> {
+        let mut resolver = Resolver::new(DnsConfig::system());
+        let tpu = ticks_per_us();
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let r = advance_one(p, &mut resolver, stats, monotonic_ns(), tpu, check);
+            if !matches!(r, Ok(None)) || until(stats) {
+                return Ok(r);
+            }
+            if Instant::now() > end {
+                return Err(format!("no progress: {stats:?}").into());
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_route_costs_no_handshake() -> R {
+        let (mut p, mut server) = gated()?;
+        let mut stats = DriverStats::default();
+        let asked = Cell::new(0);
+        let refuse = |_: RawFd| {
+            asked.set(asked.get() + 1);
+            Err(QuickAckError::Lookup {
+                flow: None,
+                error: RouteError::Timeout,
+            })
+        };
+        let out = step(&mut p, &mut stats, &refuse, &|_| false)?;
+        assert!(matches!(out, Err(Error::QuickAck(_))), "{:?}", out.err());
+        assert_eq!(asked.get(), 1);
+        assert_eq!(stats.route_lookups, 1);
+        drop(p);
+        // The client closed without sending a byte: no ClientHello.
+        server.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut b = [0u8; 64];
+        assert_eq!(server.read(&mut b)?, 0, "TLS bytes before the route check");
+        Ok(())
+    }
+
+    #[test]
+    fn the_handshake_starts_only_after_the_route_is_checked() -> R {
+        let (mut p, server) = gated()?;
+        server.set_nonblocking(true)?;
+        let mut stats = DriverStats::default();
+        // When the check runs, the server has received nothing yet.
+        let silent_then = Cell::new(None);
+        let pass = |_: RawFd| {
+            let mut b = [0u8; 1];
+            silent_then.set(Some(matches!(
+                server.peek(&mut b),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+            )));
+            Ok(RouteCheck::NotChecked)
+        };
+        let out = step(&mut p, &mut stats, &pass, &|s| s.route_lookups > 0)?;
+        assert!(matches!(out, Ok(None)), "{:?}", out.err());
+        assert_eq!(silent_then.get(), Some(true), "TLS bytes before the check");
+        // Then the next step sends the ClientHello: a TLS handshake record.
+        let mut b = [0u8; 1];
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = step(&mut p, &mut stats, &pass, &|_| true)?;
+            match server.peek(&mut b) {
+                Ok(1) => break,
+                _ if Instant::now() > end => return Err("no ClientHello after the check".into()),
+                _ => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(b[0], 0x16, "not a TLS handshake record");
+        assert_eq!(stats.route_lookups, 1, "checked once");
+        Ok(())
     }
 }

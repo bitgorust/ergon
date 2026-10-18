@@ -20,8 +20,9 @@ use crate::structured_ir::{
 };
 
 use super::conversion_helpers::{
-    DECODER_RESERVED, acting_accessors, domain_accessor_ident, field_has_conversion_free,
-    find_domain_type, owner_accessor_names, resolve_field_ident, tail_accessor_ident,
+    DECODER_RESERVED, acting_accessors, constant_converts, domain_accessor_ident,
+    field_has_conversion_free, find_domain_type, owner_accessor_names, resolve_field_ident,
+    tail_accessor_ident,
 };
 use super::converter_impls::is_optional_domain_field;
 use super::doc_attr_tokens;
@@ -447,7 +448,9 @@ fn forward_one_field(
         }
     }
 
-    if f.presence == Presence::Constant {
+    // A constant forwards the same decoder-side conversion accessors the
+    // base decoder gives it (`constant_converts`), never `Option`.
+    if f.presence == Presence::Constant && !constant_converts(f) {
         return ts;
     }
 

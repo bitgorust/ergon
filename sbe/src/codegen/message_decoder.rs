@@ -1735,13 +1735,10 @@ pub(crate) fn generate_message_decoder(
                 &self.decoder.buf[end..]
             }
             #meta_bytes
-            /// Schema version from the message header (or wrap args), not the
-            /// compiled schema constant. Fields with `sinceVersion` and optional
-            /// presence depend on this value.
+            /// Schema version from the header or wrap args, which `sinceVersion` fields follow.
             #[must_use = "discarding this value is almost always a mistake"]
             #[inline] pub fn acting_version(&self) -> u16 { self.decoder.acting_version }
-            /// Block length from the wire header / wrap args. Tail offsets use
-            /// this acting length, not only the compiled `BLOCK_LENGTH`.
+            /// Block length from the header or wrap args, which tail offsets use.
             #[must_use = "discarding this value is almost always a mistake"]
             #[inline] pub fn acting_block_length(&self) -> usize { self.decoder.acting_block_length }
         }

@@ -57,6 +57,52 @@ extern "C" {
 #define RUSTERON_DPDK_MBUF_F_RX_IPV4_CKSUM_BAD (1u << 2)
 #define RUSTERON_DPDK_MBUF_F_RX_UDP_CKSUM_BAD (1u << 3)
 
+/* DPDK encodes each RX checksum verdict as a two-bit enum (rte_mbuf_core.h,
+ * RTE_MBUF_F_RX_{IP,L4}_CKSUM_*), not as two independent bits:
+ *
+ *   00 UNKNOWN  the device did not verify it
+ *   01 BAD      verified, and it is wrong
+ *   10 GOOD     verified, and it is correct
+ *   11 NONE     the integrity of the packet is verified although the bytes
+ *               are not a normal checksum for this protocol
+ *
+ * NONE has both the GOOD and the BAD bit set, so testing the bits
+ * independently classifies a verified packet as both, and the BAD half drops
+ * it. Decode the enum, never the individual bits. */
+#define RUSTERON_DPDK_CKSUM_UNKNOWN 0u
+#define RUSTERON_DPDK_CKSUM_BAD 1u
+#define RUSTERON_DPDK_CKSUM_GOOD 2u
+#define RUSTERON_DPDK_CKSUM_NONE 3u
+
+/* Bit positions of those two verdicts in a DPDK ol_flags word
+ * (rte_mbuf_core.h: RTE_MBUF_F_RX_IP_CKSUM_BAD at bit 5, GOOD at bit 6,
+ * RTE_MBUF_F_RX_L4_CKSUM_BAD at bit 7, GOOD at bit 8). Port ops assert these
+ * still match the DPDK headers they compile against. */
+#define RUSTERON_DPDK_CKSUM_IP_SHIFT 5u
+#define RUSTERON_DPDK_CKSUM_L4_SHIFT 7u
+
+/* Map one DPDK checksum verdict onto the (good_bit | bad_bit) view flags.
+ * UNKNOWN maps to 0, which makes the transport software-verify; NONE maps to
+ * good_bit alone, which trusts the verified integrity and skips the software
+ * check; the packet must never come out with bad_bit set. */
+static inline uint32_t rusteron_dpdk_cksum_view(unsigned status, uint32_t good_bit, uint32_t bad_bit)
+{
+    switch (status)
+    {
+    case RUSTERON_DPDK_CKSUM_GOOD:
+    case RUSTERON_DPDK_CKSUM_NONE:
+        return good_bit;
+    case RUSTERON_DPDK_CKSUM_BAD:
+        return bad_bit;
+    default:
+        return 0;
+    }
+}
+
+/* Decode a DPDK ol_flags word onto the RX verdict view flags: the two two-bit
+ * verdicts at the shifts above, each mapped by rusteron_dpdk_cksum_view. */
+uint32_t rusteron_dpdk_rx_ol_flags_from_dpdk(uint64_t ol);
+
 /*
  * Opaque-to-the-encoder mbuf view. The port ops fill `opaque`/`data`/`capacity`
  * at allocation and consume everything at transmit; the encoders only write

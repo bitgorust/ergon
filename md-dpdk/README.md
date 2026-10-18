@@ -1,351 +1,425 @@
 # ergon-md-dpdk
 
+> **Not recommended for production use.**
+>
+> This crate is a proof of concept. I wrote it to get a better understanding
+> of how a kernel-bypass transport for Aeron can be written. Of all of ergon's
+> modules, it is the one where I relied on AI the most, and I could not verify
+> that what it does is correct, unlike the other modules, whose domains I
+> understand well.
+>
+> **If you need kernel bypass for Aeron, use
+> [Aeron Premium](https://aeron.io/).** It is inexpensive, faster, handles the
+> edge cases, is battle-tested, and comes with support.
+>
+> **On localhost it seems slightly slower than the open-source Aeron C
+> driver** over kernel UDP: host-local channels run on ordinary kernel
+> sockets in this driver too, so bypass cannot help there.
+> Round trips on one host, p50 / p99.99 / max: 5.48 / 8.18 / 10.73 µs against
+> the C driver's 5.58 / 7.39 / 8.86 µs on AWS `c7i.metal-24xl`, and
+> 6.16 / 10.71 / 54 µs against 5.94 / 9.39 / 49 µs on Azure
+> `Standard_D16s_v6`. On AWS Graviton5 (`c9g.2xlarge`) its median was lower,
+> 3.88 / 9.51 / 19 µs against 4.29 / 10.54 / 15 µs, and its max higher
+> ([BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md),
+> AWS round 4, Azure round 8 and Graviton round G1).
+
 An experimental DPDK kernel-bypass UDP transport for the
 [rusteron](https://crates.io/crates/rusteron-media-driver) Aeron media driver,
-on AWS (ENA) and Azure (MANA), Linux x86_64. Benchmarks against the kernel UDP
-path: [BENCHMARKS.md](BENCHMARKS.md).
+on AWS (ENA) and Azure (MANA), Linux x86_64 and aarch64 (Graviton).
+Measurements against kernel UDP: [BENCHMARKS.md](BENCHMARKS.md). A plain-English
+guide, with which transport to use when:
+[the book](https://mimran1980.github.io/ergon/md-dpdk/overview.html).
 
 > **AI assistance.** Like the rest of ergon, this crate was written **with heavy
 > AI assistance**. See
 > [AI-ASSISTANCE.md](https://github.com/mimran1980/ergon/blob/main/AI-ASSISTANCE.md).
 > It is not production-ready.
 
-Aeron's C media driver sends and receives through a table of function
-pointers, `aeron_udp_channel_transport_bindings_t`. This crate's native C fills
-in that table on DPDK, with one dedicated NIC for the sender agent and one for
-the receiver, and installs it into an `AeronDriverContext`. The conductor keeps
-resolving on the kernel socket, and the VM's primary NIC stays kernel-owned.
+- Aeron's C media driver sends and receives through a table of function
+  pointers, `aeron_udp_channel_transport_bindings_t`. This crate's C fills it
+  in on DPDK and installs it into an `AeronDriverContext`.
+- One NIC for the sender agent, one for the receiver. The conductor still
+  resolves on the kernel socket; the VM's primary NIC stays with the kernel.
+- Needs rusteron-media-driver 0.2.11 or newer, which exports the headers of the
+  Aeron it builds (`DEP_AERON_DRIVER_*`), so this C compiles against exactly
+  that driver.
 
 | Cloud | DPDK driver | Port selected by |
 |---|---|---|
-| AWS | `net_ena`, the ENA bound to `vfio-pci` | its PCI address |
+| AWS | `net_ena`, the ENA bound to `igb_uio` (`wc_activate=1`) or a write-combining `vfio-pci` | its PCI address |
 | Azure | `net_netvsc` over the MANA VF (Microsoft's recommended path), or `net_mana` alone | its MAC (`RUSTERON_DPDK_*_MAC`): every accelerated NIC of a VM is a vport on one PCI function |
-
-It needs rusteron-media-driver 0.2.11 or newer, which exports the headers of
-the Aeron it builds (`DEP_AERON_DRIVER_*`) so this crate's C compiles against
-exactly the driver it is installed into.
 
 ## Requirements
 
-- The `dpdk` feature, on Linux x86_64 with `libdpdk >= 23.11` found through
-  pkg-config (`libdpdk-dev` on Ubuntu 24.04, or DPDK built from source on
-  Amazon Linux 2023, as `deploy/aws-eks/Dockerfile.media-driver` does).
-- Without the feature the crate still builds on every platform: the
-  configuration, environment parsing and transport selection compile, and
-  selecting `dpdk-ena` returns `DpdkError::FeatureDisabled`.
-- `static` links the Aeron C driver statically (rusteron's `static`).
+- **`dpdk` feature:** Linux x86_64 or aarch64, `libdpdk >= 23.11` via
+  pkg-config (`libdpdk-dev` on Ubuntu 24.04 or Debian 13; from source on
+  Amazon Linux 2023, as `deploy/aws-eks/Dockerfile.media-driver` does). Both
+  architectures are tested against the fakes in Docker
+  (`just verify-dpdk-docker`, `--arm64`).
+- **Without the feature** the crate builds everywhere, and selecting
+  `dpdk-ena` returns `DpdkError::FeatureDisabled`.
+- **`static`** links Aeron's C driver statically (rusteron's `static`).
+- **Graviton: build for the CPU,** or Ubuntu's and Debian's gcc turn every
+  atomic add on the send and receive paths into a call to libgcc's
+  outline-atomics helper instead of one `ldadd`. C: `CFLAGS=-mcpu=native`
+  (as the Graviton runs did) or the core: `neoverse-v1` (Graviton3), `-v2`
+  (Graviton4), `-v3` (Graviton5). Rust: `RUSTFLAGS=-Ctarget-cpu=...`.
+  `CFLAGS` does not reach Aeron's own C, which
+  rusteron builds for the build host's CPU (`-march=native`) unless
+  `RUSTERON_C_MARCH` names another.
 
 ## Selecting the transport
-
-The bundled `media_driver` binary selects the transport from one environment
-variable:
 
 ```sh
 RUSTERON_MEDIA_DRIVER_TRANSPORT=dpdk-ena cargo run -p ergon-md-dpdk --features dpdk --bin media_driver
 ```
 
-- Absent or `default`: the socket transport, unchanged.
-- `dpdk-ena`: the DPDK transport. A configuration, validation or native
-  failure exits non-zero; it never falls back to the socket driver.
-- Anything else: invalid, exits non-zero.
+| `RUSTERON_MEDIA_DRIVER_TRANSPORT` | result |
+|---|---|
+| unset or `default` | the socket transport, unchanged |
+| `dpdk-ena` | the DPDK transport; any failure exits non-zero, never falling back to the socket driver |
+| anything else | invalid, exits non-zero |
 
-`RUSTERON_MEDIA_DRIVER_MLOCKALL=1` (or `lock_memory_from_env()` in your own
-driver) locks the process's memory, present and future, before the driver
-starts: every log buffer the conductor maps is then faulted in by `mmap`, so
-the agents never take a page fault on one, nor wait on the memory-map lock
-behind the conductor mapping or unmapping another. It needs `CAP_IPC_LOCK` or
-a large enough `RLIMIT_MEMLOCK`.
+- **Required:** `RUSTERON_DPDK_FILE_PREFIX`, `RUSTERON_DPDK_SENDER_PCI`,
+  `RUSTERON_DPDK_SENDER_IPV4_CIDR`, `RUSTERON_DPDK_SENDER_GATEWAY`, and their
+  `RUSTERON_DPDK_RECEIVER_*` twins (`src/env.rs`). The names are rusteron's,
+  so deployments for rusteron's DPDK branch work unchanged.
+- **`RUSTERON_DPDK_EAL_ARGS`** appends EAL options (log levels, `-l 0`), at
+  most 1 KiB with the device arguments.
+- **The Aeron context** needs its network agents busy-spinning on CPUs of
+  their own (Threading modes), disjoint wildcard port ranges, and an MTU no
+  larger than `RUSTERON_DPDK_MAX_AERON_MTU`, set with the usual `AERON_*`
+  variables.
+- **`RUSTERON_MEDIA_DRIVER_MLOCKALL=1`** (or `lock_memory_from_env()`) locks
+  the process's memory before the driver starts, so the agents never
+  page-fault on a log buffer nor wait on the memory-map lock. Needs
+  `CAP_IPC_LOCK` or a large enough `RLIMIT_MEMLOCK`. No measured gain on AWS
+  or Azure.
+- **Embedded:** a typed `DpdkTransportConfig`
+  ([`examples/embedded_dpdk.rs`](examples/embedded_dpdk.rs)), or the binary's
+  whole configuration with `driver::ConfiguredDriver`, then
+  `EnvMediaDriver::do_work` in your loop.
 
-The variable names are rusteron's, so deployments written for rusteron's DPDK
-branch work unchanged. `RUSTERON_DPDK_EAL_ARGS` appends EAL options (log
-levels, lcore lists such as `-l 0`), at most 1 KiB with the device arguments. The DPDK configuration is read from the environment
-(`src/env.rs`). The required values are `RUSTERON_DPDK_FILE_PREFIX`,
-`RUSTERON_DPDK_SENDER_PCI`, `RUSTERON_DPDK_SENDER_IPV4_CIDR` and
-`RUSTERON_DPDK_SENDER_GATEWAY`, plus their `RUSTERON_DPDK_RECEIVER_*` twins.
-The Aeron context must be a dedicated-thread driver with distinct sender and
-receiver CPUs, spin idle strategies, disjoint wildcard port ranges, and an MTU
-no larger than `RUSTERON_DPDK_MAX_AERON_MTU`. These are set through the
-standard `AERON_*` variables (`AERON_SENDER_CPU_AFFINITY`,
-`AERON_SENDER_IDLE_STRATEGY`, `AERON_SENDER_WILDCARD_PORT_RANGE`,
-`AERON_MTU_LENGTH`, ...).
+## Threading modes
 
-An embedded driver can install the transport with a typed
-`DpdkTransportConfig` instead; see
-[`examples/embedded_dpdk.rs`](examples/embedded_dpdk.rs).
+The agent that carries the network work must busy-spin (`spin` or `noop`;
+sleeping or yielding stalls a DPDK queue) on a CPU the transport knows.
 
-## Azure
+| `AERON_THREADING_MODE` | The network agent | Its CPU | Its idle strategy |
+|---|---|---|---|
+| `DEDICATED` | the sender and the receiver, a NIC each | `AERON_SENDER_CPU_AFFINITY`, `AERON_RECEIVER_CPU_AFFINITY`, distinct | `AERON_SENDER_IDLE_STRATEGY`, `AERON_RECEIVER_IDLE_STRATEGY` |
+| `SHARED_NETWORK` | one agent, both NICs | `AERON_SENDER_CPU_AFFINITY` | `AERON_SHAREDNETWORK_IDLE_STRATEGY` |
+| `SHARED` | one agent for everything | `AERON_CONDUCTOR_CPU_AFFINITY` | `AERON_SHARED_IDLE_STRATEGY` |
+| `INVOKER` | the application's thread that runs the driver | `AERON_CONDUCTOR_CPU_AFFINITY` | `AERON_SHARED_IDLE_STRATEGY` |
 
-Each data NIC's synthetic VMBus device must belong to `uio_hv_generic` (its
-kernel interface and VF down) so the netvsc PMD can take it and keep the VF data
-path switched in; `benches/cloud/vm.sh driver dpdk` shows the steps. MANA queues
-hold at most 256 descriptors (`RUSTERON_DPDK_RX_DESCRIPTORS` and
-`RUSTERON_DPDK_TX_DESCRIPTORS`; the defaults are 1024 and 512, an ENA's
-transmit maximum), and a count outside a NIC's reported limits fails start
-naming them. The transport also stops DPDK's automatic
-vdev_netvsc fail-safe device, which would otherwise take the ports (and the
-primary NIC's).
+- **Each NIC is touched only by its own agent's thread.**
+- **With one thread for both directions** (`SHARED_NETWORK`, `SHARED`,
+  `INVOKER`) a send never waits out a pacing debt:
+  `RUSTERON_DPDK_TX_PACE_SPIN_US` is 0, and a non-zero value fails the
+  install.
+- **Under `SHARED` and `INVOKER`** the conductor's work (mapping log buffers,
+  opening host-local sockets and channel transports) runs on the network
+  thread, as over kernel UDP. The bundled binary idles there with the shared
+  idle strategy; an `INVOKER` application's own loop must not sleep.
+- **The install refuses** the EAL's main lcore on a network agent's core; a
+  creating thread confined to that core (an `INVOKER` application that pinned
+  its thread first); and, under `DEDICATED` and `SHARED_NETWORK`, a network
+  agent on the conductor's CPU.
+- **So create the transport on the housekeeping CPUs** (the binary under
+  `taskset`, an `INVOKER` application before it pins), or name them:
+  `RUSTERON_DPDK_EAL_ARGS='-l <cpu>'`, `RUSTERON_DPDK_HOUSEKEEPING_CPU`.
 
 ## CPU pinning
 
-Aeron's C driver only parses `AERON_{CONDUCTOR,SENDER,RECEIVER}_CPU_AFFINITY`;
-`aeronmd` applies them with an agent start hook that rusteron's driver lacks.
-`pin_agents_to_configured_cpus` installs that hook, `DpdkTransport::install`
-calls it, and so does the bundled `media_driver` in every mode. Without it the
-agents float, or, under DPDK, inherit the EAL's CPU 0 pin, which puts the sender
-and receiver on one core (milliseconds per round trip).
+Aeron's C driver parses `AERON_{CONDUCTOR,SENDER,RECEIVER}_CPU_AFFINITY`, but
+only `aeronmd` applies them. `pin_agents_to_configured_cpus` installs the same
+start hook; `DpdkTransport::install` and the bundled binary call it in every
+mode. Without it, under DPDK, the sender and receiver inherited the EAL's
+CPU 0 and shared one core: milliseconds per round trip.
+
+## Receive ring
+
+- **`RUSTERON_DPDK_RX_DESCRIPTORS`**, unset: min(4096, the NIC's maximum),
+  rounded down to a power of two: 4096 on ENA, 256 on MANA. Set: 64 to 8192,
+  used as given; start fails on a NIC that cannot take it. The `port-info`
+  label reports it (`rx-desc=`).
+- **4096 against ENA's 1024** (AWS
+  [round 6](BENCHMARKS.md#aws-c7i4xlarge-rounds-6-and-7-2026-10-15)): loss-free
+  1,344 B rate 400 k → 600 k msgs/s, two 288 B flows 5,070 NAKs → none, idle
+  unchanged. On Graviton (c9g, round G1) no measurable effect.
+- **`RUSTERON_DPDK_MBUFS_PER_PORT`** (default 16384) must hold both rings,
+  four bursts and two lcores' mempool caches (1.5 ×
+  `RUSTERON_DPDK_MEMPOOL_CACHE` each): 5,504 with the defaults. Start fails,
+  naming both variables, when it falls short. On MANA with the ring unset, a
+  pool sized for 256 fails validation (which assumes 4096): set
+  `RUSTERON_DPDK_RX_DESCRIPTORS=256` or enlarge the pool.
+- **Hugepages:** the pool's size does not depend on the ring: about 37 MiB a
+  port at the default MTU (2,048-byte mbufs), 145 MiB at 8960.
+
+## ENA low-latency queues
+
+ENA's transmit path needs its low-latency queue (LLQ), which writes into the
+device's BAR 2; that BAR must be mapped write-combined. Without it a send
+costs about 100 times as much.
+
+- **Every ENA port asks for LLQ:** `llq_policy=1` with DPDK 24.11+,
+  `enable_llq=1` before.
+- **`RUSTERON_DPDK_ENA_DEVARGS="<key>=<value>,..."`** adds device arguments
+  to every ENA port (`miss_txc_to=5`, `control_path_poll_interval=500`); an
+  LLQ key in it (`llq_policy=3`) replaces the transport's. Keys and values
+  `[A-Za-z0-9_.:-]`, at most 200 bytes, the LLQ value decimal and in range;
+  else initialisation fails. Put ENA arguments here, not in
+  `RUSTERON_DPDK_EAL_ARGS`: DPDK takes the first `-a` for a device.
+- **Start checks every ENA port:** LLQ not turned off, and BAR 2 mapped
+  write-combined in `/proc/self/maps` (`resource2_wc`, as `igb_uio` with
+  `wc_activate=1` or `uio_pci_generic` map it). Otherwise it fails, naming the
+  port: BAR uncached (`resource2`), or unseen, as under `vfio-pci`.
+- **`RUSTERON_DPDK_VFIO_WC=1`** confirms a write-combining `vfio-pci` (Amazon's
+  patched module), so an unseen mapping starts. `0` (default) or `1`. The EKS
+  ConfigMap sets it.
+- **`RUSTERON_DPDK_ENA_LLQ_REQUIRED=0`** starts a failing port anyway, with a
+  warning, for diagnosis.
+- **`port-info` label:** `llq=wc`, `uncached`, `unseen`, `unknown` (map
+  unreadable) or `off`. It cannot see a kernel that demoted the mapping to
+  uncached (`benches/cloud/vm.sh wc-check` reads PAT's table), nor the PMD's
+  final policy (`Placement policy: Low latency` at
+  `--log-level=pmd.net.ena.driver:info`).
+
+## Azure
+
+- **Move each data NIC's VMBus device to `uio_hv_generic`** (its kernel
+  interface and VF down), so the netvsc PMD takes it and keeps the VF data
+  path. `benches/cloud/vm.sh driver dpdk` shows the steps.
+- **Set `RUSTERON_DPDK_TX_DESCRIPTORS=256`:** MANA queues hold at most 256
+  and the default is ENA's 512. A count outside a NIC's limits fails start.
+- **The transport stops DPDK's automatic vdev_netvsc fail-safe device,**
+  which would otherwise take the ports.
+
+## Host checks
+
+`driver::ConfiguredDriver::from_env` (and so the bundled binary) checks the
+host after pinning and before the driver starts (`src/checks.rs`, on
+`ergon-tune`). It prints one stderr line per check that is not fine:
+`ergon-md-dpdk warning: ...` with the measured effect and the fix, or
+`ergon-md-dpdk info: ...` (including `unknown`, never a warning, for data it
+cannot read, such as from a pod's network namespace).
+
+| Check | What | Severity |
+|---|---|---|
+| M1 | The network agents busy-spin on pinned CPUs of their own, off the conductor's | socket transport: warn; DPDK: the install refuses otherwise |
+| M2 | Non-sparse term buffers (`AERON_TERM_BUFFER_SPARSE_FILE=false`) | warn |
+| M3 | `AERON_SOCKET_SO_RCVBUF`/`SNDBUF` granted as asked (a probe socket) | socket transport: warn; DPDK: info |
+| M4 | Kernel busy polling (`net.core.busy_read`, `busy_poll`) | socket transport: warn on x86, info on Graviton |
+| M-host | T1 and T8 on the agents' CPUs, T7, T3, T4 (`AERON_DIR`), T5, T9 (no CPU quota on the driver's cgroup) | as `ergon-tune` gives them |
+| M-nic | T2 and T6 on the data NICs; N1, N2, and N4 with busy polling, for the socket transport | as `ergon-tune` gives them |
+
+- **Data NICs:** under `dpdk-ena`, the ports. For the socket transport, the
+  interfaces in `RUSTERON_MEDIA_DRIVER_DATA_NICS` (`ens6,ens7`); without it,
+  one information line says what is skipped.
+- **Re-checks:** a thread (`md-host-checks`, Linux, off the busy cores) reads
+  each named NIC's `carrier_changes` once a second and re-runs N1 and T2
+  after a reset, which on ENA re-places interrupts and turns adaptive
+  moderation back on. Nothing is re-checked under `dpdk-ena`.
+- **`RUSTERON_MEDIA_DRIVER_HOST_CHECK`:** `warn` (default), `off`, or
+  `require`, which refuses to start while any check warns
+  (`DpdkError::HostCheck`). Any other value refuses to start.
 
 ## No pauses on the hot path
 
-The driver's sender and receiver agents only send, receive and bump counters.
-Nothing periodic runs on them:
+The sender and receiver agents only send, receive and bump counters. Nothing
+periodic runs on them.
 
-- **ARP.** Only the first send to a next hop waits for its resolution (Aeron
-  retries the zero-byte result); a next hop that stays silent for 3 s fails
-  one send with `EHOSTUNREACH`, as Linux reports a failed neighbour once, and
-  later sends to it are dropped silently (as an unconnected `sendto`
-  succeeds) while it is re-probed once a second. Each NIC keeps up to 1024
-  next hops; a lookup examines at most 16 slots, and a new next hop finding
-  none free replaces the least recently used one idle for 60 s (a next hop
-  in use is never replaced). If none is idle, its datagrams are dropped and
-  `ENOBUFS` is reported at most once a minute. Requests for the NIC's
-  addresses are answered at most 1000 times a second. After resolution the cached MAC is used for every
-  send: at 30 s a refresh request goes out alongside the traffic, retried at
-  most once a second until answered, and an unanswered refresh keeps the MAC.
-  A frame from an on-link peer's IP arriving from another MAC (a pod
-  rescheduled, a failover) makes the next send refresh at once. Only a solicited answer
-  moves the next hop to a new MAC; unsolicited ARP never does. Each NIC keeps
-  its own table, touched only by its own agent thread.
-- **Statistics.** The PMD extended statistics and the NIC's basic drop
-  counters (`nic-rx-errors`, `nic-rx-missed`, `nic-rx-nombuf`), read once a
-  second (on ENA each read is an admin command to the device;
-  `RUSTERON_DPDK_NIC_STATS_MS` sets the interval, from 1000 to 3600000, and
-  0 stops the reads, leaving those counters at their first values), and the
-  mempool sample, once a second, run on a
-  housekeeping thread. It and the local-I/O thread (see Host-local channels)
-  share the conductor's core, the driver's housekeeping core: they run on
-  `RUSTERON_DPDK_HOUSEKEEPING_CPU`; else on the conductor's CPU, unless the
-  conductor busy-spins; else on the EAL's main lcore CPU; never on a core a
-  busy-spinning agent owns (SMT siblings included), else on the process's
-  CPUs minus those. The agents' CPUs and idle strategies are the driver
-  context's (env or setters), read when the transport is installed.
-- **Nothing else on the agents' cores.** The EAL's own threads (interrupts
-  and alarms, multi-process messages) would be allowed on every CPU the
-  creating thread could use except the lcores, the agents' among them: the
-  transport confines each thread `rte_eal_init` starts to the main lcore's
-  CPUs. Threads that are not the transport's (a signal handler, Aeron's own)
-  inherit the process's CPUs, so start the driver confined to its
-  housekeeping CPUs (`taskset -c 0 media_driver`); the agents are pinned
-  explicitly and leave that mask.
+- **ARP.**
+  - Only the first send to a next hop waits for resolution (Aeron retries).
+    A next hop silent for 3 s fails one send with `EHOSTUNREACH`; later sends
+    drop silently while it is re-probed once a second.
+  - Up to 1024 next hops a NIC, at most 16 slots examined a lookup; a new one
+    replaces the least recently used next hop idle for 60 s, else its
+    datagrams drop (`ENOBUFS`, reported at most once a minute).
+  - A refresh request goes out at 30 s, alongside the traffic; an unanswered
+    refresh keeps the cached MAC. A frame from a peer's IP with a new MAC triggers a
+    refresh at once; only a solicited answer changes the MAC.
+  - ARP requests for the NIC's addresses are answered at most 1000 times a
+    second.
+- **Statistics** run once a second on a housekeeping thread: NIC drop counters
+  (`nic-rx-errors`, `nic-rx-missed`, `nic-rx-nombuf`), PMD extended
+  statistics (on ENA an admin command each) and the mempool.
+  `RUSTERON_DPDK_NIC_STATS_MS` sets the interval (1000 to 3600000; `0` stops
+  the reads).
+- **Housekeeping placement:** `RUSTERON_DPDK_HOUSEKEEPING_CPU`, else the
+  conductor's CPU unless the conductor spins, else the EAL main lcore's CPU;
+  never a busy agent's core or its SMT sibling. The EAL's own threads are
+  confined to the main lcore's CPUs. Start the driver confined to
+  housekeeping (`taskset -c 0 media_driver`) so threads it does not own stay
+  there too.
+- **NIC health.** Housekeeping runs DPDK's timer service once a second, which
+  drives the ENA PMD's keep-alive and transmit-completion watchdog. A failed
+  check is counted (`nic-reset-requested`, type 79) and logged at error
+  level; the transport never resets the device: restart the media driver.
+  Under `uio_pci_generic` the keep-alive needs ENA's
+  `control_path_poll_interval` devarg (DPDK 24.11+), or the watchdog fires.
 - **Receive drain.** A poll takes up to `RUSTERON_DPDK_BURST_SIZE` frames a
-  burst whatever Aeron's vlen (each frame is dispatched the moment it is
-  parsed, zero copy, so vlen sizes nothing on this path), and while bursts
-  come back full it keeps draining, up to `RUSTERON_DPDK_RX_MAX_BURSTS` bursts
-  (default: as many as fill the receive ring, at most 8; 1 to 64), so a
-  backlog a stall left clears in one duty cycle. Each port records the most
-  frames one poll drained (`rx-backlog-max`) and the polls that drained
-  within a burst of a full ring (`rx-ring-full-suspected`): a ring that full
-  may have overflowed, which MANA does without counting a drop.
-- **Receive-ring health.** Each port counts the longest gap between receive
-  polls that found frames waiting (`rx-poll-gap-max-ns`), how many reached
-  100 µs, and polls that drained a full burst (`rx-burst-full`), so a stall
-  long enough to overflow the NIC's ring shows up. Every poll also times the
-  gap since the port's last one, frames or not (`poll-cycle-gap-max-ns`, and
-  how many fell in 20–50, 50–100 and over 100 µs): the agent's own loop, so a
-  latency spike can be matched to the agent not running. The clock is read
-  there anyway.
+  burst, zero copy, and keeps draining while bursts come back full, up to
+  `RUSTERON_DPDK_RX_MAX_BURSTS` (default: enough to fill the smaller receive
+  ring, at most 8; 1 to 64). Counters: `rx-backlog-max`, and on Azure
+  `rx-ring-full-suspected` (MANA overflows without counting a drop; ENA counts
+  its own as `nic-rx-missed`).
+- **Loop health.** Per port: the longest gap between polls that found frames
+  (`rx-poll-gap-max-ns`, and how many reached 100 µs), full-burst polls
+  (`rx-burst-full`), and the agent's own loop gap (`poll-cycle-gap-max-ns`,
+  counted in 20–50, 50–100 and over 100 µs), to match a latency spike to the
+  agent not running.
 
 ## Kernel socket semantics
 
-The transport behaves as the kernel UDP sockets Aeron's own transport uses,
-so DPDK peers and kernel peers interoperate:
+DPDK peers and kernel peers interoperate: the transport behaves as Aeron's
+kernel UDP sockets.
 
-- **Ports.** An explicit port already bound on the NIC fails init with
-  `EADDRINUSE` at once. A wildcard bind (port 0, as every plain `endpoint=`
-  publication has) gets an ephemeral port, unique on the NIC, reported by
-  `bind_addr_and_port`; port 0 never goes on the wire. The range is
-  `RUSTERON_DPDK_EPHEMERAL_PORT_RANGE="<low> <high>"`, else the network
-  namespace's `net.ipv4.ip_local_port_range`, skipping
-  `net.ipv4.ip_local_reserved_ports` and Aeron's configured wildcard ranges,
-  starting at a random offset. For a fixed, firewall-friendly source port use
-  Aeron's `interface=<nic-ip>:<port>` on the channel. If a kernel interface
-  holds a DPDK NIC's IP, start fails unless the transport's range avoids the
-  kernel's or is reserved there.
-- **Addresses.** A bind must be `0.0.0.0` or the NIC's address (or one of
-  `RUSTERON_DPDK_{SENDER,RECEIVER}_EXTRA_IPV4`, e.g. a secondary IP), else
-  `EADDRNOTAVAIL`. Each address holds its own ports: the NIC's address and an
-  extra one may both bind a port, while a `0.0.0.0` bind of it conflicts with
-  either. An extra address is answered in ARP and used as the source of what
-  its channels send; a `0.0.0.0` channel answers each peer from the address
-  that peer last reached it on. Multicast fails at creation. Sends to `0.0.0.0`, a
-  broadcast address, port 0 or the NIC's own address are errors.
-- **Connected transports** receive only from their peer, and `reconnect`
-  re-targets only a connected transport.
-- **Receive.** IP options are skipped; UDP checksums are verified per RFC 768
-  (a zero checksum is accepted even when the NIC calls it bad, and `0xFFFF` is
-  valid); IPv4 fragments and frames larger than one mbuf are dropped and
-  counted. Datagrams to a port nobody listens on get an ICMP port unreachable
-  (at most 100 a second per NIC); ICMP echo is answered (at most 100 a second,
-  payloads up to 512 bytes); an ICMP fragmentation-needed is counted and
-  reported at most once a second.
-- **Bandwidth allowance.** Clouds cap each VM's network rate and drop what
-  exceeds it before any counter here sees it; Aeron then retransmits, and
-  throughput collapses (measured on Azure: about 11 Gbps of 1,344-byte frames
-  fell to 40 thousand messages a second). `RUSTERON_DPDK_TX_RATE_MBPS` caps
-  each NIC's transmit rate in megabits per second of frames with a token
-  bucket of `RUSTERON_DPDK_TX_BUCKET_BYTES` (default 64 KiB): a send that
-  finds it overdrawn waits the debt out if that takes at most
-  `RUSTERON_DPDK_TX_PACE_SPIN_US` (default 20), else sends nothing, which
-  Aeron retries whole (counter `tx-paced`). Frames are charged as they go to
-  the NIC's ring, not as they leave it, so a burst of more than the bucket
-  handed to the ring faster than the rate is held back too, even on a slower
-  NIC. `0` turns the cap off, and it goes up to 400000. Where the VM's
-  allowance is lower, set it below that, shared between the two NICs.
-  Unset, each NIC has a backstop of 25000: AWS's highest documented rate for
-  one flow (25 Gbit/s, with ENA Express) and above every per-NIC rate
-  measured (about 12 Gbit/s, DPDK flat out at 32 B on Azure), so no
-  sustained rate measured reaches it. The backstop bounds a sustained rate,
-  holding back a runaway sender, and leaves bursts alone: its bucket is
-  1 MiB unless `RUSTERON_DPDK_TX_BUCKET_BYTES` is set, more than a full ENA
-  ring of 1,450-byte frames (742,400 bytes; 117 jumbo frames fill it), and
-  it never makes the agent wait, whatever `RUSTERON_DPDK_TX_PACE_SPIN_US`
-  says: a send it would delay sends nothing at once (`tx-paced`), and Aeron
-  retries it whole. It is per NIC, summed over every flow the NIC carries:
-  on an instance whose NIC carries more than 25 Gbit/s over several flows,
-  such as c7i.metal-24xl (37.5 Gbit/s) or c7i.48xlarge (50), raise it or
-  set `0`. One flow (one channel, whatever its streams) AWS caps at about
-  8 Gbit/s of frames regardless, so raising it carries no channel past that;
-  spread a heavier stream over several channels on different ports
-  ([`BENCHMARKS.md`](BENCHMARKS.md#aws-one-flow-carries-about-8-gbits)). A
-  slower link on the way to some destinations (a direct link to another site,
-  say) gets its own allowance with
-  `RUSTERON_DPDK_TX_ROUTE_MBPS="<a.b.c.d>/<len>=<Mbit/s>,..."` (up to 16
-  prefixes; the longest match applies, on top of the NIC's), shared by every
-  channel crossing that link. It has the bucket and the wait of a rate set,
-  under the backstop too, but while the backstop is in debt a send sends
-  nothing, whatever the route allows. Size each channel's receiver window
-  (`rcv-wnd`) to its link's bandwidth-delay product too, so one stream cannot
-  burst past it. Kernel UDP has no congestion control either: the same holds
-  for the kernel driver, which only lacks a pacer.
-- **Stream priority under the allowance.** Every stream on a NIC draws on its
-  one allowance, so near the cap a latency-critical stream could wait behind
-  bulk. `RUSTERON_DPDK_TX_LOW_STREAMS="<stream>|<first>-<last>,..."` (up to
-  16, non-negative stream ids) holds streams that can wait below the rest:
-  they send only from what leaves `RUSTERON_DPDK_TX_LOW_RESERVE_BYTES`
-  (default half of `RUSTERON_DPDK_TX_BUCKET_BYTES`) for the others, or from a
-  full bucket, never overdraw it and never wait for it (a zero result Aeron
-  retries, counted as `tx-paced`). Everything else, control frames included
-  whatever stream they name, then never queues behind them. It needs an
-  allowance set (`RUSTERON_DPDK_TX_RATE_MBPS`, even at 25000, or
-  `RUSTERON_DPDK_TX_ROUTE_MBPS`; unset or `0` does not count): the default
-  is a backstop above every link measured, not a link's capacity to share
-  out. Priority keys on the stream id each data frame carries; a
-  subscription's `reliable=false` never reaches the publishing side, so it
-  cannot.
-- **Full transmit ring.** A send is all or nothing, as a kernel socket's
-  queue: what the NIC's ring refuses of a vector waits, already built, in the
-  NIC's queue (counted as `tx-queued`), and the whole vector is reported sent.
-  The queued frames go first, in order, at the agent's next send or poll of
-  that NIC. While any still wait, a new vector is refused whole before
-  anything of it is built (a zero result Aeron retries), and out of mbufs
-  part-way, nothing of the vector is sent. Aeron advances only when a send
-  takes its whole vector, so reporting a part made it send the vector again,
-  that part twice. `RUSTERON_DPDK_TX_RETRY_US` (default 0) still offers the
-  refused frames again for up to that long before queueing them.
-- **Checksums out.** The NIC completes them when it offers both IPv4 and UDP
-  checksum offload; otherwise the transport computes them.
-- **MTU.** `max_aeron_mtu` may be up to 8960 (jumbo frames, e.g. an AWS
-  9001-byte VPC) and must fit the NIC's maximum, checked at start. Every peer's
-  Aeron MTU must be at most `max_aeron_mtu`: a SETUP announcing more is dropped
-  and reported (`peer-mtu-too-large`), so the publication shows as not
-  connected instead of stalling.
+- **Ports.** An explicit port already bound fails with `EADDRINUSE`. Port 0
+  gets an ephemeral port, unique on the NIC, from
+  `RUSTERON_DPDK_EPHEMERAL_PORT_RANGE="<low> <high>"`, else
+  `net.ipv4.ip_local_port_range` minus reserved ports and Aeron's wildcard
+  ranges. For a fixed source port use `interface=<nic-ip>:<port>`. If a kernel
+  interface holds a DPDK NIC's IP, start fails unless the transport's range
+  avoids the kernel's or is reserved there.
+- **Addresses.** Bind `0.0.0.0`, the NIC's address or one of
+  `RUSTERON_DPDK_{SENDER,RECEIVER}_EXTRA_IPV4`, else `EADDRNOTAVAIL`; each
+  address holds its own ports, and a `0.0.0.0` channel replies from the
+  address the peer last reached. Multicast fails at creation. Sends to
+  `0.0.0.0`, broadcast, port 0 or the NIC's own address are errors.
+- **Connected transports** receive only from their peer; only they can
+  `reconnect`.
+- **Receive.** UDP checksums verified (RFC 768); IP fragments and frames
+  larger than one mbuf dropped and counted. Port unreachable and echo
+  replies, at most 100 a second each.
+- **Checksums out:** offloaded to the NIC where it can, else computed.
+- **Full transmit ring.** A send is all or nothing, as a kernel socket: what
+  the ring refuses waits, built, in the NIC's queue (`tx-queued`) and goes
+  first at the next send or poll. While frames wait, a new vector is refused
+  whole and Aeron retries. `RUSTERON_DPDK_TX_RETRY_US` (default 0) re-offers
+  refused frames for that long first.
+- **MTU.** `max_aeron_mtu` up to 8960 (8960 on an AWS 9001-byte VPC, 8448
+  across inter-region peering). Every frame is one mbuf; start fails, naming
+  the largest workable value, when the NIC cannot carry it. A peer announcing
+  a larger MTU is dropped and reported (`peer-mtu-too-large`), so its
+  publication shows as not connected rather than stalling.
+
+## Bandwidth allowance
+
+Clouds drop traffic over a VM's allowance before any counter here sees it;
+Aeron then retransmits and throughput collapses. Azure's 1,344-byte collapse
+was not this: it was MANA's 256-descriptor receive ring overflowing, avoided
+with the receiver window below.
+
+| variable | meaning |
+|---|---|
+| `RUSTERON_DPDK_TX_RATE_MBPS` | each NIC's transmit cap, Mbit/s of frames; `0` off, up to 400000. Unset: a backstop of 25000 with a 1 MiB bucket, above every rate measured, that never makes the agent wait |
+| `RUSTERON_DPDK_TX_BUCKET_BYTES` | the cap's token bucket, 64 KiB by default |
+| `RUSTERON_DPDK_TX_PACE_SPIN_US` | how long a send may spin to pay a debt: 20 under `DEDICATED`, 0 (and only 0) otherwise; longer sends nothing, and Aeron retries (`tx-paced`) |
+| `RUSTERON_DPDK_TX_ROUTE_MBPS` | `<a.b.c.d>/<len>=<Mbit/s>,...`, up to 16 prefixes: an extra cap for a slower link, shared by every channel that crosses it |
+| `RUSTERON_DPDK_TX_LOW_STREAMS` | `<stream>\|<first>-<last>,...`, up to 16: streams that send only from what leaves `RUSTERON_DPDK_TX_LOW_RESERVE_BYTES` (half the bucket) for the rest, so latency-critical streams never queue behind them. Needs a cap set |
+
+- **The backstop is per NIC:** raise it, or set `0`, on an instance whose NIC
+  carries more than 25 Gbit/s over several flows (c7i.metal-24xl, 37.5).
+- **AWS caps one flow (one channel) at 7.8–8.0 Gbit/s** regardless, x86 and
+  Graviton: spread a heavier stream over several channels on different ports
+  ([data](BENCHMARKS.md#aws-one-flow-carries-about-8-gbits)).
+- **Size each channel's receiver window (`rcv-wnd`)** to its link's
+  bandwidth-delay product, so one stream cannot burst past it. On Azure, no
+  more than MANA's 256-descriptor ring holds: 256 × the smallest datagram
+  (80 KiB for 288 B), with the conductor's park capped at 20 µs
+  ([Azure](BENCHMARKS.md#azure-mana)).
 
 ## Host-local channels
 
-A DPDK NIC cannot reach its own host. Channels bound on or connected to
-loopback (`127.0.0.0/8`) or one of the host's kernel interfaces (Archive and
-Cluster control channels on `localhost`, a co-located process) therefore run
-on ordinary kernel UDP sockets, exactly as Aeron's kernel transport would
-carry them, in the same driver. A DPDK publication with a host-local
-destination among its remote ones (MDC) sends that one through a kernel
-socket and the rest over DPDK. A local-I/O thread (pinned with housekeeping)
-waits on those sockets with epoll and flags one when data is waiting, so the
-DPDK duty cycle reads a kernel socket only when it has something and never
-pays an idle syscall or touches epoll. A DPDK publication's first send to a
-host-local destination asks that thread to open a socket bound on the
-destination's own address (with the publication's port where free there);
-the agent reports zero-length sends, which Aeron retries, until it is ready
-within about 10 ms, and never makes the socket or bind calls itself. A failed
-open is reported once and retried each second, its datagrams dropped
-meanwhile. Replies on it reach the publication. A `0.0.0.0` subscription also
-listens on the kernel's interfaces, as a kernel socket would
-(`RUSTERON_DPDK_WILDCARD_LOCAL=0` or `false` opts out; any value but
-`0`, `1`, `false` and `true` fails initialisation). These kernel sockets hear only
-this host (and a connected transport only its peer): a remote peer reaching
-one through a kernel interface would get replies over DPDK from another
-address, so it is not heard. Host-local channels are not limited by `max_aeron_mtu`.
-`RUSTERON_DPDK_HOST_LOCAL=loopback` limits host-local to `127/8`, for a test
-rig whose DPDK peer is a kernel interface on the same host.
-`RUSTERON_DPDK_LOCAL_IO` picks how the agents read their host-local sockets:
-`adaptive` (the default) only when the local-I/O thread flags data while a
-socket is idle, so idle local channels cost the DPDK path nothing, but every
-duty cycle for `RUSTERON_DPDK_LOCAL_HOT_US` (default 1000) after it last had
-data, so an active one is read as promptly as the kernel driver reads it.
-While its agent reads a socket every cycle, the local-I/O thread takes it off
-its epoll: a registered socket makes every sender's datagram wake that
-thread, in the sender's own syscall over loopback (a third of a busy
-localhost sender's time, measured). It goes back on within a millisecond of
-the agent cooling, and going back on reports a datagram already waiting
-(`RUSTERON_DPDK_LOCAL_UNWATCH=0` keeps them on).
-`epoll` only ever reads on the flag, which adds a thread wake-up to every local
-message (about twice the localhost round trip: see BENCHMARKS.md); `spin`
-every duty cycle always (a `recvmmsg` per socket per cycle, idle or not), with
-no socket on the epoll at all.
+A DPDK NIC cannot reach its own host. Channels on loopback or the host's
+kernel interfaces (Archive and Cluster control channels, co-located
+processes) run on kernel UDP sockets in the same driver, as Aeron's kernel
+transport would carry them. That is why localhost gains nothing.
+
+- **No idle system calls:** a local-I/O thread on housekeeping waits on those
+  sockets with epoll and flags the ones with data.
+- **First send** to a host-local destination: that thread opens the socket;
+  the agent reports zero-length sends (Aeron retries) until it is ready,
+  within about 10 ms. A failed open is reported once and retried each second.
+- **A publication with mixed destinations** (MDC) sends host-local ones
+  through a kernel socket and the rest over DPDK.
+- **A `0.0.0.0` subscription** also listens on the kernel's interfaces
+  (`RUSTERON_DPDK_WILDCARD_LOCAL=0` opts out). These sockets hear only this
+  host.
+- **`RUSTERON_DPDK_HOST_LOCAL=loopback`** limits host-local to `127/8`, for a
+  test rig whose DPDK peer is a kernel interface on the same host.
+- **`RUSTERON_DPDK_LOCAL_IO`:**
+  - `adaptive` (default): read only when flagged while idle, but every duty
+    cycle for `RUSTERON_DPDK_LOCAL_HOT_US` (1000) after data. A hot socket
+    leaves the epoll, since a registered one wakes that thread on every
+    datagram (a third of a busy localhost sender's time);
+    `RUSTERON_DPDK_LOCAL_UNWATCH=0` keeps it on.
+  - `epoll`: only when flagged; a thread wake-up per message, about twice the
+    localhost round trip.
+  - `spin`: every duty cycle, a `recvmmsg` per socket, no epoll.
 
 ## Clocks
 
-The transport reads time on every send and poll (ARP freshness, receive-poll
-gaps) from the invariant TSC, scaled to nanoseconds by a factor
-calibrated once, over 50 ms, against `CLOCK_MONOTONIC_RAW` when the first
-transport starts (unslewed, like the TSC), and anchored to `CLOCK_MONOTONIC`. A
-CPU without `constant_tsc` and `nonstop_tsc` gets `CLOCK_MONOTONIC` instead.
-Each port's `clock` counter (type 80) reads 1 for TSC, 0 for the fallback.
-`RUSTERON_DPDK_CLOCK=monotonic` forces the fallback (`tsc`, the default, or
-unset otherwise; anything else fails initialization), to compare the two.
+- **One calibration.** `DpdkTransport::install` calibrates
+  `ergon-clock` once a process, in nanoseconds since boot
+  (`Domain::Monotonic`), and hands its `advanced::Params` to the C, whose
+  hot path reads the counter inline with the same arithmetic: no system
+  call, no call into Rust.
+- **The counter:** the TSC on x86_64 (invariant, with `rdtscp`), `CNTVCT_EL0`
+  on aarch64. Where ergon-clock refuses it, the fallback is
+  `CLOCK_MONOTONIC` through the same formula; either way, monotonic
+  nanoseconds.
+- **Which:** each port's `clock` counter (type 80) reads 1 TSC,
+  2 `CNTVCT_EL0`, 0 fallback. `RUSTERON_DPDK_CLOCK=monotonic` forces the
+  fallback (`counter` is the default).
+- **`DpdkTransport::clock`** returns the adopted clock
+  (`ergon_clock::advanced::Clock`), for your threads to stamp in the same
+  timebase. `ergon_clock::calibrate` gives UTC by default: another
+  timebase.
 
-## NIC receive timestamps
+## Receive timestamps
 
-`RUSTERON_DPDK_RX_HW_TIMESTAMP=1` (`DpdkTransportConfig::rx_hw_timestamp`)
-requests the NIC's hardware receive timestamps, and initialization fails on a
-port whose driver does not offer them. Today that is AWS ENA on Gen7+
-instances in a `precision-time` placement group (a cluster group can sit
-inside one), with DPDK 25.11 or later. Azure MANA has none. Each port then
-counts, for every timestamped datagram, the delay from NIC arrival to the
-transport handing it to Aeron (type 81: `rx-hw-delay-max-ns`,
-`rx-hw-delay-sum-ns`, `rx-hw-timestamped`). The NIC stamps with its PTP
-hardware clock and the transport compares against `CLOCK_REALTIME`, so the
-delays mean something only while chrony keeps the host on that clock: Amazon's
-ENA driver built with `ENA_PHC_INCLUDE=1`, loaded with `phc_enable=1`, and
-`refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer` in chrony
-(`benches/cloud/vm.sh build-ptp` does all three).
+- **NIC timestamps:** `RUSTERON_DPDK_RX_HW_TIMESTAMP=1`
+  (`DpdkTransportConfig::rx_hw_timestamp`). Init fails on a port that cannot:
+  today only AWS ENA on Gen7+ instances in a `precision-time` placement group,
+  DPDK 25.11+. Azure MANA has none.
+- **What it measures:** per port, NIC arrival to hand-off to Aeron, against
+  `CLOCK_REALTIME` read once a burst (type 81:
+  `nic-arrival-to-dispatch-max-ns`, `-min-ns`, `-sum-ns`, `-count`). A stamp
+  after the read is clock skew, counted in `nic-arrival-to-dispatch-negative`.
+  It means something only while chrony keeps the host on the NIC's PTP clock
+  (`benches/cloud/vm.sh build-ptp` sets it up).
+- **`media-rcv-ts-offset` channels** get each datagram's receive time, as on
+  Aeron's kernel transport: the NIC's stamp with hardware timestamps on, else
+  `CLOCK_REALTIME` once a burst; on host-local sockets, the kernel's
+  `SO_TIMESTAMPNS`. A NIC with no such channel open reads no clock for them.
+  `channel-rcv-ts-offset` needs nothing from the transport.
+- **Cost:** none measurable. On Graviton DPDK they moved p50 by at most
+  0.07 µs; one run
+  ([G3](BENCHMARKS.md#aws-graviton5-c9g2xlarge-round-g3-2026-10-16)).
 
 ## Lifetime
 
-`DpdkTransport` owns the native runtime the installed bindings point into.
-Keep it alive until every driver started from the context has stopped:
-dropping it while a driver still runs is a use-after-free in the driver's
-agents. rusteron 0.2.11's context cannot hold that dependency itself.
+- **Keep `DpdkTransport` alive until every driver started from the context
+  has stopped.** The driver's agents call into memory it owns; rusteron
+  0.2.11's context cannot hold it. Dropping it first is a use-after-free.
+- **Counters after exit:** closing a driver frees its counters. To keep them
+  readable in the `CnC` file after the process exits (a lab client),
+  `EnvMediaDriver::abandon` closes the transport but not the driver; only
+  `SHARED` and `INVOKER` allow it.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `src/` | Rust API: config, environment, errors, FFI, and the `media_driver` binary |
+| `src/` | Rust API: config, environment, the transport's clock, errors, FFI, host checks, and the `media_driver` binary |
 | `native/dpdk/` | The transport in C, split so tests link DPDK-free fakes of the EAL and port seams |
-| `tests/` | Config/environment and binary-selection tests (every platform); ABI, runtime, TX, RX, counters and interop tests against the fakes (`dpdk`) |
-| `harness/` | `dpdk-harness`, the interop scenario runner `scripts/test-dpdk-vdev.sh` and `scripts/aws-dpdk-acceptance.sh` drive, and the `rtt`, `tput` and `counters` benchmark clients (unpublished) |
+| `tests/` | Config/environment, transport-clock, binary-selection and host-check tests (every platform); ABI, runtime, clock, TX, RX, counters, health, ENA LLQ, media timestamp, threading and interop tests against the fakes (`dpdk`) |
+| `harness/` | `dpdk-harness`, the interop scenario runner behind `scripts/test-dpdk-vdev.sh` and `scripts/aws-dpdk-acceptance.sh`, and the `rtt`, `load`, `tput` and `counters` benchmark clients (unpublished). With `HARNESS_DRIVER=invoker` each embeds its own driver, configured as `media_driver` is, in `INVOKER` mode (`harness/src/lab.rs`) |
 | `benches/cloud/` | The cloud labs behind BENCHMARKS.md: `azure/lab.sh` and `aws/lab.sh` (two VMs, created and deleted per run), `vm.sh` (each VM's side), `remote.sh`, `analyse.py` |
 | `device-plugin/` | Kubelet device plugin advertising VFIO ENA pairs (unpublished) |
-| `deploy/aws-eks/` | Runtime images, DaemonSets and the node bootstrap and preflight scripts |
+| `deploy/aws-eks/` | Runtime images, DaemonSets and the node bootstrap and preflight scripts; the node and pod settings for latency: the book's [Kubernetes checklist](https://mimran1980.github.io/ergon/deploy/kubernetes.html#latency-checklist) |
 | `docs/` | The AWS EKS rollout and rollback runbook |
 
 ## Checks
@@ -354,8 +428,9 @@ From the ergon root:
 
 ```sh
 cargo test -p ergon-md-dpdk -- --test-threads=1   # every platform
-just check-dpdk                                   # Linux x86_64 + libdpdk
-just verify-dpdk-docker --build                   # the same in Docker amd64 emulation
+just check-dpdk                                   # Linux x86_64 or aarch64 + libdpdk
+just verify-dpdk-docker --build --all             # the same in Docker amd64 emulation
+just verify-dpdk-docker --arm64 --build --all     # and in Docker arm64 (native on Apple silicon)
 just test-dpdk-bootstrap                          # node scripts against fixtures
 just test-dpdk-vdev                               # tap-device interop (root)
 ```

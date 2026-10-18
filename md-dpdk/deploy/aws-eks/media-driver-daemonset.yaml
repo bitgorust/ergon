@@ -1,18 +1,20 @@
 # Media Driver DaemonSet. One driver per DPDK node, each pod requesting one
-# rusteron.io/dpdk-ena-pair, six whole CPUs, memory, and 2 MiB hugepages under
+# rusteron.io/dpdk-ena-pair, six CPUs, memory, and 2 MiB hugepages under
 # Guaranteed QoS (requests == limits on every resource, so the kubelet's CPU
 # Manager static policy hands it a dedicated cpuset).
 #
-# Six vCPUs are three physical cores on a 2-thread/core instance (the node's
-# kubelet runs full-pcpus-only, so the cpuset is whole cores): housekeeping
-# (the conductor, which does not busy-spin, plus the EAL and transport
-# housekeeping threads), sender and receiver, the last two busy-spinning. The
-# entrypoint (entrypoint.sh) assigns them from the pod's cpuset and
-# fails fast if fewer than three physical cores remain after SMT-sibling
-# exclusion. A node therefore needs at least 5 physical cores, which
-# provision-node.sh checks: one reserved for the system and kubelet, three for
-# the driver (housekeeping, sender, receiver) and one for an application. The
-# smallest c7i with them is c7i.4xlarge (8 cores).
+# SMT (hyper-threading) is off on every latency node (the launch template's
+# CpuOptions ThreadsPerCore=1; nosmt and provision-node.sh on bare metal), so
+# one CPU is one physical core and six CPUs are six cores: housekeeping (the
+# conductor, which does not busy-spin, plus the EAL and transport housekeeping
+# threads), sender and receiver (the last two busy-spinning) and three spare.
+# The entrypoint (entrypoint.sh) assigns them from the pod's cpuset and fails
+# fast if fewer than three physical cores remain after SMT-sibling exclusion
+# (a safety net: with SMT off every CPU is already its own core). A node
+# therefore needs at least 5 physical cores, which provision-node.sh checks:
+# one reserved for the system and kubelet, three for the driver (housekeeping,
+# sender, receiver) and one for an application. The smallest c7i with them is
+# c7i.4xlarge (8 cores).
 #
 # The secondary ENAs are bound on the host to igb_uio loaded with
 # wc_activate=1, the only binding on virtualised EC2 that maps the ENA's
@@ -36,8 +38,8 @@
 # mounted at /mnt/huge-aeron, with AERON_DIR=/mnt/huge-aeron/aeron,
 # AERON_TERM_BUFFER_SPARSE_FILE=false and
 # AERON_CLIENT_PRE_TOUCH_MAPPED_MEMORY=true. Give them Guaranteed QoS with
-# whole cores (requests equal to limits, an even CPU count) and pin each
-# busy-spinning thread to a core of its own in the pod's cpuset.
+# whole cores (requests equal to limits) and pin each busy-spinning thread to
+# a core of its own in the pod's cpuset.
 #
 # kubelet stops the pod with SIGTERM, on which the driver stops and then
 # releases the DPDK transport, as on SIGINT; the grace period bounds that.

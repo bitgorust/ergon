@@ -126,20 +126,36 @@ the benchmark is re-audited.
 
 ## Package boundaries
 
-Only `ergo-sbe`, `ergo-aeron-cluster` and `ergon-md-dpdk` are publication
-candidates. Inspect their payloads before any release:
+Only `ergo-sbe`, `ergo-aeron-cluster`, `ergon-clock`, `ergon-tune`, `ergon-io`
+and `ergon-md-dpdk` are publication candidates; `ergon-io` depends on
+`ergon-tune`, and `ergon-md-dpdk` on `ergon-clock` and `ergon-tune`, so the
+release publishes those two first.
+`scripts/check-publish-set.sh` (in `just policy`) fails when a published crate
+depends on an unpublished one, on a path without a version or on an older
+version than a published sibling's own, or when the release recipe, the
+release workflow, the dry runs or the public-API gate leave a published crate
+out or publish it before its dependencies. A version bump therefore updates
+every `version` beside a workspace `path` with `[workspace.package]`:
+`ergo-sbe` in `[workspace.dependencies]`, and the `ergon-clock` and
+`ergon-tune` lines in `md-dpdk/`, `io/` and `clock/bench/Cargo.toml`.
+Inspect their payloads before any release:
 
 ```sh
 cargo package -p ergo-sbe --list --allow-dirty
 cargo package -p ergo-aeron-cluster --list --allow-dirty
+cargo package -p ergon-clock --list --allow-dirty
+cargo package -p ergon-tune --list --allow-dirty
+cargo package -p ergon-io --list --allow-dirty
 cargo package -p ergon-md-dpdk --list --allow-dirty
 ```
 
 Packages must exclude repository integration tests, fixtures not required at
 build time, benchmarks, Java harness code, application protocols, samples, and
-internal plans. `ergon-md-dpdk` ships its native C (including the test fakes
-its own build compiles) but not its interop harness, device plugin or
-deployment assets.
+internal plans. `ergon-clock`, `ergon-tune` and `ergon-io` ship their library
+sources and README only (not `ergon-clock-bench`, `io/benches`, the tests,
+the example or their fixture trees).
+`ergon-md-dpdk` ships its native C (including the test fakes its own build
+compiles) but not its interop harness, device plugin or deployment assets.
 
 Publishing, tagging, and announcing a release require explicit maintainer
 authorization.

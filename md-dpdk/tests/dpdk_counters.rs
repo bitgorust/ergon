@@ -18,7 +18,7 @@
 //!     PMD's names, are re-read at most once per second (no metrics thread),
 //!     and a *missed* xstat mirrors the plan §9 type-84 counter.
 //!
-//! Linux x86_64 only; links the same archives as the other DPDK integration
+//! Linux x86_64 or aarch64; links the same archives as the other DPDK integration
 //! tests plus the counters manager/clock compiled into the core archive.
 #![allow(
     missing_docs,
@@ -29,7 +29,11 @@
     clippy::nursery,
     clippy::restriction
 )]
-#![cfg(all(feature = "dpdk", target_os = "linux", target_arch = "x86_64"))]
+#![cfg(all(
+    feature = "dpdk",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 mod common;
 use common::transport::*;
@@ -65,7 +69,7 @@ fn counters_registered_with_type_ids_and_labels() {
     assert_eq!(v, 1);
     assert!(label.contains("rusteron-dpdk role=sender bdf=0000:00:01.0 port=0 q=0 dir=- port-info"));
     assert!(
-        label.contains(" driver=net_ena mac=02:00:00:00:00:01"),
+        label.contains(" driver=net_ena mac=02:00:00:00:00:01 rx-desc=1024 llq=wc"),
         "label: {label}"
     );
 
@@ -223,7 +227,8 @@ fn counts_carry_over_when_a_port_reregisters() {
 }
 
 /// Each port publishes which clock the transport reads (type 80): 1 for the
-/// calibrated invariant TSC, 0 for the `CLOCK_MONOTONIC` fallback.
+/// x86_64 TSC, 2 for the aarch64 generic timer's virtual counter
+/// (`CNTVCT_EL0`), 0 for the `CLOCK_MONOTONIC` fallback.
 #[test]
 #[serial]
 fn clock_counter_reports_the_clock_in_use() {
@@ -231,7 +236,7 @@ fn clock_counter_reports_the_clock_in_use() {
     h.init_tx(SENDER_IP, 40000, None, 1472);
     h.init_rx(RECEIVER_IP, 60000, 1472);
 
-    let expected = i64::from(cpu_has_invariant_tsc());
+    let expected = i64::from(expected_counter_source());
     assert_eq!(i64::from(unsafe { rusteron_dpdk_clock_source() }), expected);
     let (v, _, label) = h
         .counters
@@ -847,18 +852,71 @@ fn rx_poll_gaps_and_full_bursts_counted() {
     assert_no_leak();
 }
 
-/// The largest backlog one poll drained, and the polls that drained nearly a
-/// whole ring: a ring that full may have overflowed, which MANA does without
-/// counting a drop.
+/// A harness on Azure's ports (`driver`: net_mana, or net_netvsc over its
+/// MANA VF), with a receive ring of `rx` (0: the NIC's default) and bursts of
+/// 32, the receiver's label prefix beside it.
+fn azure(env: TestEnv, driver: &str, rx: u16) -> (Harness, &'static str) {
+    env.set_driver(driver);
+    let mut config = rusteron_dpdk_config_t::mana();
+    config.rx_descriptors = rx;
+    config.burst_size = 32; // drains up to min(8, ring / 32) bursts a poll
+    (
+        Harness::build_after(env, config),
+        "role=receiver bdf=7870:00:00.0 port=1 q=0 dir=rx",
+    )
+}
+
+/// The largest backlog one poll drained, and, on Azure's ports, the polls
+/// that drained nearly a whole ring: a ring that full may have overflowed,
+/// which MANA does without counting a drop.
 #[test]
 #[serial]
 fn a_near_full_ring_is_counted_as_a_suspected_overflow() {
-    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
-    let mut config = rusteron_dpdk_config_t::valid();
-    config.rx_descriptors = 128;
-    config.burst_size = 32; // drains up to min(8, 128 / 32) = 4 bursts a poll
-    let mut h = Harness::with_config(config);
+    for driver in ["net_mana", "net_netvsc"] {
+        let (mut h, rx) = azure(TestEnv::new(), driver, 128);
+        h.init_rx(RECEIVER_IP, 60000, 1472);
+        let mut p = h.poller();
+        p.add(&mut *h.rx);
+        let frame = frame_to_receiver(60000, b"ring");
+        let inject = |n: usize| {
+            for _ in 0..n {
+                assert_eq!(
+                    unsafe { rusteron_dpdk_fake_rx_inject(RECEIVER_PORT, frame.as_ptr(), frame.len(), RX_GOOD, 1) },
+                    0
+                );
+            }
+        };
+        let mut bytes = 0i64;
+        let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+        let suspected = |h: &Harness| h.counter(TYPE_POLLER, &format!("{rx} rx-ring-full-suspected"));
+
+        inject(40);
+        assert_eq!(p.poll(16, clientd, &mut bytes), 40);
+        assert_eq!(suspected(&h), 0, "{driver}: 40 of 128: room to spare");
+        inject(100);
+        assert_eq!(p.poll(16, clientd, &mut bytes), 100);
+        assert_eq!(suspected(&h), 1, "{driver}: 100 of 128: within a burst of full");
+        assert_eq!(h.counter(TYPE_POLLER, &format!("{rx} rx-backlog-max")), 100);
+        drop(p);
+        drop(h);
+        assert_no_leak();
+    }
+}
+
+/// Unset, the ring the suspicion is measured against is the one the port
+/// took (min(4096, the NIC's maximum)), which the port-info label reports.
+#[test]
+#[serial]
+fn a_near_full_default_ring_is_counted_against_the_ring_the_port_took() {
+    let env = TestEnv::new();
+    unsafe { rusteron_dpdk_fake_set_desc_limits(64, 128, 0, 0) };
+    let (mut h, rx) = azure(env, "net_mana", 0);
     h.init_rx(RECEIVER_IP, 60000, 1472);
+    let (_, _, label) = h
+        .counters
+        .find(TYPE_PORT_INFO, "role=receiver")
+        .expect("receiver port-info");
+    assert!(label.contains(" rx-desc=128"), "{label}");
     let mut p = h.poller();
     p.add(&mut *h.rx);
     let frame = frame_to_receiver(60000, b"ring");
@@ -872,15 +930,59 @@ fn a_near_full_ring_is_counted_as_a_suspected_overflow() {
     };
     let mut bytes = 0i64;
     let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
-    let suspected = |h: &Harness| h.counter(TYPE_POLLER, &format!("{RX} rx-ring-full-suspected"));
-
+    let suspected = |h: &Harness| h.counter(TYPE_POLLER, &format!("{rx} rx-ring-full-suspected"));
     inject(40);
     assert_eq!(p.poll(16, clientd, &mut bytes), 40);
     assert_eq!(suspected(&h), 0, "40 of 128: room to spare");
     inject(100);
-    assert_eq!(p.poll(16, clientd, &mut bytes), 100);
+    assert_eq!(p.poll(16, clientd, &mut bytes), 100, "128 / 32: four bursts a poll");
     assert_eq!(suspected(&h), 1, "100 of 128: within a burst of full");
+    drop(p);
+    drop(h);
+    assert_no_leak();
+}
+
+/// An ENA counts a full ring's drops itself (`nic-rx-missed`, its `imissed`),
+/// so its ports have no suspicion counter: none is registered, and a poll
+/// that drains nearly a whole ring leaves only the backlog it drained.
+#[test]
+#[serial]
+fn an_ena_counts_its_own_ring_overflow_and_has_no_suspicion() {
+    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+    let mut config = rusteron_dpdk_config_t::valid();
+    config.rx_descriptors = 128;
+    config.burst_size = 32;
+    let mut h = Harness::with_config(config);
+    h.init_tx(SENDER_IP, 40000, None, 1472);
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let frame = frame_to_receiver(60000, b"ring");
+    for _ in 0..100 {
+        assert_eq!(
+            unsafe { rusteron_dpdk_fake_rx_inject(RECEIVER_PORT, frame.as_ptr(), frame.len(), RX_GOOD, 1) },
+            0
+        );
+    }
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    assert_eq!(p.poll(16, clientd, &mut bytes), 100);
     assert_eq!(h.counter(TYPE_POLLER, &format!("{RX} rx-backlog-max")), 100);
+    assert_eq!(
+        h.counters.find(TYPE_POLLER, "rx-ring-full-suspected"),
+        None,
+        "neither ENA port has the suspicion counter"
+    );
+    for port in ["role=sender bdf=0000:00:01.0 port=0 q=0 dir=rx", RX] {
+        assert!(
+            h.counters
+                .find(TYPE_MISSED_PACKETS, &format!("{port} nic-rx-missed"))
+                .is_some(),
+            "{port}: the NIC's own count"
+        );
+    }
+    drop(p);
+    drop(h);
     assert_no_leak();
 }
 
@@ -1097,48 +1199,150 @@ fn wildcard_replies_leave_from_the_address_the_peer_used() {
     assert_no_leak();
 }
 
+/// The receiver port's NIC-arrival-to-dispatch counters (type 81), by label.
+const ARRIVAL: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx nic-arrival-to-dispatch";
+
+/// (max, min, sum, count, negative) of the receiver port's NIC arrival to
+/// dispatch counters.
+fn arrival(h: &Harness) -> (i64, i64, i64, i64, i64) {
+    let c = |what: &str| h.counter(TYPE_RX_HW_DELAY, &format!("{ARRIVAL}-{what}"));
+    (c("max-ns"), c("min-ns"), c("sum-ns"), c("count"), c("negative"))
+}
+
+fn inject_stamped(frame: &[u8], hw_rx_ns: u64) {
+    let rc =
+        unsafe { rusteron_dpdk_fake_rx_inject_hw_ts(RECEIVER_PORT, frame.as_ptr(), frame.len(), RX_GOOD, 1, hw_rx_ns) };
+    assert_eq!(rc, 0);
+}
+
 /// With NIC RX timestamps on, each timestamped datagram adds its delay from
 /// NIC arrival to transport dispatch (host CLOCK_REALTIME minus the NIC stamp)
-/// to the type-81 sum, count and max; frames without a stamp are not counted.
+/// to the type-81 max, min, sum and count; frames without a stamp are not
+/// counted. Within a poll the max and the min are its largest and smallest
+/// delays (the poll's last frame is neither here), and across polls the
+/// minimum is the first poll's until a smaller one comes.
 #[test]
 #[serial]
-fn rx_hw_delay_counted_for_timestamped_frames() {
-    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+fn nic_arrival_to_dispatch_counted_for_timestamped_frames() {
+    let mut h = Harness::with_rx_hw_timestamp();
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    assert_eq!(
+        arrival(&h),
+        (0, 0, 0, 0, 0),
+        "nothing yet (min means nothing while count is 0)"
+    );
+    unsafe { rusteron_dpdk_test_set_realtime_ns(1_000_000) };
+
+    let frame = frame_to_receiver(60000, b"stamped");
+    // delays 500, 1_000 and 700 ns, then an unstamped frame
+    for hw_rx_ns in [999_500u64, 999_000, 999_300, 0] {
+        inject_stamped(&frame, hw_rx_ns);
+    }
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    assert_eq!(p.poll(16, clientd, &mut bytes), 4, "all four dispatched");
+    assert_eq!(arrival(&h), (1_000, 500, 2_200, 3, 0));
+
+    // A later, smaller delay lowers the min and leaves the max alone.
+    unsafe { rusteron_dpdk_test_set_realtime_ns(2_000_000) };
+    inject_stamped(&frame, 1_999_900);
+    assert_eq!(p.poll(16, clientd, &mut bytes), 1);
+    assert_eq!(arrival(&h), (1_000, 100, 2_300, 4, 0));
+
+    // A larger one raises the max and leaves the min alone.
+    unsafe { rusteron_dpdk_test_set_realtime_ns(3_000_000) };
+    inject_stamped(&frame, 2_997_000);
+    assert_eq!(p.poll(16, clientd, &mut bytes), 1);
+    assert_eq!(arrival(&h), (3_000, 100, 5_300, 5, 0));
+    assert_no_leak();
+}
+
+/// The host clock is read once a burst, after the NIC handed the burst over,
+/// never once a poll: a poll draining several bursts compares each burst's
+/// frames with a read taken after they arrived. Read once a poll, a frame of
+/// a later burst that arrived after that one read would show a negative
+/// delay.
+#[test]
+#[serial]
+fn nic_arrival_to_dispatch_reads_the_host_clock_once_a_burst() {
+    let env = TestEnv::new();
+    env.set_rx_timestamp_ok(true);
+    let mut config = rusteron_dpdk_config_t::valid();
+    config.rx_hw_timestamp = 1;
+    config.burst_size = 2; // a poll of four frames drains two full bursts
+    let mut h = Harness::build_after(env, config);
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    // each read of the host clock returns 1_000_000, then 1_001_000, ...
+    unsafe {
+        rusteron_dpdk_test_set_realtime_ns(1_000_000);
+        rusteron_dpdk_test_set_realtime_step_ns(1_000);
+    }
+    let frame = frame_to_receiver(60000, b"stamped");
+    // the first burst arrived before the first read, the second after it and
+    // before the second read
+    for hw_rx_ns in [999_000u64, 999_000, 1_000_500, 1_000_500] {
+        inject_stamped(&frame, hw_rx_ns);
+    }
+    let before = unsafe { rusteron_dpdk_test_realtime_reads() };
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    assert_eq!(p.poll(16, clientd, &mut bytes), 4);
+    assert_eq!(
+        unsafe { rusteron_dpdk_test_realtime_reads() } - before,
+        2,
+        "one read for each burst with stamped frames, none for the empty third"
+    );
+    assert_eq!(arrival(&h), (1_000, 500, 3_000, 4, 0), "no negative delay");
+    assert_no_leak();
+}
+
+/// A frame the NIC stamped later than the host clock read after it arrived
+/// is clock skew between the NIC's PTP hardware clock and CLOCK_REALTIME: it
+/// is counted apart, and changes neither the sum and count (their mean) nor
+/// the max and min. One stamped at the very nanosecond of the read is a
+/// delay of 0, not skew.
+#[test]
+#[serial]
+fn a_negative_nic_arrival_delay_is_counted_apart_as_clock_skew() {
     let mut h = Harness::with_rx_hw_timestamp();
     h.init_rx(RECEIVER_IP, 60000, 1472);
     let mut p = h.poller();
     p.add(&mut *h.rx);
     unsafe { rusteron_dpdk_test_set_realtime_ns(1_000_000) };
-
     let frame = frame_to_receiver(60000, b"stamped");
-    for hw_rx_ns in [999_000u64, 999_500, 0] {
-        assert_eq!(
-            unsafe {
-                rusteron_dpdk_fake_rx_inject_hw_ts(RECEIVER_PORT, frame.as_ptr(), frame.len(), RX_GOOD, 1, hw_rx_ns)
-            },
-            0
-        );
+    for hw_rx_ns in [1_000_250u64, 999_000, 1_000_001, 1_000_000] {
+        inject_stamped(&frame, hw_rx_ns);
     }
     let mut bytes = 0i64;
     let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
-    assert_eq!(p.poll(16, clientd, &mut bytes), 3, "all three dispatched");
-
-    assert_eq!(h.counter(TYPE_RX_HW_DELAY, &format!("{RX} rx-hw-delay-max-ns")), 1_000);
-    assert_eq!(h.counter(TYPE_RX_HW_DELAY, &format!("{RX} rx-hw-delay-sum-ns")), 1_500);
-    assert_eq!(h.counter(TYPE_RX_HW_DELAY, &format!("{RX} rx-hw-timestamped")), 2);
-
-    // A later, smaller delay leaves the max alone.
-    unsafe { rusteron_dpdk_test_set_realtime_ns(2_000_000) };
     assert_eq!(
-        unsafe {
-            rusteron_dpdk_fake_rx_inject_hw_ts(RECEIVER_PORT, frame.as_ptr(), frame.len(), RX_GOOD, 1, 1_999_900)
-        },
-        0
+        p.poll(16, clientd, &mut bytes),
+        4,
+        "every frame dispatched all the same"
     );
+    assert_eq!(arrival(&h), (1_000, 0, 1_000, 2, 2));
+    drop(p);
+    drop(h);
+
+    // Only skewed frames: the min stays unset (count 0), nothing else moves.
+    let mut h = Harness::with_rx_hw_timestamp();
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    unsafe { rusteron_dpdk_test_set_realtime_ns(5_000_000) };
+    inject_stamped(&frame, 5_000_010);
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
     assert_eq!(p.poll(16, clientd, &mut bytes), 1);
-    assert_eq!(h.counter(TYPE_RX_HW_DELAY, &format!("{RX} rx-hw-delay-max-ns")), 1_000);
-    assert_eq!(h.counter(TYPE_RX_HW_DELAY, &format!("{RX} rx-hw-delay-sum-ns")), 1_600);
-    assert_eq!(h.counter(TYPE_RX_HW_DELAY, &format!("{RX} rx-hw-timestamped")), 3);
+    assert_eq!(arrival(&h), (0, 0, 0, 0, 1));
+    // then a good one sets the min, not left at 0 by the skewed one
+    unsafe { rusteron_dpdk_test_set_realtime_ns(6_000_000) };
+    inject_stamped(&frame, 5_999_300);
+    assert_eq!(p.poll(16, clientd, &mut bytes), 1);
+    assert_eq!(arrival(&h), (700, 700, 700, 1, 1));
     assert_no_leak();
 }
 

@@ -13,8 +13,8 @@ use crate::ir::{ByteOrder, Presence};
 use crate::structured_ir::*;
 
 use super::conversion_helpers::{
-    ENCODER_RESERVED, FixedArrayTextKind, field_has_conversion_free, fixed_array_text_kind,
-    named_accessor_ident, owner_accessor_names, resolve_field_ident,
+    ENCODER_RESERVED, FixedArrayTextKind, encoder_helper_ident, field_has_conversion_free,
+    fixed_array_text_kind, named_accessor_ident, owner_accessor_names, resolve_field_ident,
 };
 use super::encoded_length;
 use super::field_type::field_type_ident;
@@ -493,6 +493,71 @@ pub(crate) fn generate_message_encoder(
                     });
                 }
                 Ok(Self::wrap_and_apply_header(buf, 0))
+            }
+        });
+    }
+
+    // Send helpers: claim → encode → check → commit, over `sbe_rt::Claim`.
+    // `send` takes the encoder already wrapped on the claim and must return
+    // the terminal stage, so only a finished frame can be committed; the
+    // length and header checks live once, in `sbe_rt::send_frame`. A field
+    // or first tail that owns `send` / `send_fixed` keeps its name and the
+    // helper is omitted (`encoder_helper_ident`): the frame still goes out
+    // through `send_frame`.
+    let fixed_name = syn::Ident::new(&format!("{name}FixedFields"), span);
+    if let Some(send_ident) = encoder_helper_ident("send", msg, conversions, domain_types) {
+        let terminal = if is_fixed {
+            quote::quote! { #name_encoder_ident<'b, sbe_rt::HeaderPresent, sbe_rt::FieldsFixed> }
+        } else {
+            let complete_ident = syn::Ident::new(&format!("{name}Complete"), span);
+            quote::quote! { #complete_ident<'b> }
+        };
+        let send_doc = format!(
+            "Encode one `{name}` frame into `claim` and commit it, through \
+             [`sbe_rt::send_frame`]: `encode` gets the encoder wrapped on the \
+             claim and returns the finished frame, which must fill the claim."
+        );
+        let send_doc = crate::codegen::runtime::doc_lines_tokens(&send_doc);
+        impl_consts.extend(quote::quote! {
+            #send_doc
+            #[inline]
+            pub fn #send_ident<C, W>(claim: C, encode: W) -> Result<(), sbe_rt::SendError<C::Error>>
+            where
+                C: sbe_rt::Claim,
+                W: for<'b> FnOnce(#name_encoder_ident<'b>) -> Result<#terminal, sbe_rt::EncodeError>,
+            {
+                sbe_rt::send_frame(claim, &Self::HEADER_TEMPLATE, |buf| {
+                    let enc = #name_encoder_ident::try_wrap_and_apply_header(buf, 0)?;
+                    Ok(encode(enc)?.encoded_length_with_header())
+                })
+            }
+        });
+    }
+    if is_fixed
+        && let Some(send_fixed_ident) =
+            encoder_helper_ident("send_fixed", msg, conversions, domain_types)
+    {
+        let send_fixed_doc = format!(
+            "Encode `fixed` as one `{name}` frame into `claim`, exactly \
+             `ENCODED_LENGTH` bytes, and commit it ([`sbe_rt::send_frame`])."
+        );
+        let send_fixed_doc = crate::codegen::runtime::doc_lines_tokens(&send_fixed_doc);
+        impl_consts.extend(quote::quote! {
+            #send_fixed_doc
+            #[inline]
+            pub fn #send_fixed_ident<C: sbe_rt::Claim>(
+                claim: C,
+                fixed: &#fixed_name,
+            ) -> Result<(), sbe_rt::SendError<C::Error>> {
+                sbe_rt::send_frame(claim, &Self::HEADER_TEMPLATE, |buf| {
+                    // A fixed-only frame is always ENCODED_LENGTH bytes:
+                    // write it only into a claim of that size, and let
+                    // `send_frame` report any other as a length mismatch.
+                    if buf.len() == Self::ENCODED_LENGTH {
+                        let _ = #name_encoder_ident::try_wrap_and_apply_header(buf, 0)?.fixed(fixed);
+                    }
+                    Ok(Self::ENCODED_LENGTH)
+                })
             }
         });
     }

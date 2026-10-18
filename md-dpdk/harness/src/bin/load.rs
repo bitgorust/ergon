@@ -93,6 +93,7 @@ impl Spec {
 }
 
 fn main() {
+    lab::lock_memory();
     let mut args = std::env::args().skip(1);
     let usage = "load xping <ping> <pong> <rate> <seconds> <size> <cpu> [burst] | \
                  load xmix <ping> <pong> <seconds> <cpu> <name:stream:rate:size[:burst]>... | \

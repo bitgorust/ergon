@@ -9,11 +9,14 @@
 #   1. Exit at once on a node that is already provisioned (its kernel command
 #      line has isolcpus=), so the reboot can never loop. Fail on anything
 #      but an Intel x86 CPU.
-#   2. Split the CPUs: the housekeeping CPUs (RUSTERON_HOUSEKEEPING_CPUS,
-#      kubelet's reservedSystemCPUs; default cpu0's physical core) take the
+#   2. Turn SMT off on a node that still has it (bare metal: EC2's CpuOptions
+#      cover a VM only) and split the CPUs: one CPU is one physical core, the
+#      same as on Graviton. The housekeeping CPUs (RUSTERON_HOUSEKEEPING_CPUS,
+#      kubelet's reservedSystemCPUs; default cpu0's core, one CPU) take the
 #      system, IRQs and kubelet; every other CPU is isolated. Housekeeping
-#      must be whole cores, and at least four cores must remain: the media
-#      driver's housekeeping, its sender, its receiver and an app.
+#      must be CPUs that run with SMT off, and at least four cores must
+#      remain: the media driver's housekeeping, its sender, its receiver and
+#      an app.
 #   3. Wait (up to RUSTERON_ENI_WAIT_SECS, default 600) until IMDS lists an
 #      ENI at each of RUSTERON_DPDK_DEVICE_NUMBERS (default "1 2"), which the
 #      launcher attaches right after the instance is running.
@@ -22,8 +25,9 @@
 #      git) are tried five times, 5, 10, 20 and 40 s apart, before they fail.
 #   5. Install bootstrap-dpdk-ena.sh, preflight.sh, irq-affinity.sh, the
 #      per-boot unit and the IRQ watcher's unit, and enable both units.
-#   6. Set the kernel command line with grubby: CPU isolation (isolcpus,
-#      nohz_full, rcu_nocbs, irqaffinity), C1 as the deepest idle state on a
+#   6. Set the kernel command line with grubby: nosmt (SMT stays off on every
+#      later boot), CPU isolation (isolcpus, nohz_full, rcu_nocbs,
+#      irqaffinity), C1 as the deepest idle state on a
 #      VM (not on bare metal), the TSC clocksource, IOMMU passthrough,
 #      transparent hugepages off from boot and 2 MiB hugepages
 #      (RUSTERON_HUGEPAGES, default 2048).
@@ -153,24 +157,64 @@ fi
 grep -q '^vendor_id[[:space:]]*:[[:space:]]*GenuineIntel' "$RUSTERON_PROC_ROOT/cpuinfo" \
     || fail "not an Intel x86 CPU ($(uname -m)): the node needs a c7i (or other Intel x86) instance"
 
-# --- 2. housekeeping and isolated CPUs --------------------------------------
-if [[ -z "$RUSTERON_HOUSEKEEPING_CPUS" ]]; then
-    RUSTERON_HOUSEKEEPING_CPUS="$(siblings_of 0)" || fail "cannot read CPU 0's thread siblings"
-fi
-hk_list="$(cpulist_expand "$RUSTERON_HOUSEKEEPING_CPUS")" \
-    || fail "RUSTERON_HOUSEKEEPING_CPUS='$RUSTERON_HOUSEKEEPING_CPUS': a CPU list such as 0,8"
+# --- 2. SMT off, then housekeeping and isolated CPUs -------------------------
+# One Kubernetes CPU is one physical core, the same as on Graviton (option 1,
+# 2026-10-17). node/launch-template.py puts CpuOptions ThreadsPerCore=1 in
+# the launch template where EC2 accepts it; bare metal takes no CPU options,
+# so the sysfs write here is the last resort before kubelet's first start and
+# the kernel's nosmt (step 6) holds every later boot. The topology keeps
+# listing the offline twins after that, so every CPU list below is one CPU per
+# physical core: the lowest id in each core's thread sibling set.
 online="$(cpulist_expand "$(cat "$RUSTERON_SYSFS_ROOT/devices/system/cpu/online")")" \
     || fail "cannot read the online CPUs"
+smt_active="$RUSTERON_SYSFS_ROOT/devices/system/cpu/smt/active"
+smt_control="$RUSTERON_SYSFS_ROOT/devices/system/cpu/smt/control"
+smt=0
+if [[ -r "$smt_active" ]]; then
+    smt="$(cat "$smt_active")"
+else
+    # no smt/active: the topology says (two online CPUs on one core)
+    for cpu in $online; do
+        sibs="$(siblings_of "$cpu")" || fail "cannot read CPU $cpu's thread siblings"
+        for sib in $(cpulist_expand "$sibs"); do
+            if [[ "$sib" != "$cpu" ]] && grep -qx "$sib" <<<"$online"; then
+                smt=1
+                break 2
+            fi
+        done
+    done
+fi
+if ((smt)); then
+    { printf '%s\n' off > "$smt_control"; } 2>/dev/null \
+        || fail "cannot turn SMT off ($smt_control)"
+    ok "SMT turned off (was active); nosmt goes on the kernel command line"
+fi
+live=""
+for cpu in $online; do
+    sibs="$(siblings_of "$cpu")" || fail "cannot read CPU $cpu's thread siblings"
+    first="$(cpulist_expand "$sibs" | sed -n '1p')" \
+        || fail "cannot parse CPU $cpu's thread siblings '$sibs'"
+    if [[ "$cpu" == "$first" ]]; then
+        live+="${live:+$'\n'}$cpu"
+    fi
+done
+if [[ -z "$RUSTERON_HOUSEKEEPING_CPUS" ]]; then
+    # cpu0's core, the one CPU that runs on it with SMT off.
+    RUSTERON_HOUSEKEEPING_CPUS="$(cpulist_expand "$(siblings_of 0)" | sed -n '1p')" \
+        || fail "cannot read CPU 0's thread siblings"
+fi
+hk_list="$(cpulist_expand "$RUSTERON_HOUSEKEEPING_CPUS")" \
+    || fail "RUSTERON_HOUSEKEEPING_CPUS='$RUSTERON_HOUSEKEEPING_CPUS': a CPU list such as 0"
 for cpu in $hk_list; do
     grep -qx "$cpu" <<<"$online" || fail "housekeeping CPU $cpu is not online"
-    sibs="$(siblings_of "$cpu")" || fail "cannot read CPU $cpu's thread siblings"
-    for sib in $(cpulist_expand "$sibs"); do
-        grep -qx "$sib" <<<"$hk_list" \
-            || fail "housekeeping CPUs $RUSTERON_HOUSEKEEPING_CPUS must be whole cores: CPU $cpu's twin $sib is missing (kubelet's full-pcpus-only)"
-    done
+    if ! grep -qx "$cpu" <<<"$live"; then
+        sibs="$(siblings_of "$cpu")" || fail "cannot read CPU $cpu's thread siblings"
+        first="$(cpulist_expand "$sibs" | sed -n '1p')"
+        fail "housekeeping CPU $cpu will not run with SMT off (its core runs on $first): use $first"
+    fi
 done
 HK="$(cpulist_compress <<<"$hk_list")"
-iso_list="$(comm -23 <(sort <<<"$online") <(sort <<<"$hk_list") | sort -n)"
+iso_list="$(comm -23 <(sort <<<"$live") <(sort <<<"$hk_list") | sort -n)"
 ISO="$(cpulist_compress <<<"$iso_list")"
 iso_cores="$(for cpu in $iso_list; do siblings_of "$cpu"; done | sort -u | wc -l | tr -d ' ')" \
     || fail "cannot read the isolated CPUs' thread siblings"
@@ -258,8 +302,10 @@ run systemctl enable "$UNIT" "$IRQ_UNIT"
 ok "$UNIT and $IRQ_UNIT enabled from the next boot"
 
 # --- 6. kernel command line -------------------------------------------------
+# nosmt keeps SMT off on every later boot (a VM's launch template turned it
+# off already with CpuOptions ThreadsPerCore=1; bare metal needs this).
 # The isolation flags are the VM lab's (vm.sh isolate).
-args="isolcpus=nohz,domain,managed_irq,$ISO nohz_full=$ISO rcu_nocbs=$ISO irqaffinity=$HK"
+args="nosmt isolcpus=nohz,domain,managed_irq,$ISO nohz_full=$ISO rcu_nocbs=$ISO irqaffinity=$HK"
 # C1 as the deepest idle state on a VM (the CPU reports the hypervisor flag),
 # as the EKS run measured it: c7i.4xlarge exposes C6, with a 190 us exit, on
 # the housekeeping core that takes every interrupt. Not on bare metal, where

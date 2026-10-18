@@ -114,11 +114,60 @@ impl Lab {
         Peer::serve_tls(self, sock)
     }
 
+    /// Like [`Lab::accept_tls`], but fails after `wait` with no client, and
+    /// the peer's reads fail after `wait` with no data: a test whose client
+    /// never connects (or refuses, as `connect_background` does on a pod
+    /// with one CPU) fails instead of hanging.
+    pub fn accept_tls_within(&self, wait: std::time::Duration) -> R<Peer> {
+        self.listener.set_nonblocking(true)?;
+        let end = std::time::Instant::now() + wait;
+        let sock = loop {
+            match self.listener.accept() {
+                Ok((sock, _)) => break sock,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > end {
+                        return Err("no client connected".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        self.listener.set_nonblocking(false)?;
+        sock.set_nonblocking(false)?;
+        sock.set_read_timeout(Some(wait))?;
+        Peer::serve_tls(self, sock)
+    }
+
     pub fn target(&self, path: &str) -> R<Target> {
         let addr = self.addr()?;
         Ok(Target::new("localhost", addr.port(), path)
             .with_addr(addr)
             .with_header("X-Test", "1"))
+    }
+
+    /// Like [`Lab::accept`], but fails after `wait` with no client, and the
+    /// peer's reads fail after `wait` with no data: a test whose client
+    /// misbehaves fails instead of hanging.
+    pub fn accept_within(&self, wait: std::time::Duration) -> R<Peer> {
+        self.listener.set_nonblocking(true)?;
+        let end = std::time::Instant::now() + wait;
+        let sock = loop {
+            match self.listener.accept() {
+                Ok((sock, _)) => break sock,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > end {
+                        return Err("no client connected".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        self.listener.set_nonblocking(false)?;
+        sock.set_nonblocking(false)?;
+        sock.set_read_timeout(Some(wait))?;
+        Peer::serve(self, sock)
     }
 
     /// Accepts one client and completes the TLS handshake and the upgrade.
@@ -201,6 +250,23 @@ impl Peer {
         Ok(p)
     }
 
+    /// Completes the TLS handshake, reads the upgrade request and writes
+    /// `respond(request, Sec-WebSocket-Accept value)`: for upgrade answers
+    /// the tests shape themselves (subprotocols, refusals).
+    pub fn serve_custom(
+        lab: &Lab,
+        sock: TcpStream,
+        respond: impl FnOnce(&HttpRequest, &str) -> String,
+    ) -> R<(Self, HttpRequest)> {
+        let mut p = Self::serve_tls(lab, sock)?;
+        let req = p.read_request()?;
+        let key = req.header("sec-websocket-key").ok_or("no key")?.to_owned();
+        let answer = respond(&req, &ws::accept_key(&key));
+        p.write(answer.as_bytes())?;
+        p.path.clone_from(&req.path);
+        Ok((p, req))
+    }
+
     /// Completes the TLS handshake and the upgrade on an accepted socket.
     pub fn serve(lab: &Lab, sock: TcpStream) -> R<Self> {
         let mut p = Self {
@@ -267,6 +333,16 @@ impl Peer {
 
     pub fn send(&mut self, opcode: u8, fin: bool, payload: &[u8]) -> R {
         self.write(&frame(opcode, fin, payload)?)
+    }
+
+    /// Sends a Close frame: `code` then `reason`, or an empty body.
+    pub fn send_close(&mut self, code: Option<u16>, reason: &str) -> R {
+        let mut body = Vec::new();
+        if let Some(c) = code {
+            body.extend_from_slice(&c.to_be_bytes());
+            body.extend_from_slice(reason.as_bytes());
+        }
+        self.send(ws::OP_CLOSE, true, &body)
     }
 
     /// Moves plaintext into `plain`, reading the socket only when rustls has
@@ -337,4 +413,51 @@ pub fn frame(opcode: u8, fin: bool, payload: &[u8]) -> R<Vec<u8>> {
         out[0] &= 0x7F;
     }
     Ok(out)
+}
+
+/// Sets `stop` when dropped, on a panic too: a failed assertion next to
+/// [`Lab::serve_http`] then fails the test instead of hanging it.
+pub struct StopOnDrop<'a>(pub &'a std::sync::atomic::AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The CPUs this process may run on: its cpuset (Docker's `--cpuset-cpus`,
+/// a Kubernetes pod's CPU set), as the test thread's mask shows it. The
+/// host-wide online list also holds CPUs a pod cannot use. Linux only.
+#[cfg(target_os = "linux")]
+pub fn cpuset() -> R<Vec<usize>> {
+    std::fs::read_to_string("/proc/thread-self/status")?
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .map(ergon_io::sys::parse_cpu_list)
+        .ok_or_else(|| "no Cpus_allowed_list".into())
+}
+
+/// A pod with one CPU: helper threads (the dial helper, `SQPOLL`) have no
+/// core of their own, so `connect_background` and `uring-sqpoll` refuse
+/// with [`ergon_io::Error::Cpu`] rather than time-slice the polling thread.
+/// Linux only (no `/proc` elsewhere); its callers are Linux test files.
+#[cfg(target_os = "linux")]
+pub fn one_cpu() -> R<bool> {
+    Ok(cpuset()?.len() == 1)
+}
+
+/// Whether `e` is the typed refusal of `want` for want of a second CPU
+/// ([`ergon_io::placement::CpuError::NoSpareCpu`]), when a test's error
+/// came back boxed.
+pub fn refused(
+    e: &(dyn std::error::Error + 'static),
+    want: ergon_io::placement::HelperThread,
+) -> bool {
+    use ergon_io::placement::CpuError;
+    match e.downcast_ref::<ergon_io::Error>() {
+        Some(ergon_io::Error::Cpu(e)) => {
+            matches!(**e, CpuError::NoSpareCpu { helper, .. } if helper == want)
+        }
+        _ => false,
+    }
 }

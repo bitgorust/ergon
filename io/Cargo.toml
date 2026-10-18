@@ -8,10 +8,17 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-readme = "../README.md"
+readme = "README.md"
+documentation = "https://docs.rs/ergon-io"
 keywords = ["io_uring", "epoll", "websocket", "low-latency", "tls"]
 categories = ["network-programming"]
-publish = false
+# Published package = the library only (src/ and the README, which is the
+# crate's front page). The tests, the example and benches/ are repo-only.
+include = [
+    "/Cargo.toml",
+    "/README.md",
+    "/src/**/*.rs",
+]
 # benches/ is the standalone benchmark crate, not bench targets of this one.
 autobenches = false
 
@@ -35,6 +42,10 @@ httparse = "1.10"
 base64 = "0.22"
 socket2 = { version = "0.6", features = ["all"] }
 webpki-roots = { version = "1", optional = true }
+# The host and NIC checks (`checks`): `Driver::new` runs T1, T3, T7 and T8;
+# ergon-io's warning thread runs T2, N1, N2 and N3 on each route's egress
+# device. Pure functions over sysfs and procfs, plus ethtool over netlink.
+ergon-tune = { version = "0.1.30", path = "../tune", features = ["nic"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
@@ -44,6 +55,18 @@ curl = { version = "0.4.51", optional = true, default-features = false, features
 rcgen = "0.14"
 # TLS 1.2 only in tests: proves a TLS 1.2 handshake is refused clearly.
 rustls = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
+# Test-only: the docs say mio is the interrupt path and so is tokio's I/O.
+# `driver.rs` proves that by reading SO_BUSY_POLL off a socket mio owns, and
+# off one tokio's reactor owns. `os-poll` and `net` are mio's Poll and its
+# TcpStream; tokio needs `net` and a current-thread runtime.
+mio = { version = "1", features = ["os-poll", "net"] }
+tokio = { version = "1", features = ["net", "rt", "macros"] }
+
+# docs.rs: the Linux API (`Driver`, `HttpClient`) and `tls::webpki_roots`.
+# `curl` adds no public item, so it is left out.
+[package.metadata.docs.rs]
+features = ["webpki-roots"]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lints]
 workspace = true

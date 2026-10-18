@@ -9,7 +9,7 @@
 //! test build links the DPDK-free fakes (see `common/mod.rs`) and every test
 //! that creates a transport runs under the skip-EAL test mode.
 //!
-//! Linux x86_64 only, and requires libdpdk >= 23.11 (the `dpdk` feature).
+//! Linux x86_64 or aarch64, and requires libdpdk >= 23.11 (the `dpdk` feature).
 #![allow(
     missing_docs,
     unsafe_code,
@@ -19,7 +19,11 @@
     clippy::nursery,
     clippy::restriction
 )]
-#![cfg(all(feature = "dpdk", target_os = "linux", target_arch = "x86_64"))]
+#![cfg(all(
+    feature = "dpdk",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 mod common;
 use common::{TestEnv, close, create, last_error, last_error_code, rusteron_dpdk_config_t};

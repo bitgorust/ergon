@@ -36,11 +36,12 @@ fn main() {
 fn build_dpdk_native() {
     use std::path::PathBuf;
 
-    // The target, not the host this script runs on.
+    // The target, not the host this script runs on: x86_64 (Intel and AMD
+    // instances) or aarch64 (AWS Graviton).
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    if os != "linux" || arch != "x86_64" {
-        panic!("the `dpdk` feature requires Linux x86_64 (target is {os} {arch})");
+    if os != "linux" || !matches!(arch.as_str(), "x86_64" | "aarch64") {
+        panic!("the `dpdk` feature requires Linux x86_64 or aarch64 (target is {os} {arch})");
     }
 
     let dpdk = pkg_config::Config::new()
@@ -83,7 +84,11 @@ fn build_dpdk_native() {
         let mut b = base();
         // DPDK's x86_64 baseline: rte_memcpy.h uses SSSE3 intrinsics
         // unconditionally, so the seams need the ISA floor DPDK is built with.
-        b.flag("-mssse3");
+        // aarch64 needs no flag: DPDK's arm64 headers use only Armv8.0
+        // (NEON is part of it), the floor of every aarch64 target.
+        if arch == "x86_64" {
+            b.flag("-mssse3");
+        }
         for inc in &dpdk.include_paths {
             b.include(inc);
         }

@@ -1,15 +1,13 @@
-//! Non-blocking DNS: `/etc/hosts`, a TTL cache, and A-record queries over a
-//! non-blocking UDP socket, advanced by [`Resolver::poll`] without waiting.
+//! Non-blocking DNS: `/etc/hosts`, a TTL cache, and A-record queries over
+//! UDP, advanced by [`Resolver::poll`] without waiting.
 //!
-//! Only IPv4 (A records) is resolved, which is what exchange endpoints publish.
-//! Names are treated as fully qualified (no search domains). A truncated answer
-//! is reported as an error rather than retried over TCP; A answers for a single
-//! name fit in one UDP datagram. Query ids are random and every query uses a
-//! fresh socket (a random source port).
-//!
-//! For the lowest connect latency resolve hosts before they are needed
-//! ([`Resolver::prefetch`]) and keep them fresh: connections then start from the
-//! cache.
+//! - IPv4 (A records) only: what exchange endpoints publish.
+//! - Names are fully qualified: no search domains.
+//! - A truncated answer is an error, not retried over TCP (A answers for one
+//!   name fit in one datagram).
+//! - Random query ids; a fresh socket (random source port) per query.
+//! - Lowest connect latency: resolve early ([`Resolver::prefetch`]) so
+//!   connects start from the cache.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};

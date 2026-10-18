@@ -26,11 +26,18 @@ fn full_stack_over_loopback() -> R {
     let target = lab.target("/x?y=1")?;
     let big: Vec<u8> = (0..40_000u32).map(|i| (i % 253) as u8).collect();
     let big2 = big.clone();
+    // The 40 kB frame goes out once the client's driver has delivered
+    // "hello": sent sooner, its records can arrive with the 101 and be read
+    // by the upgrade, which hands them over as one plaintext block, so they
+    // never span records in the driver.
+    let (upgraded, wait_upgraded) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|s| -> R {
-        let h = s.spawn(|| -> R {
+        let lab = &lab;
+        let h = s.spawn(move || -> R {
             let mut p = lab.accept()?;
             assert_eq!(p.path, "/x?y=1");
             p.send(ws::OP_TEXT, true, b"hello")?;
+            wait_upgraded.recv()?;
             p.send(ws::OP_BINARY, true, &big2)?;
             p.send(ws::OP_TEXT, false, b"ab")?;
             p.send(ws::OP_CONT, true, b"cd")?;
@@ -42,6 +49,10 @@ fn full_stack_over_loopback() -> R {
         let mut d: Driver<WsConn> = Driver::new(Config::new(Backend::EpollSpin))?;
         let id = d.add(WsConn::connect(&target, lab.client_cfg.clone(), 1 << 20)?)?;
         let mut got = Collect::default();
+        while got.0.is_empty() {
+            d.poll(&mut got)?;
+        }
+        upgraded.send(())?;
         while got.0.len() < 4 {
             d.poll(&mut got)?;
         }

@@ -8,9 +8,11 @@
 pub mod args;
 pub mod clock;
 pub mod diag;
+pub mod fair;
 pub mod json;
 pub mod matrix;
 pub mod mixed;
+pub mod order;
 pub mod periodic;
 pub mod record;
 pub mod stalls;

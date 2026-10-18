@@ -29,6 +29,16 @@ pub struct DpdkTransport {
     // Read only in the `dpdk` install path.
     #[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
     inner: Arc<NativeTransport>,
+    /// The sender's and the receiver's PCI addresses (one for both on a MANA
+    /// function), or vdev names, for the host checks (`checks`).
+    #[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
+    ports: [String; 2],
+    /// Whether the ports are test vdevs (`RUSTERON_DPDK_TEST_VDEV`).
+    #[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
+    test_vdev: bool,
+    /// The clock the native transport adopted ([`crate::clock`]).
+    #[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
+    clock: ergon_clock::advanced::Clock,
 }
 
 /// Opaque native transport state. Empty without the `dpdk` feature.
@@ -43,6 +53,10 @@ impl DpdkTransport {
     /// native DPDK runtime (EAL and both ENA ports), and install its sender and
     /// receiver bindings into `context`.
     ///
+    /// The native transport's clock is ergon-clock's, as `RUSTERON_DPDK_CLOCK`
+    /// chooses ([`crate::clock`]): the counter is calibrated once a process
+    /// and its conversion handed over in the native configuration.
+    ///
     /// Call it after the context is configured and before the driver is
     /// created. The returned handle must outlive every driver started from
     /// `context`.
@@ -52,7 +66,9 @@ impl DpdkTransport {
     /// [`DpdkError::FeatureDisabled`] without the `dpdk` feature, before the
     /// config or context is inspected; otherwise
     /// [`DpdkError::InvalidConfiguration`] for a config or context that breaks
-    /// the transport's requirements, [`DpdkError::Native`] when DPDK fails to
+    /// the transport's requirements, [`DpdkError::InvalidEnvironment`] for a
+    /// `RUSTERON_DPDK_CLOCK` that does not parse, [`DpdkError::Clock`] when the
+    /// clock cannot be calibrated, [`DpdkError::Native`] when DPDK fails to
     /// initialise, and [`DpdkError::Aeron`] when installation fails.
     #[cfg_attr(not(feature = "dpdk"), allow(clippy::missing_const_for_fn))]
     pub fn install(context: &AeronDriverContext, config: &DpdkTransportConfig) -> Result<Self, DpdkError> {
@@ -60,9 +76,14 @@ impl DpdkTransport {
         {
             config.validate()?;
             validate_context(context, config)?;
+            let choice = crate::clock::ClockChoice::from_env()?;
+            let clock = crate::clock::transport_clock(choice)?.clock;
             pin_agents_to_configured_cpus(context)?;
             let transport = Self {
-                inner: Arc::new(NativeTransport::create(config)?),
+                inner: Arc::new(NativeTransport::create(config, clock.params())?),
+                ports: [config.sender.pci_address.clone(), config.receiver.pci_address.clone()],
+                test_vdev: config.test_vdev,
+                clock,
             };
             transport.inner.install(context)?;
             Ok(transport)
@@ -73,12 +94,42 @@ impl DpdkTransport {
             Err(DpdkError::FeatureDisabled)
         }
     }
+
+    /// The clock the native transport reads: ergon-clock's calibration it
+    /// adopted ([`crate::clock`]). A copy on any thread reads the same
+    /// timebase, in the monotonic domain.
+    #[must_use]
+    pub const fn clock(&self) -> ergon_clock::advanced::Clock {
+        self.clock
+    }
+
+    /// The sender's and the receiver's PCI addresses (or vdev names), and
+    /// whether they are test vdevs.
+    pub(crate) const fn ports(&self) -> (&[String; 2], bool) {
+        (&self.ports, self.test_vdev)
+    }
+
+    /// The CPU the EAL's main lcore runs on (where the EAL keeps its own
+    /// threads), once the EAL is up.
+    #[allow(clippy::unused_self)] // the EAL is the transport's
+    #[cfg_attr(not(feature = "dpdk"), allow(clippy::missing_const_for_fn))]
+    pub(crate) fn eal_main_cpu(&self) -> Option<u32> {
+        #[cfg(feature = "dpdk")]
+        {
+            // SAFETY: reads the EAL's main lcore, or -1 when it is not up.
+            u32::try_from(unsafe { rusteron_dpdk_eal_main_cpu() }).ok()
+        }
+        #[cfg(not(feature = "dpdk"))]
+        {
+            None
+        }
+    }
 }
 
 #[cfg(feature = "dpdk")]
 impl NativeTransport {
-    fn create(config: &DpdkTransportConfig) -> Result<Self, DpdkError> {
-        let native_config = native_config(config)?;
+    fn create(config: &DpdkTransportConfig, clock: ergon_clock::advanced::Params) -> Result<Self, DpdkError> {
+        let native_config = native_config(config, clock)?;
         let mut ptr: *mut c_void = std::ptr::null_mut();
         // SAFETY: both pointers are valid for the call; the C side copies the
         // config and writes `ptr` only on success.
@@ -144,6 +195,8 @@ struct rusteron_dpdk_config_t {
     sender_mac: [c_char; 18],
     receiver_mac: [c_char; 18],
     rx_hw_timestamp: u8,
+    /// ergon-clock's calibration, the C `rusteron_dpdk_clock_params_t`.
+    clock: ergon_clock::advanced::Params,
 }
 
 // The C layout, field by field (asserted in native/dpdk/rusteron_dpdk_transport.c
@@ -172,7 +225,25 @@ const _: () = {
     assert!(offset_of!(C, sender_mac) == 4288);
     assert!(offset_of!(C, receiver_mac) == 4306);
     assert!(offset_of!(C, rx_hw_timestamp) == 4324);
-    assert!(size_of::<C>() == 4328);
+    assert!(offset_of!(C, clock) == 4328);
+    assert!(size_of::<C>() == 4376);
+};
+
+// ergon-clock's Params as the C clock parameters lay them out
+// (rusteron_dpdk_clock_params_t, asserted in rusteron_dpdk_transport.c too).
+#[cfg(feature = "dpdk")]
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    type P = ergon_clock::advanced::Params;
+    assert!(offset_of!(P, version) == 0);
+    assert!(offset_of!(P, kind) == 4);
+    assert!(offset_of!(P, domain) == 8);
+    assert!(offset_of!(P, reserved) == 12);
+    assert!(offset_of!(P, base_ticks) == 16);
+    assert!(offset_of!(P, base_ns) == 24);
+    assert!(offset_of!(P, mult) == 32);
+    assert!(offset_of!(P, hz) == 40);
+    assert!(size_of::<P>() == 48);
 };
 
 #[cfg(feature = "dpdk")]
@@ -185,10 +256,14 @@ unsafe extern "C" {
     ) -> c_int;
     fn rusteron_dpdk_transport_close(transport: *mut c_void) -> c_int;
     fn rusteron_dpdk_last_error() -> *const c_char;
+    fn rusteron_dpdk_eal_main_cpu() -> c_int;
 }
 
 #[cfg(feature = "dpdk")]
-fn native_config(config: &DpdkTransportConfig) -> Result<rusteron_dpdk_config_t, DpdkError> {
+fn native_config(
+    config: &DpdkTransportConfig,
+    clock: ergon_clock::advanced::Params,
+) -> Result<rusteron_dpdk_config_t, DpdkError> {
     let mut c = rusteron_dpdk_config_t {
         struct_size: u32::try_from(std::mem::size_of::<rusteron_dpdk_config_t>())
             .map_err(|_| DpdkError::InvalidConfiguration("native config struct exceeds u32".to_string()))?,
@@ -202,7 +277,7 @@ fn native_config(config: &DpdkTransportConfig) -> Result<rusteron_dpdk_config_t,
         receiver_ipv4: [0; 16],
         receiver_prefix_len: config.receiver.prefix_len,
         receiver_gateway: [0; 16],
-        rx_descriptors: config.rx_descriptors,
+        rx_descriptors: config.rx_descriptors.unwrap_or(0), // 0: the NIC's default, sized at start
         tx_descriptors: config.tx_descriptors,
         mbufs_per_port: config.mbufs_per_port,
         mempool_cache: config.mempool_cache,
@@ -211,6 +286,7 @@ fn native_config(config: &DpdkTransportConfig) -> Result<rusteron_dpdk_config_t,
         sender_mac: [0; 18],
         receiver_mac: [0; 18],
         rx_hw_timestamp: u8::from(config.rx_hw_timestamp),
+        clock,
     };
     if let Some(mac) = config.sender.mac {
         fill(&mut c.sender_mac, &mac.to_string(), "sender.mac")?;
@@ -284,37 +360,77 @@ fn last_error() -> String {
 /// Verify the required `AeronDriverContext` state. The DPDK
 /// transport replaces only the sender/receiver bindings; the conductor's UDP
 /// resolver stays on the kernel socket, so the context must still be a sane
-/// dedicated-thread driver configuration.
+/// driver configuration, whose network work runs on agents that busy-spin on
+/// CPUs the transport knows (to keep housekeeping off them):
+///
+/// - `DEDICATED`: the sender and the receiver, each on its own CPU;
+/// - `SHARED_NETWORK`: one agent sending and receiving, on the sender's CPU
+///   (`AERON_SHAREDNETWORK_IDLE_STRATEGY`);
+/// - `SHARED`: one agent running everything, on the conductor's CPU
+///   (`AERON_SHARED_IDLE_STRATEGY`);
+/// - `INVOKER`: the application's thread that starts the driver and runs it,
+///   which Aeron pins to the conductor's CPU as the driver starts. Whether its
+///   loop ever sleeps the transport cannot see; the shared idle strategy, what
+///   `aeron_driver_main_idle_strategy` applies to it, must busy-spin.
+///
+/// In the three shared modes one thread also receives, so a send never waits
+/// out a pacing debt there: `RUSTERON_DPDK_TX_PACE_SPIN_US` must be 0 or unset.
 #[cfg(feature = "dpdk")]
 fn validate_context(context: &AeronDriverContext, config: &DpdkTransportConfig) -> Result<(), DpdkError> {
     use rusteron_media_driver::bindings::aeron_threading_mode_t;
 
-    if context.get_threading_mode() != aeron_threading_mode_t::AERON_THREADING_MODE_DEDICATED {
-        return Err(DpdkError::InvalidConfiguration(
-            "aeron context threading mode must be AERON_THREADING_MODE_DEDICATED".to_string(),
-        ));
-    }
-
-    let sender_aff = context.get_sender_cpu_affinity();
-    let receiver_aff = context.get_receiver_cpu_affinity();
-    if sender_aff < 0 || receiver_aff < 0 {
-        return Err(DpdkError::InvalidConfiguration(format!(
-            "aeron context sender/receiver cpu affinity must be nonnegative (sender={sender_aff}, receiver={receiver_aff})"
-        )));
-    }
-    if sender_aff == receiver_aff {
-        return Err(DpdkError::InvalidConfiguration(format!(
-            "aeron context sender and receiver cpu affinity must differ (both {sender_aff})"
-        )));
-    }
-
-    let sender_idle = effective_idle_strategy(context.get_sender_idle_strategy(), "AERON_SENDER_IDLE_STRATEGY");
-    let receiver_idle = effective_idle_strategy(context.get_receiver_idle_strategy(), "AERON_RECEIVER_IDLE_STRATEGY");
-    if !is_busy_idle_strategy(&sender_idle) || !is_busy_idle_strategy(&receiver_idle) {
-        return Err(DpdkError::InvalidConfiguration(format!(
-            "aeron context sender and receiver idle strategies must busy-spin (`spin` or `noop`), not \
-             {sender_idle} and {receiver_idle}"
-        )));
+    match context.get_threading_mode() {
+        aeron_threading_mode_t::AERON_THREADING_MODE_DEDICATED => {
+            validate_dedicated_agents(context)?;
+            validate_off_the_conductor(
+                "DEDICATED",
+                &[
+                    ("sender", "AERON_SENDER_CPU_AFFINITY", context.get_sender_cpu_affinity()),
+                    (
+                        "receiver",
+                        "AERON_RECEIVER_CPU_AFFINITY",
+                        context.get_receiver_cpu_affinity(),
+                    ),
+                ],
+                context.get_conductor_cpu_affinity(),
+            )?;
+        }
+        aeron_threading_mode_t::AERON_THREADING_MODE_SHARED_NETWORK => {
+            validate_shared_agent(
+                "SHARED_NETWORK",
+                "its network agent (sender and receiver)",
+                ("AERON_SENDER_CPU_AFFINITY", context.get_sender_cpu_affinity()),
+                context.get_sharednetwork_idle_strategy(),
+                "AERON_SHAREDNETWORK_IDLE_STRATEGY",
+            )?;
+            validate_off_the_conductor(
+                "SHARED_NETWORK",
+                &[(
+                    "network agent",
+                    "AERON_SENDER_CPU_AFFINITY",
+                    context.get_sender_cpu_affinity(),
+                )],
+                context.get_conductor_cpu_affinity(),
+            )?;
+        }
+        aeron_threading_mode_t::AERON_THREADING_MODE_SHARED => {
+            validate_shared_agent(
+                "SHARED",
+                "its one agent (conductor, sender and receiver)",
+                ("AERON_CONDUCTOR_CPU_AFFINITY", context.get_conductor_cpu_affinity()),
+                context.get_shared_idle_strategy(),
+                "AERON_SHARED_IDLE_STRATEGY",
+            )?;
+        }
+        aeron_threading_mode_t::AERON_THREADING_MODE_INVOKER => {
+            validate_shared_agent(
+                "INVOKER",
+                "the application thread that starts and runs the driver",
+                ("AERON_CONDUCTOR_CPU_AFFINITY", context.get_conductor_cpu_affinity()),
+                context.get_shared_idle_strategy(),
+                "AERON_SHARED_IDLE_STRATEGY",
+            )?;
+        }
     }
 
     let (s_low, s_high) = wildcard_port_range(context, "sender")?;
@@ -345,6 +461,94 @@ fn validate_context(context: &AeronDriverContext, config: &DpdkTransportConfig) 
         )));
     }
 
+    Ok(())
+}
+
+/// One agent of a shared threading mode (`mode`) carries the network work: it
+/// must have a CPU (`cpu`: its variable and value) and an idle strategy
+/// (`stored`, or the variable `idle_var` names) that busy-spins, and no send
+/// may wait out a pacing debt on it.
+#[cfg(feature = "dpdk")]
+fn validate_shared_agent(
+    mode: &str,
+    agent: &str,
+    cpu: (&str, i32),
+    stored: &str,
+    idle_var: &str,
+) -> Result<(), DpdkError> {
+    let (cpu_var, cpu) = cpu;
+    if cpu < 0 {
+        return Err(DpdkError::InvalidConfiguration(format!(
+            "aeron context threading mode {mode}: {agent} needs a CPU to busy-spin on, which housekeeping keeps \
+             off ({cpu_var}, not {cpu})"
+        )));
+    }
+    let idle = effective_idle_strategy(stored, idle_var);
+    if !is_busy_idle_strategy(&idle) {
+        return Err(DpdkError::InvalidConfiguration(format!(
+            "aeron context threading mode {mode}: {agent} must busy-spin ({idle_var} `spin` or `noop`, not {idle})"
+        )));
+    }
+    match std::env::var(PACE_SPIN_ENV).as_deref().map(str::trim) {
+        Ok(spin) if !spin.is_empty() && spin.bytes().any(|b| b != b'0') && spin.parse::<u64>().is_ok() => {
+            Err(DpdkError::InvalidConfiguration(format!(
+                "aeron context threading mode {mode}: {PACE_SPIN_ENV}={spin} would stall the receive half of \
+                 {agent} while a send waits out a pacing debt: it must be 0 or unset"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Outside SHARED and INVOKER (where the one agent does the conductor's work
+/// itself) each busy-spinning network agent (`agents`: its name, variable and
+/// CPU) needs a CPU the conductor (on `conductor`, or floating when negative)
+/// is not pinned to: the conductor's work (log buffers, name resolution,
+/// housekeeping) would preempt it there.
+#[cfg(feature = "dpdk")]
+fn validate_off_the_conductor(mode: &str, agents: &[(&str, &str, i32)], conductor: i32) -> Result<(), DpdkError> {
+    if conductor < 0 {
+        return Ok(());
+    }
+    match agents.iter().find(|(_, _, cpu)| *cpu == conductor) {
+        Some((agent, var, cpu)) => Err(DpdkError::InvalidConfiguration(format!(
+            "aeron context threading mode {mode}: the {agent} ({var} {cpu}) is on the conductor's CPU \
+             (AERON_CONDUCTOR_CPU_AFFINITY {conductor}): a busy-spinning agent needs a CPU of its own, where \
+             the conductor's work (log buffers, name resolution) cannot preempt it; pin the conductor to a \
+             housekeeping CPU"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// How long a send may wait out a pacing debt (read natively; checked here).
+#[cfg(feature = "dpdk")]
+const PACE_SPIN_ENV: &str = "RUSTERON_DPDK_TX_PACE_SPIN_US";
+
+/// DEDICATED: the sender and the receiver, each busy-spinning on its own CPU.
+#[cfg(feature = "dpdk")]
+fn validate_dedicated_agents(context: &AeronDriverContext) -> Result<(), DpdkError> {
+    let sender_aff = context.get_sender_cpu_affinity();
+    let receiver_aff = context.get_receiver_cpu_affinity();
+    if sender_aff < 0 || receiver_aff < 0 {
+        return Err(DpdkError::InvalidConfiguration(format!(
+            "aeron context sender/receiver cpu affinity must be nonnegative (sender={sender_aff}, receiver={receiver_aff})"
+        )));
+    }
+    if sender_aff == receiver_aff {
+        return Err(DpdkError::InvalidConfiguration(format!(
+            "aeron context sender and receiver cpu affinity must differ (both {sender_aff})"
+        )));
+    }
+
+    let sender_idle = effective_idle_strategy(context.get_sender_idle_strategy(), "AERON_SENDER_IDLE_STRATEGY");
+    let receiver_idle = effective_idle_strategy(context.get_receiver_idle_strategy(), "AERON_RECEIVER_IDLE_STRATEGY");
+    if !is_busy_idle_strategy(&sender_idle) || !is_busy_idle_strategy(&receiver_idle) {
+        return Err(DpdkError::InvalidConfiguration(format!(
+            "aeron context sender and receiver idle strategies must busy-spin (`spin` or `noop`), not \
+             {sender_idle} and {receiver_idle}"
+        )));
+    }
     Ok(())
 }
 
@@ -384,9 +588,9 @@ pub fn pin_agents_to_configured_cpus(context: &AeronDriverContext) -> Result<(),
 /// The idle strategy the agent actually runs. Aeron's context init loads the
 /// strategy `AERON_*_IDLE_STRATEGY` names but leaves the stored name at its
 /// `backoff` default, so the getter alone misreads a driver configured from the
-/// environment (the standalone binary's way); a setter updates both.
-#[cfg(feature = "dpdk")]
-fn effective_idle_strategy(stored: &str, env_var: &str) -> String {
+/// environment (the standalone binary's way); a setter updates both. The DPDK
+/// install's requirements and the host checks (`checks`) both read it.
+pub(crate) fn effective_idle_strategy(stored: &str, env_var: &str) -> String {
     match std::env::var(env_var) {
         Ok(from_env) if stored == "backoff" && !from_env.is_empty() => from_env,
         _ => stored.to_string(),
@@ -395,8 +599,7 @@ fn effective_idle_strategy(stored: &str, env_var: &str) -> String {
 
 /// `spin` (busy spin with a pause) and `noop` both keep the agent polling the
 /// NIC; anything that sleeps or yields would stall a DPDK queue.
-#[cfg(feature = "dpdk")]
-fn is_busy_idle_strategy(name: &str) -> bool {
+pub(crate) fn is_busy_idle_strategy(name: &str) -> bool {
     matches!(
         name,
         "spin" | "noop" | "aeron_idle_strategy_busy_spinning" | "aeron_idle_strategy_noop"

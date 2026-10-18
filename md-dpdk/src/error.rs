@@ -11,7 +11,7 @@ use std::fmt;
 pub enum DpdkError {
     /// `dpdk-ena` was selected but the crate was not built with the `dpdk` feature.
     FeatureDisabled,
-    /// The transport was requested outside Linux `x86_64` (Amazon Linux 2023 / EKS Nitro).
+    /// The transport was requested outside Linux `x86_64` or `aarch64`.
     UnsupportedPlatform,
     /// An EAL/DPDK transport already exists in this process.
     AlreadyInitialized,
@@ -25,6 +25,13 @@ pub enum DpdkError {
     Native(String),
     /// Installation through the Aeron context failed.
     Aeron(String),
+    /// Under `RUSTERON_MEDIA_DRIVER_HOST_CHECK=require`, a host check warned
+    /// ([`crate::checks`]): the driver was not started. Names the warnings,
+    /// which were printed in full.
+    HostCheck(String),
+    /// The transport's clock could not be made ([`crate::clock`]): a kernel
+    /// clock ergon-clock calibrates against could not be read.
+    Clock(ergon_clock::Error),
 }
 
 impl fmt::Display for DpdkError {
@@ -34,10 +41,7 @@ impl fmt::Display for DpdkError {
                 f,
                 "the `dpdk-ena` transport was selected but ergon-md-dpdk was not built with the `dpdk` feature"
             ),
-            Self::UnsupportedPlatform => write!(
-                f,
-                "the `dpdk-ena` transport requires Linux x86_64 (Amazon Linux 2023 / EKS Nitro)"
-            ),
+            Self::UnsupportedPlatform => write!(f, "the `dpdk-ena` transport requires Linux x86_64 or aarch64"),
             Self::AlreadyInitialized => write!(
                 f,
                 "a DPDK EAL/transport is already initialized in this process; DPDK permits only one"
@@ -47,6 +51,8 @@ impl fmt::Display for DpdkError {
             Self::InvalidConfiguration(msg) => write!(f, "invalid DPDK configuration: {msg}"),
             Self::Native(msg) => write!(f, "DPDK native error: {msg}"),
             Self::Aeron(msg) => write!(f, "Aeron installation error: {msg}"),
+            Self::HostCheck(msg) => write!(f, "host check refused to start the driver: {msg}"),
+            Self::Clock(e) => write!(f, "the transport's clock (ergon-clock): {e}"),
         }
     }
 }

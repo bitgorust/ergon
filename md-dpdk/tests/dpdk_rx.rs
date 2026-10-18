@@ -6,7 +6,7 @@
 //! recycle ordering, the vlen/burst caps, foreign-destination and unknown-port
 //! counting, and zero allocations across repeated empty polls.
 //!
-//! Linux x86_64 only; links the same archives as dpdk_tx.rs.
+//! Linux x86_64 or aarch64; links the same archives as dpdk_tx.rs.
 #![allow(
     missing_docs,
     unsafe_code,
@@ -16,7 +16,11 @@
     clippy::nursery,
     clippy::restriction
 )]
-#![cfg(all(feature = "dpdk", target_os = "linux", target_arch = "x86_64"))]
+#![cfg(all(
+    feature = "dpdk",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 mod common;
 use common::*;
@@ -36,6 +40,7 @@ use rusteron_media_driver::bindings::*;
 unsafe extern "C" {
     fn rusteron_dpdk_transport_bindings() -> *mut aeron_udp_channel_transport_bindings_stct;
     fn rusteron_dpdk_fake_rx_queued(port_id: u16) -> c_int;
+    fn rusteron_dpdk_rx_ol_flags_from_dpdk(ol: u64) -> u32;
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +363,7 @@ impl Drop for Poller {
     }
 }
 
-/// Linux x86_64 `struct mmsghdr` (bindings.rs only declares an opaque stub).
+/// Linux x86_64 and aarch64 `struct mmsghdr`, one glibc layout (bindings.rs only declares an opaque stub).
 /// The C poller touches msg_name (offset 0) and msg_len (offset 48), both within
 /// this 56-byte layout; it is zeroed so msg_name is NULL (the C side falls back
 /// to its own source-address buffer).
@@ -1040,6 +1045,50 @@ fn reject_nic_bad_checksum() {
     assert_reject(&mut h, &mut p, &frame, RX_IPV4_BAD, 1, |s| s.checksum);
 }
 
+/// DPDK encodes each RX checksum verdict as a two-bit enum, and NONE carries
+/// both the GOOD and the BAD bit (rte_mbuf_core.h). Decoding the bits
+/// independently classifies a NONE packet as both good and bad, and the BAD
+/// half drops it. Decode the enum instead.
+#[test]
+#[serial]
+fn a_none_checksum_verdict_is_verified_good_never_bad() {
+    const UNKNOWN: u64 = 0;
+    const BAD: u64 = 1;
+    const GOOD: u64 = 2;
+    const NONE: u64 = 3;
+    const IP_SHIFT: u32 = 5;
+    const L4_SHIFT: u32 = 7;
+
+    // (ip verdict, l4 verdict) -> expected view flags.
+    // View bits: IPV4_GOOD 0b0001, UDP_GOOD 0b0010, IPV4_BAD 0b0100, UDP_BAD 0b1000.
+    let cases = [
+        (UNKNOWN, UNKNOWN, 0b0000),
+        (GOOD, UNKNOWN, 0b0001),
+        (BAD, UNKNOWN, 0b0100),
+        (NONE, UNKNOWN, 0b0001), // NONE is verified good: the old decode made it 0b0101
+        (UNKNOWN, GOOD, 0b0010),
+        (UNKNOWN, BAD, 0b1000),
+        (UNKNOWN, NONE, 0b0010), // NONE is verified good: the old decode made it 0b1010
+        (NONE, NONE, 0b0011),
+        (BAD, BAD, 0b1100),
+        (GOOD, GOOD, 0b0011),
+    ];
+    for (ip, l4, want) in cases {
+        let ol = (ip << IP_SHIFT) | (l4 << L4_SHIFT);
+        let got = unsafe { rusteron_dpdk_rx_ol_flags_from_dpdk(ol) };
+        assert_eq!(got, want, "ol_flags {ol:#x} (ip {ip} l4 {l4})");
+    }
+    // A verified NONE packet must never come out with a BAD half: that half is
+    // what the classifier drops on.
+    for shift in [IP_SHIFT, L4_SHIFT] {
+        let got = unsafe { rusteron_dpdk_rx_ol_flags_from_dpdk(NONE << shift) };
+        assert_eq!(got & (RX_IPV4_BAD | RX_UDP_BAD), 0, "shift {shift}: {got:#x}");
+    }
+    // UNKNOWN is the only verdict that sends a checksum to software verify:
+    // it alone leaves its GOOD bit clear.
+    assert_eq!(unsafe { rusteron_dpdk_rx_ol_flags_from_dpdk(UNKNOWN) }, 0);
+}
+
 #[test]
 #[serial]
 fn reject_multi_segment() {
@@ -1119,6 +1168,8 @@ fn callback_before_recycle_ordering() {
     );
     let mut bytes = 0i64;
     let clientd = &mut h.rx as *mut Vec<RxDatagram> as *mut c_void;
+    // counted from just before the poll
+    let (allocated, released) = unsafe { (rusteron_dpdk_fake_allocated(), rusteron_dpdk_fake_released()) };
     let work = p.poll(16, clientd, &mut bytes);
     assert_eq!(work, 2);
     assert_eq!(h.rx.len(), 2);
@@ -1127,10 +1178,22 @@ fn callback_before_recycle_ordering() {
     assert_eq!(a.data, b"first");
     assert_eq!(b.data, b"second");
     // Both views were allocated before any callback ran.
-    assert_eq!(a.alloc_at_cb, 2, "frame 1's mbuf is live during frame 0's callback");
-    assert_eq!(a.released_at_cb, 0, "frame 0 recycled strictly after its callback");
-    assert_eq!(b.released_at_cb, 1, "frame 0 recycled before frame 1's callback");
-    assert_eq!(b.alloc_at_cb, 2);
+    assert_eq!(
+        a.alloc_at_cb - allocated,
+        2,
+        "frame 1's mbuf is live during frame 0's callback"
+    );
+    assert_eq!(
+        a.released_at_cb - released,
+        0,
+        "frame 0 recycled strictly after its callback"
+    );
+    assert_eq!(
+        b.released_at_cb - released,
+        1,
+        "frame 0 recycled before frame 1's callback"
+    );
+    assert_eq!(b.alloc_at_cb - allocated, 2);
     assert_no_leak();
 }
 
@@ -1207,6 +1270,44 @@ fn a_full_burst_keeps_the_poll_draining() {
     assert_eq!(p.poll(16, clientd, &mut bytes), 5, "bursts of 2, 2 and 1 in one poll");
     assert_eq!(h.rx.len(), 5);
     assert_eq!(unsafe { rusteron_dpdk_fake_rx_queued(RECEIVER_PORT) }, 0);
+    assert_no_leak();
+}
+
+/// By default a poll drains as many bursts as fill the receive ring the
+/// ports took (at most 8): unset, min(4096, the NIC's maximum).
+#[test]
+#[serial]
+fn the_default_drain_fills_the_ring_the_ports_took() {
+    let env = TestEnv::new();
+    env.eal_skip();
+    unsafe { rusteron_dpdk_fake_set_desc_limits(64, 64, 0, 0) };
+    let mut config = rusteron_dpdk_config_t::valid();
+    config.rx_descriptors = 0;
+    config.burst_size = 16; // a 64-descriptor ring: 4 bursts
+    let native = create(&config).unwrap_or_else(|e| panic!("create failed: {e}"));
+    let mut h = Harness {
+        _env: env,
+        native,
+        bindings: unsafe { rusteron_dpdk_transport_bindings() },
+        transport: Box::new(unsafe { std::mem::zeroed::<aeron_udp_channel_transport_stct>() }),
+        rx: Vec::new(),
+        initialized: false,
+    };
+    h.init(
+        aeron_udp_channel_transport_affinity_t::AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_RECEIVER,
+        RECEIVER_IP,
+        60000,
+        1472,
+    );
+    let mut p = h.poller();
+    p.add(&mut *h.transport);
+    inject_n(80);
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx as *mut Vec<RxDatagram> as *mut c_void;
+    assert_eq!(p.poll(16, clientd, &mut bytes), 64, "four bursts of 16");
+    assert_eq!(p.poll(16, clientd, &mut bytes), 16);
+    drop(p);
+    drop(h);
     assert_no_leak();
 }
 

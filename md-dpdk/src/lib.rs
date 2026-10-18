@@ -13,11 +13,15 @@
 //! [`set_udp_channel_transport_bindings`](AeronDriverContext::set_udp_channel_transport_bindings)
 //! would, and also records the agents' CPUs and the conductor's idle strategy.
 //! Only the sender and receiver bindings change; the conductor keeps resolving
-//! on the kernel socket.
+//! on the kernel socket. The driver may use any of Aeron's threading modes
+//! (`DEDICATED`, `SHARED_NETWORK`, `SHARED`, `INVOKER`), provided the agent
+//! carrying the network work busy-spins on a CPU of its own; [`driver`] runs
+//! the bundled binary's configuration in a process that runs the driver
+//! itself.
 //!
 //! The crate always compiles, so applications can write transport-selection
 //! code without conditional imports. The native code is built and linked only
-//! with the `dpdk` feature (Linux `x86_64`, `libdpdk >= 23.11`); without it,
+//! with the `dpdk` feature (Linux `x86_64` or `aarch64`, `libdpdk >= 23.11`); without it,
 //! selecting `dpdk-ena` returns [`DpdkError::FeatureDisabled`].
 //!
 //! ## Selecting the transport
@@ -58,18 +62,37 @@
 //! `RUSTERON_DPDK_{SENDER,RECEIVER}_IPV4_CIDR` and
 //! `RUSTERON_DPDK_{SENDER,RECEIVER}_GATEWAY`, and the optional tuning values
 //! read by [`env::config_from_env`].
+//!
+//! ## Host checks
+//!
+//! [`driver::ConfiguredDriver::from_env`] checks the host's low-latency
+//! settings before the driver starts and prints one line on stderr for each
+//! that is not fine ([`checks`]): the agents' placement and idling, sparse
+//! term buffers, socket buffers, kernel busy polling, CPU isolation, SMT
+//! siblings, transparent hugepages, the Aeron directory, and the data NICs'
+//! interrupts and settings. `RUSTERON_MEDIA_DRIVER_HOST_CHECK` is `warn`
+//! (default), `off` or `require` (refuse to start on a warning), and
+//! `RUSTERON_MEDIA_DRIVER_DATA_NICS` names the socket transport's data NICs.
 
-// The DPDK ENA transport targets Amazon Linux 2023 / EKS Nitro instances. The
-// build script rejects other targets too; this gives a direct diagnostic.
-#[cfg(all(feature = "dpdk", not(all(target_os = "linux", target_arch = "x86_64"))))]
-compile_error!("the `dpdk` feature requires Linux x86_64 (Amazon Linux 2023 / EKS Nitro)");
+// The DPDK transport targets Linux on x86_64 (Intel and AMD instances) and
+// aarch64 (AWS Graviton). The build script rejects other targets
+// too; this gives a direct diagnostic.
+#[cfg(all(
+    feature = "dpdk",
+    not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))
+))]
+compile_error!("the `dpdk` feature requires Linux x86_64 or aarch64");
 
+pub mod checks;
+pub mod clock;
 pub mod config;
+pub mod driver;
 pub mod env;
 pub mod error;
 pub mod ffi;
 
 pub use config::{DpdkPortConfig, DpdkTransportConfig, MacAddr};
+pub use driver::{ConfiguredDriver, EnvMediaDriver};
 pub use env::Selector;
 pub use error::DpdkError;
 pub use ffi::{DpdkTransport, lock_memory_from_env, pin_agents_to_configured_cpus};

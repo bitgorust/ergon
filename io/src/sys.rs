@@ -3,7 +3,9 @@
 #![allow(unsafe_code)]
 
 use std::io;
-use std::os::fd::RawFd;
+use std::net::SocketAddr;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::time::Duration;
 
 use crate::RxMeta;
 
@@ -78,6 +80,93 @@ pub fn busy_poll_settings(fd: RawFd) -> io::Result<BusyPoll> {
     })
 }
 
+/// For a TCP socket (`SO_PROTOCOL`): sets `TCP_NODELAY` and says whether
+/// `TCP_CORK` is set. `Ok(None)` for a socket that is not TCP. Three system
+/// calls.
+///
+/// # Errors
+/// A `getsockopt` or the `setsockopt` fails.
+pub fn tcp_nodelay_and_cork(fd: RawFd) -> io::Result<Option<bool>> {
+    // SAFETY: the caller's socket stays open for the duration of the call;
+    // the borrow does not outlive it.
+    let sock = unsafe { BorrowedFd::borrow_raw(fd) };
+    let r = socket2::SockRef::from(&sock);
+    if r.protocol()? != Some(socket2::Protocol::TCP) {
+        return Ok(None);
+    }
+    r.set_tcp_nodelay(true)?;
+    Ok(Some(r.tcp_cork()?))
+}
+
+/// A socket's TCP keepalive settings and `TCP_USER_TIMEOUT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpKeepalive {
+    /// `SO_KEEPALIVE`.
+    pub enabled: bool,
+    /// `TCP_KEEPIDLE`, seconds.
+    pub idle_s: u32,
+    /// `TCP_KEEPINTVL`, seconds.
+    pub interval_s: u32,
+    /// `TCP_KEEPCNT`.
+    pub count: u32,
+    /// `TCP_USER_TIMEOUT`, ms (0: the kernel default).
+    pub user_timeout_ms: u32,
+}
+
+/// Turns TCP keepalive on with these probe settings (four `setsockopt`s).
+///
+/// # Errors
+/// A `setsockopt` fails or a value is out of range.
+pub fn set_tcp_keepalive(fd: RawFd, idle_s: u32, interval_s: u32, count: u32) -> io::Result<()> {
+    setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, to_int(idle_s)?)?;
+    setsockopt_int(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPINTVL,
+        to_int(interval_s)?,
+    )?;
+    setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, to_int(count)?)?;
+    setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)
+}
+
+/// Sets `TCP_USER_TIMEOUT` (ms; 0 restores the kernel default).
+///
+/// # Errors
+/// `setsockopt` fails or the value is out of range.
+pub fn set_tcp_user_timeout(fd: RawFd, ms: u32) -> io::Result<()> {
+    setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, to_int(ms)?)
+}
+
+/// Reads a socket's keepalive settings and `TCP_USER_TIMEOUT`.
+///
+/// # Errors
+/// A `getsockopt` fails.
+pub fn tcp_keepalive(fd: RawFd) -> io::Result<TcpKeepalive> {
+    let get = |level, opt| {
+        getsockopt_int(fd, level, opt)
+            .and_then(|v| u32::try_from(v).map_err(|_| io::Error::from(io::ErrorKind::InvalidData)))
+    };
+    Ok(TcpKeepalive {
+        enabled: get(libc::SOL_SOCKET, libc::SO_KEEPALIVE)? != 0,
+        idle_s: get(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE)?,
+        interval_s: get(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL)?,
+        count: get(libc::IPPROTO_TCP, libc::TCP_KEEPCNT)?,
+        user_timeout_ms: get(libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT)?,
+    })
+}
+
+/// What the kernel grants for an `SO_RCVBUF` of `bytes`: `getsockopt` on a
+/// fresh TCP socket after setting it (twice the size it keeps, capped at
+/// `net.core.rmem_max`, socket(7)).
+///
+/// # Errors
+/// The socket cannot be created or an option fails.
+pub fn granted_rcvbuf(bytes: u32) -> io::Result<u32> {
+    let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+    s.set_recv_buffer_size(usize::try_from(bytes).map_err(io::Error::other)?)?;
+    u32::try_from(s.recv_buffer_size()?).map_err(io::Error::other)
+}
+
 /// Sets `SO_RCVBUF`.
 ///
 /// # Errors
@@ -109,33 +198,6 @@ pub fn incoming_cpu(fd: RawFd) -> io::Result<i32> {
 pub fn current_cpu() -> Option<usize> {
     // SAFETY: plain syscall without arguments.
     usize::try_from(unsafe { libc::sched_getcpu() }).ok()
-}
-
-/// CPUs for background work: online and not isolated (`isolcpus`), without
-/// `avoid`. Falls back to every online CPU but `avoid`, then to all online
-/// CPUs. Reads sysfs, so call it off the polling thread.
-#[must_use]
-pub fn housekeeping_cpus(avoid: Option<usize>) -> Vec<usize> {
-    let read = |p: &str| {
-        std::fs::read_to_string(p)
-            .map(|s| parse_cpu_list(&s))
-            .unwrap_or_default()
-    };
-    let online = read("/sys/devices/system/cpu/online");
-    let isolated = read("/sys/devices/system/cpu/isolated");
-    let pick = |skip_isolated: bool| -> Vec<usize> {
-        online
-            .iter()
-            .copied()
-            .filter(|c| Some(*c) != avoid && !(skip_isolated && isolated.contains(c)))
-            .collect()
-    };
-    let hk = pick(true);
-    if !hk.is_empty() {
-        return hk;
-    }
-    let others = pick(false);
-    if others.is_empty() { online } else { others }
 }
 
 /// Parses a kernel CPU list such as `0-3,6,8-9`.
@@ -259,6 +321,200 @@ pub fn spawn_pinned(
         libc::pthread_attr_destroy(&raw mut attr);
         result
     }
+}
+
+/// A connected socket's addressing, as the route lookup needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketFlow {
+    /// Local address.
+    pub local: SocketAddr,
+    /// Peer address.
+    pub peer: SocketAddr,
+    /// `SO_BINDTOIFINDEX`: the interface the socket is bound to, 0 when none
+    /// (also before Linux 5.0, which cannot report it).
+    pub oif: u32,
+    /// `SO_MARK`, 0 when none.
+    pub mark: u32,
+    /// The type of service the kernel routes the connection by: `IP_TOS`
+    /// for an IPv4 peer (also over an IPv6 socket), `IPV6_TCLASS` for an
+    /// IPv6 one; 0 when unset.
+    pub tos: u8,
+}
+
+/// Reads a connected socket's addresses, bound interface and mark.
+///
+/// # Errors
+/// The socket has no peer (`ENOTCONN`) or is not an IP socket.
+pub fn socket_flow(fd: RawFd) -> io::Result<SocketFlow> {
+    // SAFETY: the caller's socket stays open for the duration of the call;
+    // the borrow does not outlive it.
+    let sock = unsafe { BorrowedFd::borrow_raw(fd) };
+    let r = socket2::SockRef::from(&sock);
+    let ip = |a: socket2::SockAddr| {
+        a.as_socket()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not an IP socket"))
+    };
+    let local = ip(r.local_addr()?)?;
+    let peer = ip(r.peer_addr()?)?;
+    let opt = |name| getsockopt_int(fd, libc::SOL_SOCKET, name).map_or(0, i32::cast_unsigned);
+    let v4 = match peer {
+        SocketAddr::V4(_) => true,
+        SocketAddr::V6(a) => a.ip().to_ipv4_mapped().is_some(),
+    };
+    let (level, name) = if v4 {
+        (libc::IPPROTO_IP, libc::IP_TOS)
+    } else {
+        (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
+    };
+    let tos = getsockopt_int(fd, level, name)
+        .ok()
+        .and_then(|t| u8::try_from(t).ok())
+        .unwrap_or(0);
+    Ok(SocketFlow {
+        local,
+        peer,
+        oif: opt(libc::SO_BINDTOIFINDEX),
+        mark: opt(libc::SO_MARK),
+        tos,
+    })
+}
+
+/// One request and its reply on a fresh `NETLINK_ROUTE` socket: sends `req`
+/// to the kernel and receives the kernel's reply into `reply`, waiting at
+/// most `timeout` for each. Returns the reply's length.
+///
+/// A timeout below a microsecond waits a microsecond: a zero one would be no
+/// timeout at all.
+///
+/// # Errors
+/// The socket or a system call fails, `TimedOut` when the kernel does not
+/// answer in time, `InvalidData` when the reply does not fit `reply` or does
+/// not come from the kernel.
+pub fn rtnetlink_exchange(req: &[u8], reply: &mut [u8], timeout: Duration) -> io::Result<usize> {
+    let timed_out = |e: io::Error| {
+        if e.kind() == io::ErrorKind::WouldBlock {
+            io::Error::from(io::ErrorKind::TimedOut)
+        } else {
+            e
+        }
+    };
+    // SAFETY: plain syscall.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh descriptor we own; closed when `sock` drops.
+    let sock = unsafe { OwnedFd::from_raw_fd(raw) };
+    let fd = sock.as_raw_fd();
+    // A zero `timeval` disables the timeout: wait at least a microsecond.
+    let timeout = timeout.max(Duration::from_micros(1));
+    let tv = libc::timeval {
+        tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+        tv_usec: libc::suseconds_t::from(timeout.subsec_micros().min(999_999)),
+    };
+    for opt in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        // SAFETY: `tv` outlives the call and its size is passed.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                (&raw const tv).cast(),
+                socklen_of::<libc::timeval>(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: all-zero is a valid sockaddr_nl: port 0, the kernel.
+    let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    kernel.nl_family = libc::sa_family_t::try_from(libc::AF_NETLINK).unwrap_or_default();
+    // SAFETY: `req` and `kernel` are valid for the lengths passed.
+    let sent = unsafe {
+        libc::sendto(
+            fd,
+            req.as_ptr().cast(),
+            req.len(),
+            0,
+            (&raw const kernel).cast(),
+            socklen_of::<libc::sockaddr_nl>(),
+        )
+    };
+    if usize::try_from(sent).ok() != Some(req.len()) {
+        return Err(if sent < 0 {
+            timed_out(io::Error::last_os_error())
+        } else {
+            io::Error::new(io::ErrorKind::WriteZero, "netlink request cut short")
+        });
+    }
+    // The kernel answers inside `sendto`, so the reply is already queued; a
+    // signal is the only reason to look twice.
+    for _ in 0..3 {
+        // SAFETY: as above.
+        let mut from: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut from_len = socklen_of::<libc::sockaddr_nl>();
+        // SAFETY: `reply`, `from` and `from_len` are valid for the call;
+        // MSG_TRUNC only makes the kernel report the full length.
+        let n = unsafe {
+            libc::recvfrom(
+                fd,
+                reply.as_mut_ptr().cast(),
+                reply.len(),
+                libc::MSG_TRUNC,
+                (&raw mut from).cast(),
+                &raw mut from_len,
+            )
+        };
+        let Ok(n) = usize::try_from(n) else {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(timed_out(e));
+        };
+        if from.nl_pid != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "netlink reply not from the kernel",
+            ));
+        }
+        if n > reply.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "netlink reply larger than the buffer",
+            ));
+        }
+        return Ok(n);
+    }
+    Err(io::Error::from(io::ErrorKind::Interrupted))
+}
+
+/// The name of interface `index`, if it exists.
+#[must_use]
+pub fn if_name(index: u32) -> Option<String> {
+    let mut buf = [0u8; libc::IF_NAMESIZE];
+    // SAFETY: `buf` holds IF_NAMESIZE bytes, as if_indextoname requires.
+    let p = unsafe { libc::if_indextoname(index, buf.as_mut_ptr().cast()) };
+    if p.is_null() {
+        return None;
+    }
+    std::ffi::CStr::from_bytes_until_nul(&buf)
+        .ok()?
+        .to_str()
+        .ok()
+        .map(str::to_owned)
+}
+
+#[allow(clippy::cast_possible_truncation)] // socket address sizes fit
+const fn socklen_of<T>() -> libc::socklen_t {
+    std::mem::size_of::<T>() as libc::socklen_t
 }
 
 fn to_int<T: TryInto<libc::c_int>>(v: T) -> io::Result<libc::c_int> {

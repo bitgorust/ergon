@@ -27,7 +27,9 @@ static void rusteron_dpdk_port_release(
 static int rusteron_dpdk_ip_index(const rusteron_dpdk_port_t *port_info, uint32_t ip);
 static uint16_t rusteron_dpdk_ephemeral_port(
     rusteron_dpdk_transport_t *native, rusteron_dpdk_port_table_t *table, const aeron_driver_context_t *context);
-static void rusteron_dpdk_transport_init_fields(aeron_udp_channel_transport_t *transport, aeron_driver_context_t *context);
+static void rusteron_dpdk_transport_init_fields(
+    aeron_udp_channel_transport_t *transport, aeron_driver_context_t *context,
+    const aeron_udp_channel_transport_params_t *params);
 /* Zeroed and cache-line aligned, so its hot fields share one line. */
 static rusteron_dpdk_client_t *rusteron_dpdk_client_alloc(void)
 {
@@ -132,7 +134,27 @@ RUSTERON_DPDK_CONFIG_AT(max_aeron_mtu, 4280);
 RUSTERON_DPDK_CONFIG_AT(sender_mac, 4288);
 RUSTERON_DPDK_CONFIG_AT(receiver_mac, 4306);
 RUSTERON_DPDK_CONFIG_AT(rx_hw_timestamp, 4324);
-_Static_assert(sizeof(rusteron_dpdk_config_t) == 4328, "config size changed: update the Rust mirrors");
+RUSTERON_DPDK_CONFIG_AT(clock, 4328);
+_Static_assert(sizeof(rusteron_dpdk_config_t) == 4376, "config size changed: update the Rust mirrors");
+/* ergon-clock's Params, field by field (src/ffi.rs asserts the Rust side). */
+#define RUSTERON_DPDK_CLOCK_PARAMS_AT(field, offset) \
+    _Static_assert(offsetof(rusteron_dpdk_clock_params_t, field) == (offset), #field " moved: ergon-clock's Params")
+RUSTERON_DPDK_CLOCK_PARAMS_AT(version, 0);
+RUSTERON_DPDK_CLOCK_PARAMS_AT(kind, 4);
+RUSTERON_DPDK_CLOCK_PARAMS_AT(domain, 8);
+RUSTERON_DPDK_CLOCK_PARAMS_AT(reserved, 12);
+RUSTERON_DPDK_CLOCK_PARAMS_AT(base_ticks, 16);
+RUSTERON_DPDK_CLOCK_PARAMS_AT(base_ns, 24);
+RUSTERON_DPDK_CLOCK_PARAMS_AT(mult, 32);
+RUSTERON_DPDK_CLOCK_PARAMS_AT(hz, 40);
+_Static_assert(sizeof(rusteron_dpdk_clock_params_t) == 48, "ergon-clock's Params are 48 bytes");
+
+/* The threading modes the runtime keys housekeeping and pacing on are Aeron's. */
+_Static_assert(RUSTERON_DPDK_THREADING_DEDICATED == (int)AERON_THREADING_MODE_DEDICATED, "Aeron's DEDICATED moved");
+_Static_assert(RUSTERON_DPDK_THREADING_SHARED_NETWORK == (int)AERON_THREADING_MODE_SHARED_NETWORK,
+               "Aeron's SHARED_NETWORK moved");
+_Static_assert(RUSTERON_DPDK_THREADING_SHARED == (int)AERON_THREADING_MODE_SHARED, "Aeron's SHARED moved");
+_Static_assert(RUSTERON_DPDK_THREADING_INVOKER == (int)AERON_THREADING_MODE_INVOKER, "Aeron's INVOKER moved");
 
 static int rusteron_dpdk_config_validate(const rusteron_dpdk_config_t *config)
 {
@@ -194,10 +216,11 @@ static int rusteron_dpdk_config_validate(const rusteron_dpdk_config_t *config)
         return -1;
     }
 
-    if (config->rx_descriptors < 64 || config->rx_descriptors > 8192 ||
+    /* rx_descriptors 0: the NIC's default, sized per port at start. */
+    if ((0 != config->rx_descriptors && (config->rx_descriptors < 64 || config->rx_descriptors > 8192)) ||
         config->tx_descriptors < 64 || config->tx_descriptors > 8192)
     {
-        rusteron_dpdk_set_error("rx/tx descriptors must be in 64..=8192");
+        rusteron_dpdk_set_error("rx/tx descriptors must be in 64..=8192 (rx 0: the NIC's default)");
         return -1;
     }
 
@@ -210,6 +233,11 @@ static int rusteron_dpdk_config_validate(const rusteron_dpdk_config_t *config)
     if (config->mbufs_per_port == 0)
     {
         rusteron_dpdk_set_error("mbufs_per_port must be non-zero");
+        return -1;
+    }
+
+    if (rusteron_dpdk_clock_params_check(&config->clock) < 0)
+    {
         return -1;
     }
 
@@ -278,13 +306,17 @@ int rusteron_dpdk_transport_install(
         return -1;
     }
 
+    if (rusteron_dpdk_runtime_agents_known(
+            transport, (int)context->threading_mode, context->conductor_cpu_affinity_no,
+            context->sender_cpu_affinity_no, context->receiver_cpu_affinity_no,
+            context->conductor_idle_strategy_name) < 0)
+    {
+        return -1;
+    }
     /* Only the sender/receiver bindings are replaced; the conductor's
      * resolver bindings stay on the socket media so DNS resolution keeps
      * working over the kernel. */
     context->udp_channel_transport_bindings = rusteron_dpdk_transport_bindings();
-    rusteron_dpdk_runtime_agents_known(
-        transport, context->conductor_cpu_affinity_no, context->sender_cpu_affinity_no,
-        context->receiver_cpu_affinity_no, context->conductor_idle_strategy_name);
     return 0;
 }
 
@@ -565,6 +597,10 @@ static int rusteron_dpdk_transport_init(
         NULL != context ? context->counters_manager : NULL,
         port, native->ops);
     port->open_transports++;
+    if (NULL != context && NULL != context->error_log)
+    {
+        port->error_log = context->error_log; /* housekeeping's reports, while a transport is open */
+    }
     pthread_mutex_unlock(&native->housekeeping_lock);
     pthread_mutex_lock(&native->port_table_lock);
     client->lazy_next = native->lazy_clients;
@@ -576,8 +612,14 @@ static int rusteron_dpdk_transport_init(
     client->lazy_linked = 1;
     pthread_mutex_unlock(&native->port_table_lock);
     rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_TRANSPORT, 1);
+    /* Its NIC's polls stamp each burst for it while it is open. */
+    if (params->is_media_timestamping)
+    {
+        client->media_ts = 1;
+        __atomic_add_fetch(&port->media_ts_transports, 1, __ATOMIC_RELAXED);
+    }
 
-    rusteron_dpdk_transport_init_fields(transport, context);
+    rusteron_dpdk_transport_init_fields(transport, context, params);
     transport->bindings_clientd = client;
     /* The connect address is caller-owned; keep a copy so NULL-address sends
      * survive past the caller's frame (connected transport, plan §7.4). A
@@ -707,15 +749,21 @@ static uint16_t rusteron_dpdk_ephemeral_port(
 }
 
 /* The fields Aeron's kernel transport initialises (aeron_udp_channel_transport.c
- * init): error log and counter from the context, no timestamps, no
- * interceptors yet. */
-static void rusteron_dpdk_transport_init_fields(aeron_udp_channel_transport_t *transport, aeron_driver_context_t *context)
+ * init): error log and counter from the context, no interceptors yet, and
+ * media receive timestamps when the channel asks for them
+ * (media-rcv-ts-offset): Aeron's image then writes each data frame's receive
+ * time at the offset, so every datagram such a transport receives comes with
+ * one (the poller's, or the kernel socket's SO_TIMESTAMPNS). */
+static void rusteron_dpdk_transport_init_fields(
+    aeron_udp_channel_transport_t *transport, aeron_driver_context_t *context,
+    const aeron_udp_channel_transport_params_t *params)
 {
     transport->error_log = NULL != context ? context->error_log : NULL;
     transport->errors_counter = NULL != context && NULL != context->system_counters
         ? aeron_system_counter_addr(context->system_counters, AERON_SYSTEM_COUNTER_ERRORS)
         : NULL;
-    transport->timestamp_flags = AERON_UDP_CHANNEL_TRANSPORT_MEDIA_RCV_TIMESTAMP_NONE;
+    transport->timestamp_flags = params->is_media_timestamping ? AERON_UDP_CHANNEL_TRANSPORT_MEDIA_RCV_TIMESTAMP
+                                                               : AERON_UDP_CHANNEL_TRANSPORT_MEDIA_RCV_TIMESTAMP_NONE;
     for (size_t i = 0; i < AERON_UDP_CHANNEL_TRANSPORT_MAX_INTERCEPTORS; i++)
     {
         transport->interceptor_clientds[i] = NULL;
@@ -771,9 +819,13 @@ static int rusteron_dpdk_transport_init_delegated(
         NULL != context ? context->counters_manager : NULL,
         port, native->ops);
     port->open_transports++;
+    if (NULL != context && NULL != context->error_log)
+    {
+        port->error_log = context->error_log; /* housekeeping's reports, while a transport is open */
+    }
     pthread_mutex_unlock(&native->housekeeping_lock);
     rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_TRANSPORT, 1);
-    rusteron_dpdk_transport_init_fields(transport, context);
+    rusteron_dpdk_transport_init_fields(transport, context, params);
     transport->bindings_clientd = client;
     transport->connected_address = NULL;
     if (NULL != connect_in)
@@ -855,6 +907,10 @@ static int rusteron_dpdk_transport_close_transport(aeron_udp_channel_transport_t
         {
             rusteron_dpdk_transport_t *native = client->runtime;
             rusteron_dpdk_counters_add(&client->port->counters, RD_COUNTER_TRANSPORT, -1);
+            if (client->media_ts)
+            {
+                __atomic_sub_fetch(&client->port->media_ts_transports, 1, __ATOMIC_RELAXED);
+            }
             /* The port's last transport: its counters stay allocated but
              * dormant, never written (no transports, no sampling), so they
              * keep reading their totals between channels, as Aeron's own
@@ -1265,7 +1321,7 @@ static int rusteron_dpdk_transport_send(
     /* The bandwidth allowances: the NIC's (RUSTERON_DPDK_TX_RATE_MBPS, below
      * the VM's allowance) and the destination's route
      * (RUSTERON_DPDK_TX_ROUTE_MBPS, a slower link on the way), token buckets
-     * owned by this NIC's agent, so plain arithmetic on the TSC. A send may
+     * owned by this NIC's agent, so plain arithmetic on the clock. A send may
      * overdraw them; while either is in debt the next send waits the few
      * microseconds the debt takes to repay, or, past
      * RUSTERON_DPDK_TX_PACE_SPIN_US, sends nothing (a zero result Aeron
@@ -1348,7 +1404,7 @@ static int rusteron_dpdk_transport_send(
             /* bounded: a clock pinned by a test never reaches `until` */
             for (uint32_t spins = 0; now < until && spins < (1U << 24); spins++)
             {
-                _mm_pause();
+                rusteron_dpdk_spin_hint();
                 now = rusteron_dpdk_clock_now();
             }
             rusteron_dpdk_pacer_refill(&port->tx_pacer, now);

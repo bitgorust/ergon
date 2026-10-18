@@ -13,7 +13,10 @@ metadata:
 data:
   # 2 MiB hugepages mounted by the DaemonSet; the DPDK EAL mempools live here.
   RUSTERON_DPDK_HUGE_DIR: "/dev/hugepages"
-  RUSTERON_DPDK_RX_DESCRIPTORS: "1024"
+  # RUSTERON_DPDK_RX_DESCRIPTORS is left unset: each port takes min(4096, the
+  # NIC's maximum), 4096 on an ENA (BENCHMARKS.md, AWS round 6: no first-point
+  # rx-missed loss and a higher loss-free rate than 1024). The pool below holds
+  # that ring.
   # ENA queues take at most 512 TX descriptors (the device reports
   # tx_desc_lim.nb_max = 512); a larger ring fails port init.
   RUSTERON_DPDK_TX_DESCRIPTORS: "512"
@@ -22,6 +25,17 @@ data:
   # headroom and its headers), so two ports take about 75 MiB of the pod's
   # hugepages-2Mi; see the README's hugepage budget before raising it.
   RUSTERON_DPDK_MBUFS_PER_PORT: "16384"
+  # A vfio-pci node's write-combining, as the node's preflight confirmed it.
+  # vfio-pci maps an ENA's low-latency-queue BAR through its device file, so
+  # /proc/self/maps cannot show it write-combined and the transport's LLQ
+  # check would refuse the port; it accepts one bound to vfio-pci when this
+  # is 1. The bootstrap binds the ENAs to vfio-pci (RUSTERON_DPDK_DRIVER) only
+  # after preflight.sh passed, which for vfio-pci requires the operator's
+  # RUSTERON_DPDK_VFIO_WC=1 on the node (a write-combining vfio-pci, Amazon's
+  # patch); a failed run leaves no inventory, so the device plugin hands out
+  # no pair. Inert for igb_uio ports, which must still show their BAR mapped
+  # write-combined (resource2_wc).
+  RUSTERON_DPDK_VFIO_WC: "1"
   RUSTERON_DPDK_MEMPOOL_CACHE: "256"
   RUSTERON_DPDK_BURST_SIZE: "32"
   # The Aeron directory on the node's own 1 GiB hugetlbfs for it (the

@@ -179,7 +179,9 @@ fn decode_chained() -> Result<(), Box<dyn std::error::Error>> {
 
 The published crate has no extra features. Java Cluster launch support lives in
 the unpublished workspace crate `ergo-aeron-cluster-test-harness` and requires
-Java 17 or newer plus locally built Aeron artifacts:
+a JDK (17 or newer; CI runs Temurin 25) plus locally built Aeron artifacts. See
+[Java for Archive and Cluster](https://mimran1980.github.io/ergon/deploy/java.html)
+for which Java to run the cluster on and the recommended JVM and Aeron settings:
 
 ```sh
 just build-aeron-jars

@@ -282,6 +282,19 @@ pub fn compile_fails_with_diagnostics(
     code: &str,
     expected_diagnostics: &[&str],
 ) {
+    compile_fails_with_diagnostics_excluding(module_name, source, code, expected_diagnostics, &[]);
+}
+
+/// [`compile_fails_with_diagnostics`], and none of `absent` may appear in the
+/// compiler's output: a fixture that must fail for one reason only (say, only
+/// the field setters are candidates, never a third item).
+pub fn compile_fails_with_diagnostics_excluding(
+    module_name: &str,
+    source: &str,
+    code: &str,
+    expected_diagnostics: &[&str],
+    absent: &[&str],
+) {
     assert!(
         !expected_diagnostics.is_empty(),
         "compile-fail test {module_name} must name its intended diagnostic"
@@ -342,6 +355,12 @@ pub fn compile_fails_with_diagnostics(
         assert!(
             stderr.contains(expected),
             "compile-fail {module_name} failed for the wrong reason: missing diagnostic fragment {expected:?}\nstderr:\n{stderr}"
+        );
+    }
+    for unwanted in absent {
+        assert!(
+            !stderr.contains(unwanted),
+            "compile-fail {module_name} failed for another reason too: diagnostic fragment {unwanted:?}\nstderr:\n{stderr}"
         );
     }
 }

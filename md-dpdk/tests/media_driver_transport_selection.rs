@@ -239,6 +239,90 @@ fn sigterm_shuts_the_driver_down_gracefully() {
     );
 }
 
+// --- CPU pinning in the shared threading modes ------------------------------------
+
+/// The CPUs in a `Cpus_allowed_list:` line of a /proc status file.
+#[cfg(target_os = "linux")]
+fn allowed_cpus(status: &str) -> Vec<usize> {
+    let list = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .expect("no Cpus_allowed_list in the status file")
+        .trim();
+    list.split(',')
+        .flat_map(|part| {
+            let (low, high) = part.split_once('-').unwrap_or((part, part));
+            low.parse::<usize>().unwrap()..=high.parse::<usize>().unwrap()
+        })
+        .collect()
+}
+
+/// Each live thread of `pid`: (tid, name, the CPUs it may run on).
+#[cfg(target_os = "linux")]
+fn threads_of(pid: u32) -> Vec<(u32, String, Vec<usize>)> {
+    let mut threads = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/task")).expect("the driver's /proc task dir") {
+        let task = entry.expect("a /proc task entry").path();
+        let tid = task.file_name().unwrap().to_string_lossy().parse().unwrap();
+        // a thread that exited between the listing and the reads is not one
+        if let (Ok(name), Ok(status)) = (
+            std::fs::read_to_string(task.join("comm")),
+            std::fs::read_to_string(task.join("status")),
+        ) {
+            threads.push((tid, name.trim().to_string(), allowed_cpus(&status)));
+        }
+    }
+    threads
+}
+
+/// Aeron's affinity hook keys on its agents' role names, so the shared
+/// threading modes' agents are pinned too: under SHARED_NETWORK the network
+/// agent (`[sender, receiver]`) to the sender's CPU and the conductor (the
+/// main thread, under the binary's manual main loop) to the conductor's; under
+/// SHARED the one agent, the main thread, to the conductor's. Comparing the
+/// threading modes on kernel UDP rests on it.
+#[cfg(target_os = "linux")]
+#[serial]
+#[test]
+fn shared_threading_modes_pin_their_agents_to_the_configured_cpus() {
+    let cpus = allowed_cpus(&std::fs::read_to_string("/proc/self/status").unwrap());
+    assert!(cpus.len() >= 2, "two CPUs are needed to tell the pins apart: {cpus:?}");
+    let (conductor, sender) = (cpus[0], cpus[cpus.len() - 1]);
+    let (conductor_cpu, sender_cpu) = (conductor.to_string(), sender.to_string());
+    for mode in ["SHARED_NETWORK", "SHARED"] {
+        let dir = aeron_dir(&format!("pin-{mode}"));
+        let envs = [
+            ("AERON_DIR", dir.as_str()),
+            ("AERON_THREADING_MODE", mode),
+            ("AERON_CONDUCTOR_CPU_AFFINITY", conductor_cpu.as_str()),
+            ("AERON_SENDER_CPU_AFFINITY", sender_cpu.as_str()),
+        ];
+        let mut child = spawn_and_wait_for_line(&envs, "media driver started");
+        let pid = child.id();
+        // An agent thread pins itself as it starts, which may follow the line.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (pinned, threads) = loop {
+            let threads = threads_of(pid);
+            let main = threads.iter().any(|(tid, _, on)| *tid == pid && on[..] == [conductor]);
+            let network = mode == "SHARED"
+                || threads
+                    .iter()
+                    .any(|(_, name, on)| name.starts_with("[sender, rec") && on[..] == [sender]);
+            if (main && network) || Instant::now() > deadline {
+                break (main && network, threads);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        send_sigint(&child);
+        let status = wait_exit(&mut child);
+        assert!(
+            pinned,
+            "{mode}: the main thread on {conductor} and any network agent on {sender}: {threads:?}"
+        );
+        assert_eq!(status.code(), Some(0), "{mode}: graceful SIGINT shutdown must exit 0");
+    }
+}
+
 // --- Receiver IO vectors: 16 only under dpdk-ena --------------------------------
 
 #[serial]

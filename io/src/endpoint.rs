@@ -28,6 +28,14 @@ impl ConnId {
     pub const fn index(self) -> usize {
         self.idx as usize
     }
+
+    /// An id from its parts, for stand-in drivers in tests. A made-up id
+    /// never reaches a connection: the driver checks the generation.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_parts(index: u32, generation: u32) -> Self {
+        Self::new(index, generation)
+    }
 }
 
 /// The driver-facing side of endpoints and dials. The module is private, so
@@ -36,6 +44,7 @@ impl ConnId {
 pub(crate) mod sealed {
     use std::net::SocketAddr;
     use std::os::fd::RawFd;
+    use std::sync::{Arc, OnceLock};
 
     use super::ConnId;
     use crate::RxMeta;
@@ -46,10 +55,24 @@ pub(crate) mod sealed {
         /// Whether [`Io::expire`] must be called (request timeouts). The
         /// driver's periodic deadline check is compiled out when `false`.
         const DEADLINES: bool = false;
-        /// Fails the connection if something it waits for is overdue.
+        /// Fails the connection if something it waits for is overdue, and
+        /// runs its timers (WebSocket pings).
         fn expire(&mut self, now_ns: i64) -> Result<()> {
             let _ = now_ns;
             Ok(())
+        }
+        /// The error to report when the connection ends with `error`: a
+        /// WebSocket whose close handshake finished reports the Close, an
+        /// HTTP connection with requests in flight which of them were sent.
+        fn close_reason(&mut self, error: crate::error::Error) -> crate::error::Error {
+            error
+        }
+        /// The kernel took `n` bytes from the front of [`Io::tx_queue`]
+        /// (`io_uring`: they were submitted, an upper bound). One add per
+        /// send on the HTTP connection; nothing elsewhere.
+        #[inline]
+        fn on_handed(&mut self, n: usize) {
+            let _ = n;
         }
         /// The socket.
         fn fd(&self) -> RawFd;
@@ -61,6 +84,12 @@ pub(crate) mod sealed {
         fn tx_queue(&mut self) -> &mut Vec<u8>;
         /// Input received before the endpoint was added, not yet decoded.
         fn has_buffered_input(&self) -> bool;
+        /// Records what the quick-ACK route check found, or the cell
+        /// ergon-io's warning thread fills in (once, when the driver takes
+        /// the connection, or at TCP connect under `require`).
+        fn set_route(&mut self, route: RouteSlot);
+        /// What the connection holds of its route check.
+        fn route_state(&self) -> &RouteSlot;
     }
 
     /// Decoding received bytes for handler `H`.
@@ -74,6 +103,47 @@ pub(crate) mod sealed {
             meta: &RxMeta,
             handler: &mut H,
         ) -> Result<usize>;
+    }
+
+    /// What a connection holds of its route check: the outcome, or the cell
+    /// ergon-io's warning thread fills in. Reading it is one atomic load, and
+    /// nothing on the read or write path reads it.
+    #[derive(Debug, Clone)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub enum RouteSlot {
+        /// Decided where the connection was set up.
+        Ready(crate::route::RouteCheck),
+        /// Filled in by the warning thread.
+        Pending(Arc<OnceLock<crate::route::RouteCheck>>),
+    }
+
+    impl Default for RouteSlot {
+        fn default() -> Self {
+            Self::Ready(crate::route::RouteCheck::NotChecked)
+        }
+    }
+
+    /// What a connection reads while its lookup is queued.
+    static PENDING: crate::route::RouteCheck = crate::route::RouteCheck::Pending;
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    impl RouteSlot {
+        /// The outcome, or [`crate::route::RouteCheck::Pending`].
+        pub fn get(&self) -> &crate::route::RouteCheck {
+            match self {
+                Self::Ready(c) => c,
+                Self::Pending(cell) => cell.get().unwrap_or(&PENDING),
+            }
+        }
+
+        /// Whether the route was checked where the connection was set up (a
+        /// gated dial under `require`).
+        pub const fn decided(&self) -> bool {
+            !matches!(
+                self,
+                Self::Ready(crate::route::RouteCheck::NotChecked) | Self::Pending(_)
+            )
+        }
     }
 
     /// A connection being set up.
@@ -90,6 +160,16 @@ pub(crate) mod sealed {
         fn start(&mut self, addr: SocketAddr) -> Result<()>;
         /// Advances as far as the socket allows; `Some` once ready.
         fn step(&mut self) -> Result<Option<Self::Conn>>;
+        /// Stop once TCP is connected, before the TLS handshake, until
+        /// [`DialIo::route_checked`]: the driver checks the route there
+        /// under `quickack_check=require`, so a refused route costs no
+        /// handshake.
+        fn gate_route(&mut self);
+        /// The socket, while the dial waits at that point.
+        fn awaiting_route(&self) -> Option<RawFd>;
+        /// The route check's outcome: the dial goes on to TLS, and the
+        /// connection it produces carries it.
+        fn route_checked(&mut self, check: crate::route::RouteCheck);
     }
 }
 
@@ -160,8 +240,9 @@ pub trait Handler {
     fn on_open(&mut self, id: ConnId) {
         let _ = id;
     }
-    /// The driver closed `id` because of `error` (including [`Error::Closed`] for
-    /// a peer close). The connection is gone when this is called.
+    /// The driver closed `id` because of `error`: [`Error::Closed`] for a peer
+    /// close, [`Error::WsClose`] after a WebSocket close handshake. The
+    /// connection is gone when this is called.
     fn on_closed(&mut self, id: ConnId, error: Error) {
         let _ = (id, error);
     }
@@ -198,6 +279,19 @@ pub struct DriverStats {
     /// Longest single connection-setup step on the polling thread, in
     /// nanoseconds (the TLS handshake's crypto lands here).
     pub connect_step_max_ns: u64,
+    /// Quick-ACK route lookups the polling thread made itself: under
+    /// `quickack_check=require`, one per connection it set up
+    /// (`Driver::connect` at TCP connect, before the TLS handshake;
+    /// `Driver::add`). Under `warn` the lookup runs on ergon-io's warning
+    /// thread, and `Driver::connect_background` makes it on the helper
+    /// thread: neither is counted.
+    pub route_lookups: u64,
+    /// Polling-thread time spent on the route check, in nanoseconds: the
+    /// lookups above, or under `warn` reading the connection's addresses
+    /// and queuing the lookup (see [`crate::route`]).
+    pub route_check_ns: u64,
+    /// The longest single one of those, in nanoseconds.
+    pub route_check_max_ns: u64,
 }
 
 impl DriverStats {

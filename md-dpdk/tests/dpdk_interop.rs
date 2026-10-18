@@ -21,7 +21,7 @@
 //!   * every emitted datagram stays within `max_aeron_mtu` and never fragments
 //!     (DF set), with oversized iovecs rejected.
 //!
-//! Linux x86_64 only; links the same archives as dpdk_rx.rs/dpdk_tx.rs.
+//! Linux x86_64 or aarch64; links the same archives as dpdk_rx.rs/dpdk_tx.rs.
 #![allow(
     missing_docs,
     unsafe_code,
@@ -31,7 +31,11 @@
     clippy::nursery,
     clippy::restriction
 )]
-#![cfg(all(feature = "dpdk", target_os = "linux", target_arch = "x86_64"))]
+#![cfg(all(
+    feature = "dpdk",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 mod common;
 use common::*;
@@ -147,9 +151,14 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_config(rusteron_dpdk_config_t::valid())
+    }
+
+    /// Over `config` instead of the default one.
+    fn with_config(config: rusteron_dpdk_config_t) -> Self {
         let env = TestEnv::new();
         env.eal_skip();
-        let native = create(&rusteron_dpdk_config_t::valid()).unwrap_or_else(|e| panic!("create failed: {e}"));
+        let native = create(&config).unwrap_or_else(|e| panic!("create failed: {e}"));
         let bindings = unsafe { rusteron_dpdk_transport_bindings() };
         assert!(!bindings.is_null());
         Harness {
@@ -1013,6 +1022,72 @@ fn mtu_bound_never_fragments() {
     assert_eq!(rc, -1);
     assert_eq!(sent, 0);
     assert!(last_error().contains("oversized"), "got: {}", last_error());
+    assert_no_leak();
+}
+
+/// Jumbo frames end to end, as on an AWS 9001-byte VPC with max_aeron_mtu
+/// 8960: a full 8960-byte datagram leaves as one 9002-byte Ethernet frame in
+/// one mbuf (IPv4 total length 8988, DF set), and the same frame received is
+/// delivered whole, byte for byte. A frame larger than the port's mbufs (from
+/// a peer whose MTU exceeds ours) arrives split over two, as ENA's always
+/// scattered receive splits it, and is dropped and counted, never delivered
+/// in part.
+#[test]
+#[serial]
+fn jumbo_frames_cross_whole_in_one_mbuf() {
+    let mut config = rusteron_dpdk_config_t::valid();
+    config.max_aeron_mtu = 8960;
+    let mut h = Harness::with_config(config);
+    h.init_tx(SENDER_IP, 40000, None, 8960);
+    h.init_rx(RECEIVER_IP, 60000, 8960);
+    const PEER: [u8; 4] = [10, 0, 0, 5];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x50];
+    h.arp_seed(PEER, PEER_MAC);
+
+    let payload: Vec<u8> = (0..8960u32).map(|i| (i * 7) as u8).collect();
+    assert_eq!(h.send_to((PEER, 40123), &[&payload]), (1, 8960), "{}", last_error());
+    let caps = captures();
+    assert_eq!(caps.len(), 1, "one frame, never fragmented");
+    let c = &caps[0];
+    assert_eq!(c.len, 9002, "Ethernet + IPv4 + UDP + 8960");
+    assert_eq!(u16_at(c, IP + 2), 8988, "IPv4 total length: the port's L3 MTU");
+    assert_eq!(ip_flags_frag(c), 0x4000, "DF set, no fragment");
+    assert_eq!(udp_payload(c), payload.as_slice());
+
+    let eth = build_udp_frame(RECEIVER_MAC, SENDER_MAC, SENDER_IP, RECEIVER_IP, 40000, 60000, &payload);
+    assert_eq!(eth.len(), 9002);
+    assert_eq!(
+        unsafe { rusteron_dpdk_fake_rx_inject(RECEIVER_PORT, eth.as_ptr(), eth.len(), RX_GOOD, 1) },
+        0
+    );
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    assert_eq!(p.poll(16, clientd, &mut bytes), 1);
+    assert_eq!(bytes, 8960);
+    assert_eq!(h.rx_dgrams[0].data, payload, "delivered whole");
+
+    // A 9001-byte IPv4 packet (a peer at the VPC's full MTU): 13 bytes more
+    // than this port's mbufs hold.
+    let big = build_udp_frame(
+        RECEIVER_MAC,
+        SENDER_MAC,
+        SENDER_IP,
+        RECEIVER_IP,
+        40000,
+        60000,
+        &[1u8; 8973],
+    );
+    assert_eq!(big.len(), 9015);
+    assert_eq!(
+        unsafe { rusteron_dpdk_fake_rx_inject(RECEIVER_PORT, big.as_ptr(), big.len(), RX_GOOD, 1) },
+        0
+    );
+    assert_eq!(p.poll(16, clientd, &mut bytes), 0, "never delivered in part");
+    assert_eq!(h.rx_dgrams.len(), 1);
+    assert_eq!(h.stats().multi_segment, 1, "dropped and counted");
+    drop(p);
     assert_no_leak();
 }
 

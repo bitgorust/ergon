@@ -51,6 +51,10 @@ pub struct Run {
     pub one_way: Option<Summary>,
     /// As [`Run::over`], for [`Run::one_way`].
     pub one_way_over: [u64; 4],
+    /// The bound on the two hosts' clock offset during the run, ns
+    /// ([`stalls::clock_bound_ns`]): one-way values are relative within
+    /// it, and the server's stalls are matched within it.
+    pub clock_bound_ns: Option<i64>,
     /// Interrupts per second during the run ([`IRQ_KINDS`], from
     /// `/proc/interrupts` before and after) on the loop CPU and, when another
     /// CPU received the packets (the SQPOLL thread's, or a softirq's), on that
@@ -64,6 +68,32 @@ pub struct Run {
 /// (firmware pauses; `vm-setup.sh irqs` adds the row).
 pub const IRQ_KINDS: [&str; 5] = ["LOC", "IWI", "RES", "CAL", "SMI"];
 
+/// Which of [`IRQ_KINDS`] a `/proc/interrupts` row (as keyed by
+/// [`stalls::interrupt_deltas`]: name, then description) counts as. x86 names
+/// its rows `LOC`, `IWI`, `RES`, `CAL` (and `vm-setup.sh` adds `SMI`); arm64
+/// numbers its IPIs (`IPI0`, ...) with the same descriptions, and its tick is
+/// the numbered `arch_timer` interrupt.
+#[must_use]
+pub fn irq_kind(key: &str) -> Option<usize> {
+    let name = key.split_whitespace().next().unwrap_or_default();
+    if let Some(i) = IRQ_KINDS.iter().position(|&c| c == name) {
+        return Some(i);
+    }
+    let desc = key.get(name.len()..).unwrap_or_default().trim();
+    if name.chars().all(|c| c.is_ascii_digit()) && desc.ends_with(" arch_timer") {
+        return Some(0);
+    }
+    if !name.starts_with("IPI") {
+        return None;
+    }
+    match desc {
+        "IRQ work interrupts" => Some(1),
+        "Rescheduling interrupts" => Some(2),
+        "Function call interrupts" => Some(3),
+        _ => None,
+    }
+}
+
 /// [`IRQ_KINDS`] per second on `cpu` over `seconds`, or `None` without
 /// both snapshots.
 fn irq_rates(dir: &Path, cpu: usize, seconds: f64) -> Option<[f64; 5]> {
@@ -71,11 +101,10 @@ fn irq_rates(dir: &Path, cpu: usize, seconds: f64) -> Option<[f64; 5]> {
     let after = std::fs::read_to_string(dir.join("irq-after.txt")).ok()?;
     let mut v = [0.0; 5];
     for (k, n) in stalls::interrupt_deltas(&before, &after, cpu) {
-        let name = k.split_whitespace().next().unwrap_or_default();
-        if let Some(i) = IRQ_KINDS.iter().position(|&c| c == name) {
+        if let Some(i) = irq_kind(&k) {
             #[allow(clippy::cast_precision_loss)]
             let rate = n as f64 / seconds.max(1.0);
-            v[i] = rate;
+            v[i] += rate;
         }
     }
     Some(v)
@@ -216,6 +245,7 @@ pub fn load_run(dir: &Path, warmup_s: i64) -> Result<Run, String> {
         .unwrap_or(0.0);
     let (loop_stats, client) = stalls::load_loop(dir, &dir.join("stalls-0.txt"))?;
     let irqs = run_irqs(dir, &m, loop_stats.cpu, seconds);
+    let clock_bound = stalls::clock_bound_ns(dir);
     let mut causes: HashMap<String, u64> = HashMap::new();
     for a in &client {
         let key = if a.cause.starts_with("loop work") {
@@ -275,6 +305,7 @@ pub fn load_run(dir: &Path, warmup_s: i64) -> Result<Run, String> {
             server.extend(stalls::load_attributed(&f, &dir.join("server-trace.txt"))?.1);
         }
         let p50 = s.as_ref().map_or(0, |s| s.p50);
+        let slack = stalls::server_slack_ns(clock_bound);
         let mut slow: Vec<_> = kept.clone();
         slow.sort_by_key(|r| std::cmp::Reverse(r.user_ns - r.src_ns));
         let worst_events: Vec<WorstEvent> = slow
@@ -284,7 +315,8 @@ pub fn load_run(dir: &Path, warmup_s: i64) -> Result<Run, String> {
                 ns: r.user_ns - r.src_ns,
                 #[allow(clippy::cast_precision_loss)]
                 at_s: (r.user_ns - t0) as f64 / 1e9,
-                cause: stalls::round_trip_cause(&client, &server, r.src_ns, r.user_ns, p50).verdict,
+                cause: stalls::round_trip_cause(&client, &server, r.src_ns, r.user_ns, p50, slack)
+                    .verdict,
             })
             .collect();
         let worst = worst_events
@@ -321,7 +353,15 @@ pub fn load_run(dir: &Path, warmup_s: i64) -> Result<Run, String> {
                 ns: r.user_ns - r.rx_sw_ns,
                 #[allow(clippy::cast_precision_loss)]
                 at_s: (r.user_ns - t0) as f64 / 1e9,
-                cause: stalls::round_trip_cause(&client, &[], r.rx_sw_ns, r.user_ns, p50).verdict,
+                cause: stalls::round_trip_cause(
+                    &client,
+                    &[],
+                    r.rx_sw_ns,
+                    r.user_ns,
+                    p50,
+                    stalls::SERVER_SLACK_NS,
+                )
+                .verdict,
             })
             .collect();
         (
@@ -346,6 +386,7 @@ pub fn load_run(dir: &Path, warmup_s: i64) -> Result<Run, String> {
         one_way,
         one_way_over,
         irqs,
+        clock_bound_ns: clock_bound,
     })
 }
 
@@ -381,6 +422,12 @@ pub fn load(root: &Path, warmup_s: i64) -> std::io::Result<Loaded> {
             let name = r.file_name().to_string_lossy().into_owned();
             if let Ok(t) = std::fs::metadata(rp.join("meta.txt")).and_then(|m| m.modified()) {
                 first = Some(first.map_or(t, |f: std::time::SystemTime| f.min(t)));
+            }
+            // A point the lab failed (its settings drifted, or the run did
+            // not finish): left out, with why.
+            if let Ok(why) = std::fs::read_to_string(rp.join("failed.txt")) {
+                skipped.push((format!("{tag}/{name}"), format!("failed: {}", why.trim())));
+                continue;
             }
             match load_run(&rp, warmup_s) {
                 Ok(run) => {
@@ -469,6 +516,8 @@ struct View {
     intro: &'static str,
     pick: fn(&Run) -> Option<&Summary>,
     over: fn(&Run) -> [u64; 4],
+    /// Two hosts' clocks: say how far apart they may be.
+    two_clocks: bool,
 }
 
 const VIEWS: [View; 2] = [
@@ -478,14 +527,18 @@ const VIEWS: [View; 2] = [
                 a stall delays every message due during it, and this includes that wait.",
         pick: |r| r.due.as_ref(),
         over: |r| r.due_over,
+        two_clocks: false,
     },
     View {
         heading: "sender → decoded (one way)",
         intro: "Every message from its send time on the sender (or the exchange's event time) to \
                 decoded: the whole path, NIC and interrupt included. Two hosts' clocks, so the values \
-                include their offset; runs made close together share it, so compare them with each other.",
+                are relative only: each includes the offset between the clocks, which drifts, and \
+                which chrony bounds by the sum of the hosts' |System time| + ½ root delay + root \
+                dispersion (chronyc tracking). Compare runs only where they differ by much more than that.",
         pick: |r| r.one_way.as_ref(),
         over: |r| r.one_way_over,
+        two_clocks: true,
     },
 ];
 
@@ -498,9 +551,25 @@ fn view_table(out: &mut String, tags: &[Tag], kind: &str, title: &str, view: &Vi
     {
         return;
     }
+    let bounds: Vec<i64> = tags
+        .iter()
+        .filter_map(|t| t.runs.get(kind))
+        .filter(|r| pick(r).is_some())
+        .filter_map(|r| r.clock_bound_ns)
+        .collect();
+    let clocks = match (view.two_clocks, bounds.iter().min(), bounds.iter().max()) {
+        (false, _, _) => String::new(),
+        (true, Some(lo), Some(hi)) => format!(
+            " Here the bound was ±{}–{} µs (chrony's own estimate, at its default maxclockerror of \
+             1 ppm: optimistic).",
+            us(*lo),
+            us(*hi)
+        ),
+        (true, _, _) => " These runs kept no chrony log, so the bound is not known.".to_owned(),
+    };
     let _ = writeln!(
         out,
-        "### {title}, {}\n\n{}\n\n\
+        "### {title}, {}\n\n{}{clocks}\n\n\
          | condition | n | p50 | p99 | p99.9 | p99.99 | max | >100 µs /min | >500 µs /min | >1 ms /min | >10 ms /min |\n\
          |---|---|---|---|---|---|---|---|---|---|---|",
         view.heading, view.intro
@@ -545,10 +614,12 @@ fn irq_table(out: &mut String, tags: &[Tag]) {
     let _ = writeln!(
         out,
         "## Interrupts per second on the loop CPU and the receiving CPU\n\n\
-         From `/proc/interrupts` around each run (so including its start-up): local timer (LOC), irq_work \
-         (IWI: on a `nohz_full` CPU, mostly the tick being restarted), rescheduling (RES) and function-call \
-         (CAL) IPIs, and system-management interrupts (SMI, bare metal only: firmware pauses). The receiving CPU is the one that last took each connection's packets when that is not \
-         the loop's: the SQPOLL thread's, or a softirq's.\n\n\
+         From `/proc/interrupts` around each run (so including its start-up): local timer (LOC; on arm64 the \
+         `arch_timer` interrupt), irq_work (IWI: on a `nohz_full` CPU, mostly the tick being restarted), \
+         rescheduling (RES) and function-call (CAL) IPIs (on arm64 the `IPIn` rows of those names), and \
+         system-management interrupts (SMI, x86 bare metal only: firmware pauses). The receiving CPU is the one \
+         that last took each connection's packets when that is not the loop's: the SQPOLL thread's, or a \
+         softirq's.\n\n\
          | run | condition | loop CPU | LOC | IWI | RES | CAL | SMI | receiving CPU | LOC | IWI | RES | CAL | SMI |\n\
          |---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     );
@@ -629,6 +700,8 @@ pub fn report(tags: &[Tag], skipped: &[(String, String)]) -> String {
     for kind in kinds {
         let title = if kind.starts_with("pp-") {
             format!("WebSocket round trip, {kind}")
+        } else if kind.starts_with("rt-") {
+            format!("WebSocket order round trip with feed connections on the loop, {kind}")
         } else if kind.starts_with("http-") {
             format!("HTTP round trip, {kind}")
         } else {

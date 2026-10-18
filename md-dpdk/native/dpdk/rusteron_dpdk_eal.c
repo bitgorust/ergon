@@ -172,6 +172,14 @@ int rusteron_dpdk_eal_init(const rusteron_dpdk_eal_params_t *params, char *errbu
     return 0;
 }
 
+void rusteron_dpdk_eal_version(int *year, int *month)
+{
+    /* The DPDK built against: a shared build runs one of the same ABI, and
+     * ENA's device arguments changed at 24.11, an ABI boundary. */
+    *year = RTE_VER_YEAR;
+    *month = RTE_VER_MONTH;
+}
+
 int rusteron_dpdk_eal_thread_register(void)
 {
     /* Only lcore-less threads need registration. A registered non-EAL thread

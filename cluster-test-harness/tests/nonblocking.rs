@@ -65,13 +65,8 @@ impl JavaDriver {
             .ok_or("aeron dir is not valid UTF-8")?
             .to_string();
         let jar = ergo_aeron_cluster_test_harness::jar::try_find_jar("aeron-all-")?;
-        let child = Command::new("java")
-            .args([
-                "--add-opens",
-                "java.base/jdk.internal.misc=ALL-UNNAMED",
-                "-Xmx128m",
-                "-cp",
-            ])
+        let child = ergo_aeron_cluster_test_harness::jvm::try_command()?
+            .arg("-cp")
             .arg(jar)
             .arg(format!("-Daeron.dir={dir}"))
             .args([

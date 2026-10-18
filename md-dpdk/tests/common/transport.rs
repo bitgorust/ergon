@@ -292,6 +292,11 @@ impl Harness {
         Self::build_from(TestEnv::new(), config)
     }
 
+    /// Over `config`, after the test set the fakes' hooks on `env`.
+    pub fn build_after(env: TestEnv, config: rusteron_dpdk_config_t) -> Self {
+        Self::build_from(env, config)
+    }
+
     fn build_with(env: TestEnv, rx_hw_timestamp: bool) -> Self {
         let mut config = rusteron_dpdk_config_t::valid();
         if rx_hw_timestamp {
@@ -352,6 +357,12 @@ impl Harness {
     }
 
     pub fn init_rx(&mut self, bind_ip: [u8; 4], bind_port: u16, mtu: usize) {
+        self.init_rx_with(bind_ip, bind_port, mtu, false);
+    }
+
+    /// As `init_rx`, for a channel that asks for media receive timestamps
+    /// (`media-rcv-ts-offset`) when `media_timestamping`.
+    pub fn init_rx_with(&mut self, bind_ip: [u8; 4], bind_port: u16, mtu: usize, media_timestamping: bool) {
         assert!(!self.rx_inited, "rx already initialized");
         self.rx_inited = true;
         let t = &mut *self.rx;
@@ -360,6 +371,7 @@ impl Harness {
         let mut dummy = SockAddrIn::new([0, 0, 0, 0], 0);
         let mut params: aeron_udp_channel_transport_params_stct = unsafe { std::mem::zeroed() };
         params.mtu_length = mtu;
+        params.is_media_timestamping = media_timestamping;
         let rc = unsafe {
             let b = &*self.bindings;
             b.init_func.unwrap()(
@@ -378,11 +390,24 @@ impl Harness {
     /// Another receiver-affinity transport on the receiver NIC, registering
     /// into this harness's counters; close it with `close_transport`.
     pub fn init_extra_rx(&mut self, bind_port: u16) -> Box<aeron_udp_channel_transport_stct> {
+        self.init_extra_rx_with(RECEIVER_IP, bind_port, false)
+    }
+
+    /// As `init_extra_rx`, bound on `bind_ip` (a host-local one runs on a
+    /// kernel socket), asking for media receive timestamps when
+    /// `media_timestamping`.
+    pub fn init_extra_rx_with(
+        &mut self,
+        bind_ip: [u8; 4],
+        bind_port: u16,
+        media_timestamping: bool,
+    ) -> Box<aeron_udp_channel_transport_stct> {
         let mut t = Box::new(unsafe { std::mem::zeroed::<aeron_udp_channel_transport_stct>() });
-        let mut bind = SockAddrIn::new(RECEIVER_IP, bind_port);
+        let mut bind = SockAddrIn::new(bind_ip, bind_port);
         let mut dummy = SockAddrIn::new([0, 0, 0, 0], 0);
         let mut params: aeron_udp_channel_transport_params_stct = unsafe { std::mem::zeroed() };
         params.mtu_length = 1472;
+        params.is_media_timestamping = media_timestamping;
         let rc = unsafe {
             (*self.bindings).init_func.unwrap()(
                 &mut *t,
@@ -471,6 +496,19 @@ impl Harness {
 
     pub fn poller(&self) -> Poller {
         Poller::new(self.bindings)
+    }
+
+    /// The `address:port` a transport reports it is bound to.
+    pub fn bind_addr_and_port(
+        bindings: *mut aeron_udp_channel_transport_bindings_stct,
+        transport: &mut Box<aeron_udp_channel_transport_stct>,
+    ) -> String {
+        let mut buf = [0 as c_char; 128];
+        let rc = unsafe { (*bindings).bind_addr_and_port_func.unwrap()(&mut **transport, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(rc, 0, "bind_addr_and_port failed: {}", last_error());
+        unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
     }
 
     pub fn counter(&self, type_id: i32, needle: &str) -> i64 {

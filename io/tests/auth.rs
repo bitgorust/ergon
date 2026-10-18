@@ -7,6 +7,7 @@ use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 
 type R = Result<(), Box<dyn std::error::Error>>;
 
+// ANCHOR: signing
 /// Binance "SIGNED endpoint" example (HMAC-SHA256, parameters in the query).
 const SECRET: &str = "NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j";
 const PARAMS: &str =
@@ -24,6 +25,7 @@ fn hmac_matches_binance_documented_example() -> R {
     assert_eq!(String::from_utf8(out)?, expected);
     Ok(())
 }
+// ANCHOR_END: signing
 
 #[test]
 fn ed25519_signature_verifies() -> R {

@@ -21,12 +21,17 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sched.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "util/aeron_error.h"
 #include "media/aeron_udp_channel_transport.h"
 
 #define RUSTERON_DPDK_KERNEL_MAX_SEND 64
+/* Datagrams one read stamps for a channel asking for media receive
+ * timestamps: Aeron's receiver vectors at most this many
+ * (AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX). */
+#define RUSTERON_DPDK_KERNEL_MAX_STAMPED 16
 
 int rusteron_dpdk_kernel_open(
     int *fd_out,
@@ -54,6 +59,14 @@ int rusteron_dpdk_kernel_open(
         AERON_SET_ERR(errno, "%s", "DPDK transport kernel path: SO_SNDBUF");
         close(fd);
         return -1;
+    }
+    /* A channel asking for media receive timestamps: the kernel stamps each
+     * datagram at its receive (CLOCK_REALTIME), as Aeron's kernel transport
+     * has it do. Should it refuse, a read stamps with CLOCK_REALTIME itself. */
+    const int one = 1;
+    if (NULL != params && params->is_media_timestamping)
+    {
+        (void)setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof(one));
     }
     if (bind(fd, (const struct sockaddr *)bind_addr, sizeof(*bind_addr)) < 0)
     {
@@ -133,6 +146,17 @@ int rusteron_dpdk_kernel_send(
     return (int)sent;
 }
 
+/* The control buffers a stamped read lent msgvec, taken back: they are its
+ * frame's, and Aeron's msgvec outlives it. */
+static void rusteron_dpdk_kernel_unstamp(struct mmsghdr *msgvec, size_t vlen, int media_ts)
+{
+    for (size_t i = 0; media_ts && i < vlen; i++)
+    {
+        msgvec[i].msg_hdr.msg_control = NULL;
+        msgvec[i].msg_hdr.msg_controllen = 0;
+    }
+}
+
 int rusteron_dpdk_kernel_recv(
     int fd,
     const rusteron_dpdk_client_t *dpdk_client,
@@ -143,10 +167,24 @@ int rusteron_dpdk_kernel_recv(
     aeron_udp_transport_recv_func_t recv_func,
     void *clientd)
 {
+    /* A channel asking for media receive timestamps gets each datagram's
+     * from the kernel (SO_TIMESTAMPNS), into control buffers of this call's
+     * that are taken off msgvec again before it returns. */
+    const int media_ts = 0 != (transport->timestamp_flags & AERON_UDP_CHANNEL_TRANSPORT_MEDIA_RCV_TIMESTAMP);
+    union
+    {
+        char buf[CMSG_SPACE(sizeof(struct timespec))];
+        struct cmsghdr align;
+    } control[RUSTERON_DPDK_KERNEL_MAX_STAMPED];
+    if (media_ts && vlen > RUSTERON_DPDK_KERNEL_MAX_STAMPED)
+    {
+        vlen = RUSTERON_DPDK_KERNEL_MAX_STAMPED;
+    }
     for (size_t i = 0; i < vlen; i++)
     {
         msgvec[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
-        msgvec[i].msg_hdr.msg_controllen = 0;
+        msgvec[i].msg_hdr.msg_control = media_ts ? control[i].buf : NULL;
+        msgvec[i].msg_hdr.msg_controllen = media_ts ? sizeof(control[i].buf) : 0;
         msgvec[i].msg_len = 0;
     }
     /* No timeout: with MSG_DONTWAIT it reads until the socket is empty or
@@ -155,9 +193,11 @@ int rusteron_dpdk_kernel_recv(
      * pending socket error (ICMP port unreachable on a connected socket) is
      * reported before any queued datagram, so it is not "drained": say so. */
     int result = recvmmsg(fd, msgvec, (unsigned int)vlen, MSG_DONTWAIT, NULL);
+    struct timespec fallback = { 0, 0 };
     if (result < 0)
     {
         int err = errno;
+        rusteron_dpdk_kernel_unstamp(msgvec, vlen, media_ts);
         if (EAGAIN == err || EWOULDBLOCK == err)
         {
             return 0;
@@ -184,6 +224,29 @@ int rusteron_dpdk_kernel_recv(
         {
             continue;
         }
+        struct timespec *media_timestamp = NULL;
+        if (media_ts)
+        {
+            for (struct cmsghdr *c = CMSG_FIRSTHDR(&msgvec[i].msg_hdr); NULL != c;
+                 c = CMSG_NXTHDR(&msgvec[i].msg_hdr, c))
+            {
+                if (SOL_SOCKET == c->cmsg_level && SCM_TIMESTAMPNS == c->cmsg_type &&
+                    CMSG_LEN(sizeof(struct timespec)) == c->cmsg_len)
+                {
+                    media_timestamp = (struct timespec *)CMSG_DATA(c);
+                }
+            }
+            if (NULL == media_timestamp)
+            {
+                if (0 == fallback.tv_sec && 0 == fallback.tv_nsec)
+                {
+                    const uint64_t now = rusteron_dpdk_realtime_ns();
+                    fallback.tv_sec = (time_t)(now / 1000000000ULL);
+                    fallback.tv_nsec = (long)(now % 1000000000ULL);
+                }
+                media_timestamp = &fallback;
+            }
+        }
         recv_func(
             transport->data_paths,
             transport,
@@ -193,9 +256,10 @@ int rusteron_dpdk_kernel_recv(
             msgvec[i].msg_hdr.msg_iov[0].iov_base,
             msgvec[i].msg_len,
             msgvec[i].msg_hdr.msg_name,
-            NULL);
+            media_timestamp);
         *bytes_rcved += msgvec[i].msg_len;
     }
+    rusteron_dpdk_kernel_unstamp(msgvec, vlen, media_ts);
     return result;
 }
 

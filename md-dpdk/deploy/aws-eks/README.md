@@ -73,14 +73,46 @@ nodeadm `NodeConfig`: the cluster fields (nothing is merged for a stock AMI
 launched outside a managed node group), the node label
 `rusteron-dpdk/ena=true`, the taint `rusteron-dpdk=true:NoSchedule`, and the
 kubelet latency settings: CPU Manager `static` with `full-pcpus-only`,
-`reservedSystemCPUs` (the housekeeping core, e.g. `0,8`) with the
+`reservedSystemCPUs` (the housekeeping core, one CPU: e.g. `0`) with the
 reserved-cgroup settings cleared so kubelet accepts it, and Topology Manager
-`single-numa-node` at pod scope. The Memory Manager stays at `None`: every
+`single-numa-node` at pod scope. `cpuCFSQuota` is not set, so it stays
+`true` and every pod's CPU limit holds. The driver still gets no CPU quota:
+kubelet 1.33 and later (use 1.36 or later) sets none on a container with
+exclusive CPUs (static policy, Guaranteed pod, whole-number CPU request), nor
+on its pod. Do not set `cpuCFSQuota: false`: it removes the CPU limit of
+every pod on the node
+([checklist](https://mimran1980.github.io/ergon/deploy/kubernetes.html#latency-checklist)).
+The Memory Manager stays at `None`: every
 c7i size below `metal-48xl` has one NUMA node, so `Static` would pin nothing,
 and kubelet refuses to start under `Static` unless `reservedMemory` exactly
 equals kubeReserved, systemReserved and the hard eviction threshold together.
 `userdata.sh` fails if its gzipped output exceeds EC2's 16384-byte user-data
 limit.
+
+### SMT off (one CPU is one physical core)
+
+Hyper-threading (SMT) is off on every x86 latency node, so one Kubernetes CPU
+is one physical core, the same as on Graviton. A pod's CPU request is a whole
+number of cores with no twin sharing its execution resources.
+
+- **Where EC2 takes CPU options** (every VM type that has SMT, e.g. `c7i`):
+  `node/launch-template.py` puts `CpuOptions` `ThreadsPerCore=1` and the
+  `CoreCount` EC2 requires alongside it in the node group's launch template,
+  so the node boots with half the type's vCPUs and no SMT. There is no extra
+  charge. EC2 takes no CPU options on bare metal, none on T2/C7a/M7a/R7a
+  (EC2 will not change them; C7a/M7a/R7a already run one thread per core) and
+  none on Graviton (arm64, likewise).
+- **Bare metal** (no CPU options): `provision-node.sh` turns SMT off on the
+  first boot — the sysfs `smt/control` write is the last resort before kubelet
+  starts, and `nosmt` on the kernel command line holds every later boot. It
+  then computes the CPU lists from one CPU per physical core: the kernel keeps
+  listing the offline twins in the topology, so a list that names a twin fails
+  the node (`housekeeping CPU N will not run with SMT off`).
+- The live check (`benches/cloud/aws/eks.sh`) fails a node whose
+  `/sys/devices/system/cpu/smt/active` is 1.
+
+Kubelet's `full-pcpus-only` stays on as a safety net: with SMT off every CPU
+is already a whole core, so it only matters if a node somehow runs with SMT.
 
 ### First boot (`provision-node.sh`)
 
@@ -88,10 +120,11 @@ Runs from user data, before kubelet has ever started (nodeadm starts kubelet
 after cloud-init). It does nothing on a node whose kernel command line already
 has `isolcpus=`, so it can never loop. Otherwise it:
 
-1. checks the node: an Intel x86 CPU, housekeeping CPUs
-   (`RUSTERON_HOUSEKEEPING_CPUS`, default cpu0's core) that are online whole
-   cores, and at least four physical cores outside them (the driver's
-   housekeeping, sender and receiver, and an application);
+1. turns SMT off on a node that still has it (bare metal: EC2's CPU options
+   cover a VM only), then checks the node: an Intel x86 CPU, housekeeping CPUs
+   (`RUSTERON_HOUSEKEEPING_CPUS`, default cpu0's core, one CPU per core) that
+   run with SMT off, and at least four physical cores outside them (the
+   driver's housekeeping, sender and receiver, and an application);
 2. waits (up to `RUSTERON_ENI_WAIT_SECS`, default 600) for the secondary ENAs
    (IMDS `device-number` 1 and 2 by default, `RUSTERON_DPDK_DEVICE_NUMBERS`)
    to be attached;
@@ -103,7 +136,8 @@ has `isolcpus=`, so it can never loop. Otherwise it:
    the two systemd units (the per-boot bootstrap and the IRQ watcher), and
    enables both;
 5. sets the kernel command line with `grubby --update-kernel=ALL --args=...`
-   and checks the default entry took it: `isolcpus`
+   and checks the default entry took it: `nosmt` (SMT stays off on every later
+   boot), `isolcpus`
    (`nohz,domain,managed_irq`), `nohz_full` and `rcu_nocbs` on every CPU but
    the housekeeping core, `irqaffinity` on it, `intel_idle.max_cstate=1
    processor.max_cstate=1` on a VM only (the CPU's `hypervisor` flag; see
@@ -133,7 +167,11 @@ leaves none. Then, in order:
    none): IOMMU groups are allowed only when every one is in passthrough
    (`identity`, from `iommu=pt`). For vfio-pci: needs IOMMU groups, `vfio_iommu_type1`, and
    `RUSTERON_DPDK_VFIO_WC=1` (a write-combining vfio-pci; mainline maps none,
-   and ENA's low-latency queues need it). Always: 2 MiB hugepages reserved at
+   and ENA's low-latency queues need it). The driver pod's transport takes
+   that confirmation from the ConfigMap's `RUSTERON_DPDK_VFIO_WC=1`: vfio-pci
+   maps the LLQ BAR through its device file, which `/proc/self/maps` cannot
+   show write-combined, so its start check accepts a vfio-pci port on it,
+   without a warning (see [the ConfigMap](#the-configmap)). Always: 2 MiB hugepages reserved at
    `/dev/hugepages`, NUMA topology present, at least three ENA PCI functions,
    and complete IMDS identity for the selected ENAs. The sender and receiver
    are the ENAs at the configured IMDS device numbers (first = sender); the
@@ -238,14 +276,18 @@ Optional settings, read from `/etc/rusteron-dpdk/node.env` (the unit's
 - AL2023 x86_64 Intel Nitro instance with at least 5 physical cores, which
   `provision-node.sh` checks: one reserved for the system and kubelet, three
   for the driver pod (housekeeping, sender, receiver) and one for an
-  application. The smallest c7i with them is c7i.4xlarge (8 cores).
+  application. The smallest c7i with them is c7i.4xlarge (8 cores). SMT is off
+  ([above](#smt-off-one-cpu-is-one-physical-core)), so one CPU is one core.
 - Three ENAs: the primary plus the sender and receiver, created with the tag
   `node.k8s.amazonaws.com/no_manage=true` so the VPC CNI never claims them.
 - The ENAs bind to igb_uio with `wc_activate=1`, the only write-combining
   binding on virtualised EC2, and on `*.metal` too (see
   [Bare metal](#bare-metal)). A write-combining vfio-pci
-  (`RUSTERON_DPDK_DRIVER=vfio-pci RUSTERON_DPDK_VFIO_WC=1`) is the
-  alternative on metal; the manifests here do not implement that variant.
+  (`RUSTERON_DPDK_DRIVER=vfio-pci RUSTERON_DPDK_VFIO_WC=1` in the node's
+  environment) is the alternative on metal: the bootstrap and preflight
+  support it, the device plugin hands out its VFIO devices, and the
+  ConfigMap's `RUSTERON_DPDK_VFIO_WC=1` lets the transport's start check
+  accept its LLQ BAR mapping; the DaemonSet stays privileged as for igb_uio.
 - Both nodes of a cell in the same cluster placement group.
 - `chronyd` active: DPDK timestamps here are software clock readings and need
   a disciplined host clock.
@@ -266,13 +308,19 @@ node path serves it, with two differences:
   `provision-node.sh` sets it only on a VM, where the EKS run measured it
   (`c7i.4xlarge` exposes C6, with a 190 µs exit, on the core that takes every
   interrupt).
+- SMT off at boot, not by EC2: bare metal takes no CPU options, so
+  `provision-node.sh` writes sysfs's `smt/control` before kubelet's first
+  start and `nosmt` holds every later boot
+  ([above](#smt-off-one-cpu-is-one-physical-core)). A metal `c7i` still
+  occupies the type's full vCPU count for the EC2 quota: `nosmt` takes half
+  the threads offline, it does not give them back to the pool.
 
 ## 3. Media driver pod
 
 `media-driver-daemonset.yaml` runs one pod per `rusteron-dpdk/ena=true` node,
-requesting one `rusteron.io/dpdk-ena-pair`, 6 CPUs (three whole cores),
-2 GiB of memory and 2 GiB of 2 MiB hugepages, with requests equal to limits
-(Guaranteed QoS, so the CPU Manager gives it exclusive cores).
+requesting one `rusteron.io/dpdk-ena-pair`, 6 CPUs (six physical cores: SMT is
+off), 2 GiB of memory and 2 GiB of 2 MiB hugepages, with requests equal to
+limits (Guaranteed QoS, so the CPU Manager gives it exclusive cores).
 
 The container is **privileged**. With igb_uio the DPDK EAL runs in
 IOVA-as-PA mode: it reads `/proc/self/pagemap` (`CAP_SYS_ADMIN`,
@@ -285,13 +333,20 @@ kubelet stops the pod with SIGTERM. The driver stops on it as on SIGINT
 transport; without a handler, the container's PID 1 would ignore SIGTERM until
 the SIGKILL that ends the grace period (`terminationGracePeriodSeconds: 15`).
 
-`media-driver-config.yaml` sets what is the same on every node:
+### The ConfigMap
+
+`media-driver-config.yaml` sets what is the same on every node. It leaves
+`RUSTERON_DPDK_RX_DESCRIPTORS` unset, so each port takes min(4096, the NIC's
+maximum), 4096 on an ENA (`BENCHMARKS.md`, AWS round 6: no first-point
+`nic-rx-missed` loss, a higher loss-free rate than 1024), and the pool holds
+that ring.
 
 | Setting | Value | Why |
 |---|---|---|
 | `AERON_RECEIVER_IO_VECTOR_CAPACITY` | `16` | Aeron's maximum (its default is 4), the setting every kept DPDK measurement used and `BENCHMARKS.md`'s recommended configuration. The DPDK receive poll drains whole bursts whatever this is; it still sizes each receive from a host-local socket. The media driver also defaults to 16 under `dpdk-ena` when it is unset, never under the socket transport; a rollback sets it back to 4 (the runbook's §4) |
 | `RUSTERON_DPDK_TX_DESCRIPTORS` | `512` | An ENA queue takes at most 512 transmit descriptors; a larger ring fails the port's start |
-| `RUSTERON_DPDK_MBUFS_PER_PORT` | `16384` | The count every lab measurement used (`benches/cloud/vm.sh`): about 37 MiB of hugepages a port; see [Hugepage budget](#hugepage-budget) |
+| `RUSTERON_DPDK_MBUFS_PER_PORT` | `16384` | The count every lab measurement used (`benches/cloud/vm.sh`): about 37 MiB of hugepages a port; see [Hugepage budget](#hugepage-budget). It holds the 4096-descriptor receive ring, the transmit ring, four bursts of 32 and two mempool caches (4096 + 512 + 128 + 768 = 5,504) with room to spare |
+| `RUSTERON_DPDK_VFIO_WC` | `1` | A vfio-pci node's write-combining, as its preflight confirmed: the bootstrap binds the ENAs to vfio-pci only after `preflight.sh` passed with the operator's `RUSTERON_DPDK_VFIO_WC=1`, and a failed run leaves no inventory, so the device plugin hands out no pair. vfio-pci maps the LLQ BAR through its device file, so `/proc/self/maps` cannot show it write-combined; with this the transport's start check accepts a port bound to vfio-pci, with no warning. Inert for igb_uio ports, which must still show `resource2_wc` |
 | `AERON_DIR`, `RUSTERON_MEDIA_DRIVER_DIR` | `/mnt/huge-aeron/aeron` | Aeron's directory on a hugetlbfs of its own that the node bootstrap mounts with a size (an unsized hugetlbfs reports no free space, and Aeron's storage check then refuses every log buffer) |
 | `AERON_FILE_PAGE_SIZE`, `AERON_TERM_BUFFER_SPARSE_FILE`, `AERON_DIR_DELETE_ON_START` | `2097152`, `false`, `true` | Log buffers in whole 2 MiB pages, filled when created, as in the VM lab |
 | `AERON_RCV_INITIAL_WINDOW_LENGTH`, `AERON_SOCKET_SO_RCVBUF`, `AERON_SOCKET_SO_SNDBUF` | `2097152` | The VM lab's window; the driver refuses a window larger than its receive buffer, and the bootstrap raises `rmem_max`/`wmem_max` to allow it |
@@ -336,8 +391,8 @@ driver through the same directory and needs the same treatment:
 - the `rusteron-dpdk/ena=true` node selector and the `rusteron-dpdk` taint's
   toleration;
 - Guaranteed QoS with whole cores: requests equal to limits on every
-  resource, and an even CPU count, so the static CPU Manager
-  (`full-pcpus-only`) gives it physical cores of its own;
+  resource, so the static CPU Manager (`full-pcpus-only`) gives it physical
+  cores of its own (SMT is off, so one CPU is one core);
 - each busy-spinning thread pinned to a core of its own from the pod's cpuset
   (`Cpus_allowed_list` in `/proc/self/status`, as the entrypoint reads it),
   one logical CPU a core, and Aeron's client conductor off those cores.
@@ -445,10 +500,13 @@ command line on a VM and on bare metal, IRQ placement (the pass and its
 check, an IRQ the kernel keeps, one it moves only at its next interrupt,
 and the watcher re-pinning after a link event), and idempotent rerun (dry
 run: no
-host sysfs, /proc or networkd directory is touched), provisioning (the
+host sysfs, /proc or networkd directory is touched), provisioning (SMT off
+on a node that still has it and CPU lists of one CPU per physical core, the
 C-state cap on VMs only, the kubelet hold on failure), the user data's size
 with an incompressible CA, its kubelet settings and a dry run of the scripts
-it embeds, and the entrypoint's CPU layout. It needs bash and python3; in a container, from the
+it embeds, `launch-template.py`'s `CpuOptions` (present on x86 with SMT,
+absent on Graviton, bare metal and 1-thread types), and the entrypoint's CPU
+layout. It needs bash and python3; in a container, from the
 ergon repo root:
 
 ```bash
@@ -461,10 +519,15 @@ docker run --rm -v "$PWD":/src:ro -w /src rust:1-slim-bookworm bash -c \
 `md-dpdk/benches/cloud/aws/eks.sh` builds both images, creates a cluster and
 two nodes (launched with this directory's user data; `EKS_TYPE` may be a
 `*.metal` type) tagged `owner=ergon-lab`, deploys this base through an
-overlay (images in ECR, the driver pod on four whole cores so `rtt` has a
-spare one), checks the settings the latency depends on (the kernel command
-line, the per-boot tuning, write-combining on both data BARs, kubelet's CPU
-Manager, the driver pod's cpuset, CFS quota and thread placement; it reports
+overlay (images in ECR, the driver pod on four CPUs so `rtt` has a
+spare one), checks the settings the latency depends on (SMT off
+(`/sys/devices/system/cpu/smt/active` 0), the kernel command line
+(`nosmt` and the isolation flags), the per-boot tuning, write-combining on
+both data BARs, kubelet's CPU
+Manager, the driver pod's cpuset and thread placement, and the CPU quota:
+kubelet 1.36 or later (`EKS_K8S`, default 1.36), `cpuCFSQuota` true,
+`DisableCPUQuotaWithExclusiveCPUs` on, `cpu.max` `max` on the driver's
+container and pod, and the device plugin's 100m limit still a quota; it reports
 `vm.min_free_kbytes` and the primary ENA's coalescing without judging them),
 runs `rtt` across the DPDK ENAs, and deletes and verifies every resource on
 exit. `EKS_KEEP=1` keeps the run (and its bill) for work by hand;

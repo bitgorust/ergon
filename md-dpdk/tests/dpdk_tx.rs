@@ -7,7 +7,7 @@
 //! rejection, mbuf exhaustion, partial bursts, and mbuf ownership.
 //!
 //! The native transport links the same `rusteron_dpdk` core archive plus the
-//! fakes declared in `common/mod.rs`. Linux x86_64 only.
+//! fakes declared in `common/mod.rs`. Linux x86_64 or aarch64.
 #![allow(
     missing_docs,
     unsafe_code,
@@ -17,7 +17,11 @@
     clippy::nursery,
     clippy::restriction
 )]
-#![cfg(all(feature = "dpdk", target_os = "linux", target_arch = "x86_64"))]
+#![cfg(all(
+    feature = "dpdk",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 mod common;
 use common::*;
@@ -63,7 +67,7 @@ impl SockAddrIn {
             sin_port: port.to_be(),
             // s_addr is a plain u32 read natively by the C side (no ntohl), so
             // the octets must sit in memory in order: ip[0] at the low byte on
-            // little-endian x86_64. from_be_bytes would store them reversed and
+            // little-endian x86_64 and aarch64. from_be_bytes would store them reversed and
             // every ARP lookup / multicast check in transport.c would miss.
             sin_addr: u32::from_le_bytes(ip),
             sin_zero: [0; 8],
@@ -1545,6 +1549,46 @@ fn an_allowance_refills_however_often_a_send_is_retried() {
     }
     assert_eq!(sent_after_ns, Some(500_000), "the 500 bytes owed repaid in 500 µs");
     assert_eq!(captures().len(), 3);
+    assert_no_leak();
+}
+
+/// A clock read behind an allowance's last refill (a counter read a little
+/// behind on another core, a recalibration) credits nothing, and the refill
+/// stays at the furthest time it has credited, so no interval is credited
+/// twice: the debt is repaid only as the clock passes it.
+#[test]
+#[serial]
+fn a_clock_read_behind_the_last_refill_credits_nothing() {
+    let _rate = EnvGuard::set("RUSTERON_DPDK_TX_RATE_MBPS", "8"); // a byte a microsecond
+    let _bucket = EnvGuard::set("RUSTERON_DPDK_TX_BUCKET_BYTES", "1500");
+    let _spin = EnvGuard::set("RUSTERON_DPDK_TX_PACE_SPIN_US", "0");
+    let mut h = Harness::new();
+    const T0: u64 = 1_000_000_000;
+    pin_clock_ns(T0); // after the harness's reset
+    h.init(
+        aeron_udp_channel_transport_affinity_t::AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_SENDER,
+        SENDER_IP,
+        40000,
+        None,
+        1472,
+    );
+    h.arp_seed([10, 0, 0, 5], [0x02, 0, 0, 0, 0, 0x50]);
+    let payload = vec![7u8; 958]; // 1000 bytes on the wire with the headers
+    let dst = ([10, 0, 0, 5], 40123);
+    assert_eq!(h.send_to(dst, &[&payload]).0, 1, "within the bucket");
+    assert_eq!(h.send_to(dst, &[&payload]).0, 1, "the last token: 500 owed");
+    pin_clock_ns(T0 - 1_000_000); // a millisecond behind the last refill
+    assert_eq!(h.send_to(dst, &[&payload]).0, 0, "a step back credits nothing");
+    pin_clock_ns(T0 + 400_000); // 400 of the 500 bytes owed back
+    assert_eq!(
+        h.send_to(dst, &[&payload]).0,
+        0,
+        "credited from the last refill, not from the step back"
+    );
+    pin_clock_ns(T0 + 500_000);
+    assert_eq!(h.send_to(dst, &[&payload]).0, 1, "repaid");
+    // the datagrams (the step back also has ARP refresh the next hop)
+    assert_eq!(captures().iter().filter(|c| eth_type(c) == 0x0800).count(), 3);
     assert_no_leak();
 }
 

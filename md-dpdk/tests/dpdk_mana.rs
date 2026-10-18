@@ -3,7 +3,7 @@
 //! and its queues hold at most 256 descriptors.
 //!
 //! Drives the runtime against the DPDK-free fakes: the fake port ops resolve a
-//! MAC-selected port to the fake port reporting that MAC. Linux x86_64 only.
+//! MAC-selected port to the fake port reporting that MAC. Linux x86_64 or aarch64.
 #![allow(
     missing_docs,
     unsafe_code,
@@ -13,7 +13,11 @@
     clippy::nursery,
     clippy::restriction
 )]
-#![cfg(all(feature = "dpdk", target_os = "linux", target_arch = "x86_64"))]
+#![cfg(all(
+    feature = "dpdk",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 mod common;
 use common::{
@@ -74,6 +78,25 @@ fn mana_rejects_more_than_256_descriptors() {
     config.rx_descriptors = 1024;
     let err = create(&config).unwrap_err();
     assert!(err.contains("256"), "got: {err}");
+}
+
+/// Unset, MANA's receive ring is its 256-descriptor maximum: netvsc sets its
+/// VF up with what it is given, whatever it reports itself.
+#[serial]
+#[test]
+fn mana_takes_its_256_descriptor_maximum_by_default() {
+    let env = TestEnv::new();
+    for driver in ["net_mana", "net_netvsc"] {
+        env.reset();
+        env.eal_skip();
+        env.set_driver(driver);
+        let mut config = rusteron_dpdk_config_t::mana();
+        config.rx_descriptors = 0;
+        let transport = create(&config).unwrap_or_else(|e| panic!("{driver}: {e}"));
+        assert!(log_contains(&env, "rx 0 (q=0 desc=256)"), "{driver}: sender");
+        assert!(log_contains(&env, "rx 1 (q=0 desc=256)"), "{driver}: receiver");
+        assert_eq!(close(transport), 0);
+    }
 }
 
 #[serial]
@@ -158,13 +181,14 @@ fn ena_ports_without_macs_are_still_accepted() {
     assert_eq!(close(transport), 0);
 }
 
+/// One PCI address per role, each naming ENA's LLQ policy (dpdk_ena_llq.rs).
 #[serial]
 #[test]
 fn eal_allow_list_for_ena_is_one_pci_address_per_role() {
     let _env = TestEnv::new();
     assert_eq!(
         eal_allow_args(&rusteron_dpdk_config_t::valid()).unwrap(),
-        "-a 0000:00:01.0 -a 0000:00:02.0"
+        "-a 0000:00:01.0,llq_policy=1 -a 0000:00:02.0,llq_policy=1"
     );
 }
 
@@ -205,7 +229,7 @@ fn eal_args_append_the_operator_options() {
     unsafe { std::env::remove_var("RUSTERON_DPDK_EAL_ARGS") };
     assert_eq!(
         args.unwrap(),
-        "-a 0000:00:01.0 -a 0000:00:02.0 --log-level=pmd.net.netvsc:debug -l 0"
+        "-a 0000:00:01.0,llq_policy=1 -a 0000:00:02.0,llq_policy=1 --log-level=pmd.net.netvsc:debug -l 0"
     );
 }
 
@@ -220,7 +244,10 @@ fn eal_args_are_never_cut_short() {
         let _args = EnvGuard::set("RUSTERON_DPDK_EAL_ARGS", &long);
         eal_allow_args(&rusteron_dpdk_config_t::valid())
     };
-    assert_eq!(whole.unwrap(), format!("-a 0000:00:01.0 -a 0000:00:02.0{long}"));
+    assert_eq!(
+        whole.unwrap(),
+        format!("-a 0000:00:01.0,llq_policy=1 -a 0000:00:02.0,llq_policy=1{long}")
+    );
     let refused = {
         let _args = EnvGuard::set("RUSTERON_DPDK_EAL_ARGS", &long.repeat(2)); // past the EAL's 1024
         eal_allow_args(&rusteron_dpdk_config_t::valid())

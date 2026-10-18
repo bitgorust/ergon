@@ -10,7 +10,7 @@
 | ergo-sbe (codec generator) | 0.1.x | schema 111 session + mark codecs |
 | Rust | 1.88+ | MSRV, edition 2024 |
 | OS | Linux x86-64, macOS aarch64 | CI-tested |
-| Java | 17+ | test harness only |
+| Java | 25 (17+) | Archive and Cluster; the test harness runs Temurin 25 in CI (17 for the Aeron 1.46.8 compatibility job). [Java for Archive and Cluster](../deploy/java.md) |
 
 ## Schema identities
 

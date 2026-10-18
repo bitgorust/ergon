@@ -7,6 +7,7 @@ mod support;
 
 use std::time::{Duration, Instant};
 
+use ergon_io::placement::HelperThread;
 use ergon_io::{
     AnyConn, AnyDial, Backend, Config, ConnId, Driver, Error, Handler, HttpConn, HttpDial,
     HttpHandler, HttpOptions, Response, RxMeta, WsDial, WsHandler, ws,
@@ -22,6 +23,9 @@ struct Collect {
     messages: Vec<(ConnId, Vec<u8>)>,
     closed: Vec<(ConnId, String)>,
     opened: Vec<ConnId>,
+    /// Closes with requests in flight: the first request not handed to the
+    /// kernel, and the cause.
+    unanswered: Vec<(ConnId, Option<u64>, String)>,
 }
 
 impl Handler for Collect {
@@ -29,6 +33,10 @@ impl Handler for Collect {
         self.opened.push(id);
     }
     fn on_closed(&mut self, id: ConnId, error: Error) {
+        if let Error::Unanswered(u) = &error {
+            self.unanswered
+                .push((id, u.first_unsent, u.cause.to_string()));
+        }
         self.closed.push((id, error.to_string()));
     }
 }
@@ -99,7 +107,15 @@ fn dial(lab: &Lab, opts: HttpOptions) -> R<HttpDial> {
 fn keep_alive_requests_on_every_backend() -> R {
     for b in Backend::ALL {
         let lab = Lab::new()?;
-        let mut d = http_driver(b)?;
+        let mut d = match http_driver(b) {
+            Ok(d) => d,
+            // A pod with one CPU has no core for SQPOLL (asserted in
+            // driver.rs's `each_backend`); the other backends run the body.
+            Err(e) if b == Backend::UringSqpoll && support::refused(&*e, HelperThread::SqPoll) => {
+                continue;
+            }
+            Err(e) => return Err(format!("{b}: {e}").into()),
+        };
         std::thread::scope(|s| -> R {
             let srv = s.spawn(|| -> R {
                 let mut p = lab.accept_tls()?;
@@ -290,10 +306,116 @@ fn request_timeout_closes_the_connection() -> R {
         assert!(t0.elapsed() >= Duration::from_millis(50));
         assert_eq!(h.closed[0].0, id);
         assert!(h.closed[0].1.contains("timed out"), "{}", h.closed[0].1);
+        // The request was handed to the kernel: it may have run.
+        assert_eq!(
+            h.unanswered,
+            vec![(id, None, "timed out: http request".to_owned())]
+        );
         assert!(d.get(id).is_none());
         srv.join().map_err(|_| "server panicked")??;
         Ok(())
     })
+}
+
+#[test]
+fn a_close_with_a_request_in_flight_says_it_was_handed() -> R {
+    let lab = Lab::new()?;
+    let mut d = http_driver(Backend::RecvBusy)?;
+    std::thread::scope(|s| -> R {
+        let srv = s.spawn(|| -> R {
+            let mut p = lab.accept_tls()?;
+            p.read_request()?;
+            drop(p); // no reply
+            Ok(())
+        });
+        let mut h = Collect::default();
+        let id = d.connect(dial(&lab, HttpOptions::default())?)?;
+        poll_until(&mut d, &mut h, |h| !h.opened.is_empty())?;
+        d.get_mut(id).ok_or("gone")?.request("GET", "/", &[], &[])?;
+        poll_until(&mut d, &mut h, |h| !h.closed.is_empty())?;
+        assert_eq!(
+            h.unanswered,
+            vec![(id, None, "peer closed the connection".to_owned())]
+        );
+        srv.join().map_err(|_| "server panicked")??;
+        Ok(())
+    })
+}
+
+/// Pipelined requests the kernel could not take before the server reset
+/// the connection: the first of them, and every later one, cannot have
+/// reached the server.
+#[test]
+fn requests_never_handed_to_the_kernel_are_named() -> R {
+    const N: usize = 1_000;
+    for b in Backend::ALL {
+        let lab = Lab::new()?;
+        let mut d = match http_driver(b) {
+            Ok(d) => d,
+            // A pod with one CPU has no core for SQPOLL (asserted in
+            // driver.rs's `each_backend`); the other backends run the body.
+            Err(e) if b == Backend::UringSqpoll && support::refused(&*e, HelperThread::SqPoll) => {
+                continue;
+            }
+            Err(e) => return Err(format!("{b}: {e}").into()),
+        };
+        let (go, wait_go) = std::sync::mpsc::channel::<()>();
+        let (gone, wait_gone) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|s| -> R {
+            let l = &lab;
+            let srv = s.spawn(move || -> R<usize> {
+                let mut p = l.accept_tls()?;
+                // Once the client has queued everything and sent what the
+                // kernel took (and stopped polling), read what arrived.
+                wait_go.recv_timeout(Duration::from_secs(10))?;
+                p.sock.set_read_timeout(Some(Duration::from_millis(300)))?;
+                let mut seen = 0;
+                while p.read_request().is_ok() {
+                    seen += 1;
+                }
+                socket2::SockRef::from(&p.sock).set_linger(Some(Duration::ZERO))?;
+                drop(p); // reset
+                gone.send(())?;
+                Ok(seen)
+            });
+            let result = (|| -> R<Option<u64>> {
+                let mut h = Collect::default();
+                let opts = HttpOptions {
+                    max_in_flight: N,
+                    ..HttpOptions::default()
+                };
+                let id = d.connect(dial(&lab, opts)?)?;
+                poll_until(&mut d, &mut h, |h| !h.opened.is_empty())?;
+                let body = vec![b'x'; 15_000];
+                for _ in 0..N {
+                    d.get_mut(id)
+                        .ok_or("gone")?
+                        .request("POST", "/", &[], &body)?;
+                }
+                for _ in 0..100 {
+                    d.poll(&mut h)?;
+                }
+                go.send(())?;
+                wait_gone.recv_timeout(Duration::from_secs(30))?;
+                poll_until(&mut d, &mut h, |h| !h.closed.is_empty())?;
+                assert_eq!(h.unanswered.len(), 1, "{b}: {:?}", h.closed);
+                Ok(h.unanswered[0].1)
+            })();
+            let seen = srv.join().map_err(|_| "server panicked")??;
+            let first_unsent = result?;
+            // 15 MB cannot all be in the two kernels' buffers: on epoll the
+            // driver counts exactly what `send` took. io_uring counts what
+            // it submitted, an upper bound, so it may name none.
+            if !b.is_uring() {
+                let k = first_unsent.ok_or_else(|| format!("{b}: every request handed"))?;
+                assert!(usize::try_from(k)? < N, "{b}: {k}");
+            }
+            let handed = first_unsent.map_or(N, |k| usize::try_from(k).unwrap_or(N));
+            assert!(seen <= handed, "{b}: server read {seen}, handed {handed}");
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 #[test]

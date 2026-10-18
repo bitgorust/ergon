@@ -51,7 +51,7 @@ library at runtime.
 | [`cluster-rfq/`](cluster-rfq/) | **Build only** | RFQ / auction protocol codecs + cluster examples | Java harness for live examples |
 | [`cluster-ha-orderbook/`](cluster-ha-orderbook/) | **Build only** (may still dep cluster) | Claim-based Cluster publishing + HA-shaped book | Java harness only for leader-kill coverage |
 | [`sbe-codegen-examples/`](sbe-codegen-examples/) | **Runtime only** | Generator API as a library (no `build.rs`) | None |
-| [`cluster-tutorial/`](cluster-tutorial/) | **Neither** (uses `ergo-aeron-cluster`) | Connect, offer, poll, keep-alive, close walkthrough | Java 17+ and built Aeron artifacts |
+| [`cluster-tutorial/`](cluster-tutorial/) | **Neither** (uses `ergo-aeron-cluster`) | Connect, offer, poll, keep-alive, close walkthrough | JDK 25 (17+) and built Aeron artifacts |
 
 ### Seeing generated code (without committing it)
 

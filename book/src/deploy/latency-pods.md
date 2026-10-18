@@ -29,7 +29,7 @@ facts.
 | # | extension | mechanism | pod opt-in | env the app sees |
 |---|---|---|---|---|
 | 1 | sized hugetlbfs for `AERON_DIR` | NRI `AddMount` `type: hugetlbfs` with `pagesize=2M,size=N`, plus `AddLinuxHugepageLimit`; N is the container's `hugepages-2Mi` limit | `hugepages.ergon.io/<ctr>: "2M"` and a `hugepages-2Mi` resource (requests = limits) | `ERGON_HUGEPAGES_DIR`, `ERGON_HUGEPAGE_SIZE` |
-| 2 | `cpuset.cpus.partition=isolated` on the exclusive CPUs | a `createRuntime` hook makes a **child** cgroup holding only those CPUs, writes `cpuset.cpus.exclusive` down the hierarchy, then `cpuset.cpus.partition=isolated`, and reads it back | `cpu-partition.ergon.io/<ctr>: "isolated"` | `ERGON_ISOLATED_CGROUP`, `ERGON_ISOLATED_CPUS`, `ERGON_SHARED_CPUS` |
+| 2 | `cpuset.cpus.partition=isolated` on the exclusive CPUs | a `createRuntime` hook makes a **child** cgroup holding only those CPUs, unions them into the ancestors' `cpuset.cpus.exclusive`, then writes `cpuset.cpus.partition=isolated`, and reads every write back. Takes whole processes, not one thread (see below) | `cpu-partition.ergon.io/<ctr>: "isolated"` | `ERGON_ISOLATED_CGROUP`, `ERGON_ISOLATED_CPUS`, `ERGON_SHARED_CPUS` |
 | 3 | io_uring seccomp profile | (a) NRI `SetLinuxSeccompPolicy`: the request's profile plus the `io_uring_*` allow rules; (b) fallback, pod field `seccompProfile: Localhost` | `seccomp.ergon.io/<ctr>: "io-uring"` (or the Localhost fallback) | `ERGON_SECCOMP` |
 | 4 | no exec probes, no always-restart sidecars | `ValidatingAdmissionPolicy` (CEL, GA 1.30) | pod label `ergon.io/latency: "hot"` | — |
 | 5 | device grants | NRI `AddDevice`, plus a read-only bind of the node facts file | `ptp.ergon.io/<ctr>: "auto"` (the NIC PHC); `cpuqos.ergon.io/<ctr>` (`/dev/cpu_dma_latency`, x86 only) | `ERGON_PTP_DEVICE`, `ERGON_NODE_FACTS`, `ERGON_CPU_DMA_LATENCY` |
@@ -53,10 +53,32 @@ to 106 µs (the p99 moved far less; the max is what matters).
 
 ### 2. Isolated partition
 
-The loop's core must not be woken by the scheduler. `cpuset.cpus.partition=isolated`
-makes the kernel treat the set as isolated: no load balancing into it,
-and wake-ups of its threads do not run on it. The grant is applied to a
-child cgroup so the pod's own cgroup keeps its shared CPUs.
+The loop's core must not be woken by the scheduler.
+`cpuset.cpus.partition=isolated` makes the kernel treat the set as
+isolated: no load balancing into it, and wake-ups of other tasks do not
+run on it. The grant is applied to a **child** cgroup so the pod's own
+cgroup keeps its shared CPUs.
+
+**What moves into the child: whole processes, not one thread.** A
+domain cgroup takes a thread group through `cgroup.procs`;
+`cgroup.threads` only exists in a threaded subtree, and a threaded
+subtree cannot use cpuset partitions. So:
+
+| app shape | how the exclusive CPUs are used |
+|---|---|
+| one process whose threads all belong on the exclusive CPUs | write the pid to `$ERGON_ISOLATED_CGROUP/cgroup.procs`, then pin each thread to `ERGON_ISOLATED_CPUS` |
+| one hot thread in a multi-threaded process (a media driver: sender, receiver, conductor) | the thread stays in the container cgroup and is placed with `sched_setaffinity`. The partition cannot take it alone. Isolation then comes from the boot line: `isolcpus=managed_irq,domain,E nohz_full=E rcu_nocbs=E` |
+
+The second row is the common case, and it is why the worked example in
+[Shared CPUs](shared-cpus.md#worked-example-an-aeron-media-driver) uses
+the boot line rather than this annotation. On a managed node where the
+boot line cannot be changed there is currently no way to isolate the
+exclusive CPUs of only some threads of a process.
+
+`cpuset.cpus.exclusive` is a **replace**, not a union, so every directory
+the new partition shares with an already-running pod has to be updated
+with the union of both reservations. The hook does that under a lock and
+reads every write back; a write that does not stick fails the create.
 
 ### 3. io_uring
 

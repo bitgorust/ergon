@@ -9,8 +9,18 @@
 #   guest-agent A/B, with the loop on a CPU the gap map saw stall; sqtick: the SQPOLL CPU with and
 #   without nohz_full (boot profiles full and full-sqtick), A/B/A/B; http: ergon-io (every backend),
 #   libcurl (distro, source) and reqwest; md: market data, two backends paired per message;
-#   many: 100 connections with mixed trickle and bursts, each backend alone
+#   many: 100 connections with mixed trickle and bursts, each backend alone; fair: every
+#   backend with its own best tuning on the same hosts (lib-matrix.sh run_fair; the plan and
+#   estimate are Azure's: scripts/azure-flags.sh MODE=fair DRY_RUN=1)
 #   RCV_TYPE=c7i.2xlarge SND_TYPE=c7i.xlarge AZ_ID=apne1-az4 REGION=ap-northeast-1
+#   NIC=stock|tuned RCV_BOOT=full BUILD_RUSTFLAGS=<per host> (scripts/lib-cloud.sh)
+#
+# Graviton: RCV_TYPE (or SND_TYPE) may be an Arm type such as c7g.2xlarge or
+# c8g.2xlarge; each host boots Ubuntu for its own architecture, and the host
+# set-up applies Graviton's own settings (core layout without SMT, idle CPUs
+# polling on the sender, Rust built for its Neoverse core). The sender may
+# stay the x86 rig: its programs are then built on it. See BENCHMARK.md,
+# "Graviton".
 #
 # Every resource carries the tags owner=ergon-lab and run=<stamp>: a key pair,
 # a security group, a cluster placement group and two instances (their root
@@ -214,6 +224,19 @@ deadman() {
 }
 prepare_hosts
 deadman
+if [[ $MODE == fair ]]; then
+  # The fair report's heading: the run id and the environment.
+  FAIR_ENV="run=$STAMP
+cloud=aws
+region=$REGION $AZ_ID
+arch=$RARCH
+priority=on-demand
+receiver=$RCV_TYPE
+sender=$SND_TYPE
+image=Ubuntu 24.04 (Canonical, SSM parameter)
+receiver_cpu=$(host_facts rssh | cut -d' ' -f3-)
+kernel=$(rssh uname -r)"
+fi
 case $MODE in
   base) run_base_only ;;
   base-many) run_base_only; run_many ;;
@@ -223,6 +246,7 @@ case $MODE in
   http) run_http ;;
   md) run_md ;;
   many) run_many ;;
+  fair) run_fair ;;
   *) run_matrix ;;
 esac
 collect_results

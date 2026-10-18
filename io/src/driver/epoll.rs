@@ -1,22 +1,22 @@
 //! `epoll-spin`, `epoll-busy` and `recv-busy`.
 //!
-//! - `epoll-spin`: `epoll_wait(timeout = 0)` every poll, then one `recvmsg` per
-//!   ready socket (level-triggered, so data left behind is reported again).
-//! - `epoll-busy`: `epoll_pwait2(wait_us)` with busy poll enabled on the epoll
+//! - `epoll-spin`: `epoll_wait(timeout = 0)` every poll, then one `recvmsg`
+//!   per ready socket (level-triggered: data left behind is reported again).
+//! - `epoll-busy`: `epoll_pwait2(wait_us)` with busy poll on the epoll
 //!   instance (`EPIOCSPARAMS`, carrying `Config::prefer_busy_poll` and
-//!   `busy_poll_budget`): when nothing is ready the kernel polls the NIC queue
+//!   `busy_poll_budget`). With nothing ready the kernel polls the NIC queue
 //!   for up to `busy_poll_us`, then sleeps until an event or the timeout. A
 //!   zero timeout returns before the busy loop, so this backend sleeps by
-//!   design. An epoll instance tracks one NAPI id, so with
-//!   sockets on several RX queues only one is polled.
-//! - `recv-busy`: no epoll; a non-blocking `recvmsg` on every socket every poll,
-//!   with `SO_BUSY_POLL` set (by [`super::Driver::add`]). An empty read runs
-//!   `sk_busy_loop(sk, nonblock)`: one NAPI pass, then `EAGAIN`. Never sleeps.
-//!   A poll costs one syscall per socket, so with many sockets
-//!   `Config::per_queue` reads one socket per NIC queue (its NAPI id; sockets
-//!   whose queue is not known yet are all read), which polls every queue
-//!   once, then `epoll_wait(0)` for the sockets those passes (or interrupts)
-//!   made ready: queues plus ready sockets per poll instead of every socket.
+//!   design. An epoll instance tracks one NAPI id: with sockets on several
+//!   RX queues, only one queue is polled.
+//! - `recv-busy`: no epoll. A non-blocking `recvmsg` on every socket every
+//!   poll, with `SO_BUSY_POLL` set (by [`super::Driver::add`]). An empty read
+//!   runs `sk_busy_loop(sk, nonblock)`: one NAPI pass, then `EAGAIN`. Never
+//!   sleeps. One syscall per socket per poll.
+//! - `recv-busy` with `Config::per_queue`: one read per NIC queue (one
+//!   socket per NAPI id; sockets whose queue is not known yet are all read),
+//!   which polls every queue once, then `epoll_wait(0)` for the sockets those
+//!   passes (or interrupts) made ready.
 #![allow(unsafe_code)]
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -48,6 +48,11 @@ pub(super) struct Epoll {
     reps: Vec<usize>,
     /// Sockets came or went, or a queue may have become known.
     dirty: bool,
+    /// A socket was added or removed: the cached NAPI ids are stale. A slot
+    /// that is reused for a connection on a different queue kept the previous
+    /// connection's id, so the new socket was never chosen as a polling
+    /// representative and lost busy polling until the end of the run.
+    rebind: bool,
     polls: u64,
     ep: Option<OwnedFd>,
     slot: Box<MsgSlot>,
@@ -84,6 +89,7 @@ impl Epoll {
             polled: Vec::new(),
             reps: Vec::new(),
             dirty: true,
+            rebind: true,
             polls: 0,
             ep,
             slot: MsgSlot::new(),
@@ -97,6 +103,12 @@ impl Epoll {
 
     pub(super) fn add(&mut self, fd: RawFd, id: ConnId) -> Result<()> {
         self.dirty = true;
+        // The slot may be a reused one whose cached NAPI id belongs to the
+        // connection that left it.
+        self.rebind = true;
+        if let Some(n) = self.napi.get_mut(id.index()) {
+            *n = 0;
+        }
         let Some(ep) = &self.ep else {
             return Ok(());
         };
@@ -113,6 +125,8 @@ impl Epoll {
 
     pub(super) fn remove(&mut self, fd: RawFd) {
         self.dirty = true;
+        // Whoever takes this slot next must learn its own queue.
+        self.rebind = true;
         if let Some(ep) = &self.ep {
             // SAFETY: valid fds; a null event is allowed for DEL.
             unsafe {
@@ -147,7 +161,13 @@ impl Epoll {
             // now and then until every socket's is known.
             self.polls += 1;
             if self.dirty || self.polls.is_multiple_of(4096) {
-                self.pick_reps(conns);
+                // A socket coming or going, and the periodic look-again, both
+                // refresh every id: a NIC can move a queue under a live
+                // socket (RSS remap), and a reused slot can hold the previous
+                // connection's queue. A rebuild only to fill ids that are
+                // still unknown reads nothing new.
+                let refresh_all = self.rebind || self.polls.is_multiple_of(4096);
+                self.pick_reps(conns, refresh_all);
             }
             for k in 0..self.reps.len() {
                 let i = self.reps[k];
@@ -189,6 +209,7 @@ impl Epoll {
             return;
         };
         if let Err(e) = recv_one(conn, id, &mut self.slot, handler, stats, read_seq) {
+            let e = conn.close_reason(e);
             self.remove(conn.fd());
             conns.remove(i);
             stats.closed += 1;
@@ -197,9 +218,17 @@ impl Epoll {
     }
 
     /// One slot per known NIC queue, plus every slot whose queue is unknown.
-    fn pick_reps<E: Endpoint>(&mut self, conns: &mut Conns<E>) {
+    ///
+    /// `refresh_all` drops every cached queue id first, so each live socket is
+    /// asked again which queue it is on. Without it only ids that are still
+    /// unknown are read, which never corrects an id that has gone stale.
+    fn pick_reps<E: Endpoint>(&mut self, conns: &mut Conns<E>, refresh_all: bool) {
         let n = conns.len_slots();
         self.napi.resize(n, 0);
+        if refresh_all {
+            self.rebind = false;
+            self.napi.fill(0);
+        }
         self.polled.clear();
         self.polled.resize(n, false);
         self.reps.clear();

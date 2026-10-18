@@ -886,18 +886,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "ergon-clock"
+version = "0.1.30"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "ergon-clock-bench"
+version = "0.1.30"
+dependencies = [
+ "criterion",
+ "ergon-clock",
+ "libc",
+ "minstant",
+ "quanta",
+]
+
+[[package]]
 name = "ergon-io"
 version = "0.1.30"
 dependencies = [
  "base64 0.22.1",
  "curl",
+ "ergon-tune",
  "httparse",
  "io-uring",
  "libc",
+ "mio",
  "rcgen",
  "ring",
  "rustls",
  "socket2",
+ "tokio",
  "webpki-roots",
 ]
 
@@ -908,11 +929,14 @@ dependencies = [
  "cc",
  "criterion",
  "ctrlc",
+ "ergon-clock",
+ "ergon-tune",
  "libc",
  "log",
  "minstant",
  "pkg-config",
  "rusteron-media-driver",
+ "rustix",
  "serial_test",
 ]
 
@@ -940,6 +964,7 @@ name = "ergon-md-dpdk-harness"
 version = "0.1.30"
 dependencies = [
  "env_logger",
+ "ergon-clock",
  "ergon-md-dpdk",
  "hdrhistogram",
  "libc",
@@ -947,6 +972,13 @@ dependencies = [
  "minstant",
  "rusteron-client",
  "rusteron-media-driver",
+]
+
+[[package]]
+name = "ergon-tune"
+version = "0.1.30"
+dependencies = [
+ "rustix",
 ]
 
 [[package]]
@@ -1611,6 +1643,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -2081,6 +2114,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "quanta"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73be39b77b45d82a4d1a5793fe9a89a5c143ceaa6ad0d8417982566bb0f34e11"
+dependencies = [
+ "libc",
+ "portable-atomic",
+ "raw-cpuid",
+ "wasip1",
+ "wasip2",
+ "web-sys",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2173,6 +2221,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "raw-cpuid"
+version = "11.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
+dependencies = [
+ "bitflags 2.13.1",
 ]
 
 [[package]]
@@ -3160,6 +3217,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
+name = "wasip1"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e26842486624357dbeb8f0381cf1fb42f022291fd787d4a816768fec8cc760"
+
+[[package]]
 name = "wasip2"
 version = "1.0.4+wasi-0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3429,6 +3492,9 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+dependencies = [
+ "bitflags 2.13.1",
+]
 
 [[package]]
 name = "x509-parser"

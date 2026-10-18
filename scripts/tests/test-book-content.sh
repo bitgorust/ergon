@@ -43,6 +43,50 @@ fi
 BOOK_CONTENT_ROOT="$fixture/prose" "$checker" >"$fixture/prose.out"
 grep -F -q 'check-book-content: PASS' "$fixture/prose.out"
 
+# An {{#include}} whose file or anchor is gone must fail: mdbook (0.4 and 0.5)
+# renders an empty block and exits 0, and the SBE fence harness skips
+# `rust,ignore` and non-Rust fences, so nothing else notices.
+mkdir -p "$fixture/includes/ok" "$fixture/includes/anchor" "$fixture/includes/file"
+cat > "$fixture/includes/code.rs" <<'EOF'
+// ANCHOR: present
+fn present() {}
+// ANCHOR_END: present
+EOF
+cat > "$fixture/includes/ok/page.md" <<'EOF'
+```rust,ignore
+{{#include ../code.rs:present}}
+```
+
+```rust,ignore
+{{#include ../code.rs}}
+```
+
+```rust,ignore
+{{#include ../code.rs:2:3}}
+```
+EOF
+cat > "$fixture/includes/anchor/page.md" <<'EOF'
+```rust,ignore
+{{#include ../code.rs:renamed}}
+```
+EOF
+cat > "$fixture/includes/file/page.md" <<'EOF'
+```yaml
+{{#include ../moved.yaml}}
+```
+EOF
+BOOK_CONTENT_ROOT="$fixture/includes/ok" "$checker" >"$fixture/include-ok.out"
+grep -F -q 'check-book-content: PASS' "$fixture/include-ok.out"
+for case in anchor file; do
+    if BOOK_CONTENT_ROOT="$fixture/includes/$case" "$checker" >"$fixture/include-$case.out" 2>&1; then
+        echo "expected an {{#include}} with a missing $case to fail" >&2
+        cat "$fixture/include-$case.out" >&2
+        exit 1
+    fi
+done
+grep -F -q "anchor 'renamed' not found" "$fixture/include-anchor.out"
+grep -F -q 'moved.yaml' "$fixture/include-file.out"
+
 "$checker" >"$fixture/real.out"
 grep -F -q 'check-book-content: PASS' "$fixture/real.out"
 echo "test-book-content: PASS"

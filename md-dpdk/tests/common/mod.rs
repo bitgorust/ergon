@@ -17,6 +17,7 @@
 )]
 #![allow(dead_code)]
 
+pub mod driver;
 pub mod transport;
 
 use std::ffi::{CStr, CString};
@@ -60,6 +61,8 @@ pub struct rusteron_dpdk_config_t {
     pub sender_mac: [c_char; 18],
     pub receiver_mac: [c_char; 18],
     pub rx_hw_timestamp: u8,
+    /// ergon-clock's calibration, which the transport's clock adopts.
+    pub clock: ergon_clock::advanced::Params,
 }
 
 // The C layout, field by field (asserted in native/dpdk/rusteron_dpdk_transport.c
@@ -88,7 +91,8 @@ const _: () = {
     assert!(offset_of!(C, sender_mac) == 4288);
     assert!(offset_of!(C, receiver_mac) == 4306);
     assert!(offset_of!(C, rx_hw_timestamp) == 4324);
-    assert!(size_of::<C>() == 4328);
+    assert!(offset_of!(C, clock) == 4328);
+    assert!(size_of::<C>() == 4376);
 };
 
 impl rusteron_dpdk_config_t {
@@ -115,6 +119,7 @@ impl rusteron_dpdk_config_t {
             sender_mac: [0; 18],
             receiver_mac: [0; 18],
             rx_hw_timestamp: 0,
+            clock: test_clock().params(),
         };
         fill_cstr(&mut c.file_prefix, "rusteron-ena");
         fill_cstr(&mut c.hugepage_dir, "/dev/hugepages");
@@ -235,6 +240,25 @@ impl TestEnv {
         unsafe { rusteron_dpdk_fake_set_rx_timestamp_ok(ok as c_int) };
     }
 
+    /// How a fake ENA port reports its LLQ BAR mapped (`ENA_LLQ_*`;
+    /// write-combined after reset).
+    pub fn set_ena_llq(&self, state: c_int) {
+        unsafe { rusteron_dpdk_fake_set_ena_llq(state) };
+    }
+
+    /// The DPDK version the fake EAL reports (25.11 after reset), which picks
+    /// ENA's LLQ device argument.
+    pub fn set_eal_version(&self, year: c_int, month: c_int) {
+        unsafe { rusteron_dpdk_fake_set_eal_version(year, month) };
+    }
+
+    /// The kernel driver every PCI port reads as bound to (its sysfs driver
+    /// link: `vfio-pci`, `igb_uio`), until reset; reset reads sysfs again.
+    pub fn set_kernel_driver(&self, driver: &str) {
+        let c = CString::new(driver).unwrap();
+        unsafe { rusteron_dpdk_test_set_pci_kernel_driver(c.as_ptr()) };
+    }
+
     pub fn log_count(&self) -> c_int {
         unsafe { rusteron_dpdk_fake_log_count() }
     }
@@ -293,11 +317,14 @@ pub fn dump(transport: *const c_void) -> Dump {
     d
 }
 
-/// Mirror of the fake's capture slot (native/dpdk/fake/rusteron_dpdk_fake_port_ops.c).
+/// The largest frame the fake carries (`RUSTERON_DPDK_FAKE_FRAME_MAX`).
+pub const FAKE_FRAME_MAX: usize = 9216;
+
+/// Mirror of the fake's capture slot (native/dpdk/test/rusteron_dpdk_fake.h).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FakeCapture {
-    pub data: [u8; 2048],
+    pub data: [u8; FAKE_FRAME_MAX],
     pub len: u32,
     pub ol_flags: u32,
     pub l2_len: u16,
@@ -354,6 +381,13 @@ unsafe extern "C" {
     fn rusteron_dpdk_fake_log_count() -> c_int;
     fn rusteron_dpdk_fake_log_at(index: c_int, buf: *mut c_char, buflen: usize);
     fn rusteron_dpdk_fake_eal_reset();
+    fn rusteron_dpdk_fake_set_ena_llq(state: c_int);
+    fn rusteron_dpdk_fake_set_eal_version(year: c_int, month: c_int);
+    /// How `bdf`'s BAR 2 is mapped in the memory map at `maps_path`
+    /// (`ENA_LLQ_*`; native/dpdk/rusteron_dpdk_runtime.c).
+    pub fn rusteron_dpdk_ena_llq_mapping(maps_path: *const c_char, bdf: *const c_char) -> c_int;
+    /// Reads of the pinned realtime clock since the reset.
+    pub fn rusteron_dpdk_test_realtime_reads() -> u64;
 
     // Shared native test hooks. These used to be duplicated in every test
     // file's extern block; only `rusteron_dpdk_transport_bindings` (its
@@ -384,10 +418,24 @@ unsafe extern "C" {
         hw_rx_ns: u64,
     ) -> c_int;
     pub fn rusteron_dpdk_test_set_realtime_ns(ns: u64);
+    /// Each read of the pinned realtime clock advances it by `ns` after
+    /// returning (0, the reset's: it stays put).
+    pub fn rusteron_dpdk_test_set_realtime_step_ns(ns: u64);
     /// The transport's clock before the TSC change, kept in the fake archive
     /// for the clock benchmark: CLOCK_MONOTONIC in milliseconds.
     pub fn rusteron_dpdk_fake_legacy_clock_ms() -> u64;
     pub fn rusteron_dpdk_fake_set_max_mtu(mtu: u16);
+    /// Each pool's mbufs hold at most `room` bytes of data, whatever was
+    /// asked (0: as asked); the fake logs what was asked.
+    pub fn rusteron_dpdk_fake_set_mbuf_room_cap(room: u32);
+    /// The timer service's calls, those from a thread the fake EAL never
+    /// registered, whether this thread made the last, and its result.
+    pub fn rusteron_dpdk_fake_timer_service_calls() -> c_int;
+    pub fn rusteron_dpdk_fake_timer_service_unregistered() -> c_int;
+    pub fn rusteron_dpdk_fake_timer_service_on_caller() -> c_int;
+    pub fn rusteron_dpdk_fake_set_timer_service_rc(rc: c_int);
+    /// A device-reset request (`RTE_ETH_EVENT_INTR_RESET`) from the port's PMD.
+    pub fn rusteron_dpdk_fake_raise_reset(port_id: u16);
     /// The descriptor limits the fake ports report (0: none).
     pub fn rusteron_dpdk_fake_set_desc_limits(rx_min: u16, rx_max: u16, tx_min: u16, tx_max: u16);
     pub fn rusteron_dpdk_fake_set_basic_stats(ierrors: u64, imissed: u64, rx_nombuf: u64);
@@ -405,7 +453,76 @@ unsafe extern "C" {
     pub fn rusteron_dpdk_test_set_clock_step_ns(ns: u64);
     pub fn rusteron_dpdk_clock_ns() -> u64;
     pub fn rusteron_dpdk_clock_source() -> c_int;
-    pub fn rusteron_dpdk_test_clock_recalibrate(allow_tsc: c_int) -> c_int;
+    /// Adopt ergon-clock's calibration as the transport's clock, as create
+    /// does with its configuration's (0, or -1 with the error recorded).
+    pub fn rusteron_dpdk_clock_adopt(params: *const ergon_clock::advanced::Params) -> c_int;
+    fn rusteron_dpdk_test_set_pci_kernel_driver(driver: *const c_char);
+}
+
+/// How an ENA's LLQ BAR (BAR 2) is mapped (`RUSTERON_DPDK_ENA_LLQ_*` in
+/// native/dpdk/rusteron_dpdk_port_ops.h).
+pub const ENA_LLQ_WC: c_int = 1;
+pub const ENA_LLQ_UNCACHED: c_int = 2;
+pub const ENA_LLQ_UNSEEN: c_int = 3;
+pub const ENA_LLQ_UNKNOWN: c_int = 4;
+
+/// The clock every test transport adopts ([`rusteron_dpdk_config_t::valid`]):
+/// the transport's own, ergon-clock's calibration as `DpdkTransport::install`
+/// makes it (once a process).
+pub fn test_clock() -> ergon_clock::advanced::Clock {
+    ergon_md_dpdk::clock::transport_clock(ergon_md_dpdk::clock::ClockChoice::Counter)
+        .unwrap_or_else(|e| panic!("the transport's clock: {e}"))
+        .clock
+}
+
+/// A counter clock made from parameters (another calibration's, as
+/// ergon-clock lets a process share one), wherever this process can read the
+/// counter: the transport's counter path is exercised even on a host whose
+/// own calibration falls back (amd64 emulated on an arm64 kernel, whose clock
+/// source is not the TSC). The rate is measured roughly over 10 ms; the
+/// native and ergon-clock reads convert the same ticks either way. Panics
+/// where the counter cannot be read (x86_64 without `rdtscp`).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn counter_clock() -> ergon_clock::advanced::Clock {
+    use std::time::{Duration, Instant};
+    #[cfg(target_arch = "x86_64")]
+    let read = ergon_clock::advanced::raw::rdtsc;
+    #[cfg(target_arch = "aarch64")]
+    let read = ergon_clock::advanced::raw::cntvct;
+    let (t0, i0) = (read(), Instant::now());
+    while i0.elapsed() < Duration::from_millis(10) {
+        std::hint::spin_loop();
+    }
+    let (t1, i1) = (read(), Instant::now());
+    let hz = u64::try_from(u128::from(t1 - t0) * 1_000_000_000 / (i1 - i0).as_nanos()).unwrap();
+    let (mono, _) = ergon_clock::advanced::MonotonicClock::always(ergon_clock::Domain::Monotonic);
+    let scale = ergon_clock::advanced::Scale::from_hz(hz, read(), mono.now_ns()).unwrap();
+    let params = ergon_clock::advanced::Params {
+        version: ergon_clock::advanced::PARAMS_VERSION,
+        kind: ergon_clock::advanced::KIND_COUNTER,
+        domain: 0,
+        reserved: 0,
+        base_ticks: scale.base_ticks(),
+        base_ns: scale.base_ns(),
+        mult: scale.mult(),
+        hz: scale.hz(),
+    };
+    ergon_clock::advanced::Clock::Counter(
+        ergon_clock::advanced::CounterClock::from_params(&params)
+            .unwrap_or_else(|e| panic!("this process cannot read the counter: {e}")),
+    )
+}
+
+/// The clock source a test transport reports (`rusteron_dpdk_clock_source`,
+/// counter type 80): ergon-clock's choice for this host, 1 for the TSC on
+/// x86_64 or 2 for the generic timer's virtual counter (`CNTVCT_EL0`) on
+/// aarch64, else 0, its `CLOCK_MONOTONIC` fallback.
+pub fn expected_counter_source() -> c_int {
+    match (test_clock().is_counter(), cfg!(target_arch = "aarch64")) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+    }
 }
 
 /// Pin the transport clock at `ms` milliseconds (stored in nanoseconds).
@@ -424,16 +541,6 @@ pub fn pin_clock_ns(ns: u64) {
 /// leave it where it is. `TestEnv::new` clears it.
 pub fn step_pinned_clock_ns(ns: u64) {
     unsafe { rusteron_dpdk_test_set_clock_step_ns(ns) };
-}
-
-/// Whether the CPU advertises an invariant TSC (`constant_tsc` and
-/// `nonstop_tsc`), the condition under which the transport clocks with TSC.
-pub fn cpu_has_invariant_tsc() -> bool {
-    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    cpuinfo.lines().filter(|l| l.starts_with("flags")).take(1).any(|l| {
-        let flags: Vec<&str> = l.split_whitespace().collect();
-        flags.contains(&"constant_tsc") && flags.contains(&"nonstop_tsc")
-    })
 }
 
 /// The mbuf pool must be balanced after every test (allocated == released).
@@ -457,6 +564,12 @@ impl EnvGuard {
     pub fn set(key: &'static str, value: &str) -> Self {
         let previous = std::env::var(key).ok();
         unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+
+    pub fn unset(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        unsafe { std::env::remove_var(key) };
         Self { key, previous }
     }
 }

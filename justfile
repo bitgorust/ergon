@@ -19,7 +19,8 @@ default:
 
 # ── build ─────────────────────────────────────────────────────────────────
 
-# Compile product workspace + sample harnesses (no tests, no Java jars).
+# Compile product workspace + sample harnesses, then check that rusteron, the
+# aeron submodule and any jars built in it are one Aeron release (no tests, no Java jars).
 build:
     cargo build --workspace --all-features --exclude ergo-aeron-cluster-test-harness --exclude ergon-md-dpdk --exclude ergon-md-dpdk-harness
     cargo build -p ergon-md-dpdk -p ergon-md-dpdk-harness --all-targets
@@ -27,6 +28,8 @@ build:
     cd samples/exchange-example && cargo build
     cd samples/cluster-ha-orderbook && cargo build
     cd samples/cluster-rfq && cargo build
+    # Last, so cargo has fetched the rusteron sources the offline check reads.
+    ./scripts/check-aeron-version.sh
 
 # ── check ─────────────────────────────────────────────────────────────────
 
@@ -42,11 +45,14 @@ policy:
     bash scripts/tests/test-cluster-ergo-sbe-features.sh
     bash scripts/tests/test-book-content.sh
     bash scripts/tests/test-rerun-if-changed.sh
+    bash scripts/tests/test-aeron-version.sh
+    bash scripts/tests/test-publish-set.sh
     ./scripts/check-test-policy.sh
     ./scripts/check-mutation-config.sh
     ./scripts/check-stale-deny-ignores.sh
     ./scripts/check-cluster-ergo-sbe-features.sh
     ./scripts/check-rerun-if-changed.sh
+    ./scripts/check-publish-set.sh
 
 # Every cheap correctness gate in one pass — the ones that otherwise only run
 # inside `just release`.
@@ -88,6 +94,8 @@ preflight:
     bash scripts/tests/test-cluster-ergo-sbe-features.sh
     bash scripts/tests/test-book-content.sh
     bash scripts/tests/test-rerun-if-changed.sh
+    bash scripts/tests/test-aeron-version.sh
+    bash scripts/tests/test-publish-set.sh
     bash scripts/test-package-bench-artifacts.sh
     @echo "=== repository + docs ==="
     ./scripts/check-repository-hygiene.sh
@@ -105,6 +113,8 @@ preflight:
     ./scripts/check-stale-deny-ignores.sh
     ./scripts/check-cluster-ergo-sbe-features.sh
     ./scripts/check-rerun-if-changed.sh
+    ./scripts/check-aeron-version.sh
+    ./scripts/check-publish-set.sh
     @echo ""
     @echo "audit: all cheap gates pass"
 
@@ -128,7 +138,7 @@ check-local: policy
     cd samples/cluster-rfq && cargo fmt --check
     cd samples/cluster-rfq && cargo clippy --all-targets -- -D warnings
 
-# Product-only gate: fmt, clippy, and tests for the two publishable prototype crates only.
+# Product-only gate: fmt, clippy, and tests for ergo-sbe and ergo-aeron-cluster only (the other published crates are in check-local and test).
 check-products: policy
     ./scripts/regenerate-golden.sh --check
     cargo fmt --all --check
@@ -177,14 +187,21 @@ release-check: test check-coverage check-generated-rustdoc
     RUSTDOCFLAGS='-D warnings' cargo doc -p ergo-sbe --all-features --no-deps
     RUSTDOCFLAGS='-D warnings' cargo doc -p ergo-aeron-cluster --no-deps
     cargo publish -p ergo-sbe --dry-run --allow-dirty
+    ./scripts/check-publish-set.sh
+    RUSTDOCFLAGS='-D warnings' cargo doc -p ergon-clock --no-deps
+    RUSTDOCFLAGS='-D warnings' cargo doc -p ergon-tune --all-features --no-deps
+    RUSTDOCFLAGS='-D warnings' cargo doc -p ergon-io --features webpki-roots --no-deps
     RUSTDOCFLAGS='-D warnings' cargo doc -p ergon-md-dpdk --no-deps
-    cargo publish -p ergon-md-dpdk --dry-run --allow-dirty
+    # One multi-package dry run, so ergon-io and ergon-md-dpdk verify against
+    # the packaged ergon-clock and ergon-tune: none of the four is on
+    # crates.io at this version until the release publishes them.
+    cargo publish -p ergon-clock -p ergon-tune -p ergon-io -p ergon-md-dpdk --dry-run --allow-dirty
     bash scripts/check-packaged-cluster-features.sh --list
     bash scripts/check-packaged-cluster-features.sh --unpack --package ergo-sbe
     # ergo-aeron-cluster unpack-and-build waits until ergo-sbe is on crates.io (publish step below).
     @echo "=== bench-cold (generated-size + compile-time diagnostic) ==="
     bash scripts/measure-codegen-cold-path.sh
-    @echo "release-check: product crates pass, benches compile, ergo-sbe dry-run publish OK"
+    @echo "release-check: product crates pass, benches compile, dry-run publishes OK"
 
 # Release when the benchmark gates were already proven on a QUIET machine.
 #
@@ -275,8 +292,11 @@ _release-post:
     bash scripts/check-packaged-cluster-features.sh --unpack
     @echo "=== publish ergo-aeron-cluster ==="
     cargo publish -p ergo-aeron-cluster
-    @echo "=== publish ergon-md-dpdk ==="
-    cargo publish -p ergon-md-dpdk
+    @echo "=== publish ergon-clock, ergon-tune, ergon-io, ergon-md-dpdk ==="
+    # Cargo publishes them in dependency order and waits for crates.io to
+    # list ergon-tune before it publishes ergon-io, and ergon-clock and
+    # ergon-tune before it publishes ergon-md-dpdk.
+    cargo publish -p ergon-clock -p ergon-tune -p ergon-io -p ergon-md-dpdk
     @echo "=== tag ==="
     just _tag
     @echo "=== GitHub release (with bench archives) ==="

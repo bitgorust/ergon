@@ -16,7 +16,8 @@
 //! A slow configuration stops early: warmup after a quarter of `RTT_SECONDS`
 //! (default 20) and the measured run after all of it.
 //!
-//! Round trips are stamped with the calibrated TSC (`lab::Clock`). With
+//! Round trips are stamped with ergon-clock's calibrated counter, its ordered
+//! read at both ends (`lab::Clock::stamp`), in nanoseconds. With
 //! `RTT_HISTOGRAM=<path>` xping also writes the full histogram there, one
 //! `value_ns,count` row per recorded value. With `LOAD_SPIKES=<path>` it writes
 //! every measured round trip of at least `LOAD_SPIKE_NS` (default 100000) as
@@ -29,16 +30,28 @@
 //! `stalls-ping.csv` / `stalls-pong.csv` (`end_ns,gap_ns` from the line
 //! `# start_realtime_ns=`), so a spike can be told from a client that did not
 //! run. xpong stops on SIGTERM, writing its stalls.
+//!
+//! Neither outlives its run. A back-pressured echo or ping retries only
+//! while it can still make progress (`lab::Retry`): xpong gives the echo up,
+//! and ends, on SIGTERM, once its ping's image closes, or once its
+//! publication has been not connected for over a second; xping fails, its
+//! pong gone, on the last two. xpong says on stderr why it ended.
+//!
+//! `HARNESS_DRIVER=invoker` embeds the media driver instead (`lab.rs`): the
+//! measuring thread then also runs the client's conductor and the driver,
+//! every pass of its loop. `rtt idle` measures an external driver's agents, so
+//! it refuses it. `PUB_CHANNEL_PARAMS` is appended to every publication's
+//! channel, `SUB_CHANNEL_PARAMS` to every subscription's.
 
 #[path = "../lab.rs"]
 mod lab;
 
 use hdrhistogram::Histogram;
-use lab::{Clock, aeron_dir, cpu_arg, label, pin, retry_closing, sub_channel, wait_until};
+use lab::{Clock, Duty, External, Halt, Lab, Retry, STOP, cpu_arg, label, pin, sub_channel};
 use rusteron_client::*;
 use std::ffi::{CStr, CString};
 use std::hint::spin_loop;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 const PING_STREAM_ID: i32 = 1002;
@@ -51,22 +64,19 @@ const STALL_CAPACITY: usize = 1_000_000;
 /// Gaps in the calling loop of at least a threshold, each with when it ended:
 /// time this client did not run. Preallocated, so recording never allocates.
 struct Stalls {
-    threshold: u64, // ticks
+    threshold: u64, // ns
     last: u64,
     t0: u64,
     t0_realtime: u128,
-    rows: Vec<(u64, u64)>, // (end, gap) in ticks
+    rows: Vec<(u64, u64)>, // (end, gap) in ns
 }
 
 impl Stalls {
     /// `None` unless `LOOP_STALLS_DIR` is set.
     fn new(clock: &Clock) -> Option<Self> {
         std::env::var("LOOP_STALLS_DIR").ok().filter(|d| !d.is_empty())?;
-        let ns: u64 = std::env::var("LOOP_STALL_NS").map_or(20_000, |v| v.parse().expect("LOOP_STALL_NS"));
-        // ticks for `ns`, from how many ns a billion ticks are
-        let threshold =
-            u64::try_from(u128::from(ns) * 1_000_000_000 / u128::from(clock.ns(1_000_000_000).max(1))).unwrap();
-        let t0 = clock.ticks();
+        let threshold: u64 = std::env::var("LOOP_STALL_NS").map_or(20_000, |v| v.parse().expect("LOOP_STALL_NS"));
+        let t0 = clock.now();
         Some(Self {
             threshold,
             last: t0,
@@ -86,32 +96,17 @@ impl Stalls {
         self.last = now;
     }
 
-    fn write(&self, clock: &Clock, name: &str) {
+    fn write(&self, name: &str) {
         let Some(dir) = std::env::var("LOOP_STALLS_DIR").ok() else {
             return;
         };
         let mut rows = format!("# start_realtime_ns={}\nend_ns,gap_ns\n", self.t0_realtime);
         for (end, gap) in &self.rows {
-            rows.push_str(&format!("{},{}\n", clock.ns(*end), clock.ns(*gap)));
+            rows.push_str(&format!("{end},{gap}\n"));
         }
         let path = format!("{dir}/{name}");
         std::fs::write(&path, rows).unwrap_or_else(|e| panic!("LOOP_STALLS_DIR {path}: {e}"));
     }
-}
-
-/// Set by SIGTERM, so pong stops its loop and writes what it recorded.
-static STOP: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_sigterm(_signal: libc::c_int) {
-    STOP.store(true, Ordering::Relaxed);
-}
-
-fn client() -> Aeron {
-    let context = AeronContext::new().unwrap();
-    context.set_dir(&aeron_dir()).unwrap();
-    let aeron = Aeron::new(&context).unwrap();
-    aeron.start().unwrap();
-    aeron
 }
 
 fn udp(endpoint: Option<String>) -> CString {
@@ -119,6 +114,7 @@ fn udp(endpoint: Option<String>) -> CString {
 }
 
 fn main() {
+    lab::lock_memory();
     let mut args = std::env::args().skip(1);
     let mode = args.next().expect("xping|xpong|idle");
     if mode == "idle" {
@@ -127,41 +123,47 @@ fn main() {
     }
     let (ping_channel, pong_channel) = (udp(args.next()), udp(args.next()));
     match mode.as_str() {
-        "xpong" => run_pong(&ping_channel, &pong_channel, cpu_arg(args.next())),
+        "xpong" => {
+            let cpu = cpu_arg(args.next());
+            let lab = Lab::connect(cpu);
+            match lab.invoker() {
+                Some(duty) => run_pong(&lab, &duty, &ping_channel, &pong_channel, cpu),
+                None => run_pong(&lab, &External, &ping_channel, &pong_channel, cpu),
+            }
+        }
         "xping" => {
             let number = |a: Option<String>| -> usize { a.expect("messages and warmup").parse().unwrap() };
             let (messages, warmup) = (number(args.next()), number(args.next()));
-            run_ping(&ping_channel, &pong_channel, messages, warmup, cpu_arg(args.next()));
+            let cpu = cpu_arg(args.next());
+            let lab = Lab::connect(cpu);
+            match lab.invoker() {
+                Some(duty) => run_ping(&lab, &duty, &ping_channel, &pong_channel, messages, warmup, cpu),
+                None => run_ping(&lab, &External, &ping_channel, &pong_channel, messages, warmup, cpu),
+            }
         }
         other => panic!("unknown mode {other}: xping, xpong or idle"),
     }
 }
 
-fn run_ping(ping_channel: &CStr, pong_channel: &CStr, messages: usize, warmup: usize, cpu: Option<usize>) {
-    let aeron = client();
-    let publication = retry_closing("publication", || {
-        aeron
-            .async_add_exclusive_publication(ping_channel, PING_STREAM_ID)
-            .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
-    });
-    let subscription = retry_closing("subscription", || {
-        aeron
-            .async_add_subscription(
-                &sub_channel(pong_channel),
-                PONG_STREAM_ID,
-                Handlers::NONE,
-                Handlers::NONE,
-            )
-            .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
-    });
-    wait_until("pong", 30, || {
+fn run_ping(
+    lab: &Lab,
+    duty: &impl Duty,
+    ping_channel: &CStr,
+    pong_channel: &CStr,
+    messages: usize,
+    warmup: usize,
+    cpu: Option<usize>,
+) {
+    let publication = lab.add_publication(ping_channel, PING_STREAM_ID);
+    let subscription = lab.add_subscription(&sub_channel(pong_channel), PONG_STREAM_ID);
+    lab.wait_until("pong", 30, || {
         publication.is_connected() && subscription.image_at_index(0).is_some()
     });
     let image = subscription.image_at_index(0).unwrap();
     pin(cpu);
     let clock = Clock::calibrate();
-    if !clock.is_tsc() {
-        eprintln!("rtt: no invariant TSC, stamping with CLOCK_MONOTONIC");
+    if !clock.is_counter() {
+        eprintln!("rtt: no hardware counter (or BENCH_CLOCK=monotonic), stamping with CLOCK_MONOTONIC");
     }
 
     let budget = Duration::from_secs(std::env::var("RTT_SECONDS").map_or(20, |s| s.parse().unwrap()));
@@ -176,6 +178,7 @@ fn run_ping(ping_channel: &CStr, pong_channel: &CStr, messages: usize, warmup: u
     for i in 0..warmup {
         seq += 1;
         round_trip(
+            duty,
             &clock,
             &publication,
             &image,
@@ -195,13 +198,14 @@ fn run_ping(ping_channel: &CStr, pong_channel: &CStr, messages: usize, warmup: u
     let mut spikes: Vec<(u64, u64)> = Vec::with_capacity(if spikes_path.is_some() { SPIKE_CAPACITY } else { 0 });
     let mut spikes_total = 0_u64;
     let start = Instant::now();
-    let t0 = clock.ticks();
+    let t0 = clock.now();
     let t0_realtime = realtime_ns();
     let mut stalls = Stalls::new(&clock);
     let mut lost = 0_u64;
     for i in 0..messages {
         seq += 1;
         let echoed = round_trip(
+            duty,
             &clock,
             &publication,
             &image,
@@ -214,7 +218,7 @@ fn run_ping(ping_channel: &CStr, pong_channel: &CStr, messages: usize, warmup: u
                 if rtt >= spike_ns {
                     spikes_total += 1;
                     if spikes.len() < spikes.capacity() {
-                        spikes.push((clock.ns(clock.ticks().wrapping_sub(t0)).saturating_sub(rtt), rtt));
+                        spikes.push((clock.now().wrapping_sub(t0).saturating_sub(rtt), rtt));
                     }
                 }
             },
@@ -258,7 +262,7 @@ fn run_ping(ping_channel: &CStr, pong_channel: &CStr, messages: usize, warmup: u
         std::fs::write(&path, rows).unwrap_or_else(|e| panic!("LOAD_SPIKES {path}: {e}"));
     }
     if let Some(stalls) = &stalls {
-        stalls.write(&clock, "stalls-ping.csv");
+        stalls.write("stalls-ping.csv");
     }
 }
 
@@ -274,8 +278,11 @@ fn realtime_ns() -> u128 {
 /// One round trip of message `seq`: `true` once its echo is back, `false` if
 /// none came within `timeout_ns` (0: wait for ever, as a reliable channel
 /// repairs any loss). An echo of an earlier, timed-out message is skipped.
+/// `duty` runs every pass (an embedded driver sends the ping and receives the
+/// echo in it).
 #[allow(clippy::too_many_arguments)]
 fn round_trip(
+    duty: &impl Duty,
     clock: &Clock,
     publication: &AeronExclusivePublication,
     image: &AeronImage,
@@ -286,39 +293,48 @@ fn round_trip(
     mut record: impl FnMut(u64),
 ) -> bool {
     if let Some(s) = stalls.as_mut() {
-        s.pass(clock.ticks());
+        s.pass(clock.now());
     }
     buffer[8..16].copy_from_slice(&seq.to_le_bytes());
+    let mut retry = Retry::default();
     let started = loop {
         // stamped on each attempt, so time back-pressured is not counted
-        let now = clock.ticks();
+        let now = clock.stamp();
         buffer[..8].copy_from_slice(&now.to_le_bytes());
         match publication.offer(buffer) {
             Ok(_) => break now,
-            Err(e) if e.is_retryable() => spin_loop(),
+            Err(e) if e.is_retryable() => {
+                if let Err(halt) = retry.check(publication, image) {
+                    pong_gone(halt);
+                }
+                if duty.run() == 0 {
+                    spin_loop();
+                }
+            }
             Err(e) => panic!("offer: {e:?}"),
         }
     };
     let mut echoed = false;
     while !echoed {
         if let Some(s) = stalls.as_mut() {
-            s.pass(clock.ticks());
+            s.pass(clock.now());
         }
+        let work = duty.run();
         let fragments = image
             .poll_fn(
                 |reply, _header| {
                     if u64::from_le_bytes(reply[8..16].try_into().unwrap()) == seq {
                         let sent = u64::from_le_bytes(reply[..8].try_into().unwrap());
-                        record(clock.ns(clock.ticks().wrapping_sub(sent)));
+                        record(clock.stamp().wrapping_sub(sent));
                         echoed = true;
                     }
                 },
                 FRAGMENT_COUNT_LIMIT,
             )
             .unwrap();
-        if fragments == 0 {
+        if fragments == 0 && work == 0 {
             assert!(!image.is_closed(), "pong went away");
-            if timeout_ns != 0 && clock.ns(clock.ticks().wrapping_sub(started)) > timeout_ns {
+            if timeout_ns != 0 && clock.now().wrapping_sub(started) > timeout_ns {
                 return false;
             }
             spin_loop();
@@ -327,70 +343,71 @@ fn round_trip(
     true
 }
 
-/// Echoes every ping until the ping side's image goes away.
-fn run_pong(ping_channel: &CStr, pong_channel: &CStr, cpu: Option<usize>) {
-    let aeron = client();
-    let publication = retry_closing("publication", || {
-        aeron
-            .async_add_exclusive_publication(pong_channel, PONG_STREAM_ID)
-            .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
-    });
-    let subscription = retry_closing("subscription", || {
-        aeron
-            .async_add_subscription(
-                &sub_channel(ping_channel),
-                PING_STREAM_ID,
-                Handlers::NONE,
-                Handlers::NONE,
-            )
-            .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
-    });
-    wait_until("ping", 60, || subscription.image_at_index(0).is_some());
+/// The ping's end when its pong is gone while it sends: it fails, as it
+/// does when the pong's image closes while it waits for an echo.
+#[cold]
+#[inline(never)]
+fn pong_gone(halt: Halt) -> ! {
+    panic!("pong went away: {halt} while the ping was back-pressured")
+}
+
+/// Echoes every ping until the ping side's image goes away, SIGTERM, or an
+/// echo given up (`lab::echo`: SIGTERM, the ping's image closed, or this
+/// publication not connected for over a second); says why on stderr.
+fn run_pong(lab: &Lab, duty: &impl Duty, ping_channel: &CStr, pong_channel: &CStr, cpu: Option<usize>) {
+    let publication = lab.add_publication(pong_channel, PONG_STREAM_ID);
+    let subscription = lab.add_subscription(&sub_channel(ping_channel), PING_STREAM_ID);
+    lab.wait_until("ping", 60, || subscription.image_at_index(0).is_some());
     let image = subscription.image_at_index(0).unwrap();
     pin(cpu);
-    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
-    unsafe { libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t) };
+    lab::stop_on_sigterm();
     let clock = Clock::calibrate();
     let mut stalls = Stalls::new(&clock);
-    while !image.is_closed() && !STOP.load(Ordering::Relaxed) {
+    let mut halt = None;
+    while halt.is_none() && !image.is_closed() && !STOP.load(Ordering::Relaxed) {
         if let Some(s) = stalls.as_mut() {
-            s.pass(clock.ticks());
+            s.pass(clock.now());
         }
+        let work = duty.run();
         let fragments = image
-            .poll_fn(|ping, _header| echo(&publication, ping), FRAGMENT_COUNT_LIMIT)
+            .poll_fn(
+                |ping, _header| {
+                    if halt.is_none()
+                        && let Err(why) = lab::echo(duty, &publication, &image, ping)
+                    {
+                        halt = Some(why);
+                    }
+                },
+                FRAGMENT_COUNT_LIMIT,
+            )
             .unwrap();
-        if fragments == 0 {
+        if fragments == 0 && work == 0 {
             spin_loop();
         }
     }
     if let Some(stalls) = &stalls {
-        stalls.write(&clock, "stalls-pong.csv");
+        stalls.write("stalls-pong.csv");
     }
+    let why = match halt {
+        Some(Halt::Stopped) => "SIGTERM",
+        Some(Halt::ImageClosed) => "its ping's image closed",
+        Some(Halt::NotConnected) => "its publication not connected for over 1 s, its echoes unread",
+        None if STOP.load(Ordering::Relaxed) => "SIGTERM",
+        None => "its ping's image closed",
+    };
+    eprintln!("rtt: pong ended: {why}");
 }
 
-#[inline]
-fn echo(publication: &AeronExclusivePublication, ping: &[u8]) {
-    loop {
-        match publication.try_claim_owned(ping.len()) {
-            Ok(mut claim) => {
-                claim.data().copy_from_slice(ping);
-                claim.commit().unwrap();
-                return;
-            }
-            Err(e) if e.is_retryable() => spin_loop(),
-            Err(e) => panic!("claim: {e:?}"),
-        }
-    }
-}
-
-/// Holds a subscription on `channel` that nobody publishes to, for `seconds`.
+/// Holds a subscription on `channel` that nobody publishes to, for `seconds`:
+/// what an idle host-local channel costs an external driver's agents. An
+/// embedded driver would measure nothing of the kind, so it is refused.
 fn run_idle(channel: &CStr, seconds: u64) {
-    let aeron = client();
-    let _subscription = retry_closing("subscription", || {
-        aeron
-            .async_add_subscription(channel, PONG_STREAM_ID + 100, Handlers::NONE, Handlers::NONE)
-            .and_then(|a| a.poll_blocking(Duration::from_secs(5)))
-    });
+    assert!(
+        !lab::embedded(),
+        "rtt idle measures an external driver's agents: HARNESS_DRIVER=invoker would embed one, which nothing else uses"
+    );
+    let lab = Lab::connect(None);
+    let _subscription = lab.add_subscription(channel, PONG_STREAM_ID + 100);
     eprintln!("rtt: idle subscription on {}", channel.to_string_lossy());
     std::thread::sleep(Duration::from_secs(seconds));
 }

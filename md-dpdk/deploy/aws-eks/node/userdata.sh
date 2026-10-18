@@ -17,8 +17,9 @@
 #
 #   <reserved-cpus>  kubelet's reservedSystemCPUs, which provision-node.sh also
 #                    makes the kernel's housekeeping CPUs (irqaffinity; every
-#                    other CPU is isolated): whole cores, e.g. "0,8" on a
-#                    c7i.4xlarge, whose SMT twins are N and N+8.
+#                    other CPU is isolated): whole physical cores, one CPU
+#                    each with SMT off (the launch template's CpuOptions
+#                    ThreadsPerCore=1), e.g. "0" on a c7i.4xlarge.
 #
 # The output is binary: pass it as `--user-data fileb://userdata.gz`. EC2
 # limits raw user data to 16384 bytes, and cloud-init and nodeadm both
@@ -45,8 +46,11 @@
 #     kubelet refuses to start under Static unless reservedMemory equals
 #     kubeReserved + systemReserved + the hard eviction threshold exactly.
 #     nodeadm's memory reservations stay as it derives them.
-#   * cpuCFSQuota stays at its default: exclusive CPUs carry no CFS quota
-#     (DisableCPUQuotaWithExclusiveCPUs, on by default).
+#   * cpuCFSQuota is not set: it stays true (the default), so every pod's CPU
+#     limit holds. Kubelet 1.33 and later (1.36 or later here) sets no CPU
+#     quota on a container with exclusive CPUs (this static policy, a
+#     Guaranteed pod, a whole-number CPU request), nor on its pod. Never set
+#     it false: that removes the CPU limit of every pod on the node.
 #   * The node registers labelled rusteron-dpdk/ena=true and tainted
 #     rusteron-dpdk=true:NoSchedule, so only the DPDK workloads land there.
 set -euo pipefail
@@ -64,7 +68,7 @@ hugepages="${RUSTERON_HUGEPAGES:-2048}"
 [[ "$endpoint" =~ ^https://[^[:space:]]+$ ]] || fail "API server endpoint '$endpoint': https://..."
 [[ "$ca" =~ ^[A-Za-z0-9+/=]+$ ]] || fail "certificate authority: base64 data"
 [[ "$cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] || fail "service CIDR '$cidr'"
-[[ "$reserved" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || fail "reserved CPUs '$reserved': a CPU list such as 0,8"
+[[ "$reserved" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || fail "reserved CPUs '$reserved': a CPU list such as 0"
 [[ "$device_numbers" =~ ^[1-9][0-9]*\ [1-9][0-9]*$ ]] || fail "RUSTERON_DPDK_DEVICE_NUMBERS='$device_numbers': two device numbers"
 [[ "$hugepages" =~ ^[1-9][0-9]*$ ]] || fail "RUSTERON_HUGEPAGES='$hugepages': a positive count"
 

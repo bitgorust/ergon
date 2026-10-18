@@ -567,3 +567,18 @@ rusteron_dpdk_rx_result_t rusteron_dpdk_packet_classify_rx(
 
     return RUSTERON_DPDK_RX_RESULT_OK;
 }
+
+/* Decode a DPDK ol_flags word onto the RX verdict view flags. See the enum
+ * note in rusteron_dpdk_packet.h: each verdict is a two-bit enum and NONE
+ * carries both the GOOD and the BAD bit, so the word is decoded by shifting
+ * and masking, never by testing the individual bits. */
+uint32_t rusteron_dpdk_rx_ol_flags_from_dpdk(uint64_t ol)
+{
+    const unsigned ip = (unsigned)((ol >> RUSTERON_DPDK_CKSUM_IP_SHIFT) & 3u);
+    const unsigned l4 = (unsigned)((ol >> RUSTERON_DPDK_CKSUM_L4_SHIFT) & 3u);
+    uint32_t flags = rusteron_dpdk_cksum_view(
+        ip, RUSTERON_DPDK_MBUF_F_RX_IPV4_CKSUM_GOOD, RUSTERON_DPDK_MBUF_F_RX_IPV4_CKSUM_BAD);
+    flags |= rusteron_dpdk_cksum_view(
+        l4, RUSTERON_DPDK_MBUF_F_RX_UDP_CKSUM_GOOD, RUSTERON_DPDK_MBUF_F_RX_UDP_CKSUM_BAD);
+    return flags;
+}

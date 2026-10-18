@@ -53,9 +53,9 @@ static const rusteron_dpdk_counter_spec_t rusteron_dpdk_counter_specs[RD_COUNTER
     [RD_COUNTER_MEMPOOL_AVAILABLE] =
         { RUSTERON_DPDK_TYPE_MEMPOOL_AVAILABLE, "mempool-available", "-" },
     [RD_COUNTER_CLOCK] = { RUSTERON_DPDK_TYPE_CLOCK, "clock", "-" },
-    [RD_COUNTER_RX_HW_DELAY_MAX] = { RUSTERON_DPDK_TYPE_RX_HW_DELAY, "rx-hw-delay-max-ns", "rx" },
-    [RD_COUNTER_RX_HW_DELAY_SUM] = { RUSTERON_DPDK_TYPE_RX_HW_DELAY, "rx-hw-delay-sum-ns", "rx" },
-    [RD_COUNTER_RX_HW_TIMESTAMPED] = { RUSTERON_DPDK_TYPE_RX_HW_DELAY, "rx-hw-timestamped", "rx" },
+    [RD_COUNTER_RX_HW_DELAY_MAX] = { RUSTERON_DPDK_TYPE_RX_HW_DELAY, "nic-arrival-to-dispatch-max-ns", "rx" },
+    [RD_COUNTER_RX_HW_DELAY_SUM] = { RUSTERON_DPDK_TYPE_RX_HW_DELAY, "nic-arrival-to-dispatch-sum-ns", "rx" },
+    [RD_COUNTER_RX_HW_TIMESTAMPED] = { RUSTERON_DPDK_TYPE_RX_HW_DELAY, "nic-arrival-to-dispatch-count", "rx" },
     [RD_COUNTER_RX_POLL_GAP_MAX] = { RUSTERON_DPDK_TYPE_POLLER, "rx-poll-gap-max-ns", "rx" },
     [RD_COUNTER_RX_POLL_GAPS_100US] = { RUSTERON_DPDK_TYPE_POLLER, "rx-poll-gaps-over-100us", "rx" },
     [RD_COUNTER_RX_BURST_FULL] = { RUSTERON_DPDK_TYPE_POLLER, "rx-burst-full", "rx" },
@@ -78,6 +78,9 @@ static const rusteron_dpdk_counter_spec_t rusteron_dpdk_counter_specs[RD_COUNTER
     [RD_COUNTER_TX_QUEUED] = { RUSTERON_DPDK_TYPE_TX_EAGAIN, "tx-queued", "tx" },
     [RD_COUNTER_RX_BACKLOG_MAX] = { RUSTERON_DPDK_TYPE_POLLER, "rx-backlog-max", "rx" },
     [RD_COUNTER_RX_RING_FULL_SUSPECTED] = { RUSTERON_DPDK_TYPE_POLLER, "rx-ring-full-suspected", "rx" },
+    [RD_COUNTER_NIC_RESET_REQUESTED] = { RUSTERON_DPDK_TYPE_ERROR, "nic-reset-requested", "-" },
+    [RD_COUNTER_RX_HW_DELAY_MIN] = { RUSTERON_DPDK_TYPE_RX_HW_DELAY, "nic-arrival-to-dispatch-min-ns", "rx" },
+    [RD_COUNTER_RX_HW_DELAY_NEGATIVE] = { RUSTERON_DPDK_TYPE_RX_HW_DELAY, "nic-arrival-to-dispatch-negative", "rx" },
 };
 
 static void rusteron_dpdk_counters_label(
@@ -237,6 +240,14 @@ int rusteron_dpdk_counters_register(
         const char *name = rusteron_dpdk_counter_specs[kind].name;
         const char *dir = rusteron_dpdk_counter_specs[kind].dir;
 
+        if (RD_COUNTER_RX_RING_FULL_SUSPECTED == kind && UINT32_MAX == port->rx_ring_full_at)
+        {
+            /* an ENA counts a full ring's drops itself (nic-rx-missed) */
+            c->id[kind] = -1;
+            c->addr[kind] = NULL;
+            continue;
+        }
+
         if (RD_COUNTER_DISCARD == kind)
         {
             type_id = (port->role == RUSTERON_DPDK_ROLE_SENDER)
@@ -246,15 +257,20 @@ int rusteron_dpdk_counters_register(
 
         if (RD_COUNTER_PORT_INFO == kind)
         {
-            /* port-info carries the driver + MAC in its label. */
+            /* port-info carries the driver + MAC in its label, the receive
+             * ring it took (the NIC's default unless configured) and, on an
+             * ENA, whether its LLQ BAR was seen write-combined. */
+            static const char *const llq[] = { "", " llq=wc", " llq=uncached", " llq=unseen", " llq=unknown",
+                                               " llq=off" };
             rusteron_dpdk_counters_label(label, sizeof(label), port, name, dir);
             size_t off = strlen(label);
             snprintf(
                 label + off, sizeof(label) - off,
-                " driver=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                " driver=%s mac=%02x:%02x:%02x:%02x:%02x:%02x rx-desc=%u%s",
                 port->driver[0] != '\0' ? port->driver : "-",
                 port->mac[0], port->mac[1], port->mac[2],
-                port->mac[3], port->mac[4], port->mac[5]);
+                port->mac[3], port->mac[4], port->mac[5], (unsigned)port->rx_descriptors,
+                port->ena_llq >= 0 && port->ena_llq <= RUSTERON_DPDK_ENA_LLQ_DISABLED ? llq[port->ena_llq] : "");
         }
         else
         {
@@ -289,6 +305,14 @@ int rusteron_dpdk_counters_register(
     if (NULL != c->addr[RD_COUNTER_CLOCK])
     {
         __atomic_store_n(c->addr[RD_COUNTER_CLOCK], (int64_t)rusteron_dpdk_clock_source(), __ATOMIC_RELAXED);
+    }
+    /* Reset requests the port saw before this set existed (housekeeping
+     * keeps it current while a transport is open). */
+    if (NULL != c->addr[RD_COUNTER_NIC_RESET_REQUESTED])
+    {
+        __atomic_store_n(
+            c->addr[RD_COUNTER_NIC_RESET_REQUESTED],
+            (int64_t)__atomic_load_n(&port->nic_resets, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
     }
 
     c->last_sample_ns = rusteron_dpdk_clock_now();

@@ -10,6 +10,11 @@
 //! loss gap fills, invalid packets and errors, and the DPDK transport's drop
 //! counters summed over its ports. lab.sh takes it before and after each run.
 //! `counters errors` prints the driver's distinct error log and loss report.
+//!
+//! Every mode reads the driver's `CnC` file directly, as no client of the
+//! driver: so it reads a driver that has stopped too (until the next one
+//! deletes the directory), such as the one a lab client embedded
+//! (`HARNESS_DRIVER=invoker`), which leaves every counter in place at exit.
 
 // Only `aeron_dir` of the shared helpers is used here.
 #[allow(dead_code)]
@@ -70,11 +75,8 @@ fn main() {
         errors();
         return;
     }
-    let context = AeronContext::new().unwrap();
-    context.set_dir(&aeron_dir()).unwrap();
-    let aeron = Aeron::new(&context).unwrap();
-    aeron.start().unwrap();
-    aeron
+    AeronCnc::open(&aeron_dir())
+        .unwrap()
         .counters_reader()
         .foreach_counter_fn(|value, _id, type_id, _key, label| {
             if label.contains(filter.as_str()) {
@@ -108,17 +110,13 @@ fn errors() {
 }
 
 fn loss() {
-    let context = AeronContext::new().unwrap();
-    context.set_dir(&aeron_dir()).unwrap();
-    let aeron = Aeron::new(&context).unwrap();
-    aeron.start().unwrap();
+    let cnc = AeronCnc::open(&aeron_dir()).unwrap();
     let mut totals: Vec<(String, i64)> = AERON_LOSS
         .iter()
         .map(|(_, k)| ((*k).to_string(), 0))
         .chain(DPDK_LOSS.iter().map(|k| (dpdk_key(k), 0)))
         .collect();
-    aeron
-        .counters_reader()
+    cnc.counters_reader()
         .foreach_counter_fn(|value, _id, _type_id, _key, label| {
             let key = if label.starts_with("rusteron-dpdk") {
                 label

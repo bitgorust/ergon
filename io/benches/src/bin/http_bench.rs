@@ -60,16 +60,8 @@ mod imp {
 
     type BoxResult<T> = Result<T, Box<dyn StdError>>;
 
-    pub const API_KEY: &str = "vmPUZE6mv9SD5VNHk4HlWFsOr6aKE2zvsw0MuIgwCIPy6utIco14y7Ju91duEh8A";
-
-    /// The request body: Binance new-order parameters plus a signature.
-    pub fn order_body(seq: u64) -> String {
-        format!(
-            "symbol=BTCUSDT&side=BUY&type=LIMIT&timeInForce=GTC&quantity=0.00100000&price=50000.00\
-             &newClientOrderId=x-ergon-{seq:016}&recvWindow=5000&timestamp=1760400000000\
-             &signature=c8db56825ae71d6d79447849e617115f4a920fa2acdcab2b053c4b2838bd6b71"
-        )
-    }
+    // The same request bytes as every other lab client (`mio_bench http`).
+    pub use io_bench::order::{API_KEY, order_body};
 
     pub struct Run {
         pub label: String,
@@ -396,7 +388,7 @@ mod imp {
                 }
                 self.done = true;
             }
-            fn on_error(&mut self, _: u64, e: Error) {
+            fn on_error(&mut self, _: u64, _: ergon_io::Sent, e: Error) {
                 self.error = Some(e.to_string());
                 self.done = true;
             }
@@ -419,6 +411,9 @@ mod imp {
         };
         if !plan.live {
             cfg.curl_ca_file = Some(a.req("ca")?);
+            // The lab server's POST is harmless to receive twice; the
+            // measurement needs libcurl on the same request as native.
+            cfg.curl_allow_non_idempotent_methods = true;
         }
         let mut target = Target::new(plan.host.clone(), plan.server.port(), "")
             .with_addr(plan.server)
@@ -438,8 +433,19 @@ mod imp {
             error: None,
             records: Vec::with_capacity(plan.capacity),
         };
-        while c.idle() == 0 {
+        // Every connection of the pool open before timing starts: a pool
+        // still connecting would put its handshakes in the measured loop.
+        let deadline = t0 + 30_000_000_000;
+        while c.idle() < cfg.pool {
             c.poll(&mut h)?;
+            if monotonic_ns() > deadline {
+                return Err(format!(
+                    "only {} of the pool's {} connections opened in 30 s",
+                    c.idle(),
+                    cfg.pool
+                )
+                .into());
+            }
         }
         let connect_ns = monotonic_ns() - t0;
         let interval = plan.interval_ns();
@@ -490,7 +496,7 @@ mod imp {
             label,
             records,
             connect_ns,
-            extra: String::new(),
+            extra: format!("pool={}\nconns_per_variant={}\n", cfg.pool, cfg.pool),
             stalls,
         })
     }

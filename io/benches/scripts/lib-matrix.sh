@@ -4,12 +4,23 @@
 # The caller provides: log, rssh, sssh, rrun, relay, wait_ssh; and RCV, SND,
 # SND_PRIV, RUSER (the VMs' login), SSHO (ssh options), CPU_A (the loop CPU),
 # CPU_SQ (the SQPOLL CPU), CPU_SIB (CPU_A's hyperthread sibling, empty without
-# SMT), CPU_SPARE (an idle isolated CPU, empty if there is none), HK, ISO,
-# S_CPU, OUT.
+# SMT, as on Graviton), CPU_SPARE (an idle isolated CPU, empty if there is
+# none), HK, ISO, S_CPU, OUT, RARCH (the receiver's architecture),
+# RCV_DEEP_IDLE (yes when it has idle states deeper than 1 µs), RFLAGS.
+#
+# Before every run both hosts are pinned again (vm-setup.sh pin): IRQs on
+# their housekeeping CPUs and the NIC's interrupt moderation as the run set
+# it, since the ENA driver resets both whenever the interface comes up.
 #
 # During every timed run the noise probe spins on CPU_SPARE (traced like the
 # loop CPU): a loop stall that the spare core shares is the whole VM paused by
 # the hypervisor, not the loop or its kernel work.
+#
+# Around every run both hosts' chrony state is kept with the run's results
+# (`vm-setup.sh clock`: res/<run>/clock-{before,after}.txt and
+# clock-{before,after}-sender.txt): one-way figures compare the two hosts'
+# clocks, and analyse bounds their offset (and the slack for matching the
+# server's stalls) from these.
 #
 # Every condition is measured the same way (`measure`): platform noise on the
 # loop CPU, ping-pong round trips paced and back to back per backend, HTTP, and
@@ -33,23 +44,25 @@ HTTP_S=${HTTP_S:-120}
 NOISE_S=${NOISE_S:-120}
 MD_S=${MD_S:-60}
 ROUNDS=${ROUNDS:-1}
-ALL_BACKENDS=${ALL_BACKENDS:-recv-busy uring-sqpoll uring-spin epoll-spin}
+# mio (mio + rustls, the usual Rust way) runs wherever epoll-spin does.
+ALL_BACKENDS=${ALL_BACKENDS:-recv-busy uring-sqpoll uring-spin epoll-spin mio}
 
-# name(s, joined by +) | backends | extra bench flags | command prefix | needs SMT
+# name(s, joined by +) | backends | extra bench flags | command prefix | needs
+# (smt: a hyperthread sibling; cstates: idle states deeper than 1 µs)
 CONDITIONS=(
   "housekeeping|recv-busy uring-sqpoll uring-spin|||"
   "prefer|recv-busy uring-sqpoll|--prefer-busy-poll||"
   "noquickack|recv-busy uring-spin|||"
   "nogro|recv-busy uring-spin|||"
-  "nocoalesce|recv-busy uring-spin|||"
-  "irqlocal|recv-busy uring-spin epoll-spin|||"
+  "nocoalesce|recv-busy uring-spin epoll-spin mio|||"
+  "irqlocal|recv-busy uring-spin epoll-spin mio|||"
   "rt|recv-busy uring-spin||chrt -f 50|"
   "sibling|recv-busy uring-sqpoll uring-spin|||smt"
   "busypoll50|recv-busy|--busy-poll 50||"
   "budget64|recv-busy|--busy-poll-budget 64||"
-  "cstate|recv-busy uring-sqpoll uring-spin epoll-spin|||"
+  "cstate|recv-busy uring-sqpoll uring-spin epoll-spin mio|||cstates"
   "noagent|recv-busy uring-sqpoll uring-spin|||"
-  "nodim|recv-busy uring-sqpoll uring-spin|||"
+  "nodim|recv-busy uring-sqpoll uring-spin epoll-spin mio|||"
   "onequeue|recv-busy uring-sqpoll uring-spin|||"
   "noautocork|recv-busy uring-sqpoll|||"
 )
@@ -76,32 +89,92 @@ start_servers() {
 # CPU is traced too and its stall log for this connection is kept on the
 # sender under srvres/<dir> (merged into the receiver's results at the end).
 # With `secs`, the noise probe spins on CPU_SPARE for the run (res/<dir>/spare).
-# TRACE_EXTRA (set by the caller) adds CPUs to the trace.
+# TRACE_EXTRA (set by the caller) adds CPUs to the trace. TRACE_NOIRQ=1 (the
+# fair mode's irqlocal points) leaves the interrupt and softirq events out of
+# it (vm-setup.sh trace start ... noirq).
+# FAIR_CHECK=1 (the fair mode): after each host's pin, and again after the
+# run, `vm-setup.sh check` keeps every setting the mode holds
+# (res/<dir>/settings-{before,after}.txt and settings-*-sender.txt). Settings
+# not as wanted before the run skip it; settings that drifted during it, or a
+# run that failed, fail the point (fail_point: res/<dir>/failed.txt, which
+# the analysis leaves out and lists).
+POINT_FAILED=""
 traced_run() {
   local dir=$1 cmd=$2 server=${3:-} secs=${4:-}
   local cpus=$CPU_A${TRACE_EXTRA:+,$TRACE_EXTRA} spare_on="" spare_off=""
+  local s_before="" s_after="" r_before="" r_after="" safter="" rc=0
+  POINT_FAILED=""
+  if [[ -n ${FAIR_CHECK:-} ]]; then
+    s_before="sudo bash vm-setup.sh check > srvres/$dir/settings-before-sender.txt; echo \"sender-before-\$(tail -1 srvres/$dir/settings-before-sender.txt)\""
+    s_after="sudo bash vm-setup.sh check > srvres/$dir/settings-after-sender.txt; echo \"sender-after-\$(tail -1 srvres/$dir/settings-after-sender.txt)\""
+    r_before="sudo bash vm-setup.sh check > res/$dir/settings-before.txt; ok=\$?; echo \"receiver-before-\$(tail -1 res/$dir/settings-before.txt)\""
+    r_after="sudo bash vm-setup.sh check > res/$dir/settings-after.txt; echo \"receiver-after-\$(tail -1 res/$dir/settings-after.txt)\""
+  fi
   if [[ -n $secs && -n ${CPU_SPARE:-} ]]; then
     cpus="$cpus,$CPU_SPARE"
     spare_on="sudo bin/noise_probe --cpu $CPU_SPARE --duration $((secs + 8)) --out res/$dir/spare > /dev/null 2>&1 & spare=\$!"
     spare_off="wait \$spare"
   fi
   if [[ -n $server ]]; then
-    sssh "sudo bash vm-setup.sh trace start $S_CPU" > /dev/null || log "run $dir: sender trace did not start"
+    # Trace events this kernel lacks are listed once, in env-snd.txt.
+    sssh "sudo bash vm-setup.sh trace start $S_CPU" > /dev/null 2>&1 || log "run $dir: sender trace did not start"
   fi
-  sssh "mkdir -p srvres/$dir; sudo bash vm-setup.sh netstats srvres/$dir/net-before-sender.txt" > /dev/null 2>&1 || true
-  rrun "mkdir -p res/$dir; sudo bash vm-setup.sh netstats res/$dir/net-before.txt; sudo bash vm-setup.sh irqs res/$dir/irq-before.txt; sudo bash vm-setup.sh trace start $cpus
+  local runlog spin
+  runlog="$OUT/logs/$(echo "$dir" | tr / _).log"
+  spin=$(sssh "mkdir -p srvres/$dir; sudo bash vm-setup.sh pin | tee srvres/$dir/pin-sender.txt
+    $s_before
+    sudo bash vm-setup.sh netstats srvres/$dir/net-before-sender.txt > /dev/null 2>&1
+    sudo bash vm-setup.sh clock srvres/$dir/clock-before-sender.txt > /dev/null 2>&1" 2> /dev/null) || true
+  if grep -qE '^pin: ([1-9][0-9]* of|.* again$)' <<< "$spin"; then
+    log "run $dir: the sender's IRQs or NIC moderation had drifted and were pinned again: $(grep -E '^pin: ' <<< "$spin" | paste -sd ';' -)"
+  fi
+  rrun "mkdir -p res/$dir; sudo bash vm-setup.sh pin | tee res/$dir/pin.txt
+    ok=0; $r_before
+    sudo bash vm-setup.sh netstats res/$dir/net-before.txt; sudo bash vm-setup.sh irqs res/$dir/irq-before.txt
+    sudo bash vm-setup.sh clock res/$dir/clock-before.txt; sudo bash vm-setup.sh trace start $cpus${TRACE_NOIRQ:+ noirq}
     $spare_on
+    if [[ \$ok == 0 ]]; then
     $cmd; rc=\$?
+    else echo 'not measured: the settings were not as wanted'; rc=97; fi
     $spare_off
     sudo bash vm-setup.sh trace stop res/$dir/trace.txt; sudo bash vm-setup.sh irqs res/$dir/irq-after.txt
+    $r_after
+    sudo bash vm-setup.sh clock res/$dir/clock-after.txt
     sudo bash vm-setup.sh netstats res/$dir/net-after.txt; sudo chown -R \$(id -un) res; exit \$rc" \
-    > "$OUT/logs/$(echo "$dir" | tr / _).log" 2>&1 || log "run $dir failed (see logs)"
-  sssh "sudo bash vm-setup.sh netstats srvres/$dir/net-after-sender.txt; sudo chown -R \$(id -un) srvres" > /dev/null 2>&1 || true
+    > "$runlog" 2>&1 || rc=$?
+  (( rc == 0 )) || log "run $dir failed (exit $rc, see logs)"
+  if grep -qE '^pin: ([1-9][0-9]* of|.* again$)' "$runlog"; then
+    log "run $dir: the receiver's IRQs or NIC moderation had drifted and were pinned again: $(grep -E '^pin: ' "$runlog" | paste -sd ';' -)"
+  fi
+  safter=$(sssh "sudo bash vm-setup.sh netstats srvres/$dir/net-after-sender.txt
+    sudo bash vm-setup.sh clock srvres/$dir/clock-after-sender.txt
+    $s_after
+    sudo chown -R \$(id -un) srvres" 2> /dev/null) || true
+  if [[ -n ${FAIR_CHECK:-} ]]; then
+    local why="" k
+    for k in receiver-before receiver-after; do
+      grep -q "^$k-check: ok" "$runlog" || why+="$k: $(grep -m1 "^$k-check" "$runlog" || echo "no check"); "
+    done
+    grep -q '^sender-before-check: ok' <<< "$spin" || why+="sender-before: $(grep -m1 '^sender-before-check' <<< "$spin" || echo "no check"); "
+    grep -q '^sender-after-check: ok' <<< "$safter" || why+="sender-after: $(grep -m1 '^sender-after-check' <<< "$safter" || echo "no check"); "
+    (( rc == 0 )) || why+="run exit $rc; "
+    [[ -z $why ]] || fail_point "$dir" "${why%; }"
+  fi
   if [[ -n $server ]]; then
     sleep 1
     sssh "mkdir -p srvres/$dir; sudo bash vm-setup.sh trace stop srvres/$dir/server-trace.txt
       f=\$(ls -t srvstalls/server-$server-*.txt 2>/dev/null | head -1); [[ -n \$f ]] && sudo mv \$f srvres/$dir/; sudo chown -R \$(id -un) srvres" > /dev/null || true
   fi
+}
+
+# Marks point $1 failed for reason $2: logged, listed in failed-points.txt and
+# kept with the run (res/<dir>/failed.txt), so the analysis leaves it out.
+fail_point() {
+  POINT_FAILED=$2
+  log "!!! point $1 FAILED: $2"
+  echo "$1: $2" >> "$OUT/failed-points.txt"
+  rssh "mkdir -p res/$1; printf '%s\n' $(printf '%q' "$2") > res/$1/failed.txt" > /dev/null 2>&1 \
+    || log "point $1: failed.txt not written"
 }
 
 # Market data: 50-message bursts every millisecond, one receiving loop.
@@ -134,6 +207,10 @@ pp_run() {
   fi
   # uring-sqpoll-sib: the SQPOLL thread on the loop's hyperthread sibling.
   if [[ $b == uring-sqpoll-sib ]]; then
+    if [[ -z ${CPU_SIB:-} ]]; then
+      log "skip $tag $b: no hyperthread sibling (no SMT: a second vCPU is a whole core, which is uring-sqpoll)"
+      return
+    fi
     TRACE_EXTRA=$CPU_SIB
     traced_run "$tag/pp-$b-$rate" "sudo $prefix bin/io_bench pingpong --server $SND_PRIV:9444 --ca cert-echo.pem --sni lab.local \
       --variant uring-sqpoll --cpu $CPU_A --sqpoll-cpu $CPU_SIB --busy-poll 1 --wait-us 0 $flags --rate $rate --duration $secs \
@@ -198,10 +275,14 @@ apply_conds() {
 
 # condition <round> <spec>
 condition() {
-  local round=$1 name backends flags prefix smt
-  IFS='|' read -r name backends flags prefix smt <<< "$2"
-  if [[ $smt == smt && -z ${CPU_SIB:-} ]]; then
+  local round=$1 name backends flags prefix needs
+  IFS='|' read -r name backends flags prefix needs <<< "$2"
+  if [[ $needs == smt && -z ${CPU_SIB:-} ]]; then
     log "skip $name: no hyperthread sibling on this instance type"
+    return
+  fi
+  if [[ $needs == cstates && ${RCV_DEEP_IDLE:-yes} != yes ]]; then
+    log "skip $name: the receiver has no idle state deeper than 1 µs to cap (${RARCH:-}; on Graviton the boot profile full-nohlt is the counterpart)"
     return
   fi
   local tag=r$round-$name
@@ -223,7 +304,7 @@ reboot_into() {
   if [[ $p == stock ]]; then
     rssh "sudo bash vm-setup.sh tune stock" > "$OUT/env-rcv-$p.txt" || log "boot $p: tune failed"
   else
-    rssh "sudo bash vm-setup.sh tune" > "$OUT/env-rcv-$p.txt" || log "boot $p: tune failed"
+    rssh "sudo bash vm-setup.sh tune $(tune_arg)" > "$OUT/env-rcv-$p.txt" || log "boot $p: tune failed"
   fi
   # A reboot cancels a scheduled power-off.
   if declare -F deadman > /dev/null; then deadman; fi
@@ -279,6 +360,12 @@ run_matrix() {
       boot_profile stock
       boot_profile isolcpus
       boot_profile full-nomitig
+      # Idle CPUs polling instead of WFI: Graviton's only idle-state lever.
+      if [[ ${RARCH:-} == aarch64 ]]; then
+        boot_profile full-nohlt
+      else
+        log "skip boot profile full-nohlt: arm64 only (x86 has no nohlt)"
+      fi
       boot_profile full
     fi
   done
@@ -298,12 +385,12 @@ run_confirm() {
   mkdir -p "$OUT/logs"
   rssh "mkdir -p res"
   start_servers
-  local specs rep spec name backends flags prefix smt b
+  local specs rep spec name backends flags prefix needs b
   IFS=';' read -ra specs <<< "${CONFIRM:?CONFIRM=<specs>}"
   for ((rep = 1; rep <= CONFIRM_REPEATS; rep++)); do
     for spec in "${specs[@]}"; do
       if [[ $spec == base ]]; then spec="base|$CONFIRM_BACKENDS|||"; fi
-      IFS='|' read -r name backends flags prefix smt <<< "$spec"
+      IFS='|' read -r name backends flags prefix needs <<< "$spec"
       local tag=c$rep-$name
       [[ $name == base ]] || apply_conds "$name" on "$tag"
       log "confirm $tag: ${CONFIRM_S}s per backend at ${CONFIRM_RATE}/s"
@@ -335,7 +422,7 @@ run_diagnose() {
   local b
   log "diagnose: hardware latency on CPUs $ISO"
   rrun "mkdir -p res/diag/hwlat && printf 'mode=hwlat\ncpu=$ISO\nduration_s=$DIAG_S\n' > res/diag/hwlat/meta.txt
-    sudo bash vm-setup.sh hwlat start $ISO 10; sleep $DIAG_S; sudo bash vm-setup.sh hwlat stop res/diag/hwlat/hwlat.txt; sudo chown -R \$(id -un) res" \
+    sudo bash vm-setup.sh pin; sudo bash vm-setup.sh hwlat start $ISO 10; sleep $DIAG_S; sudo bash vm-setup.sh hwlat stop res/diag/hwlat/hwlat.txt; sudo chown -R \$(id -un) res" \
     > "$OUT/logs/diag-hwlat.log" 2>&1 || log "diagnose: hwlat failed"
   for b in $DIAG_BACKENDS; do
     log "diagnose: slow syscalls, $b"
@@ -344,7 +431,7 @@ run_diagnose() {
         --sqpoll-cpu $CPU_SQ --busy-poll 1 --wait-us 0 --rate $PACED_RATE --duration $DIAG_S --out res/diag/syscalls-pp-$b
       sudo bash vm-setup.sh slowsys stop" echo
     log "diagnose: slow kernel functions, $b"
-    rrun "mkdir -p res/diag/fgraph-pp-$b; sudo bash vm-setup.sh fgraph start $CPU_A 50
+    rrun "mkdir -p res/diag/fgraph-pp-$b; sudo bash vm-setup.sh pin; sudo bash vm-setup.sh fgraph start $CPU_A 50
       sudo bin/io_bench pingpong --server $SND_PRIV:9444 --ca cert-echo.pem --sni lab.local --variant $b --cpu $CPU_A \
         --sqpoll-cpu $CPU_SQ --busy-poll 1 --wait-us 0 --rate $PACED_RATE --duration $((DIAG_S / 2)) --out res/diag/fgraph-pp-$b
       sudo bash vm-setup.sh fgraph stop res/diag/fgraph-pp-$b/fgraph.txt; sudo chown -R \$(id -un) res" \
@@ -366,8 +453,11 @@ run_diagnose() {
 
 # HTTP clients (MODE=http): ergon-io's client on every backend and through
 # the pooled HttpClient API, libcurl (the distro library and a source build
-# with c-ares and -O3 -march=native) and reqwest, paced and back to back,
-# HTTP_ROUNDS times with the client order reversed every other round.
+# with c-ares, -O3 and the build host's CPU: -march=native on x86,
+# -mcpu=native on aarch64, where -march sets the architecture only and
+# -mcpu also tunes for the core, GCC's AArch64 options; AWS's Graviton C/C++
+# guide tunes with -mcpu) and reqwest, paced and back to back, HTTP_ROUNDS
+# times with the client order reversed every other round.
 HTTP_ROUNDS=${HTTP_ROUNDS:-2}
 CURL_SRC=${CURL_SRC:-8.23.0}
 build_http_clients() {
@@ -376,13 +466,15 @@ build_http_clients() {
     sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libssl-dev libcurl4-openssl-dev libc-ares-dev cmake perl xz-utils zlib1g-dev > /dev/null
     . ~/.cargo/env; cd ergon/io/benches
+    export RUSTFLAGS='${RFLAGS:-}'
+    case \$(uname -m) in aarch64) native=-mcpu=native ;; *) native=-march=native ;; esac
     cargo build --release --bin http_bench --features reqwest --target-dir t-reqwest -q
     cp t-reqwest/release/http_bench ~/bin/http_bench_reqwest
     cargo build --release --bin http_bench --features curl --target-dir t-distro -q
     cp t-distro/release/http_bench ~/bin/http_bench_curl_distro
     cd ~; (curl -sSfLO https://curl.se/download/curl-$CURL_SRC.tar.xz || curl -sSfLO https://curl.se/download/curl-8.22.0.tar.xz)
     tar -xJf curl-*.tar.xz; cd curl-*/
-    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS='-O3 -march=native' -DCMAKE_INSTALL_PREFIX=/opt/curl \\
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=\"-O3 \$native\" -DCMAKE_INSTALL_PREFIX=/opt/curl \\
       -DENABLE_ARES=ON -DENABLE_THREADED_RESOLVER=OFF -DHTTP_ONLY=ON -DCURL_USE_OPENSSL=ON -DUSE_NGHTTP2=OFF \\
       -DCURL_USE_LIBPSL=OFF -DCURL_USE_LIBSSH2=OFF -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF -DUSE_LIBIDN2=OFF \\
       -DBUILD_CURL_EXE=OFF -DBUILD_SHARED_LIBS=ON -DBUILD_TESTING=OFF > /dev/null
@@ -403,12 +495,13 @@ run_http() {
     [ergon-uring-sqpoll]="bin/http_bench --client ergon --backend uring-sqpoll --sqpoll-cpu $CPU_SQ"
     [ergon-uring-spin]="bin/http_bench --client ergon --backend uring-spin"
     [ergon-epoll-spin]="bin/http_bench --client ergon --backend epoll-spin"
+    [mio]="bin/mio_bench http --pool 1"
     [api-native-recv-busy]="bin/http_bench --client client --impl native --backend recv-busy"
     [curl-distro]="bin/http_bench_curl_distro --client curl --curl-label distro"
     [curl-source]="env LD_LIBRARY_PATH=/opt/curl/lib bin/http_bench_curl_source --client curl --curl-label source"
     [reqwest]="bin/http_bench_reqwest --client reqwest"
   )
-  local order=(ergon-recv-busy ergon-uring-sqpoll ergon-uring-spin ergon-epoll-spin api-native-recv-busy curl-distro curl-source reqwest)
+  local order=(ergon-recv-busy ergon-uring-sqpoll ergon-uring-spin ergon-epoll-spin mio api-native-recv-busy curl-distro curl-source reqwest)
   local ok=() c round rate i TRACE_EXTRA
   log "http: smoke test, every client for 3 s (a client that fails is left out)"
   for c in "${order[@]}"; do
@@ -478,7 +571,9 @@ run_md() {
 # messages to each of 10 random connections; about 68,000 messages a second).
 # Each backend runs alone with the same traffic (a fixed seed), MANY_ROUNDS
 # times in alternating order. The one-way numbers (sender clock -> decoded)
-# include the hosts' clock offset; chrony's view of it is logged around every run.
+# include the hosts' clock offset: relative only. Both hosts' chrony state is
+# kept with every run (traced_run), and analyse labels the one-way tables
+# with the bound on that offset.
 # MANY_CONNS is a list: the whole set runs per connection count.
 MANY_CONNS=${MANY_CONNS:-1 10 100}
 MANY_S=${MANY_S:-60}
@@ -506,13 +601,16 @@ run_many() {
         || log "many: sender did not start"
       sleep 2
       relay "$SND" cert-many.pem "$RCV" cert-many.pem || log "many: certificate not copied"
-      for h in rcv snd; do
-        if [[ $h == rcv ]]; then rssh "chronyc tracking" ; else sssh "chronyc tracking"; fi \
-          > "$OUT/logs/chrony-$h-$round-$b-c$conns.txt" 2>&1 || true
-      done
+      # Both hosts' chrony state is kept with the run itself (traced_run).
       TRACE_EXTRA=""
       if [[ $b == uring-sqpoll ]]; then TRACE_EXTRA=$CPU_SQ; fi
-      if [[ $b == uring-sqpoll-sib ]]; then TRACE_EXTRA=$CPU_SIB; fi
+      if [[ $b == uring-sqpoll-sib ]]; then
+        if [[ -z ${CPU_SIB:-} ]]; then
+          log "skip $tag: no hyperthread sibling (no SMT: a second vCPU is a whole core, which is uring-sqpoll)"
+          continue
+        fi
+        TRACE_EXTRA=$CPU_SIB
+      fi
       local lab_cmd="bin/io_bench lab --variants $b --cpus $CPU_A --sqpoll-cpu $CPU_SQ --busy-poll 1 --wait-us 0"
       if [[ $b == mio ]]; then lab_cmd="bin/mio_bench lab --cpu $CPU_A"; fi
       # uring-sqpoll-sib: the SQPOLL thread on the loop's hyperthread sibling
@@ -530,6 +628,271 @@ run_many() {
    done
   done
   sssh "sudo pkill -f 'replay_serve[r] --listen 0.0.0.0:9447' || true" > /dev/null || true
+}
+
+# The fair comparison (MODE=fair): every backend on the same hosts, each
+# with its own best tuning, the host settings held and checked before and
+# after every point (FAIR_CHECK, traced_run), a point whose settings drifted
+# failed and measured again (FAIR_RETRIES). The receiver's roles come from
+# fair_roles (lib-cloud.sh): housekeeping, the NIC interrupts, the loop and
+# the SQPOLL thread each on a core of its own. Conditions (FAIR_CONDS):
+#   irqcore   every NIC queue interrupt on the IRQ core, every backend
+#   irqlocal  every NIC queue interrupt on the loop's own CPU, the
+#             interrupt-driven backends only (FAIR_IRQLOCAL_BACKENDS)
+# Points, per round and condition (FAIR_ROUNDS; the backend order and the
+# condition order reverse every other round):
+#   md    market data on FAIR_MD_CONNS connections, FAIR_MD_STREAMS streams
+#         over them (replay_server --mode mixed: the same traffic for every
+#         connection count), FAIR_MD_S seconds; analysed as sender -> decoded
+#         (the whole path: the only cross-family comparison) and, within a
+#         family only, kernel arrival -> decoded
+#   rt    the WebSocket order round trip on 1 connection at FAIR_RT_RATES while
+#         N-1 more connections on the same loop carry the market data
+#         (N in FAIR_RT_CONNS; one server thread answers the order connection
+#         between any two feed sends), FAIR_RT_S seconds
+#   http  the HTTP order round trip through a pool of P connections (P in
+#         FAIR_HTTP_POOLS; requests take the pool's connections in turn), the
+#         server answering every connection from one thread, FAIR_HTTP_S
+#         seconds
+FAIR_ROUNDS=${FAIR_ROUNDS:-2}
+FAIR_CONDS=${FAIR_CONDS:-irqcore irqlocal}
+FAIR_BACKENDS=${FAIR_BACKENDS:-epoll-spin mio uring-spin recv-busy recv-busy-pq uring-sqpoll}
+FAIR_IRQLOCAL_BACKENDS=${FAIR_IRQLOCAL_BACKENDS:-epoll-spin mio uring-spin}
+FAIR_KINDS=${FAIR_KINDS:-md rt http}
+FAIR_MD_CONNS=${FAIR_MD_CONNS:-1 4 16 64 256}
+FAIR_MD_STREAMS=${FAIR_MD_STREAMS:-1024}
+# The market data's schedule (replay_server --mode mixed): each of the 1024
+# streams a trickle at its own mean interval of 10-100 ms (about 26,000
+# messages a second in all) and every 2 ms 5 messages to each of 10 random
+# streams (25,000 a second): about 51,000 a second whatever the connection
+# count, well within what the sender holds (it logs how late it ran:
+# fair_point warns when over 1% of its sends began 100 µs late). MANY_SERVER_FLAGS'
+# 1-10 ms trickle over 1024 streams asks for about 310,000 a second, more than
+# a sender holds, so its rate followed the sender and the receiver instead.
+FAIR_MD_SERVER_FLAGS=${FAIR_MD_SERVER_FLAGS:---trickle-min-us 10000 --trickle-max-us 100000 --burst-every-us 2000 --burst-slots 10 --burst 5 --seed 42}
+FAIR_MD_S=${FAIR_MD_S:-60}
+FAIR_RT_CONNS=${FAIR_RT_CONNS:-1 4 16 64}
+FAIR_RT_RATES=${FAIR_RT_RATES:-10000}
+FAIR_RT_S=${FAIR_RT_S:-60}
+FAIR_HTTP_POOLS=${FAIR_HTTP_POOLS:-1 20}
+FAIR_HTTP_RATE=${FAIR_HTTP_RATE:-10000}
+FAIR_HTTP_S=${FAIR_HTTP_S:-60}
+FAIR_RETRIES=${FAIR_RETRIES:-1}
+# Set-up and copying around each point (server start, certificate relay,
+# pins, checks, traces, polling): for the time estimate only.
+FAIR_POINT_OVERHEAD_S=${FAIR_POINT_OVERHEAD_S:-35}
+
+# polling or interrupt: the family of backend $1.
+fair_family() {
+  case $1 in
+    recv-busy | recv-busy-pq | uring-sqpoll) echo polling ;;
+    *) echo interrupt ;;
+  esac
+}
+
+# What backend $1 sets for itself (every other setting is the host's, the
+# same for all).
+fair_backend_desc() {
+  case $1 in
+    epoll-spin) echo "ergon-io: epoll_wait(0) in a spin loop, SO_BUSY_POLL 0 on its sockets: purely interrupt driven" ;;
+    mio) echo "mio + rustls (the usual Rust way): Poll::poll(0) (epoll) in a spin loop, no busy polling: purely interrupt driven" ;;
+    uring-spin) echo "ergon-io: io_uring submitted and reaped without waiting, no NAPI registration: interrupt driven" ;;
+    recv-busy) echo "ergon-io: a non-blocking recvmsg on every socket every poll, SO_BUSY_POLL 1 µs: each empty read polls the NIC queue once" ;;
+    recv-busy-pq) echo "ergon-io: recv-busy reading one socket per NIC queue, then epoll_wait(0) for the rest (Config::per_queue)" ;;
+    uring-sqpoll) echo "ergon-io: io_uring with its SQPOLL kernel thread on its own core (sqpoll_cpu), NAPI busy poll 1 µs registered for its sockets' queues" ;;
+    *) echo "unknown backend" ;;
+  esac
+}
+
+# The host settings every backend shares in the fair mode.
+fair_settings_desc() {
+  cat << 'EOS'
+net.core.busy_poll 0, net.core.busy_read 0 (no global busy polling: the interrupt-driven backends are purely interrupt driven; recv-busy and uring-sqpoll set their own per socket or ring)
+NIC interrupt moderation off where the NIC has it: adaptive-rx off, rx-usecs 0, RX CQE coalescing off (rx-cqe-frames 1); a NIC without the setting is recorded as such
+napi_defer_hard_irqs 0, gro_flush_timeout 0 on every NIC
+every NIC queue interrupt on the IRQ core (irqcore), or on the loop's CPU (irqlocal); every other movable interrupt on housekeeping; irqbalance off
+idle CPUs poll instead of halting where no SMT sibling would spin (boot profile full-pollidle: x86 idle=poll, arm64 nohlt), so the IRQ core never wakes from sleep for an interrupt; else halt (recorded)
+isolcpus, nohz_full and rcu_nocbs on every CPU but housekeeping; routes with quickack 1, rto_min 5ms
+the sender: the same settings, its NIC interrupts on its housekeeping CPU, its server loop on the other CPU (the round-trip and HTTP servers busy poll their sockets; the market-data sender only sends)
+kernel trace of the loop CPU (and the SQPOLL CPU) for the cause of each stall; in irqlocal without interrupt and softirq events, which there fire on every packet of the interrupt-driven backends only (/proc/interrupts still counts them)
+EOS
+}
+
+# The fair points in run order, one per line:
+#   <round> <condition> <kind> <backend> <connections> <rate|-> <seconds>
+# (connections: md the connections, rt N = 1 order + N-1 feeds, http the pool).
+fair_points() {
+  local round cond kind b n rate list conds backends i
+  for ((round = 1; round <= FAIR_ROUNDS; round++)); do
+    read -ra conds <<< "$FAIR_CONDS"
+    if (( round % 2 == 0 )); then
+      local rev=()
+      for ((i = ${#conds[@]} - 1; i >= 0; i--)); do rev+=("${conds[$i]}"); done
+      conds=("${rev[@]}")
+    fi
+    for cond in "${conds[@]}"; do
+      list=$FAIR_BACKENDS
+      if [[ $cond == irqlocal ]]; then
+        list=""
+        for b in $FAIR_BACKENDS; do [[ " $FAIR_IRQLOCAL_BACKENDS " == *" $b "* ]] && list+="$b "; done
+      fi
+      read -ra backends <<< "$list"
+      if (( round % 2 == 0 )); then
+        local rb=()
+        for ((i = ${#backends[@]} - 1; i >= 0; i--)); do rb+=("${backends[$i]}"); done
+        backends=("${rb[@]}")
+      fi
+      for kind in $FAIR_KINDS; do
+        case $kind in
+          md) for n in $FAIR_MD_CONNS; do for b in "${backends[@]}"; do echo "$round $cond md $b $n - $FAIR_MD_S"; done; done ;;
+          rt) for n in $FAIR_RT_CONNS; do for rate in $FAIR_RT_RATES; do for b in "${backends[@]}"; do echo "$round $cond rt $b $n $rate $FAIR_RT_S"; done; done; done ;;
+          http) for n in $FAIR_HTTP_POOLS; do for b in "${backends[@]}"; do echo "$round $cond http $b $n $FAIR_HTTP_RATE $FAIR_HTTP_S"; done; done ;;
+        esac
+      done
+    done
+  done
+}
+
+# Seconds the fair points take: measuring, and with FAIR_POINT_OVERHEAD_S each.
+fair_measure_s() { fair_points | awk '{s += $7} END {print s + 0}'; }
+fair_points_s() { fair_points | awk -v o="$FAIR_POINT_OVERHEAD_S" '{s += $7 + o} END {print s + 0}'; }
+
+# The plan: the points by kind and condition, the settings and each
+# backend's own, then every point. No host is needed.
+fair_plan() {
+  local n
+  n=$(fair_points | wc -l | tr -d ' ')
+  echo "== points: $n ($FAIR_ROUNDS rounds; conditions $FAIR_CONDS)"
+  fair_points | awk '{k = $2 " " $3; c[k]++; s[k] += $7} END {for (k in c) printf "  %-16s %4d points, %6d s measuring\n", k, c[k], s[k]}' | sort
+  echo "  market data: connections $FAIR_MD_CONNS, $FAIR_MD_STREAMS streams over them (about 51,000 messages a second: $FAIR_MD_SERVER_FLAGS), ${FAIR_MD_S} s each; metric across families: sender -> decoded; kernel arrival -> decoded within a family only"
+  echo "  order round trip: N = $FAIR_RT_CONNS (1 order connection + N-1 market-data connections on the same loop), ${FAIR_RT_RATES// /, } round trips a second, ${FAIR_RT_S} s each"
+  echo "  HTTP: pools of ${FAIR_HTTP_POOLS// /, } connections (one request in flight, the pool's connections in turn), ${FAIR_HTTP_RATE}/s, ${FAIR_HTTP_S} s each; the server answers every connection from one thread"
+  echo "  a point whose settings drift fails and is measured again up to $FAIR_RETRIES time(s)"
+  echo "== settings every backend shares (vm-setup.sh fair, held by pin, checked before and after every point)"
+  fair_settings_desc | sed 's/^/  /'
+  echo "== what each backend sets for itself"
+  local b
+  for b in $FAIR_BACKENDS; do printf '  %-13s %-9s %s\n' "$b" "$(fair_family "$b")" "$(fair_backend_desc "$b")"; done
+  echo "== every point: round condition kind backend connections rate seconds"
+  fair_points | sed 's/^/  /'
+}
+
+# The fair run's environment for the report (res/fair-env.txt), one
+# key=value a line: FAIR_ENV (set by the caller: run, cloud, region, sizes,
+# priority) first.
+fair_env() {
+  printf '%s\n' "${FAIR_ENV:-}"
+  printf '%s\n' "layout=${LAYOUT:-}" "housekeeping_cpu=$HK" "irq_cpu=${CPU_IRQ:-}" "loop_cpu=$CPU_A" \
+    "sqpoll_cpu=$CPU_SQ" "spare_cpu=${CPU_SPARE:-none}" "receiver_boot=$RCV_BOOT"
+  local b
+  for b in $FAIR_BACKENDS; do echo "backend.$b=$(fair_family "$b"): $(fair_backend_desc "$b")"; done
+  fair_settings_desc | awk '{printf "setting.%d=%s\n", NR, $0}'
+}
+
+# A replay_server on port $1 writing certificate $2, with arguments $3,
+# then its certificate on the receiver.
+fair_server() {
+  # Separate calls: a shell whose command line holds the start command would
+  # match the pattern and kill itself.
+  sssh "sudo pkill -f 'replay_serve[r] --listen 0.0.0.0:$1' || true" > /dev/null || true
+  sssh "mkdir -p srvstalls; nohup sudo bin/replay_server --listen 0.0.0.0:$1 --cert-out $2 $3 --cpu $S_CPU \
+    > srv-fair.log 2>&1 < /dev/null &" || return 1
+  sleep 2
+  relay "$SND" "$2" "$RCV" "$2"
+}
+
+# The client command of one fair point: kind, backend, server, certificate,
+# connections (md), N (rt) or pool (http), rate, seconds, output directory.
+fair_client() {
+  local kind=$1 b=$2 common="--server $3 --ca $4 --sni lab.local" n=$5 rate=$6 secs=$7 out=$8 v=$2 extra=""
+  [[ $b == recv-busy-pq ]] && v=recv-busy extra=--per-queue
+  [[ $b == uring-sqpoll ]] && extra="--sqpoll-cpu $CPU_SQ"
+  case $kind:$b in
+    md:mio) echo "bin/mio_bench lab $common --cpu $CPU_A --conns $n --capacity 8000000 --duration $secs --out $out" ;;
+    md:*) echo "bin/io_bench lab $common --variants $v $extra --cpus $CPU_A --busy-poll 1 --wait-us 0 --conns $n --capacity 8000000 --duration $secs --out $out" ;;
+    rt:mio) echo "bin/mio_bench pingpong $common --cpu $CPU_A --feeds $((n - 1)) --rate $rate --duration $secs --out $out" ;;
+    rt:*) echo "bin/io_bench pingpong $common --variant $v $extra --cpu $CPU_A --busy-poll 1 --wait-us 0 --feeds $((n - 1)) --rate $rate --duration $secs --out $out" ;;
+    http:mio) echo "bin/mio_bench http $common --cpu $CPU_A --pool $n --rate $rate --duration $secs --out $out" ;;
+    http:*) echo "bin/http_bench --client client --impl native --backend $v $extra --pool $n $common --cpu $CPU_A --rate $rate --duration $secs --out $out" ;;
+  esac
+}
+
+# One fair point (fair_points' fields); a failed one is measured again up to
+# FAIR_RETRIES times, the failed attempt kept as <run>.attempt<k>.
+fair_point() {
+  local round=$1 cond=$2 kind=$3 b=$4 n=$5 rate=$6 secs=$7 try dir run port cert server args TRACE_EXTRA=""
+  local tag=f$round-$cond at=""
+  [[ $rate != - ]] && at=", $rate/s"
+  case $kind in
+    md) run=md-$b-c$n port=9447 cert=cert-many.pem server=""
+      args="--clients $n --mode mixed $FAIR_MD_SERVER_FLAGS --streams $FAIR_MD_STREAMS --duration $((secs + 60))" ;;
+    rt) run=rt-$b-n$n-r$rate port=9448 cert=cert-rt.pem server=echo
+      args="--clients $n --mode mixed $FAIR_MD_SERVER_FLAGS --busy-poll 50 --stalls-dir \$HOME/srvstalls --duration $((secs + 60))"
+      (( n > 1 )) && args+=" --streams $FAIR_MD_STREAMS" ;;
+    http) run=http-$b-p$n-r$rate port=9445 cert=cert-http.pem server=http
+      args="--mode http --threads one --busy-poll 50 --stalls-dir \$HOME/srvstalls --duration $((secs + 60))" ;;
+    *) log "fair: unknown kind $kind"; return 1 ;;
+  esac
+  dir=$tag/$run
+  [[ $b == uring-sqpoll ]] && TRACE_EXTRA=$CPU_SQ
+  # irqlocal: every packet's interrupt is on the traced loop CPU; tracing it
+  # would slow the interrupt-driven backends alone (vm-setup.sh trace noirq).
+  local TRACE_NOIRQ=""
+  [[ $cond == irqlocal ]] && TRACE_NOIRQ=1
+  for ((try = 0; try <= FAIR_RETRIES; try++)); do
+    log "fair $tag: $kind $b, $n connection(s)$at"
+    if fair_server "$port" "$cert" "$args"; then
+      traced_run "$dir" "sudo $(fair_client "$kind" "$b" "$SND_PRIV:$port" "$cert" "$n" "$rate" "$secs" "res/$dir")" "$server" "$secs"
+    else
+      fail_point "$dir" "the server did not start"
+    fi
+    local srvlog
+    srvlog="$OUT/logs/srv-$(echo "$dir" | tr / _).txt"
+    sleep 1
+    sssh "tail -4 srv-fair.log" > "$srvlog" 2>&1 || true
+    # schedule: sent=N batches=B late_100us=K late_max_us=M (market data and
+    # feeds; K of the B due times began over 100 µs late).
+    awk '/^schedule: / { for (i = 2; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+        if (v["batches"] > 0 && v["late_100us"] * 100 > v["batches"])
+          printf "%d of %d sends began over 100 µs late, the latest %d µs\n", v["late_100us"], v["batches"], v["late_max_us"] }' "$srvlog" \
+      | while read -r l; do log "!!! point $dir: the sender fell behind its schedule ($l): its traffic was not the planned traffic"; done
+    [[ -z $POINT_FAILED ]] && return 0
+    if (( try < FAIR_RETRIES )); then
+      log "point $dir: measuring again ($((try + 1)) of $FAIR_RETRIES); the failed attempt is kept as $dir.attempt$((try + 1))"
+      rssh "rm -rf res/$dir.attempt$((try + 1)); mv res/$dir res/$dir.attempt$((try + 1))" || true
+    fi
+  done
+}
+
+run_fair() {
+  mkdir -p "$OUT/logs"
+  rssh "mkdir -p res"
+  FAIR_CHECK=1
+  local points p cur="" round cond kind b n rate secs
+  # The environment and every held setting as the run starts, for the report.
+  local env
+  env="$(fair_env)
+$(rssh "sudo bash vm-setup.sh check" | { grep -E '^(idle|boot-profile|sysctl\.|nic\.)' || true; } | sed 's/^/receiver./')
+$(sssh "sudo bash vm-setup.sh check" | { grep -E '^(idle|boot-profile|sysctl\.|nic\.)' || true; } | sed 's/^/sender./')"
+  printf '%s\n' "$env" | rssh "cat > res/fair-env.txt"
+  # Read first: the ssh calls inside the loop would read its input.
+  mapfile -t points < <(fair_points)
+  log "fair: ${#points[@]} points, about $(( $(fair_points_s) / 60 )) minutes"
+  for p in "${points[@]}"; do
+    read -r round cond kind b n rate secs <<< "$p"
+    if [[ $cond != "$cur" ]]; then
+      [[ $cur == irqlocal ]] && apply_conds irqlocal off "fair-$round"
+      [[ $cond == irqlocal ]] && apply_conds irqlocal on "fair-$round"
+      cur=$cond
+      log "fair round $round: condition $cond"
+    fi
+    fair_point "$round" "$cond" "$kind" "$b" "$n" "$rate" "$secs"
+  done
+  [[ $cur == irqlocal ]] && apply_conds irqlocal off "fair-end"
+  sssh "sudo pkill -x replay_server || true" > /dev/null || true
+  local failed=0
+  [[ -s $OUT/failed-points.txt ]] && failed=$(wc -l < "$OUT/failed-points.txt" | tr -d ' ')
+  log "fair: done; $failed failed attempt(s) (failed-points.txt)"
 }
 
 # The baseline set only (instance-type comparisons).
@@ -559,8 +922,11 @@ collect_results() {
     log "collect: analysing on the receiver"
     # Every CPU may run it now (the isolated ones are idle).
     rssh "cd res && taskset -c 0-\$((\$(nproc) - 1)) ~/bin/analyse --warmup-s 2 --matrix . > ../tables.md 2> ../analyse.err; true"
-    rssh "tar -czf res.tgz --exclude='records.bin*' --exclude='trace.txt*' --exclude='server-trace.txt*' --exclude='fgraph.txt' \
-      res tables.md analyse.err" && scp "${SSHO[@]}" "$RUSER@$RCV:res.tgz" "$OUT/" > /dev/null
+    # The fair mode's own report: each backend against the others, per
+    # connection count, with the run id and the environment.
+    [[ ${MODE:-} != fair ]] || rssh "cd res && taskset -c 0-\$((\$(nproc) - 1)) ~/bin/analyse --warmup-s 2 --fair . > ../fair.md 2>> ../analyse.err; true"
+    rssh "touch fair.md; tar -czf res.tgz --exclude='records.bin*' --exclude='trace.txt*' --exclude='server-trace.txt*' --exclude='fgraph.txt' \
+      res tables.md fair.md analyse.err" && scp "${SSHO[@]}" "$RUSER@$RCV:res.tgz" "$OUT/" > /dev/null
     tar -xzf "$OUT/res.tgz" -C "$OUT" && rm -f "$OUT/res.tgz"
     log "collect: tables and logs copied ($(du -sh "$OUT/res" | cut -f1)); raw records and traces left on the VM"
     return
@@ -589,4 +955,8 @@ collect_results() {
   ANALYSE=${ANALYSE:-target/release/analyse}
   "$ANALYSE" --warmup-s 2 --matrix "$OUT/res" > "$OUT/tables.md" 2> "$OUT/analyse.err" \
     || log "collect: analysis failed (see analyse.err)"
+  if [[ ${MODE:-} == fair ]]; then
+    "$ANALYSE" --warmup-s 2 --fair "$OUT/res" > "$OUT/fair.md" 2>> "$OUT/analyse.err" \
+      || log "collect: fair report failed (see analyse.err)"
+  fi
 }

@@ -17,6 +17,10 @@
 extern "C" {
 #endif
 
+/* The largest frame the fake carries, sent or received: a jumbo frame (a
+ * 9001-byte MTU's) and more. */
+#define RUSTERON_DPDK_FAKE_FRAME_MAX 9216
+
 /* Reset all fake state (call via the Rust test setup between tests). */
 void rusteron_dpdk_fake_reset(void);
 void rusteron_dpdk_fake_set_desc_limits(uint16_t rx_min, uint16_t rx_max, uint16_t tx_min, uint16_t tx_max);
@@ -27,6 +31,9 @@ void rusteron_dpdk_fake_set_failure(int step);
 /* Override the reported driver name and checksum capability (0 clears). */
 void rusteron_dpdk_fake_set_driver(const char *driver);
 void rusteron_dpdk_fake_set_csum_ok(int ok);
+/* How an ENA port's LLQ BAR is mapped (RUSTERON_DPDK_ENA_LLQ_*, dev_info's
+ * ena_llq for net_ena): RUSTERON_DPDK_ENA_LLQ_WC after the reset. */
+void rusteron_dpdk_fake_set_ena_llq(int state);
 
 /* The fake's call log, for reverse-teardown ordering assertions. */
 int rusteron_dpdk_fake_log_count(void);
@@ -46,7 +53,7 @@ void rusteron_dpdk_fake_set_xstats(const char *const *names, const uint64_t *val
 /* A frame accepted by the fake tx_burst (the mbuf is owned by the "NIC"). */
 typedef struct rusteron_dpdk_fake_capture_stct
 {
-    uint8_t data[2048];
+    uint8_t data[RUSTERON_DPDK_FAKE_FRAME_MAX];
     uint32_t len;
     uint32_t ol_flags;
     uint16_t l2_len, l3_len, l4_len;
@@ -73,8 +80,36 @@ int rusteron_dpdk_fake_rx_inject(
 /* Number of frames still queued for the port's rx_burst (test assertion). */
 int rusteron_dpdk_fake_rx_queued(uint16_t port_id);
 
+/* Each pool's mbufs hold the data room the transport asks for (the fake logs
+ * it as "pool <name> (<n>, room <bytes>)"), at most `room` once this is set,
+ * as a pool or PMD that gives less would (0: as asked). A frame injected for
+ * a port larger than its receive pool's room arrives in several segments. */
+void rusteron_dpdk_fake_set_mbuf_room_cap(uint32_t room);
+
+/* The timer service (the PMDs' timers: ENA's health checks): how often it
+ * ran, how often from a thread the fake EAL never registered, whether the
+ * calling thread ran it last, and what it returns (0 until set). */
+int rusteron_dpdk_fake_timer_service_calls(void);
+int rusteron_dpdk_fake_timer_service_unregistered(void);
+int rusteron_dpdk_fake_timer_service_on_caller(void);
+void rusteron_dpdk_fake_set_timer_service_rc(int rc);
+
+/* A device-reset request (RTE_ETH_EVENT_INTR_RESET) from the port's PMD, as
+ * its event callback raises it: the transport's count for the port goes up. */
+void rusteron_dpdk_fake_raise_reset(uint16_t port_id);
+
 /* Fake EAL seam reset (rusteron_dpdk_fake_eal.c). */
 void rusteron_dpdk_fake_eal_reset(void);
+/* The DPDK version the fake EAL reports (rusteron_dpdk_eal_version), which
+ * picks ENA's LLQ device argument: 25.11 after the reset. */
+void rusteron_dpdk_fake_set_eal_version(int year, int month);
+/* The CPU the fake EAL reports its main lcore on (rusteron_dpdk_eal_main_cpu),
+ * where the real one confines its own threads; -1 (none) until set, and
+ * again after the reset. */
+void rusteron_dpdk_fake_set_eal_main_cpu(int cpu);
+/* Whether the calling thread registered with the fake EAL
+ * (rusteron_dpdk_eal_thread_register) and has not unregistered since. */
+int rusteron_dpdk_fake_eal_thread_registered(void);
 
 #ifdef __cplusplus
 }

@@ -71,6 +71,20 @@ pub struct DpdkPortConfig {
     pub gateway_ipv4: Ipv4Addr,
 }
 
+/// The receive ring a port takes when [`DpdkTransportConfig::rx_descriptors`]
+/// is `None`.
+///
+/// Fewer only where the NIC reports a lower maximum (Azure MANA's 256). AWS
+/// measured 4096 against ENA's 1024 (BENCHMARKS.md, round 6): no first-point
+/// `rx-missed` loss, a higher loss-free rate, and no NAKs with two flows, at
+/// the same idle latency.
+pub const DEFAULT_RX_DESCRIPTORS: u16 = 4096;
+
+/// Azure MANA's queue limit (the native `RUSTERON_DPDK_MANA_MAX_DESCRIPTORS`):
+/// what an unset receive ring takes there, and what the pool validation's
+/// error suggests for a pool sized for it.
+const MANA_MAX_DESCRIPTORS: u16 = 256;
+
 /// Validated transport configuration covering both ENA roles and the EAL.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DpdkTransportConfig {
@@ -90,19 +104,26 @@ pub struct DpdkTransportConfig {
     /// Hugepage mount. Must be absolute; hugetlbfs backing is verified natively
     /// at EAL initialization.
     pub hugepage_dir: PathBuf,
-    /// Receive ring descriptors per port (`64..=8192`).
-    pub rx_descriptors: u16,
+    /// Receive ring descriptors per port (`64..=8192`). `None` (the default)
+    /// takes min([`DEFAULT_RX_DESCRIPTORS`], the NIC's reported maximum) on
+    /// each port at start: 4096 on an ENA, 256 on Azure MANA. An explicit
+    /// count is used as given, and start fails on a NIC that cannot take it.
+    pub rx_descriptors: Option<u16>,
     /// Transmit ring descriptors per port (`64..=8192`).
     pub tx_descriptors: u16,
-    /// Mbufs in each port's mempool; at least both rings plus four bursts.
+    /// Mbufs in each port's mempool; at least both rings, four bursts and two
+    /// per-lcore mempool caches (the receive ring at its most, 4096, when
+    /// `rx_descriptors` is `None`).
     pub mbufs_per_port: u32,
     /// Per-lcore mempool cache size.
     pub mempool_cache: u16,
     /// Packets per receive/transmit burst (`1..=256`).
     pub burst_size: u16,
-    /// Largest Aeron MTU the transport carries: 32-aligned, at most 8960 (jumbo
-    /// frames: an AWS 9001-byte VPC MTU less IPv4+UDP), and it must fit the NIC's
-    /// maximum MTU (checked when the ports start). Every peer's Aeron MTU must
+    /// Largest Aeron MTU the transport carries: non-zero, 32-aligned, at most
+    /// 8960 (jumbo frames: an AWS 9001-byte VPC MTU less IPv4+UDP; 8448 for an
+    /// 8500-byte path such as inter-region VPC peering), and it must fit the
+    /// NIC's maximum MTU and its mbufs (checked when the ports start: each port
+    /// takes it plus 28 as its MTU, and every frame is one mbuf). Every peer's Aeron MTU must
     /// be at most this: IPv4 fragments are never accepted.
     /// The context's MTU must not exceed it.
     pub max_aeron_mtu: usize,
@@ -157,10 +178,11 @@ impl DpdkTransportConfig {
             )));
         }
 
-        if !(64..=8192).contains(&self.rx_descriptors) {
+        if let Some(rx) = self.rx_descriptors
+            && !(64..=8192).contains(&rx)
+        {
             return Err(DpdkError::InvalidConfiguration(format!(
-                "rx_descriptors {} must be in 64..=8192",
-                self.rx_descriptors
+                "rx_descriptors {rx} must be in 64..=8192"
             )));
         }
         if !(64..=8192).contains(&self.tx_descriptors) {
@@ -184,19 +206,47 @@ impl DpdkTransportConfig {
             )));
         }
 
-        // The mbuf pool must cover both descriptor rings plus four bursts of
-        // headroom.
-        let required = u64::from(self.rx_descriptors) + u64::from(self.tx_descriptors) + 4 * u64::from(self.burst_size);
-        if u64::from(self.mbufs_per_port) < required {
-            return Err(DpdkError::InvalidConfiguration(format!(
-                "mbufs_per_port {} is below the required {required} (rx + tx descriptors + 4 bursts)",
-                self.mbufs_per_port
-            )));
+        // The mbuf pool must cover both descriptor rings, four bursts of
+        // headroom and what two lcores' mempool caches may hold (the port's
+        // agent, and the EAL main lcore, which starts and stops the port),
+        // each up to DPDK's flush threshold of 1.5 times the cache size.
+        // Unset, the receive ring is sized at start: DEFAULT_RX_DESCRIPTORS
+        // at most.
+        let caches = 3 * u64::from(self.mempool_cache);
+        let required =
+            |rx: u16| u64::from(rx) + u64::from(self.tx_descriptors) + 4 * u64::from(self.burst_size) + caches;
+        let rx = self.rx_descriptors.unwrap_or(DEFAULT_RX_DESCRIPTORS);
+        let need = required(rx);
+        if u64::from(self.mbufs_per_port) < need {
+            let parts = format!(
+                "rx descriptors {rx} + tx {} + 4 bursts of {} + two mempool caches of up to {} each",
+                self.tx_descriptors,
+                self.burst_size,
+                caches / 2
+            );
+            return Err(DpdkError::InvalidConfiguration(match self.rx_descriptors {
+                // A NIC capped lower (Azure MANA's 256) takes less at start,
+                // but the pool is checked here for the most it can take.
+                None => format!(
+                    "mbufs_per_port {} is below the required {need} for a receive ring of up to {rx} \
+                     (RUSTERON_DPDK_RX_DESCRIPTORS unset: min({rx}, the NIC's maximum)): {parts}. Enlarge the \
+                     pool (RUSTERON_DPDK_MBUFS_PER_PORT={need}), or on a NIC capped at {MANA_MAX_DESCRIPTORS} \
+                     descriptors (Azure MANA) set RUSTERON_DPDK_RX_DESCRIPTORS={MANA_MAX_DESCRIPTORS}, which \
+                     needs {}",
+                    self.mbufs_per_port,
+                    required(MANA_MAX_DESCRIPTORS)
+                ),
+                Some(_) => format!(
+                    "mbufs_per_port {} is below the required {need}: {parts}. Enlarge the pool \
+                     (RUSTERON_DPDK_MBUFS_PER_PORT={need}), or set RUSTERON_DPDK_RX_DESCRIPTORS lower",
+                    self.mbufs_per_port
+                ),
+            }));
         }
 
-        if !self.max_aeron_mtu.is_multiple_of(32) || self.max_aeron_mtu > 8960 {
+        if self.max_aeron_mtu == 0 || !self.max_aeron_mtu.is_multiple_of(32) || self.max_aeron_mtu > 8960 {
             return Err(DpdkError::InvalidConfiguration(format!(
-                "max_aeron_mtu {} must be 32-aligned and at most 8960",
+                "max_aeron_mtu {} must be non-zero, 32-aligned and at most 8960",
                 self.max_aeron_mtu
             )));
         }

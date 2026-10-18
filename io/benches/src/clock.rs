@@ -2,6 +2,35 @@
 
 pub use ergon_io::clock::*;
 
+/// The raw counter [`rdtsc`] reads on this architecture.
+#[must_use]
+pub const fn counter_name() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "cntvct_el0"
+    } else if cfg!(target_arch = "x86_64") {
+        "rdtsc"
+    } else {
+        "none"
+    }
+}
+
+/// `meta.txt` lines naming the counter the loops time themselves with, its
+/// rate in Hz and where the rate came from: `CNTFRQ_EL0` (aarch64, exact) or
+/// `measured` (the TSC, against `CLOCK_MONOTONIC`).
+#[must_use]
+pub fn counter_meta() -> String {
+    let rate = if counter_frequency_hz().is_some() {
+        "CNTFRQ_EL0"
+    } else {
+        "measured"
+    };
+    format!(
+        "counter={}\ncounter_hz={:.0}\ncounter_rate={rate}\n",
+        counter_name(),
+        ticks_per_us() * 1e6
+    )
+}
+
 /// Mean cost in nanoseconds of `clock_gettime(CLOCK_REALTIME)` and the raw counter
 /// ([`rdtsc`]), over `iters` reads each.
 #[must_use]

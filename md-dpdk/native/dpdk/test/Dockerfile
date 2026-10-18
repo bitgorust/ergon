@@ -1,5 +1,7 @@
 # Verification environment for the ergon-md-dpdk `dpdk` feature.
-# Runs on x86_64 (Docker amd64 emulation is fine on an arm64 host).
+# Builds for linux/amd64 (emulated on an arm64 host) or linux/arm64 (Graviton's
+# architecture, native on Apple silicon; verify-dpdk.sh --arm64): nothing in it
+# names an architecture.
 #
 # Hosts the full `cargo test -p ergon-md-dpdk --features dpdk` path:
 # Rust 1.99.0 (pinned), Aeron C build-from-source deps (cmake/clang/Java),

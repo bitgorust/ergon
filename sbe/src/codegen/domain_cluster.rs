@@ -6,7 +6,7 @@
 
 use super::conversion_helpers::{
     DECODER_RESERVED, ENCODER_RESERVED, domain_accessor_ident, domain_encode_setter_name,
-    dto_domain_type, enum_uses_null_as_option, field_has_conversion_free, find_domain_type,
+    dto_domain_type, encoder_helper_ident, enum_uses_null_as_option, field_has_conversion_free,
     message_field_infos,
 };
 use super::runtime::{to_pascal_case, to_snake_case};
@@ -51,6 +51,7 @@ pub(crate) fn generate_domain_objects(
         domain_types,
         domain_var_data,
         false, // is_entry — this is a message, not a group entry
+        "",    // path_prefix — message fields' paths are their names
         hooks,
         schema,
         null_as_option,
@@ -76,7 +77,7 @@ pub(crate) fn domain_entry_can_bulk_encode(
                 || (f.presence != Presence::Optional
                     && f.since_version == 0
                     && !field_has_conversion_free(f, conversions)
-                    && find_domain_type(f, domain_types).is_none()
+                    && dto_domain_type(f, domain_types, elements).is_none()
                     && !matches!(
                         &f.field_type,
                         FieldType::Enum { name, .. } if crate::structured_ir::is_bool_enum(elements, name)
@@ -195,6 +196,43 @@ fn dto_enum_or_null(
     quote::quote! { #owner.#field.unwrap_or(#type_ident::NullVal) }
 }
 
+/// The `map_err` closure for a domain setter on the DTO and `encode_from`
+/// paths: the refusal keeps where it happened (`path`, the field's schema
+/// path from the message; each enclosing group adds its entry index) and
+/// the conversion's own error.
+fn conversion_refusal(path: &str, span: proc_macro2::Span) -> proc_macro2::TokenStream {
+    let path = syn::LitStr::new(path, span);
+    quote::quote! {
+        |error| sbe_rt::EncodeError::Conversion {
+            at: Some(sbe_rt::FieldPath::new(#path)),
+            error: sbe_rt::ConversionError::of(error),
+        }
+    }
+}
+
+/// Refuse `Some(value)` for an optional scalar whose `value` is the field's
+/// null value, by the decoder's own null test: written, it would read back
+/// as `None`. For a float that is NaN, unless the schema's `nullValue` is
+/// another value.
+fn some_null_refusal(
+    f: &MessageField,
+    prim: PrimitiveType,
+    value: &proc_macro2::TokenStream,
+    path: &str,
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    let is_null = super::runtime::composite_member_null_check(prim, f.null_value);
+    let path = syn::LitStr::new(path, span);
+    quote::quote! {
+        {
+            let val = #value;
+            if #is_null {
+                return Err(sbe_rt::EncodeError::SomeNullValue { at: sbe_rt::FieldPath::new(#path) });
+            }
+        }
+    }
+}
+
 /// Push the DTO field, `from_decoder` expression, and encode statement for a
 /// field whose wire type is a generated named type (non-boolean enum, set).
 ///
@@ -215,6 +253,10 @@ fn push_named_type_cell(
     // The raw accessor already returns `Option<T>` independently of version
     // (`null_as_option`), so the DTO field must be optional even at v0.
     accessor_optional: bool,
+    // The field's schema path from the message, for a refusal.
+    path: &str,
+    // An enum: `None` writes `NullVal` (a set has no null).
+    is_enum: bool,
     span: proc_macro2::Span,
     struct_fields: &mut Vec<proc_macro2::TokenStream>,
     from_exprs: &mut Vec<proc_macro2::TokenStream>,
@@ -251,18 +293,22 @@ fn push_named_type_cell(
             }
         })?
     };
+    let refusal = conversion_refusal(path, span);
     let encode_one = quote::quote! {
-        enc.#dom_set(v).map_err(|_| {
-            sbe_rt::EncodeError::DomainConversionFailed {
-                field: #field_lit,
-                reason: "domain conversion rejected domain value",
-            }
-        })?;
+        enc.#dom_set(v).map_err(#refusal)?;
     };
     if f.since_version > 0 || accessor_optional {
         struct_fields.push(quote::quote! { pub #f_ident: Option<#dt_ty> });
         from_exprs.push(decode);
-        encode_stmts.push(quote::quote! { if let Some(v) = self.#f_ident { #encode_one } });
+        // `None` writes `NullVal` through the raw setter, as the plain enum
+        // cell does: skipping it would leave whatever the buffer held.
+        let absent = if is_enum {
+            let wire_setter = syn::Ident::new(&format!("{f_snake}_wire"), span);
+            quote::quote! { else { enc.#wire_setter(#type_ident::NullVal); } }
+        } else {
+            proc_macro2::TokenStream::new()
+        };
+        encode_stmts.push(quote::quote! { if let Some(v) = self.#f_ident { #encode_one } #absent });
     } else {
         struct_fields.push(quote::quote! { pub #f_ident: #dt_ty });
         from_exprs.push(decode);
@@ -340,6 +386,8 @@ pub(crate) fn generate_domain_recursive(
     domain_types: &[(crate::ConversionSelector, String)],
     domain_var_data: crate::config::DomainVarData,
     is_entry: bool,
+    // `group.` per enclosing group, in schema names: a refusal's path.
+    path_prefix: &str,
     hooks: &crate::config::Hooks,
     schema: &crate::Schema,
     null_as_option: &[crate::ConversionSelector],
@@ -371,6 +419,7 @@ pub(crate) fn generate_domain_recursive(
         let f_ident = syn::Ident::new(&f_snake, span);
         let dom_get = domain_accessor_ident(&f_snake, get_reserved);
         let dom_set = domain_accessor_ident(&f_snake, set_reserved);
+        let path = format!("{path_prefix}{}", f.name);
         match &f.field_type {
             FieldType::Primitive(prim, length) => {
                 let r_type_str = rust_type(*prim);
@@ -417,9 +466,15 @@ pub(crate) fn generate_domain_recursive(
                 } else if f.presence == Presence::Optional {
                     struct_fields.push(quote::quote! { pub #f_ident: Option<#r_type> });
                     from_exprs.push(quote::quote! { #f_ident: dec.#raw_getter() });
+                    let refusal = some_null_refusal(f, *prim, &quote::quote! { v }, &path, span);
                     let range_check = dto_range_check_tokens(f, *prim, quote::quote! { v }, span);
+                    // `None` writes nothing here: a message DTO applied every
+                    // null image first (`apply_nulls`), and a group's `add`
+                    // writes an entry's optional null images before its
+                    // closure runs.
                     encode_stmts.push(quote::quote! {
                         if let Some(v) = self.#f_ident {
+                            #refusal
                             #range_check
                             enc.#enc_setter(v);
                         }
@@ -443,14 +498,10 @@ pub(crate) fn generate_domain_recursive(
                                     }
                                 })?
                             });
+                            let refusal = conversion_refusal(&path, span);
                             encode_stmts.push(quote::quote! {
                                 if let Some(v) = self.#f_ident {
-                                    enc.#enc_setter(v).map_err(|_| {
-                                        sbe_rt::EncodeError::DomainConversionFailed {
-                                            field: #field_lit,
-                                            reason: "domain conversion rejected domain value",
-                                        }
-                                    })?;
+                                    enc.#enc_setter(v).map_err(#refusal)?;
                                 }
                             });
                         } else {
@@ -481,13 +532,9 @@ pub(crate) fn generate_domain_recursive(
                                     }
                                 })?
                             });
+                            let refusal = conversion_refusal(&path, span);
                             encode_stmts.push(quote::quote! {
-                                enc.#enc_setter(self.#f_ident).map_err(|_| {
-                                    sbe_rt::EncodeError::DomainConversionFailed {
-                                            field: #field_lit,
-                                            reason: "domain conversion rejected domain value",
-                                        }
-                                })?;
+                                enc.#enc_setter(self.#f_ident).map_err(#refusal)?;
                             });
                         } else {
                             let from_getter = if field_has_conversion_free(f, conversions) {
@@ -519,7 +566,7 @@ pub(crate) fn generate_domain_recursive(
                 // If a domain type is configured for this composite (e.g.
                 // Decimal → rust_decimal::Decimal), the DTO field uses the
                 // domain type and reads/writes via the domain accessors.
-                let domain_ty = find_domain_type(f, domain_types);
+                let domain_ty = dto_domain_type(f, domain_types, elements);
                 let enc_setter = syn::Ident::new(
                     &domain_encode_setter_name(
                         f,
@@ -556,14 +603,10 @@ pub(crate) fn generate_domain_recursive(
                                     }
                             })?
                         });
+                        let refusal = conversion_refusal(&path, span);
                         encode_stmts.push(quote::quote! {
                             if let Some(v) = self.#f_ident {
-                                enc.#enc_setter(v).map_err(|_| {
-                                    sbe_rt::EncodeError::DomainConversionFailed {
-                                            field: #field_lit,
-                                            reason: "domain conversion rejected domain value",
-                                        }
-                                })?;
+                                enc.#enc_setter(v).map_err(#refusal)?;
                             }
                         });
                     } else {
@@ -583,13 +626,9 @@ pub(crate) fn generate_domain_recursive(
                                     }
                             })?
                         });
+                        let refusal = conversion_refusal(&path, span);
                         encode_stmts.push(quote::quote! {
-                            enc.#enc_setter(self.#f_ident).map_err(|_| {
-                                sbe_rt::EncodeError::DomainConversionFailed {
-                                            field: #field_lit,
-                                            reason: "domain conversion rejected domain value",
-                                        }
-                            })?;
+                            enc.#enc_setter(self.#f_ident).map_err(#refusal)?;
                         });
                     } else {
                         from_exprs.push(quote::quote! { #f_ident: dec.#as_struct_ident() });
@@ -641,6 +680,8 @@ pub(crate) fn generate_domain_recursive(
                         &type_ident,
                         dto_domain_type(f, domain_types, elements),
                         accessor_optional,
+                        &path,
+                        true,
                         span,
                         &mut struct_fields,
                         &mut from_exprs,
@@ -660,6 +701,8 @@ pub(crate) fn generate_domain_recursive(
                         (&dom_get, &dom_set),
                         &type_ident,
                         Some(dt),
+                        false,
+                        &path,
                         false,
                         span,
                         &mut struct_fields,
@@ -764,8 +807,8 @@ pub(crate) fn generate_domain_recursive(
                 let enc = enc.#g_field_ident(
                     count,
                     |g| -> Result<(), sbe_rt::EncodeError> {
-                        for e in &self.#g_field_ident {
-                            g.add(|entry| e.encode_into(entry))?;
+                        for (index, e) in self.#g_field_ident.iter().enumerate() {
+                            g.add(|entry| e.encode_into(entry)).map_err(|error| error.in_entry(index))?;
                         }
                         Ok(())
                     }
@@ -790,6 +833,7 @@ pub(crate) fn generate_domain_recursive(
             domain_types,
             domain_var_data,
             true,
+            &format!("{path_prefix}{}.", g.name),
             hooks,
             schema,
             null_as_option,
@@ -1358,4 +1402,688 @@ pub(crate) fn generate_domain_recursive(
             }
         });
     }
+}
+
+// ── Source traits (`with_source_traits`) ─────────────────────────────────
+//
+// A `{Message}Source` trait per message and an `{Group}EntrySource` per
+// repeating group: getters an application type implements so the encoder
+// can write it with `encode_from`, through the same setters and tail stages a
+// hand-written encode uses. Fixed getters return what the field's
+// `*FixedFields` entry holds (or its domain type), groups return an
+// `ExactSizeIterator` of entry sources, var-data returns `&[u8]`; nothing is
+// collected, so encoding allocates nothing.
+
+/// Names of every source trait generated for `msg`, message first.
+pub(crate) fn source_trait_names(msg: &MessageStructure, multi_message: bool) -> Vec<String> {
+    fn entries(scope: &str, groups: &[MessageGroup], out: &mut Vec<String>) {
+        for g in groups {
+            let scoped = format!("{scope}{}", to_pascal_case(&g.name));
+            out.push(format!("{scoped}EntrySource"));
+            entries(&scoped, &g.groups, out);
+        }
+    }
+    let name = to_pascal_case(&msg.name);
+    let mut out = vec![format!("{name}Source")];
+    entries(
+        if multi_message { &name } else { "" },
+        &msg.groups,
+        &mut out,
+    );
+    out
+}
+
+/// The type a fixed-field getter returns: the field's `*FixedFields` type
+/// (`Option` when `presence="optional"`), or its domain type.
+///
+/// The domain decision is [`dto_domain_type`], the same predicate the DTO
+/// field type and the encode setter use. Asking `find_domain_type` here typed
+/// an optional scalar's getter with the domain type while `source_fixed_writes`
+/// wrote it through the raw setter — a Source impl could not compile.
+fn source_getter_type(
+    f: &MessageField,
+    domain_types: &[(crate::ConversionSelector, String)],
+    elements: &SchemaElements,
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    let inner = match dto_domain_type(f, domain_types, elements) {
+        Some(dt) => {
+            let ty: syn::Type = syn::parse_str(dt).expect("validated domain type path");
+            quote::quote! { #ty }
+        }
+        None => {
+            let ty = super::field_type::field_type_ident(&f.field_type, span);
+            quote::quote! { #ty }
+        }
+    };
+    if f.presence == Presence::Optional {
+        quote::quote! { Option<#inner> }
+    } else {
+        inner
+    }
+}
+
+/// Write every non-constant fixed field from `src` on `receiver` (an encoder
+/// or entry encoder). Domain-typed fields go through their domain setter,
+/// primitive scalars get the schema range check the DTO applies, and an
+/// absent optional writes its null image, as `fixed()` does.
+fn source_fixed_writes(
+    fields: &[MessageField],
+    receiver: &proc_macro2::TokenStream,
+    buf_expr: &syn::Expr,
+    base_offset: &proc_macro2::TokenStream,
+    reserved: &[&str],
+    owner: &str,
+    path_prefix: &str,
+    conversions: &[crate::ConversionSelector],
+    domain_types: &[(crate::ConversionSelector, String)],
+    byte_order: ByteOrder,
+    elements: &SchemaElements,
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    let mut writes = proc_macro2::TokenStream::new();
+    for f in fields {
+        if f.presence == Presence::Constant {
+            continue;
+        }
+        let snake = to_snake_case(&f.name);
+        let getter = syn::Ident::new(&snake, span);
+        let path = format!("{path_prefix}{}", f.name);
+        let write_some =
+            if super::conversion_helpers::dto_domain_type(f, domain_types, elements).is_some() {
+                let setter = domain_accessor_ident(&snake, reserved);
+                let refusal = conversion_refusal(&path, span);
+                quote::quote! {
+                    #receiver.#setter(v).map_err(#refusal)?;
+                }
+            } else {
+                let wire_name =
+                    field_has_conversion_free(f, conversions).then(|| format!("{snake}_wire"));
+                let setter =
+                    super::conversion_helpers::resolve_field_ident(&snake, &wire_name, reserved);
+                let checks = match f.field_type {
+                    FieldType::Primitive(prim, None) => {
+                        let value = quote::quote! { v };
+                        let refusal = (f.presence == Presence::Optional)
+                            .then(|| some_null_refusal(f, prim, &value, &path, span));
+                        let range_check = dto_range_check_tokens(f, prim, value, span);
+                        quote::quote! { #refusal #range_check }
+                    }
+                    _ => proc_macro2::TokenStream::new(),
+                };
+                quote::quote! {
+                    #checks
+                    #receiver.#setter(v);
+                }
+            };
+        if f.presence == Presence::Optional {
+            let off = syn::LitInt::new(&f.offset.to_string(), span);
+            let abs = quote::quote! { #base_offset + #off };
+            let null_write = match super::nullification::null_image_stmts_for_field(
+                f, abs, buf_expr, byte_order, elements,
+            ) {
+                Ok(Some(ts)) => ts,
+                Ok(None) => proc_macro2::TokenStream::new(),
+                Err(reason) => {
+                    let msg = syn::LitStr::new(
+                        &format!(
+                            "cannot derive null image for optional field '{}' on '{owner}': {reason}",
+                            f.name
+                        ),
+                        span,
+                    );
+                    quote::quote! { compile_error!(#msg); }
+                }
+            };
+            writes.extend(quote::quote! {
+                match src.#getter() {
+                    Some(v) => { #write_some }
+                    None => { #null_write }
+                }
+            });
+        } else {
+            writes.extend(quote::quote! {
+                {
+                    let v = src.#getter();
+                    #write_some
+                }
+            });
+        }
+    }
+    writes
+}
+
+/// Whether any field takes a write, so the writer must be bound `mut`.
+fn has_fixed_writes(fields: &[MessageField]) -> bool {
+    fields.iter().any(|f| f.presence != Presence::Constant)
+}
+
+/// Private helpers for one group's entries, named after its scoped name.
+fn source_entry_fn_idents(scoped: &str, span: proc_macro2::Span) -> (syn::Ident, syn::Ident) {
+    let snake = to_snake_case(scoped);
+    (
+        syn::Ident::new(&format!("__encode_{snake}_entry_from"), span),
+        syn::Ident::new(&format!("__{snake}_entry_length_from"), span),
+    )
+}
+
+/// The `numInGroup` a source's iterator length becomes, or the typed error
+/// when it does not fit.
+fn source_group_count(
+    g: &MessageGroup,
+    entries: &syn::Ident,
+    elements: &SchemaElements,
+    span: proc_macro2::Span,
+) -> (syn::Type, proc_macro2::TokenStream) {
+    let (_, _, count_prim) = get_dim_num_layout(elements, &g.dimension_type);
+    let count_ty: syn::Type = syn::parse_str(rust_type(count_prim)).expect("primitive type");
+    let name_lit = syn::LitStr::new(&g.name, span);
+    let count = quote::quote! {
+        <#count_ty>::try_from(#entries.len()).map_err(|_| sbe_rt::EncodeError::ValueOutOfRange {
+            field: #name_lit,
+            min: 0,
+            max: #count_ty::MAX as i128,
+            actual: #entries.len() as i128,
+        })?
+    };
+    (count_ty, count)
+}
+
+/// Group and var-data writes on the consuming stage `enc`, in wire order.
+/// A refusal inside an entry gains that entry's index.
+fn source_tail_writes(
+    scope: &str,
+    groups: &[MessageGroup],
+    var_data: &[MessageVarData],
+    elements: &SchemaElements,
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    let mut writes = proc_macro2::TokenStream::new();
+    let entries = syn::Ident::new("__entries", span);
+    for g in groups {
+        let scoped = format!("{scope}{}", to_pascal_case(&g.name));
+        let g_ident = syn::Ident::new(&to_snake_case(&g.name), span);
+        let (entry_fn, _) = source_entry_fn_idents(&scoped, span);
+        let (_, count) = source_group_count(g, &entries, elements, span);
+        writes.extend(quote::quote! {
+            let #entries = src.#g_ident();
+            let __count = #count;
+            let enc = enc.#g_ident(__count, |__group| {
+                for (__index, __entry) in #entries.enumerate() {
+                    __group
+                        .add(|__enc| #entry_fn(__enc, &__entry))
+                        .map_err(|__error| __error.in_entry(__index))?;
+                }
+                Ok(())
+            })?;
+        });
+    }
+    for vd in var_data {
+        let vd_ident = syn::Ident::new(&to_snake_case(&vd.name), span);
+        writes.extend(quote::quote! {
+            let enc = enc.#vd_ident(src.#vd_ident())?;
+        });
+    }
+    writes
+}
+
+/// Length of the groups and var-data `src` would write, added to `len`,
+/// with the same count and var-data limits the encoder enforces.
+fn source_tail_lengths(
+    scope: &str,
+    groups: &[MessageGroup],
+    var_data: &[MessageVarData],
+    elements: &SchemaElements,
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    let mut stmts = proc_macro2::TokenStream::new();
+    let overflow = quote::quote! { .ok_or(sbe_rt::EncodeError::EncodedLengthOverflow)? };
+    let entries = syn::Ident::new("__entries", span);
+    for g in groups {
+        let scoped = format!("{scope}{}", to_pascal_case(&g.name));
+        let g_ident = syn::Ident::new(&to_snake_case(&g.name), span);
+        let (_, length_fn) = source_entry_fn_idents(&scoped, span);
+        let (_, dim_size, _, _) = get_dimension_info(elements, &g.dimension_type);
+        let dim_lit = syn::LitInt::new(&dim_size.to_string(), span);
+        let (_, count) = source_group_count(g, &entries, elements, span);
+        stmts.extend(quote::quote! {
+            let #entries = src.#g_ident();
+            let _ = #count;
+            len = len.checked_add(#dim_lit)#overflow;
+            for __entry in #entries {
+                len = len.checked_add(#length_fn(&__entry)?)#overflow;
+            }
+        });
+    }
+    for vd in var_data {
+        let vd_ident = syn::Ident::new(&to_snake_case(&vd.name), span);
+        let (_, prefix_size, _, _) = get_vardata_info(elements, &vd.type_name);
+        let prefix_lit = syn::LitInt::new(&prefix_size.to_string(), span);
+        let max_check = vd.max_length.map(|max| {
+            let max_lit = syn::LitInt::new(&max.to_string(), span);
+            let name_lit = syn::LitStr::new(&vd.name, span);
+            quote::quote! {
+                if __data.len() > #max_lit {
+                    return Err(sbe_rt::EncodeError::VarDataTooLong {
+                        field: #name_lit,
+                        max_length: #max_lit,
+                        actual: __data.len(),
+                    });
+                }
+            }
+        });
+        stmts.extend(quote::quote! {
+            let __data = src.#vd_ident();
+            #max_check
+            len = len.checked_add(#prefix_lit)#overflow;
+            len = len.checked_add(__data.len())#overflow;
+        });
+    }
+    stmts
+}
+
+/// Getter declarations for a field list plus its groups and var-data.
+fn source_trait_methods(
+    scope: &str,
+    fields: &[MessageField],
+    groups: &[MessageGroup],
+    var_data: &[MessageVarData],
+    domain_types: &[(crate::ConversionSelector, String)],
+    elements: &SchemaElements,
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    let mut methods = proc_macro2::TokenStream::new();
+    for f in fields {
+        if f.presence == Presence::Constant {
+            continue;
+        }
+        let getter = syn::Ident::new(&to_snake_case(&f.name), span);
+        let ty = source_getter_type(f, domain_types, elements, span);
+        let doc = super::runtime::doc_lines_tokens(&match &f.description {
+            Some(d) => format!(" `{}`: {}", f.name, d.trim()),
+            None => format!(" The `{}` field.", f.name),
+        });
+        methods.extend(quote::quote! {
+            #doc
+            fn #getter(&self) -> #ty;
+        });
+    }
+    for g in groups {
+        let scoped = format!("{scope}{}", to_pascal_case(&g.name));
+        let entry_trait = syn::Ident::new(&format!("{scoped}EntrySource"), span);
+        let getter = syn::Ident::new(&to_snake_case(&g.name), span);
+        let doc = super::runtime::doc_lines_tokens(&format!(
+            " The `{}` entries, in wire order. `len()` is the count the group \
+             header carries: an iterator that yields another number of entries \
+             is an encode error.",
+            g.name
+        ));
+        methods.extend(quote::quote! {
+            #doc
+            fn #getter(&self) -> impl ExactSizeIterator<Item = impl #entry_trait>;
+        });
+    }
+    for vd in var_data {
+        let getter = syn::Ident::new(&to_snake_case(&vd.name), span);
+        let doc = super::runtime::doc_lines_tokens(&format!(" The `{}` bytes.", vd.name));
+        methods.extend(quote::quote! {
+            #doc
+            fn #getter(&self) -> &[u8];
+        });
+    }
+    methods
+}
+
+/// Entry traits, their reference blanket impls and the private encode /
+/// length helpers, for `groups` and everything nested in them.
+fn source_entry_items(
+    scope: &str,
+    path_prefix: &str,
+    // Which private helpers the message's `encode_from` and sizing helper
+    // call: none for one this message left out.
+    (emit_encode, emit_length): (bool, bool),
+    groups: &[MessageGroup],
+    conversions: &[crate::ConversionSelector],
+    domain_types: &[(crate::ConversionSelector, String)],
+    byte_order: ByteOrder,
+    elements: &SchemaElements,
+    span: proc_macro2::Span,
+    ts: &mut proc_macro2::TokenStream,
+) {
+    for g in groups {
+        let scoped = format!("{scope}{}", to_pascal_case(&g.name));
+        let entry_path = format!("{path_prefix}{}.", g.name);
+        let entry_trait = syn::Ident::new(&format!("{scoped}EntrySource"), span);
+        let entry_enc = syn::Ident::new(&format!("{scoped}EntryEncoder"), span);
+        let entry_complete = syn::Ident::new(&format!("{scoped}EntryComplete"), span);
+        let (encode_fn, length_fn) = source_entry_fn_idents(&scoped, span);
+        let methods = source_trait_methods(
+            &scoped,
+            &g.fields,
+            &g.groups,
+            &g.var_data,
+            domain_types,
+            elements,
+            span,
+        );
+
+        // `&T` forwards, so `self.items.iter()` is a valid group getter.
+        let mut forwards = proc_macro2::TokenStream::new();
+        for f in &g.fields {
+            if f.presence == Presence::Constant {
+                continue;
+            }
+            let getter = syn::Ident::new(&to_snake_case(&f.name), span);
+            let ty = source_getter_type(f, domain_types, elements, span);
+            forwards.extend(quote::quote! {
+                #[inline]
+                fn #getter(&self) -> #ty { (**self).#getter() }
+            });
+        }
+        for ng in &g.groups {
+            let nested_trait = syn::Ident::new(
+                &format!("{scoped}{}EntrySource", to_pascal_case(&ng.name)),
+                span,
+            );
+            let getter = syn::Ident::new(&to_snake_case(&ng.name), span);
+            forwards.extend(quote::quote! {
+                #[inline]
+                fn #getter(&self) -> impl ExactSizeIterator<Item = impl #nested_trait> {
+                    (**self).#getter()
+                }
+            });
+        }
+        for vd in &g.var_data {
+            let getter = syn::Ident::new(&to_snake_case(&vd.name), span);
+            forwards.extend(quote::quote! {
+                #[inline]
+                fn #getter(&self) -> &[u8] { (**self).#getter() }
+            });
+        }
+
+        let trait_doc = super::runtime::doc_lines_tokens(&format!(
+            " One `{}` entry read by getters, which `encode_from` writes \
+             through [`{entry_enc}`].",
+            g.name
+        ));
+        ts.extend(quote::quote! {
+            #trait_doc
+            pub trait #entry_trait {
+                #methods
+            }
+
+            impl<T: #entry_trait + ?Sized> #entry_trait for &T {
+                #forwards
+            }
+        });
+
+        let receiver = quote::quote! { enc };
+        let buf_expr: syn::Expr = syn::parse_quote!(enc.buf);
+        let base = quote::quote! { enc.entry_start };
+        let fixed = source_fixed_writes(
+            &g.fields,
+            &receiver,
+            &buf_expr,
+            &base,
+            &[],
+            &scoped,
+            &entry_path,
+            conversions,
+            domain_types,
+            byte_order,
+            elements,
+            span,
+        );
+        let block_lit = syn::LitInt::new(&g.effective_block_length().to_string(), span);
+        if g.has_fixed_stride() {
+            if emit_encode {
+                ts.extend(quote::quote! {
+                    #[inline]
+                    fn #encode_fn<S: #entry_trait + ?Sized>(
+                        enc: &mut #entry_enc<'_>,
+                        src: &S,
+                    ) -> Result<(), sbe_rt::EncodeError> {
+                        #fixed
+                        Ok(())
+                    }
+                });
+            }
+            if emit_length {
+                ts.extend(quote::quote! {
+                    #[inline]
+                    fn #length_fn<S: #entry_trait + ?Sized>(
+                        _src: &S,
+                    ) -> Result<usize, sbe_rt::EncodeError> {
+                        Ok(#block_lit)
+                    }
+                });
+            }
+        } else {
+            let tails = source_tail_writes(&scoped, &g.groups, &g.var_data, elements, span);
+            let lengths = source_tail_lengths(&scoped, &g.groups, &g.var_data, elements, span);
+            let enc_binding = if has_fixed_writes(&g.fields) {
+                quote::quote! { mut enc }
+            } else {
+                quote::quote! { enc }
+            };
+            if emit_encode {
+                ts.extend(quote::quote! {
+                    #[inline]
+                    fn #encode_fn<'b, S: #entry_trait + ?Sized>(
+                        #enc_binding: #entry_enc<'b>,
+                        src: &S,
+                    ) -> Result<#entry_complete<'b>, sbe_rt::EncodeError> {
+                        #fixed
+                        #tails
+                        Ok(enc)
+                    }
+                });
+            }
+            if emit_length {
+                ts.extend(quote::quote! {
+                    #[inline]
+                    fn #length_fn<S: #entry_trait + ?Sized>(
+                        src: &S,
+                    ) -> Result<usize, sbe_rt::EncodeError> {
+                        let mut len: usize = #block_lit;
+                        #lengths
+                        Ok(len)
+                    }
+                });
+            }
+        }
+        source_entry_items(
+            &scoped,
+            &entry_path,
+            (emit_encode, emit_length),
+            &g.groups,
+            conversions,
+            domain_types,
+            byte_order,
+            elements,
+            span,
+            ts,
+        );
+    }
+}
+
+/// `{Message}Source`, its entry traits, and the encoder's `encode_from` /
+/// `encoded_length_with_header_from`.
+pub(crate) fn generate_source_traits(
+    msg: &MessageStructure,
+    elements: &SchemaElements,
+    byte_order: ByteOrder,
+    multi_message: bool,
+    header_type: &str,
+    conversions: &[crate::ConversionSelector],
+    domain_types: &[(crate::ConversionSelector, String)],
+) -> proc_macro2::TokenStream {
+    let span = proc_macro2::Span::call_site();
+    let name = to_pascal_case(&msg.name);
+    let scope = if multi_message { name.as_str() } else { "" };
+    let trait_ident = syn::Ident::new(&format!("{name}Source"), span);
+    let enc = syn::Ident::new(&format!("{name}Encoder"), span);
+    let header_size = elements
+        .composites
+        .iter()
+        .find(|c| c[0].name == header_type)
+        .and_then(|c| c[0].encoding.offset)
+        .unwrap_or(8);
+    let header_lit = syn::LitInt::new(&header_size.to_string(), span);
+
+    // A field or first tail that owns a helper's name keeps it, and the
+    // helper is left out of this message (`encoder_helper_ident`).
+    let encode_from_ident = encoder_helper_ident("encode_from", msg, conversions, domain_types);
+    let length_ident = encoder_helper_ident(
+        "encoded_length_with_header_from",
+        msg,
+        conversions,
+        domain_types,
+    );
+
+    let mut ts = proc_macro2::TokenStream::new();
+    let methods = source_trait_methods(
+        scope,
+        &msg.fields,
+        &msg.groups,
+        &msg.var_data,
+        domain_types,
+        elements,
+        span,
+    );
+    // Without the helper, the docs say why instead of naming it.
+    let no_helper = format!(
+        "`{enc}` has no `encode_from` helper: this message's own field or first \
+         tail is named `encode_from` and keeps that name."
+    );
+    let summary = if encode_from_ident.is_some() {
+        format!(
+            " A `{name}` message read by getters, so an application type can be \
+             encoded with [`{enc}::encode_from`]: no DTO, no allocation."
+        )
+    } else {
+        format!(" A `{name}` message read by getters. {no_helper}")
+    };
+    let trait_doc = super::runtime::doc_lines_tokens(&format!(
+        "{summary}\n\
+         \n\
+         One getter per field in wire order. A schema that gains a field gains \
+         a getter, so every implementation stops compiling until it provides one."
+    ));
+    ts.extend(quote::quote! {
+        #trait_doc
+        pub trait #trait_ident {
+            #methods
+        }
+    });
+    source_entry_items(
+        scope,
+        "",
+        (encode_from_ident.is_some(), length_ident.is_some()),
+        &msg.groups,
+        conversions,
+        domain_types,
+        byte_order,
+        elements,
+        span,
+        &mut ts,
+    );
+
+    let receiver = quote::quote! { self };
+    let buf_expr: syn::Expr = syn::parse_quote!(self.buf);
+    let base = quote::quote! { self.msg_offset + #header_lit };
+    let fixed = source_fixed_writes(
+        &msg.fields,
+        &receiver,
+        &buf_expr,
+        &base,
+        ENCODER_RESERVED,
+        &name,
+        "",
+        conversions,
+        domain_types,
+        byte_order,
+        elements,
+        span,
+    );
+    let has_tails = !msg.groups.is_empty() || !msg.var_data.is_empty();
+    let terminal = if has_tails {
+        let complete = syn::Ident::new(&format!("{name}Complete"), span);
+        quote::quote! { #complete<'a, H> }
+    } else {
+        quote::quote! { #enc<'a, H, sbe_rt::FieldsFixed> }
+    };
+    let tails = source_tail_writes(scope, &msg.groups, &msg.var_data, elements, span);
+    let lengths = source_tail_lengths(scope, &msg.groups, &msg.var_data, elements, span);
+    let len_binding = if has_tails {
+        quote::quote! { let mut len: usize = Self::HEADER_LENGTH + Self::BLOCK_LENGTH; }
+    } else {
+        quote::quote! { let len: usize = Self::HEADER_LENGTH + Self::BLOCK_LENGTH; let _ = src; }
+    };
+    let self_binding = if has_fixed_writes(&msg.fields) {
+        quote::quote! { mut self }
+    } else {
+        quote::quote! { self }
+    };
+    let encode_doc = super::runtime::doc_lines_tokens(
+        " Write every field of `src` in wire order — fixed block, groups, \
+         var-data — and return the finished stage.\n\
+         \n\
+         An absent optional field writes its null value, as `fixed()` does. \
+         Errors are the encoder's own, plus `SomeNullValue` for `Some` of a \
+         field's null value (NaN for a float), `Conversion` for a value its \
+         domain conversion refused (with the field's path and the \
+         conversion's error), and `ValueOutOfRange` for a group longer than \
+         its count type or a value outside the schema range.",
+    );
+    let length_doc = super::runtime::doc_lines_tokens(&if encode_from_ident.is_some() {
+        format!(
+            " The exact frame length, header included, that [`{enc}::encode_from`] \
+             writes for `src`: the size of the claim or buffer to encode it into."
+        )
+    } else {
+        format!(
+            " The exact frame length, header included, of `src` as one `{name}` \
+             frame: the size of the claim or buffer to encode it into. {no_helper}"
+        )
+    });
+    if let Some(encode_from) = encode_from_ident {
+        ts.extend(quote::quote! {
+            impl<'a, H: sbe_rt::HeaderState> #enc<'a, H, sbe_rt::FieldsUnfixed> {
+                #encode_doc
+                #[inline]
+                pub fn #encode_from<S: #trait_ident + ?Sized>(
+                    #self_binding,
+                    src: &S,
+                ) -> Result<#terminal, sbe_rt::EncodeError> {
+                    #fixed
+                    let enc = #enc {
+                        buf: self.buf,
+                        msg_offset: self.msg_offset,
+                        offset: self.offset,
+                        _header: core::marker::PhantomData,
+                        _fields: core::marker::PhantomData::<sbe_rt::FieldsFixed>,
+                    };
+                    #tails
+                    Ok(enc)
+                }
+            }
+        });
+    }
+    if let Some(length) = length_ident {
+        ts.extend(quote::quote! {
+            impl<'a> #enc<'a> {
+                #length_doc
+                #[inline]
+                pub fn #length<S: #trait_ident + ?Sized>(
+                    src: &S,
+                ) -> Result<usize, sbe_rt::EncodeError> {
+                    #len_binding
+                    #lengths
+                    Ok(len)
+                }
+            }
+        });
+    }
+    ts
 }
