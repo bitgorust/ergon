@@ -147,10 +147,46 @@ fn k2_warns_when_the_pod_has_the_shared_pool() -> R {
 #[test]
 fn k2_is_ok_on_exclusive_cpus() -> R {
     let f = pod_at("k2-exclusive", QOS_BURSTABLE, Some("2-3,6-7"))?;
+    // Exclusivity has to be evidenced: a proper subset of the node's CPUs is
+    // also what a restricted shared pool looks like from inside the pod.
+    f.file(
+        &format!("/sys/fs/cgroup{QOS_BURSTABLE}/cpuset.cpus.partition"),
+        "isolated\n",
+    )?;
     let v = k8s_checks(&f.host(), &hot(), &needs());
     let k2 = by_id(&v, CheckId::K2)?;
     assert_eq!(k2.status, Status::Ok, "{v:#?}");
     assert!(k2.message.contains("exclusive"), "{}", k2.message);
+    assert!(k2.message.contains("partition=isolated"), "{}", k2.message);
+    Ok(())
+}
+
+#[test]
+fn k2_is_ok_when_the_exclusive_file_matches_the_cpuset() -> R {
+    let f = pod_at("k2-exclusive-file", QOS_BURSTABLE, Some("2-3,6-7"))?;
+    f.file(
+        &format!("/sys/fs/cgroup{QOS_BURSTABLE}/cpuset.cpus.exclusive"),
+        "2-3,6-7\n",
+    )?;
+    let v = k8s_checks(&f.host(), &hot(), &needs());
+    let k2 = by_id(&v, CheckId::K2)?;
+    assert_eq!(k2.status, Status::Ok, "{v:#?}");
+    assert!(k2.message.contains("exclusive"), "{}", k2.message);
+    Ok(())
+}
+
+#[test]
+fn k2_does_not_call_a_restricted_cpuset_exclusive_without_evidence() -> R {
+    // A proper subset of the node's online CPUs, with nothing that says who
+    // owns them: exactly what a restricted shared pool looks like.
+    let f = pod_at("k2-unevidenced", QOS_BURSTABLE, Some("2-3,6-7"))?;
+    let v = k8s_checks(&f.host(), &hot(), &needs());
+    let k2 = by_id(&v, CheckId::K2)?;
+    assert!(
+        !matches!(k2.status, Status::Ok),
+        "exclusivity must not be claimed without evidence: {v:#?}"
+    );
+    assert!(k2.is_unknown(), "{v:#?}");
     Ok(())
 }
 
@@ -211,6 +247,22 @@ fn k3_is_ok_without_smt() -> R {
         "{}",
         k3.message
     );
+    Ok(())
+}
+
+#[test]
+fn k3_is_unknown_when_the_topology_is_unreadable() -> R {
+    // A missing thread_siblings_list is not "SMT is off". Without it the
+    // check cannot tell whether a sibling is in the pod.
+    let f = pod_at("k3-notopo", QOS_BURSTABLE, Some("2"))?;
+    f.remove("/sys/devices/system/cpu/cpu2/topology/thread_siblings_list")?;
+    let v = k8s_checks(&f.host(), &hot(), &needs());
+    let k3 = by_id(&v, CheckId::K3)?;
+    assert!(
+        !matches!(k3.status, Status::Ok),
+        "unreadable topology must not pass: {v:#?}"
+    );
+    assert!(k3.is_unknown(), "{v:#?}");
     Ok(())
 }
 
@@ -334,6 +386,21 @@ fn k6_warns_on_memory_high_and_on_pressure() -> R {
     assert!(m.contains("memory.pressure some avg10 2.5"), "{m}");
     assert!(m.contains("Fix (pod spec):"), "{m}");
     assert!(m.contains("Fix (node):"), "{m}");
+    Ok(())
+}
+
+#[test]
+fn k6_is_unknown_when_there_is_no_pressure_evidence() -> R {
+    // No memory.high and no PSI file is not "no pressure": it is a kernel or
+    // a cgroup that will not say. The check must not report success.
+    let f = pod_at("k6-nofiles", QOS_BURSTABLE, Some("2"))?;
+    let v = k8s_checks(&f.host(), &hot(), &needs());
+    let k6 = by_id(&v, CheckId::K6)?;
+    assert!(
+        !matches!(k6.status, Status::Ok),
+        "missing pressure evidence must not pass: {v:#?}"
+    );
+    assert!(k6.is_unknown(), "{v:#?}");
     Ok(())
 }
 

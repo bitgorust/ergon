@@ -210,6 +210,40 @@ fn pod_cpuset(host: &Host, cg: Option<&CpuCgroup>) -> Result<CpuSet, ReadError> 
     Err(last)
 }
 
+/// The cgroup directories `pod_cpuset` reads from: the container's own first,
+/// then the cgroup root.
+fn pod_cgroup_dirs(cg: Option<&CpuCgroup>) -> Vec<String> {
+    let mut dirs: Vec<String> = cg.map(|c| vec![c.dir.clone()]).unwrap_or_default();
+    dirs.push("/sys/fs/cgroup".to_owned());
+    dirs
+}
+
+/// Why this pod's CPUs are its own, if the kernel says so. `cpuset.cpus` alone
+/// cannot: a restricted shared pool looks the same from inside the pod.
+/// `cpuset.cpus.partition` is `isolated`/`root` for a partition this cgroup
+/// owns; `cpuset.cpus.exclusive` naming exactly this cpuset is the other.
+/// `Ok(None)` means the kernel exposed no answer here.
+fn exclusivity_evidence(host: &Host, cg: Option<&CpuCgroup>, set: &CpuSet) -> Option<String> {
+    for dir in pod_cgroup_dirs(cg) {
+        if let Ok(partition) = host.read(&format!("{dir}/cpuset.cpus.partition")) {
+            let p = partition.trim();
+            if p == "isolated" || p == "root" {
+                return Some(format!("cpuset.cpus.partition={p}"));
+            }
+            if p == "member" {
+                return None;
+            }
+        }
+        if let Ok(exclusive) = host.read_cpu_list(&format!("{dir}/cpuset.cpus.exclusive"))
+            && !exclusive.is_empty()
+            && &exclusive == set
+        {
+            return Some("cpuset.cpus.exclusive names exactly this cpuset".to_owned());
+        }
+    }
+    None
+}
+
 /// K2: the pod's CPUs are its own, not the shared pool.
 fn k2_exclusive(host: &Host, cg: Option<&CpuCgroup>) -> Finding {
     let id = CheckId::K2;
@@ -261,14 +295,29 @@ fn k2_exclusive(host: &Host, cg: Option<&CpuCgroup>) -> Finding {
             ),
         );
     }
-    Finding::ok(
+    if let Some(why) = exclusivity_evidence(host, cg, &set) {
+        return Finding::ok(
+            id,
+            sev,
+            K_EVIDENCE,
+            format!(
+                "this pod's cpuset ({set}) is a proper subset of the node's online CPUs \
+                 ({online}): exclusive CPUs ({why})"
+            ),
+        );
+    }
+    Finding::unknown(
         id,
         sev,
         K_EVIDENCE,
         format!(
-            "this pod's cpuset ({set}) is a proper subset of the node's online CPUs ({online}): \
-             exclusive CPUs"
+            "this pod's cpuset ({set}) is a proper subset of the node's online CPUs ({online}), \
+             which is what exclusive CPUs look like — and also what a restricted shared pool \
+             looks like from inside the pod. Nothing here says which"
         ),
+        "no cpuset.cpus.partition (isolated/root) and no cpuset.cpus.exclusive matching this \
+         cpuset; exclusivity is node-side state (the kubelet CPU manager) that this pod cannot \
+         read",
     )
 }
 
@@ -291,6 +340,9 @@ fn k3_smt_sibling(host: &Host, cpus: &HotSet, cg: Option<&CpuCgroup>) -> Finding
     let online = host.read_cpu_list("/sys/devices/system/cpu/online");
     let mut lost: Vec<(u32, u32)> = Vec::new();
     let mut smt = false;
+    // CPUs whose topology is missing. A missing thread_siblings_list is not
+    // "SMT is off": it is evidence this check does not have.
+    let mut unreadable: Vec<String> = Vec::new();
     for cpu in cpus.spinning().iter() {
         let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
         match host.read_cpu_list(&path) {
@@ -303,7 +355,9 @@ fn k3_smt_sibling(host: &Host, cpus: &HotSet, cg: Option<&CpuCgroup>) -> Finding
                     }
                 }
             }
-            Err(ReadError::Io { .. }) => {}
+            Err(ReadError::Io { .. }) => {
+                unreadable.push(cpus.describe(cpu));
+            }
             Err(e) => {
                 return Finding::unknown(
                     id,
@@ -316,11 +370,23 @@ fn k3_smt_sibling(host: &Host, cpus: &HotSet, cg: Option<&CpuCgroup>) -> Finding
         }
     }
     if lost.is_empty() {
+        if !unreadable.is_empty() {
+            return Finding::unknown(
+                id,
+                sev,
+                K_EVIDENCE,
+                format!(
+                    "cannot tell whether {} has an SMT sibling in this pod",
+                    unreadable.join(", ")
+                ),
+                "no thread_siblings_list for the busy-spinning CPUs; SMT off and unreadable \
+                 topology look the same without it",
+            );
+        }
         let message = if smt {
             "every hot CPU's SMT siblings are in this pod's cpuset".to_owned()
         } else {
-            "no hot CPU has an SMT sibling (SMT is off, or the topology is not readable there)"
-                .to_owned()
+            "no hot CPU has an SMT sibling".to_owned()
         };
         return Finding::ok(id, sev, K_EVIDENCE, message);
     }
@@ -533,15 +599,20 @@ fn k6_pressure(host: &Host, cg: Option<&CpuCgroup>) -> Finding {
         ));
     }
     if problems.is_empty() {
+        if !saw_file {
+            return Finding::unknown(
+                id,
+                sev,
+                K_EVIDENCE,
+                "no cgroup v2 memory.high or pressure file here to read".to_owned(),
+                "no memory.high and no PSI file is a kernel that will not say, not a quiet cgroup",
+            );
+        }
         return Finding::ok(
             id,
             sev,
             K_EVIDENCE,
-            if saw_file {
-                "no memory.high and no CPU or memory pressure".to_owned()
-            } else {
-                "no cgroup v2 memory.high or pressure file here to read".to_owned()
-            },
+            "no memory.high and no CPU or memory pressure".to_owned(),
         );
     }
     Finding::found(
