@@ -146,9 +146,39 @@ func TestPickMemsUnknownNode(t *testing.T) {
 }
 
 func TestPickMemsNoNodes(t *testing.T) {
-	_, _, err := PickMems("", []int{}, 0)
+	// An empty list means the topology was never read. Nothing may be bound
+	// from it, and a request must not be dropped in silence.
+	for _, ask := range []string{"", "0", "0,1"} {
+		_, _, err := PickMems(ask, nil, -1)
+		if err == nil {
+			t.Fatalf("PickMems(%q) with no topology: want a refusal", ask)
+		}
+		if !strings.Contains(err.Error(), "NUMA topology") {
+			t.Errorf("error %q must name the missing topology", err)
+		}
+	}
+}
+
+func TestPickMemsEmptyRequestOnASingleNode(t *testing.T) {
+	// "\"\" is the NIC's node, and a one-node machine has only one answer.
+	mems, nodes, err := PickMems("", []int{0}, -1)
 	if err != nil {
-		t.Fatal("a node with no NUMA facts must degrade, not fail")
+		t.Fatal(err)
+	}
+	if mems != "0" || nodes != "0" {
+		t.Errorf("got mems=%q nodes=%q, want 0", mems, nodes)
+	}
+}
+
+func TestPickMemsEmptyRequestWithoutANicNode(t *testing.T) {
+	// Several nodes and no data NIC recorded: node 0 would be a guess, so the
+	// request is refused and names the fix.
+	_, _, err := PickMems("", []int{0, 1}, -1)
+	if err == nil {
+		t.Fatal("want a refusal when the NIC's node is unknown on a multi-node machine")
+	}
+	if !strings.Contains(err.Error(), "numa.ergon.io") {
+		t.Errorf("error %q must name the annotation to set", err)
 	}
 }
 

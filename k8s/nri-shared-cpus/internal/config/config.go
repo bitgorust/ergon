@@ -119,11 +119,14 @@ type Config struct {
 	// HugepagesAeronDir is the AERON_DIR to export when a pod mounts hugetlbfs.
 	HugepagesAeronDir string
 
-	// NodeNumaNodes is every NUMA node on the machine (sysfs, at start).
-	// Empty means "the machine reports no NUMA nodes": the mems grant is a
-	// no-op.
+	// NodeNumaNodes is every NUMA node on the machine, as DiscoverHostNuma
+	// read it from sysfs at start-up. It is never empty on a running plugin:
+	// a kernel with no NUMA directory still has node 0. Empty means the
+	// topology was never read, and every numa.ergon.io request is refused.
 	NodeNumaNodes []int
-	// NicNumaNode is the NUMA node the data NIC is on (-1 if unknown).
+	// NicNumaNode is the NUMA node the data NIC is on (-1 if unknown). While
+	// it is unknown, numa.ergon.io: "" ("the NIC's node") is refused on a
+	// multi-node machine and answered on a one-node one.
 	NicNumaNode int
 	// HostPtp is every /dev/ptp* the node has (filesystem, at start).
 	HostPtp []string
@@ -442,5 +445,42 @@ func DiscoverHostDevices(c *Config, goarch string) error {
 	} else {
 		c.HostCpuDmaLatency = ""
 	}
+	return nil
+}
+
+// DiscoverHostNuma fills in NodeNumaNodes: every node<N> under
+// sysRoot/devices/system/node. That list is what a numa.ergon.io request is
+// checked against, so it is never left holding "we never looked". A kernel
+// built without CONFIG_NUMA has no node directory and still has one node,
+// which cpuset.mems names 0, so the list is [0]. A directory that exists but
+// names no node is an error: the plugin would otherwise answer a binding
+// request from a list it never saw.
+func DiscoverHostNuma(c *Config, sysRoot string) error {
+	dir := filepath.Join(sysRoot, "devices/system/node")
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		c.NodeNumaNodes = []int{0}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("host NUMA: %s: %w", dir, err)
+	}
+	var nodes []int
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "node") {
+			continue
+		}
+		n, convErr := strconv.Atoi(strings.TrimPrefix(name, "node"))
+		if convErr != nil || n < 0 {
+			continue
+		}
+		nodes = append(nodes, n)
+	}
+	if len(nodes) == 0 {
+		return fmt.Errorf("host NUMA: %s names no node<N>: numa.ergon.io cannot be answered", dir)
+	}
+	sort.Ints(nodes)
+	c.NodeNumaNodes = nodes
 	return nil
 }

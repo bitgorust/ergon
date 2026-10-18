@@ -197,6 +197,8 @@ Then run a pod with the example above and check
 | kernel has no `cpuset.cpus.exclusive` | shared-only pods work; every `cpu-partition` opt-in is refused and the pod stays out of the partition (6.7 or a vendor backport of that file) |
 | one physical core is split between the exclusive and the shared CPUs | the container is refused, naming the core: on SMT the hot thread and the helpers would share one core, which is the noise this removes |
 | a CPU has no `thread_siblings_list` | the container is refused: without it the plugin cannot tell which CPUs share a core and will not guess |
+| `numa.ergon.io` and the node's NUMA topology was never read | the container is refused, naming the cause: a binding is never chosen from a list nothing read |
+| `numa.ergon.io: ""` on a machine with several NUMA nodes and no data NIC node recorded | the container is refused and told to name the node itself; node 0 would be a guess |
 
 ## Limits
 

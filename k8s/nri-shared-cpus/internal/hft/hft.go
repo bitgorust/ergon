@@ -137,12 +137,17 @@ func FormatRlimit(v uint64) string {
 // PickMems chooses cpuset.mems and the MPOL_BIND nodes for a latency pod.
 // requested is the `numa.ergon.io/<container>` annotation ("0", "0,1", or
 // empty for "the NIC's node"). nodeNumaNodes is every NUMA node the machine
-// has; nicNode is the node the data NIC is on. Returns ("", "") when the
-// machine reports no NUMA nodes: the grant degrades to a no-op rather than
-// failing the pod.
+// has, as DiscoverHostNuma read it; nicNode is the node the data NIC is on
+// (-1 when none is recorded).
+//
+// Every answer is a binding the machine can actually take. There is no silent
+// no-op: a request that cannot be answered is refused and names what is
+// missing. An empty nodeNumaNodes means the topology was never read, so
+// nothing is chosen from it.
 func PickMems(requested string, nodeNumaNodes []int, nicNode int) (mems string, nodes string, err error) {
 	if len(nodeNumaNodes) == 0 {
-		return "", "", nil
+		return "", "", grantErr("numa",
+			"numa.ergon.io: this node's NUMA topology is unknown (nothing read /sys/devices/system/node), so no node can be chosen; the plugin reads it at start-up")
 	}
 	have := map[int]bool{}
 	for _, n := range nodeNumaNodes {
@@ -150,14 +155,20 @@ func PickMems(requested string, nodeNumaNodes []int, nicNode int) (mems string, 
 	}
 	requested = strings.TrimSpace(requested)
 	if requested == "" {
-		if !have[nicNode] {
-			// No NIC node recorded: fall back to node 0 if it exists.
-			if have[0] {
-				return "0", "0", nil
-			}
-			return "", "", nil
+		// "": the data NIC's node.
+		if have[nicNode] {
+			return strconv.Itoa(nicNode), strconv.Itoa(nicNode), nil
 		}
-		return strconv.Itoa(nicNode), strconv.Itoa(nicNode), nil
+		if len(nodeNumaNodes) == 1 {
+			// One node: the NIC is on it, and it is the whole topology.
+			n := nodeNumaNodes[0]
+			return strconv.Itoa(n), strconv.Itoa(n), nil
+		}
+		sorted := make([]int, 0, len(nodeNumaNodes))
+		sorted = append(sorted, nodeNumaNodes...)
+		sort.Ints(sorted)
+		return "", "", grantErr("numa",
+			"numa.ergon.io: \"\" means the data NIC's NUMA node, and this node has none recorded (has %v); set numa.ergon.io/<container>: \"<node>\" to name it", sorted)
 	}
 	var pick []int
 	for _, p := range strings.Split(requested, ",") {

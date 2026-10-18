@@ -85,6 +85,13 @@ func run(configPath string, log *slog.Logger) error {
 	}
 	log.Info("host devices", "devRoot", cfg.DevRoot, "ptp", cfg.HostPtp,
 		"cpu_dma_latency", cfg.HostCpuDmaLatency, "goarch", cfg.GOARCH)
+	// The numa.ergon.io grant is chosen from the node's NUMA nodes. Without
+	// this the list stays empty and every such request is answered with
+	// nothing bound, in silence.
+	if err := config.DiscoverHostNuma(cfg, "/sys"); err != nil {
+		return err
+	}
+	log.Info("host numa", "nodes", cfg.NodeNumaNodes, "nicNode", cfg.NicNumaNode)
 
 	if err := installHook(cfg.HookPath, log); err != nil {
 		return err

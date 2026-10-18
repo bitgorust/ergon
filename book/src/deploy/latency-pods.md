@@ -38,6 +38,13 @@ Ride-along: `rlimits.ergon.io/<ctr>` grants `MEMLOCK`, `NOFILE` and
 `RTPRIO` (a limit value only — see below). The values are ceilings the
 pod may ask for, set in the plugin config.
 
+Also `numa.ergon.io/<ctr>`: `"0"`, `"0,1"` or `""` binds the container's
+memory to those NUMA nodes (`cpuset.mems` and `MPOL_BIND`). `""` means the
+data NIC's node, which needs that node recorded; on a one-node machine the
+only node is the answer. A request the node cannot answer is refused and
+says why — an unread topology, a node the machine does not have, or `""`
+with several nodes and no NIC node. A binding is never dropped in silence.
+
 ### 1. The app owns `AERON_DIR`
 
 The plugin mounts a **sized** hugetlbfs at `/dev/hugepages` and exports

@@ -181,6 +181,42 @@ func TestResolveGrantsNumaDefaultNic(t *testing.T) {
 	}
 }
 
+// A pod that asks for a NUMA binding is refused rather than granted nothing
+// when the node's topology was never read.
+func TestResolveGrantsNumaUnreadTopology(t *testing.T) {
+	cfg := grantConfig(t)
+	cfg.NodeNumaNodes = nil
+	r := baseRequest()
+	r.PodAnnotations = map[string]string{
+		names.NumaPrefix + r.Container: "0",
+	}
+	_, err := resolveGrants(cfg, &r)
+	if err == nil {
+		t.Fatal("want a refusal when the node's NUMA topology is unknown")
+	}
+	if !strings.Contains(err.Error(), "NUMA topology") {
+		t.Errorf("error %q must name the missing topology", err)
+	}
+}
+
+// "": the NIC's node. With several nodes and none recorded, node 0 would be
+// a guess, so the pod is told to name the node itself.
+func TestResolveGrantsNumaDefaultNicUnknown(t *testing.T) {
+	cfg := grantConfig(t)
+	cfg.NicNumaNode = -1
+	r := baseRequest()
+	r.PodAnnotations = map[string]string{
+		names.NumaPrefix + r.Container: "",
+	}
+	_, err := resolveGrants(cfg, &r)
+	if err == nil {
+		t.Fatal("want a refusal when the data NIC's node is unknown on a multi-node machine")
+	}
+	if !strings.Contains(err.Error(), "numa.ergon.io") {
+		t.Errorf("error %q must name the annotation to set", err)
+	}
+}
+
 func TestResolveGrantsPtp(t *testing.T) {
 	cfg := grantConfig(t)
 	r := baseRequest()
