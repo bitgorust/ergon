@@ -409,6 +409,61 @@ fn housekeeping_from_the_environment_avoids_each_modes_spinning_core() {
     assert!(!on.contains(&first) && !on.contains(&last), "SHARED_NETWORK: {on:?}");
 }
 
+/// `RUSTERON_DPDK_HOUSEKEEPING_CPU` is an override, not an exemption: a CPU a
+/// busy-spinning agent owns is refused, its SMT siblings included.
+#[test]
+#[serial]
+fn housekeeping_cpu_on_a_spinning_core_is_refused() {
+    let _env = TestEnv::new();
+    let cpus = allowed_cpus();
+    let (first, last) = (cpus[0], cpus[cpus.len() - 1]);
+    for mode in ["SHARED", "INVOKER"] {
+        let _mode = EnvGuard::set("AERON_THREADING_MODE", mode);
+        let _conductor = EnvGuard::set("AERON_CONDUCTOR_CPU_AFFINITY", &last.to_string());
+        let _hk = EnvGuard::set("RUSTERON_DPDK_HOUSEKEEPING_CPU", &last.to_string());
+        let (rc, on) = housekeeping(std::ptr::null());
+        assert_eq!(rc, -1, "{mode}: on the shared agent's CPU {last} accepted: {on:?}");
+        for sibling in core_of(last).into_iter().filter(|c| *c != last) {
+            let _on_sibling = EnvGuard::set("RUSTERON_DPDK_HOUSEKEEPING_CPU", &sibling.to_string());
+            let (rc, on) = housekeeping(std::ptr::null());
+            assert_eq!(
+                rc, -1,
+                "{mode}: on the spinning core's sibling {sibling} accepted: {on:?}"
+            );
+        }
+    }
+    let _mode = EnvGuard::set("AERON_THREADING_MODE", "SHARED_NETWORK");
+    let _sender = EnvGuard::set("AERON_SENDER_CPU_AFFINITY", &first.to_string());
+    let _hk = EnvGuard::set("RUSTERON_DPDK_HOUSEKEEPING_CPU", &first.to_string());
+    let (rc, on) = housekeeping(std::ptr::null());
+    assert_eq!(
+        rc, -1,
+        "SHARED_NETWORK: on the network agent's CPU {first} accepted: {on:?}"
+    );
+}
+
+/// A `RUSTERON_DPDK_HOUSEKEEPING_CPU` the kernel will not put a thread on —
+/// offline, or outside the cpuset cgroup — fails the install. A pin that does
+/// not land leaves housekeeping free to run on a trading core, so its result
+/// is never ignored.
+#[test]
+#[serial]
+fn a_housekeeping_cpu_the_kernel_will_not_take_fails_the_install() {
+    let cpus = allowed_cpus();
+    let cpu = unusable_cpu();
+    let _hk = EnvGuard::set("RUSTERON_DPDK_HOUSEKEEPING_CPU", &cpu.to_string());
+    let ctx = spinning_on(SHARED, cpus[0]);
+    let text = install_with_housekeeping(&ctx, |installed| match installed {
+        Ok(_) => Err(format!("accepted: housekeeping on {:?}", thread_cpus("dpdk-housekeep"))),
+        Err(e) => Ok(e.to_string()),
+    })
+    .unwrap_or_else(|on| panic!("a CPU the kernel refuses accepted, {on}"));
+    assert!(
+        text.contains("housekeeping thread") && text.contains(&cpu.to_string()),
+        "{text}"
+    );
+}
+
 /// Once installed, from the driver's context: the same places, and the
 /// local-I/O thread moved there.
 #[test]
@@ -452,10 +507,27 @@ fn installed_housekeeping_and_local_io_avoid_each_modes_spinning_core() {
 
 /// Pins the calling thread to `cpu`.
 fn pin_this_thread(cpu: usize) {
+    pin_this_thread_to(&[cpu]);
+}
+
+/// Confines the calling thread to `cpus`, as a pod's cpuset does.
+fn pin_this_thread_to(cpus: &[usize]) {
     let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
-    unsafe { libc::CPU_SET(cpu, &mut set) };
+    for cpu in cpus {
+        unsafe { libc::CPU_SET(*cpu, &mut set) };
+    }
     let rc = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
-    assert_eq!(rc, 0, "pinning to {cpu}");
+    assert_eq!(rc, 0, "pinning to {cpus:?}");
+}
+
+/// A CPU number the kernel refuses in an affinity mask: one the machine does
+/// not have online. `pthread_setaffinity_np` fails on it however the cgroup is
+/// set up.
+fn unusable_cpu() -> usize {
+    let online = cpu_list(&std::fs::read_to_string("/sys/devices/system/cpu/online").expect("the online CPU list"));
+    (0..1024)
+        .find(|cpu| !online.contains(cpu))
+        .expect("every CPU 0..1024 is online: no unusable CPU to test the pin with")
 }
 
 /// A shared mode's context, its network agent busy-spinning on `cpu`.

@@ -629,12 +629,15 @@ void rusteron_dpdk_housekeeping_stop(rusteron_dpdk_transport_t *native);
 /* The CPU the EAL's main lcore runs on, or -1 (the fake EAL): where the
  * housekeeping thread goes unless RUSTERON_DPDK_HOUSEKEEPING_CPU says. */
 int rusteron_dpdk_eal_main_cpu(void);
-/* RUSTERON_DPDK_HOUSEKEEPING_CPU, else the EAL main lcore's CPU; -1 none, -2 bad env. */
+/* Where housekeeping and local I/O run: 1 with `set` filled, 0 unpinned, -1
+ * bad env. */
 #include <sched.h>
 #ifdef CPU_SETSIZE /* cpu_set_t: only units built with _GNU_SOURCE + sched.h */
 int rusteron_dpdk_housekeeping_affinity(const rusteron_dpdk_transport_t *native, cpu_set_t *set);
 /* `cpus` NULL: unpinned. */
 int rusteron_dpdk_local_io_start(rusteron_dpdk_transport_t *native, const cpu_set_t *cpus);
+/* The CPUs in `set` as "0,3,5", into `buf`, which it returns. */
+const char *rusteron_dpdk_cpu_set_list(const cpu_set_t *set, char *buf, size_t len);
 #endif
 
 /* EAL seam — implemented by rusteron_dpdk_eal.c (real rte_eal) in production

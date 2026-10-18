@@ -488,7 +488,19 @@ int rusteron_dpdk_local_io_start(rusteron_dpdk_transport_t *native, const cpu_se
     pthread_setname_np(native->local_io_thread, "dpdk-local-io");
     if (NULL != cpus)
     {
-        pthread_setaffinity_np(native->local_io_thread, sizeof(*cpus), cpus);
+        const int why = pthread_setaffinity_np(native->local_io_thread, sizeof(*cpus), cpus);
+        if (0 != why)
+        {
+            /* Left unpinned it would run wherever the scheduler puts it, on a
+             * trading core included. Fail instead: the start is undone. */
+            rusteron_dpdk_local_io_stop(native);
+            char names[128];
+            char detail[256];
+            snprintf(detail, sizeof(detail), "cannot pin the local-I/O thread to CPU %s",
+                     rusteron_dpdk_cpu_set_list(cpus, names, sizeof(names)));
+            rusteron_dpdk_set_error_code(detail, why);
+            return -1;
+        }
     }
     return 0;
 }

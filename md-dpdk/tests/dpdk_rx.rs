@@ -1086,9 +1086,7 @@ impl Masks {
 }
 
 fn decode(ol: u64, ip: Masks, l4: Masks) -> u32 {
-    unsafe {
-        rusteron_dpdk_rx_ol_flags_from_dpdk(ol, ip.bad, ip.good, ip.none, l4.bad, l4.good, l4.none)
-    }
+    unsafe { rusteron_dpdk_rx_ol_flags_from_dpdk(ol, ip.bad, ip.good, ip.none, l4.bad, l4.good, l4.none) }
 }
 
 /// DPDK encodes each RX checksum verdict as a two-bit enum, and NONE carries

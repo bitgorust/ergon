@@ -1750,6 +1750,32 @@ static int rusteron_dpdk_idle_spins(const char *name)
          0 == strcmp(name, "aeron_idle_strategy_busy_spinning") || 0 == strcmp(name, "aeron_idle_strategy_noop"));
 }
 
+/* The CPUs in `set` as "0,3,5", into `buf`, which it returns. For error
+ * messages: a pin that did not land has to say which CPUs it wanted. */
+const char *rusteron_dpdk_cpu_set_list(const cpu_set_t *set, char *buf, size_t len)
+{
+    if (0 == len)
+    {
+        return buf;
+    }
+    size_t at = 0;
+    buf[0] = '\0';
+    for (int cpu = 0; cpu < CPU_SETSIZE && at + 1 < len; cpu++)
+    {
+        if (!CPU_ISSET(cpu, set))
+        {
+            continue;
+        }
+        const int wrote = snprintf(buf + at, len - at, "%s%d", at > 0 ? "," : "", cpu);
+        if (wrote <= 0)
+        {
+            break;
+        }
+        at += (size_t)wrote;
+    }
+    return buf;
+}
+
 /* Clear `cpu` and its SMT siblings from `set`: a busy-spinning agent owns
  * its whole core. */
 static void rusteron_dpdk_clear_core(cpu_set_t *set, int cpu)
@@ -1813,19 +1839,6 @@ static void rusteron_dpdk_clear_core(cpu_set_t *set, int cpu)
 int rusteron_dpdk_housekeeping_affinity(const rusteron_dpdk_transport_t *native, cpu_set_t *set)
 {
     CPU_ZERO(set);
-    const char *env = getenv("RUSTERON_DPDK_HOUSEKEEPING_CPU");
-    if (NULL != env && '\0' != env[0])
-    {
-        char *end = NULL;
-        long v = strtol(env, &end, 10);
-        if ('\0' != *end || v < 0 || v >= CPU_SETSIZE)
-        {
-            rusteron_dpdk_set_error("RUSTERON_DPDK_HOUSEKEEPING_CPU must be a CPU number");
-            return -1;
-        }
-        CPU_SET((int)v, set);
-        return 1;
-    }
     const int installed = NULL != native && native->agent_cpus_known;
     const int mode = installed ? native->threading_mode : rusteron_dpdk_threading_mode_env();
     const int conductor = installed ? native->agent_cpus[0] : rusteron_dpdk_agent_cpu("AERON_CONDUCTOR_CPU_AFFINITY");
@@ -1846,7 +1859,20 @@ int rusteron_dpdk_housekeeping_affinity(const rusteron_dpdk_transport_t *native,
     }
     const size_t spinner_count = sizeof(spinners) / sizeof(spinners[0]);
 
-    /* The candidates, minus every spinning agent's core. */
+    /* Every CPU but the spinning agents' cores (SMT siblings included): a
+     * busy-spinning agent owns its whole core. */
+    cpu_set_t free_cpus;
+    CPU_ZERO(&free_cpus);
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+    {
+        CPU_SET(cpu, &free_cpus);
+    }
+    for (size_t i = 0; i < spinner_count; i++)
+    {
+        rusteron_dpdk_clear_core(&free_cpus, spinners[i]);
+    }
+
+    /* The candidates: what this thread may run on. */
     if (NULL != native && native->process_cpus_known)
     {
         for (int cpu = 0; cpu < CPU_SETSIZE && cpu < 1024; cpu++)
@@ -1861,23 +1887,51 @@ int rusteron_dpdk_housekeeping_affinity(const rusteron_dpdk_transport_t *native,
     {
         CPU_ZERO(set);
     }
-    cpu_set_t free_cpus;
-    CPU_ZERO(&free_cpus);
-    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+
+    const char *env = getenv("RUSTERON_DPDK_HOUSEKEEPING_CPU");
+    if (NULL != env && '\0' != env[0])
     {
-        CPU_SET(cpu, &free_cpus);
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if ('\0' != *end || v < 0 || v >= CPU_SETSIZE)
+        {
+            rusteron_dpdk_set_error("RUSTERON_DPDK_HOUSEKEEPING_CPU must be a CPU number");
+            return -1;
+        }
+        const int cpu = (int)v;
+        /* An override, not an exemption: a core a busy-spinning agent owns is
+         * refused. Whether the thread can actually be pinned there is the
+         * kernel's answer, and a pin that does not land fails the start (see
+         * rusteron_dpdk_housekeeping_start): pthread_setaffinity_np is bounded
+         * by the cpuset cgroup, not by the creating thread's own mask. */
+        if (cpu < 0 || cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &free_cpus))
+        {
+            char detail[256];
+            snprintf(detail, sizeof(detail),
+                     "RUSTERON_DPDK_HOUSEKEEPING_CPU %d is on the core a busy-spinning agent owns (SMT siblings "
+                     "included): give housekeeping a CPU of its own",
+                     cpu);
+            rusteron_dpdk_set_error(detail);
+            return -1;
+        }
+        CPU_ZERO(set);
+        CPU_SET(cpu, set);
+        return 1;
     }
+
+    /* The candidates, minus every spinning agent's core. */
     for (size_t i = 0; i < spinner_count; i++)
     {
         rusteron_dpdk_clear_core(set, spinners[i]);
-        rusteron_dpdk_clear_core(&free_cpus, spinners[i]);
     }
 
-    /* The conductor's CPU, then the EAL main lcore's, when no spinner owns it. */
+    /* The conductor's CPU, then the EAL main lcore's, when no spinner owns it
+     * and this thread may run on it. */
     const int preferred[] = { conductor, rusteron_dpdk_eal_main_cpu() };
     for (size_t i = 0; i < sizeof(preferred) / sizeof(preferred[0]); i++)
     {
-        if (preferred[i] >= 0 && preferred[i] < CPU_SETSIZE && CPU_ISSET(preferred[i], &free_cpus))
+        if (preferred[i] >= 0 && preferred[i] < CPU_SETSIZE && CPU_ISSET(preferred[i], &free_cpus) &&
+            CPU_ISSET(preferred[i], set))
         {
             CPU_ZERO(set);
             CPU_SET(preferred[i], set);
@@ -1905,7 +1959,19 @@ int rusteron_dpdk_housekeeping_start(rusteron_dpdk_transport_t *native)
     pthread_setname_np(native->housekeeping_thread, "dpdk-housekeep");
     if (pin > 0)
     {
-        pthread_setaffinity_np(native->housekeeping_thread, sizeof(set), &set);
+        const int why = pthread_setaffinity_np(native->housekeeping_thread, sizeof(set), &set);
+        if (0 != why)
+        {
+            /* Left unpinned it would run wherever the scheduler puts it, on a
+             * trading core included. Fail instead: the start is undone. */
+            rusteron_dpdk_housekeeping_stop(native);
+            char cpus[128];
+            char detail[256];
+            snprintf(detail, sizeof(detail), "cannot pin the housekeeping thread to CPU %s",
+                     rusteron_dpdk_cpu_set_list(&set, cpus, sizeof(cpus)));
+            rusteron_dpdk_set_error_code(detail, why);
+            return -1;
+        }
     }
     return 0;
 }
@@ -2334,13 +2400,31 @@ int rusteron_dpdk_runtime_agents_known(
     {
         return 0;
     }
+    /* A pin that does not land leaves the thread free to run on a trading
+     * core. Fail the install rather than report an isolation that is not
+     * there. */
+    char cpus[128];
+    char detail[256];
+    const char *on = rusteron_dpdk_cpu_set_list(&set, cpus, sizeof(cpus));
     if (native->housekeeping_running)
     {
-        pthread_setaffinity_np(native->housekeeping_thread, sizeof(set), &set);
+        const int why = pthread_setaffinity_np(native->housekeeping_thread, sizeof(set), &set);
+        if (0 != why)
+        {
+            snprintf(detail, sizeof(detail), "cannot pin the housekeeping thread to CPU %s", on);
+            rusteron_dpdk_set_error_code(detail, why);
+            return -1;
+        }
     }
     if (native->local_io_running)
     {
-        pthread_setaffinity_np(native->local_io_thread, sizeof(set), &set);
+        const int why = pthread_setaffinity_np(native->local_io_thread, sizeof(set), &set);
+        if (0 != why)
+        {
+            snprintf(detail, sizeof(detail), "cannot pin the local-I/O thread to CPU %s", on);
+            rusteron_dpdk_set_error_code(detail, why);
+            return -1;
+        }
     }
     return 0;
 }

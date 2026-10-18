@@ -114,8 +114,12 @@ impl ConfiguredDriver {
                 (None, None)
             }
             HostCheckPolicy::Warn | HostCheckPolicy::Require => {
-                let (report, rechecks) =
-                    run_host_checks(&context, transport.as_ref().and_then(CloseOnDrop::get), data_nics, policy)?;
+                let (report, rechecks) = run_host_checks(
+                    &context,
+                    transport.as_ref().and_then(CloseOnDrop::get),
+                    data_nics,
+                    policy,
+                )?;
                 (Some(report), rechecks)
             }
         };
