@@ -129,8 +129,11 @@ pub struct DpdkTransportConfig {
     pub max_aeron_mtu: usize,
     /// Request the NIC's hardware receive timestamps (AWS ENA in a
     /// `precision-time` placement group, DPDK >= 25.11). Each port then
-    /// reports the delay from NIC arrival to transport dispatch. Initialization
-    /// fails on a port whose driver does not offer RX timestamps.
+    /// reports the delay from NIC arrival to the receive burst that carried
+    /// the frame: `CLOCK_REALTIME` is read once a burst, before any frame of
+    /// it is dispatched, so a frame after the burst's first is measured
+    /// before its own dispatch. Initialization fails on a port whose driver
+    /// does not offer RX timestamps.
     pub rx_hw_timestamp: bool,
 }
 

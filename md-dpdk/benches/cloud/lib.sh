@@ -1133,7 +1133,7 @@ bench_state() {
             on "$A" 'cat bench/stalls-ping.csv' >"$out/stalls-ping-$state-$fm-$rep.csv" 2>/dev/null || true
             on "$B" 'cat bench/stalls-pong.csv' >"$out/stalls-pong-$state-$fm-$rep.csv" 2>/dev/null || true
             both "jitter-after-rtt-$state-$fm-$rep" jitter || true
-            # NIC arrival -> dispatch on each receiver port (DPDK with NIC RX timestamps only)
+            # NIC arrival -> the receive burst on each receiver port (DPDK with NIC RX timestamps only)
             for host in "$A" "$B"; do
                 # (awk, not sed: a label may hold a /, BIN's directory)
                 on "$host" "$vm rx-hw-delay" 2>/dev/null | awk -v p="$rep,rxhw,$label," '{print p $0}' >>"$results" || true

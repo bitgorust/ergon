@@ -78,7 +78,7 @@
 #                            precision-time, fails unless the PHC is chrony's source within 10 us
 #   vm.sh timesync-wait      AWS: chronyc waitsync until chrony has settled (lib.sh: before each state);
 #                            1 if it never does
-#   vm.sh rx-hw-delay        "<mean ns>,<max ns>,<frames>,<min ns>,<negative>" NIC arrival -> dispatch on the receiver port
+#   vm.sh rx-hw-delay        "<mean ns>,<max ns>,<frames>,<min ns>,<negative>" NIC arrival -> the receive burst on the receiver port
 #   vm.sh pmtu <peer ip>...  jumbo frames: the data NICs at the jumbo MTU and the path to each peer
 #                            address checked at it (ping -M do), before a JUMBO=1 mode's drivers start
 #   vm.sh mtu                "<link MTU> <Aeron MTU>" the running mode uses
@@ -2097,18 +2097,24 @@ base-rtt)
     sudo ping -q -c 200 -i 0.01 -I "$src" "$peer" | ping_stats
     ;;
 rx-hw-delay)
-    # the receiver port's NIC-arrival-to-dispatch counters (type 81), as
+    # the receiver port's NIC-arrival-to-rx-burst counters (type 81), as
     # "<mean ns>,<max ns>,<frames>,<min ns>,<negative>": the mean over the
     # frames in the sum; apart, the frames the NIC stamped after the host
-    # clock read after them (PHC and host clock skew). A driver built before
-    # the labels said so (an @BIN= base build) has no min or negative: empty.
-    # Only skewed frames (a NIC clock chrony does not keep the host on) give
-    # ",,0,,<negative>"; no stamped frame gives nothing.
+    # clock read at their burst (PHC and host clock skew). The endpoint is
+    # the burst that carried the frame, so a frame after the burst's first is
+    # measured before its own dispatch. A driver built before the labels said
+    # so (an @BIN= base build) has no min or negative: empty. Only skewed
+    # frames (a NIC clock chrony does not keep the host on) give
+    # ",,0,,<negative>"; no stamped frame gives nothing. Older drivers
+    # labelled these nic-arrival-to-dispatch-* and rx-hw-delay-*: both still
+    # parse.
     driver_cnc || exit 0
     sudo env AERON_DIR="$AERON_DIR" "$tools/counters" 'role=receiver' | awk '
-        / (nic-arrival-to-dispatch|rx-hw-delay)-max-ns$/ {max = $1}
-        / (nic-arrival-to-dispatch|rx-hw-delay)-sum-ns$/ {sum = $1}
-        / (nic-arrival-to-dispatch-count|rx-hw-timestamped)$/ {n = $1}
+        / (nic-arrival-to-rx-burst|nic-arrival-to-dispatch|rx-hw-delay)-max-ns$/ {max = $1}
+        / (nic-arrival-to-rx-burst|nic-arrival-to-dispatch|rx-hw-delay)-sum-ns$/ {sum = $1}
+        / (nic-arrival-to-rx-burst-count|nic-arrival-to-dispatch-count|rx-hw-timestamped)$/ {n = $1}
+        / nic-arrival-to-rx-burst-min-ns$/ {min = $1}
+        / nic-arrival-to-rx-burst-negative$/ {neg = $1}
         / nic-arrival-to-dispatch-min-ns$/ {min = $1}
         / nic-arrival-to-dispatch-negative$/ {neg = $1}
         END {

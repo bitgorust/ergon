@@ -35,10 +35,12 @@
   `DpdkTransport::clock` gives callers the clock the transport adopted;
   and with `RUSTERON_DPDK_RX_HW_TIMESTAMP=1` takes the NIC's hardware RX
   timestamps (AWS ENA in a precision-time placement group, DPDK >= 25.11),
-  reporting NIC arrival to dispatch per port (type 81: max, min, sum and
-  count, against `CLOCK_REALTIME` read once a receive burst after the NIC
-  handed the burst over; a frame stamped after that read, skew between the
-  NIC's PTP clock and the host's, is counted apart, never in the sum).
+  reporting NIC arrival to the receive burst that carried the frame per port
+  (type 81: max, min, sum and count, against `CLOCK_REALTIME` read once a
+  receive burst after the NIC handed the burst over and before any frame of it
+  is dispatched, so a frame after the burst's first is measured before its own
+  dispatch; a frame stamped after that read, skew between the NIC's PTP clock
+  and the host's, is counted apart, never in the sum).
   Nothing periodic runs on the driver's agents: a learned ARP next hop is
   refreshed in the background while sends keep using it, and the 1 Hz statistics
   sample runs on a housekeeping thread (`RUSTERON_DPDK_NIC_STATS_MS` sets how

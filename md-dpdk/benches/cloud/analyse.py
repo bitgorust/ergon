@@ -7,9 +7,11 @@ results.csv rows (lab.sh prefixes the rep):
   <rep>,tput,<mode>,udp,<median msgs/s>,<min>,<max>,<received>,<lost>,<window start ns>,<window end ns>
         (the measured window on the subscriber's wall clock; older clients end at <max> or <lost>)
   <rep>,rxhw,<mode>,<mean ns>,<max ns>,<frames>[,<min ns>,<negative>]   (one per host; NIC RX
-        timestamps only: NIC arrival to dispatch over <frames>; <negative>, frames stamped after the
-        host clock read after them, PHC/host clock skew; mean and max empty when only those came, min
-        and negative empty from a driver built before they were counted)
+        timestamps only: NIC arrival to the receive burst that carried the frame over <frames>;
+        <negative>, frames stamped after the host clock read at their burst, PHC/host clock skew;
+        the read is once a burst and before any frame of it is dispatched, so a frame after the
+        burst's first is measured before its own dispatch; mean and max empty when only those came,
+        min and negative empty from a driver built before they were counted)
   <rep>,tputmax,<mode>,<size>,<median msgs/s>,<min>,<max>   (the load sweep's one-way maximum)
   <rep>,tputflows,<mode>,<size>,<flows>,<sum msgs/s>,<flow 1 median msgs/s>,...,<flow n>,<overlap>
         (several flows' sustained maxima at once; a flow without a result, and then the sum, empty;
@@ -576,7 +578,7 @@ def main():
     host_checks(r)
 
     if rxhw:
-        print("\n## NIC arrival to transport dispatch, receiver port (µs)\n")
+        print("\n## NIC arrival to the receive burst, receiver port (µs)\n")
         def stat(runs, i):
             values = [r[i] for r in runs if r[i] is not None]
             return cell(values, 1000, 2) if values else "–"

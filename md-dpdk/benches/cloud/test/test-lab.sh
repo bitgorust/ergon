@@ -4056,16 +4056,19 @@ else
     diff -u <(echo "$want") <(echo "$datanics") >&2 || true
 fi
 
-# vm.sh rx-hw-delay: the receiver port's NIC-arrival-to-dispatch counters
+# vm.sh rx-hw-delay: the receiver port's NIC-arrival-to-rx-burst counters
 # (type 81, by their exact labels, never a near miss) as "<mean ns>,<max
 # ns>,<frames>,<min ns>,<negative>": the mean over the frames in the sum, and
-# apart the frames the NIC stamped after the host clock read after them (PHC
-# and host clock skew). A driver built before the labels said so (an A/B's
-# @BIN= base build) still gives its mean, max and frames, its min and
-# negative empty; only skewed frames give ",,0,,<negative>" (a NIC clock the
-# host is not kept on), and no stamped frame nothing. analyse.py's table then
-# has the min, mean and max, and the skewed frames summed ("–" where a build
-# did not count them).
+# apart the frames the NIC stamped after the host clock read at their burst
+# (PHC and host clock skew). The endpoint is the receive burst that carried
+# the frame, so a frame after the burst's first is measured before its own
+# dispatch. A driver from before this rename still labels them
+# nic-arrival-to-dispatch-*, and one older still rx-hw-delay-*: both parse,
+# and the oldest gives its mean, max and frames with min and negative empty.
+# Only skewed frames give ",,0,,<negative>" (a NIC clock the host is not kept
+# on), and no stamped frame gives nothing. analyse.py's table then has the
+# min, mean and max, and the skewed frames summed ("–" where a build did not
+# count them).
 sbh=$tmp/vm-rxhw
 mkdir -p "$sbh/bin" "$sbh/home/ergon/target/release" "$sbh/home/bench" "$sbh/sys"
 cp "$sb/bin/"* "$sbh/bin/"
@@ -4083,21 +4086,29 @@ cp -R "$sys/aws-x86/." "$sbh/sys/"
 echo aws >"$sbh/home/bench/cloud"
 rx=' 81 rusteron-dpdk role=receiver bdf=0000:00:07.0 port=1 q=0 dir=rx'
 cat >"$tmp/rxhw-new" <<EOF
+3000$rx nic-arrival-to-rx-burst-max-ns
+500$rx nic-arrival-to-rx-burst-min-ns
+4800$rx nic-arrival-to-rx-burst-sum-ns
+4$rx nic-arrival-to-rx-burst-count
+2$rx nic-arrival-to-rx-burst-negative
+999$rx nic-arrival-to-rx-burst-max-ns-old
+777$rx nic-arrival-to-rx-burst-min-ns-old
+7 82 rusteron-dpdk role=receiver bdf=0000:00:07.0 port=1 q=0 dir=rx pkts
+EOF
+cat >"$tmp/rxhw-one" <<EOF
+700$rx nic-arrival-to-rx-burst-max-ns
+700$rx nic-arrival-to-rx-burst-min-ns
+700$rx nic-arrival-to-rx-burst-sum-ns
+1$rx nic-arrival-to-rx-burst-count
+0$rx nic-arrival-to-rx-burst-negative
+EOF
+# a driver from before the rename: the same numbers under the old labels
+cat >"$tmp/rxhw-prev" <<EOF
 3000$rx nic-arrival-to-dispatch-max-ns
 500$rx nic-arrival-to-dispatch-min-ns
 4800$rx nic-arrival-to-dispatch-sum-ns
 4$rx nic-arrival-to-dispatch-count
 2$rx nic-arrival-to-dispatch-negative
-999$rx nic-arrival-to-dispatch-max-ns-old
-777$rx nic-arrival-to-dispatch-min-ns-old
-7 82 rusteron-dpdk role=receiver bdf=0000:00:07.0 port=1 q=0 dir=rx pkts
-EOF
-cat >"$tmp/rxhw-one" <<EOF
-700$rx nic-arrival-to-dispatch-max-ns
-700$rx nic-arrival-to-dispatch-min-ns
-700$rx nic-arrival-to-dispatch-sum-ns
-1$rx nic-arrival-to-dispatch-count
-0$rx nic-arrival-to-dispatch-negative
 EOF
 cat >"$tmp/rxhw-old" <<EOF
 2000$rx rx-hw-delay-max-ns
@@ -4105,11 +4116,11 @@ cat >"$tmp/rxhw-old" <<EOF
 3$rx rx-hw-timestamped
 EOF
 cat >"$tmp/rxhw-skewed" <<EOF
-0$rx nic-arrival-to-dispatch-max-ns
-0$rx nic-arrival-to-dispatch-min-ns
-0$rx nic-arrival-to-dispatch-sum-ns
-0$rx nic-arrival-to-dispatch-count
-5$rx nic-arrival-to-dispatch-negative
+0$rx nic-arrival-to-rx-burst-max-ns
+0$rx nic-arrival-to-rx-burst-min-ns
+0$rx nic-arrival-to-rx-burst-sum-ns
+0$rx nic-arrival-to-rx-burst-count
+5$rx nic-arrival-to-rx-burst-negative
 EOF
 sed 's/^5 /0 /' "$tmp/rxhw-skewed" >"$tmp/rxhw-none"
 rxhw() { # <counters fixture>: "[<the line it printed> ]rc <status>"
@@ -4120,16 +4131,18 @@ rxhw() { # <counters fixture>: "[<the line it printed> ]rc <status>"
 }
 got="new: $(rxhw new)
 one: $(rxhw one)
+prev: $(rxhw prev)
 old: $(rxhw old)
 skewed: $(rxhw skewed)
 none: $(rxhw none)"
 want="new: 1200,3000,4,500,2 rc 0
 one: 700,700,1,700,0 rc 0
+prev: 1200,3000,4,500,2 rc 0
 old: 1000,2000,3,, rc 0
 skewed: ,,0,,5 rc 0
 none: rc 0"
 if [[ $got == "$want" ]]; then
-    pass "vm.sh rx-hw-delay: NIC arrival to dispatch by its labels (mean, max, frames, min, the skewed frames apart), a base build's older labels, only skewed frames, nothing without a stamped frame"
+    pass "vm.sh rx-hw-delay: NIC arrival to the receive burst by its labels (mean, max, frames, min, the skewed frames apart), the pre-rename and older labels, only skewed frames, nothing without a stamped frame"
 else
     fail "vm.sh rx-hw-delay"
     diff -u <(echo "$want") <(echo "$got") >&2 || true
@@ -4142,14 +4155,14 @@ cat >"$tmp/rxhw-run/results.csv" <<'EOF'
 1,rxhw,isolated:dpdk@BIN=bin-base,1000,2000,3,,
 EOF
 python3 "$cloud/analyse.py" "$tmp/rxhw-run/results.csv" >"$tmp/rxhw-run/out.md" 2>&1 || fail "analyse.py with rxhw rows exited $?"
-rxhw_table=$(awk '/^## NIC arrival to transport dispatch/ {on = 1; next} /^## / {on = 0} on' "$tmp/rxhw-run/out.md" |
+rxhw_table=$(awk '/^## NIC arrival to the receive burst/ {on = 1; next} /^## / {on = 0} on' "$tmp/rxhw-run/out.md" |
     grep '^| isolated' || true)
 rxhw_want="| isolated, DPDK              | 3         | 0.60 (0.50–0.70) | 1.10 (1.00–1.20) | 2.80 (2.60–3.00) | 8                              |
 | isolated, dpdk@BIN=bin-base | 1         | –                | 1.00 (1.00–1.00) | 2.00 (2.00–2.00) | –                              |"
 if [[ $rxhw_table == "$rxhw_want" ]]; then
-    pass "analyse.py: NIC arrival to dispatch with its min, mean and max, and the skewed frames apart (\"–\" for a build that did not count them)"
+    pass "analyse.py: NIC arrival to the receive burst with its min, mean and max, and the skewed frames apart (\"–\" for a build that did not count them)"
 else
-    fail "analyse.py: the NIC arrival to dispatch table"
+    fail "analyse.py: the NIC arrival to the receive burst table"
     diff -u <(echo "$rxhw_want") <(echo "$rxhw_table") >&2 || cat "$tmp/rxhw-run/out.md" >&2
 fi
 

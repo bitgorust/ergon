@@ -594,9 +594,15 @@ int rusteron_dpdk_poller_receive(
     int work_count = 0;
     int64_t rx_bytes = 0;
     int64_t sw_csum = 0;
-    /* NIC arrival to dispatch, over the frames the NIC stamped no later than
-     * the host clock read after their burst; one stamped later is clock skew
-     * between the NIC's PTP hardware clock and CLOCK_REALTIME, counted apart. */
+    /* NIC arrival to the receive burst that carried the frame, over the frames
+     * the NIC stamped no later than the host clock read at that burst; one
+     * stamped later is clock skew between the NIC's PTP hardware clock and
+     * CLOCK_REALTIME, counted apart. The read is once a burst and before any
+     * frame of it is classified or dispatched, so a frame after the burst's
+     * first is measured before its own dispatch: a lower bound on arrival to
+     * dispatch, exact only for the first frame of the burst. Per-frame dispatch
+     * stamps would cost a clock read per frame on the receive path; the burst
+     * endpoint is the one this path can report without adding that. */
     int64_t hw_sum = 0, hw_count = 0, hw_max = INT64_MIN, hw_min = INT64_MAX, hw_negative = 0;
     int observed = 0; /* the first datagram's source checked against ARP */
     /* A channel on this NIC asking for media receive timestamps
@@ -654,7 +660,7 @@ int rusteron_dpdk_poller_receive(
                 struct timespec nic_ts;
                 if (0 != m->hw_rx_ns)
                 {
-                    /* NIC arrival to dispatch: the NIC stamps with its PTP
+                    /* NIC arrival to this burst: the NIC stamps with its PTP
                      * hardware clock, which chrony keeps CLOCK_REALTIME on. */
                     if (0 == realtime_ns)
                     {
