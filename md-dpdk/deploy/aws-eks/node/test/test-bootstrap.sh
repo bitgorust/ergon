@@ -178,7 +178,11 @@ echo "$VM_CPUINFO" > "$PROC/cpuinfo"
 ISO="1-7"
 # As provision-node.sh writes it: nosmt always, the C-state cap on a VM only.
 ISOLATION="nosmt isolcpus=nohz,domain,managed_irq,$ISO nohz_full=$ISO rcu_nocbs=$ISO irqaffinity=0"
-COMMON_ARGS="clocksource=tsc tsc=reliable iommu=pt transparent_hugepage=never hugepagesz=2M hugepages=2048"
+# The clocksource is no longer forced by default: only bare metal with
+# RUSTERON_FORCE_TSC=1 gets it, and a VM never does (tsc=reliable turns the
+# kernel's TSC checks off).
+COMMON_ARGS="iommu=pt transparent_hugepage=never hugepagesz=2M hugepages=2048"
+TSC_ARGS="clocksource=tsc tsc=reliable $COMMON_ARGS"
 PROVISIONED_CMDLINE="BOOT_IMAGE=(hd0,gpt1)/boot/vmlinuz root=UUID=x ro $ISOLATION intel_idle.max_cstate=1 processor.max_cstate=1 $COMMON_ARGS"
 METAL_CMDLINE="BOOT_IMAGE=(hd0,gpt1)/boot/vmlinuz root=UUID=x ro $ISOLATION $COMMON_ARGS"
 echo "$PROVISIONED_CMDLINE" > "$PROC/cmdline"
@@ -522,6 +526,11 @@ fixture_env RUSTERON_NODE_ENV="$TMP/node.env" RUSTERON_DRY_RUN=1 "$PROVISION" 2>
     || { cat "$TMP/provision.err" >&2; die "provision failed"; }
 cat "$TMP/provision.err"
 assert_grep "dry-run: kernel args: $ISOLATION intel_idle.max_cstate=1 processor.max_cstate=1 $COMMON_ARGS" "$TMP/provision.err"
+# A VM never gets a clocksource override: the hypervisor's is the kernel's
+# choice, and tsc=reliable would turn the kernel's TSC checks off.
+assert_no_grep "clocksource=" "$TMP/provision.err"
+assert_grep "clocksource left to the kernel: this is a VM" "$TMP/provision.err"
+assert_grep "would write /opt/rusteron-dpdk/clocksource-policy: kernel: a VM gets no clocksource override" "$TMP/provision.err"
 assert_grep "dry-run: would run, retried: install_build_deps" "$TMP/provision.err"
 assert_grep "dry-run: would run, retried: fetch_dpdk_kmods" "$TMP/provision.err"
 assert_grep "dry-run: would run: systemctl enable rusteron-dpdk-ena.service" "$TMP/provision.err"
@@ -540,6 +549,17 @@ fixture_env RUSTERON_NODE_ENV="$TMP/node.env" RUSTERON_DRY_RUN=1 "$PROVISION" 2>
     || { cat "$TMP/provision.err" >&2; die "provision on bare metal failed"; }
 assert_grep "dry-run: kernel args: $ISOLATION $COMMON_ARGS" "$TMP/provision.err"
 assert_no_grep "max_cstate" "$TMP/provision.err"
+# Unqualified bare metal still keeps the kernel's clocksource: the TSC is
+# only forced when the operator says this machine was measured for it.
+assert_no_grep "clocksource=" "$TMP/provision.err"
+assert_grep "RUSTERON_FORCE_TSC=1 only on bare metal" "$TMP/provision.err"
+# The one case that forces it: bare metal, qualified, opt in. The policy is
+# recorded, and it says the kernel's TSC checks are off.
+fixture_env RUSTERON_NODE_ENV="$TMP/node.env" RUSTERON_FORCE_TSC=1 RUSTERON_DRY_RUN=1 "$PROVISION" 2>"$TMP/provision.err" \
+    || { cat "$TMP/provision.err" >&2; die "provision with a forced TSC failed"; }
+assert_grep "dry-run: kernel args: $ISOLATION $TSC_ARGS" "$TMP/provision.err"
+assert_grep "clocksource forced to tsc (RUSTERON_FORCE_TSC=1): the kernel's TSC checks are off" "$TMP/provision.err"
+assert_grep "would write /opt/rusteron-dpdk/clocksource-policy: forced:" "$TMP/provision.err"
 echo "$VM_CPUINFO" > "$PROC/cpuinfo"
 # The housekeeping CPUs default to cpu0's core, one CPU (its only thread).
 fixture_env RUSTERON_DRY_RUN=1 "$PROVISION" 2>"$TMP/provision.err" \

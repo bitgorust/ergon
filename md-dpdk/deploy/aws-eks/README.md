@@ -141,9 +141,14 @@ has `isolcpus=`, so it can never loop. Otherwise it:
    (`nohz,domain,managed_irq`), `nohz_full` and `rcu_nocbs` on every CPU but
    the housekeeping core, `irqaffinity` on it, `intel_idle.max_cstate=1
    processor.max_cstate=1` on a VM only (the CPU's `hypervisor` flag; see
-   [Bare metal](#bare-metal)), `clocksource=tsc tsc=reliable`, `iommu=pt`,
-   `transparent_hugepage=never`, and boot-time 2 MiB hugepages (so kubelet's
-   first start advertises `hugepages-2Mi`);
+   [Bare metal](#bare-metal)), `iommu=pt`, `transparent_hugepage=never`, and
+   boot-time 2 MiB hugepages (so kubelet's first start advertises
+   `hugepages-2Mi`). The clocksource is left to the kernel. Bare metal may
+   add `clocksource=tsc tsc=reliable` with `RUSTERON_FORCE_TSC=1`, which is
+   the operator saying this machine's TSC has been measured as the same
+   across cores against a PTP/PHC reference: `tsc=reliable` turns the
+   kernel's TSC checks off. A VM never gets it. The choice is written to
+   `/opt/rusteron-dpdk/clocksource-policy`;
 6. clears kubelet's CPU and memory manager state and reboots once.
 
 If any step fails, it writes `/var/lib/rusteron-dpdk/provision-failed` and a

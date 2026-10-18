@@ -28,9 +28,11 @@
 #   6. Set the kernel command line with grubby: nosmt (SMT stays off on every
 #      later boot), CPU isolation (isolcpus, nohz_full, rcu_nocbs,
 #      irqaffinity), C1 as the deepest idle state on a
-#      VM (not on bare metal), the TSC clocksource, IOMMU passthrough,
+#      VM (not on bare metal), IOMMU passthrough,
 #      transparent hugepages off from boot and 2 MiB hugepages
-#      (RUSTERON_HUGEPAGES, default 2048).
+#      (RUSTERON_HUGEPAGES, default 2048). The clocksource is left to the
+#      kernel unless bare metal and RUSTERON_FORCE_TSC=1 say otherwise; the
+#      choice is recorded in $PREFIX/clocksource-policy.
 #   7. Clear kubelet's CPU and memory manager state and reboot.
 #
 # Any failure holds kubelet back for good: a kubelet drop-in asserts that
@@ -310,17 +312,49 @@ args="nosmt isolcpus=nohz,domain,managed_irq,$ISO nohz_full=$ISO rcu_nocbs=$ISO 
 # as the EKS run measured it: c7i.4xlarge exposes C6, with a 190 us exit, on
 # the housekeeping core that takes every interrupt. Not on bare metal, where
 # it made kernel UDP slower (BENCHMARKS.md, AWS round 4).
+is_vm=0
 if grep -m1 '^flags' "$RUSTERON_PROC_ROOT/cpuinfo" | grep -qw hypervisor; then
+    is_vm=1
     args+=" intel_idle.max_cstate=1 processor.max_cstate=1"
+fi
+# The clocksource is an explicit hardware profile, not a fix for a source the
+# kernel rejected. `tsc=reliable` turns the kernel's TSC verification off, and
+# the invariance flags say nothing about whether the TSC agrees across cores.
+# So: never on a VM, where the hypervisor's clocksource is the kernel's
+# considered choice; on bare metal only with RUSTERON_FORCE_TSC=1, which is
+# the operator saying this machine's TSC has been qualified as the same across
+# cores against a PTP/PHC reference. Either way the choice is written to
+# $PREFIX/clocksource-policy so a later run can see what was decided.
+clocksource_args=""
+clocksource_policy="kernel: the kernel keeps its own clocksource and its TSC checks"
+if ((is_vm)); then
+    clocksource_policy="kernel: a VM gets no clocksource override (tsc=reliable would turn the kernel's TSC checks off)"
+    ok "clocksource left to the kernel: this is a VM"
+elif [[ "${RUSTERON_FORCE_TSC:-0}" == "1" ]]; then
+    clocksource_args="clocksource=tsc tsc=reliable"
+    clocksource_policy="forced: clocksource=tsc tsc=reliable on bare metal qualified as the same TSC across cores (RUSTERON_FORCE_TSC=1); the kernel's TSC checks are OFF, so keep an independent PTP/PHC health check"
+    ok "clocksource forced to tsc (RUSTERON_FORCE_TSC=1): the kernel's TSC checks are off"
+else
+    clocksource_policy="kernel: bare metal, not qualified for a forced TSC (set RUSTERON_FORCE_TSC=1 only after measuring the same TSC across cores)"
+    ok "clocksource left to the kernel: set RUSTERON_FORCE_TSC=1 only on bare metal measured as the same TSC across cores"
 fi
 # iommu=pt: bare metal has a real IOMMU, which igb_uio does not program;
 # passthrough (identity mapping for host-owned devices) lets its DMA through,
 # as in the metal lab. A VM has no IOMMU, so it changes nothing there.
 # transparent_hugepage=never from boot, before the per-boot unit sets it.
-args+=" clocksource=tsc tsc=reliable iommu=pt transparent_hugepage=never"
+if [[ -n "$clocksource_args" ]]; then
+    args+=" $clocksource_args"
+fi
+args+=" iommu=pt transparent_hugepage=never"
 args+=" hugepagesz=2M hugepages=$RUSTERON_HUGEPAGES"
 if ((RUSTERON_DRY_RUN)); then
     ok "dry-run: kernel args: $args"
+    ok "dry-run: would write $PREFIX/clocksource-policy: $clocksource_policy"
+else
+    mkdir -p "$PREFIX"
+    printf '%s\n' "$clocksource_policy" > "$PREFIX/clocksource-policy" \
+        || fail "cannot write $PREFIX/clocksource-policy"
+    ok "clocksource policy recorded in $PREFIX/clocksource-policy"
 fi
 run grubby --update-kernel=ALL --args="$args"
 if ! ((RUSTERON_DRY_RUN)); then

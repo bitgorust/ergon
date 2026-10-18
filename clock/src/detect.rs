@@ -367,10 +367,22 @@ impl HostFacts {
                         "on c7i with the tsc source the counter clock read in 15.63 ns (slowest \
                          batch 16.68) against 25.01 (26.06) for CLOCK_MONOTONIC through the vDSO",
                         if self.invariant_tsc == Some(false) {
-                            "The TSC is not invariant here, so the kernel's choice stands."
+                            "The TSC is not invariant here, so the kernel's choice stands and \
+                             forcing the TSC would be wrong."
                         } else {
-                            "Boot with `clocksource=tsc tsc=reliable` where the TSC is invariant \
-                             (`constant_tsc nonstop_tsc` in /proc/cpuinfo)."
+                            // Not "boot with": forcing the TSC is a hardware decision, not a
+                            // fix for a source the kernel rejected. The invariance flags say
+                            // the counter will not stop or drift; they say nothing about
+                            // whether it agrees across cores. `tsc=reliable` also turns off
+                            // the kernel's TSC verification, and the calibration this finding
+                            // is talking about still trusts the kernel's chosen source.
+                            "Do not force it as a fix. `constant_tsc nonstop_tsc` say the counter \
+                             will not stop or drift; they do not say it agrees across cores. \
+                             `tsc=reliable` also turns off the kernel's TSC checks, and the \
+                             calibration above still trusts the kernel's source. Force \
+                             `clocksource=tsc tsc=reliable` only on hardware qualified as the \
+                             same across cores against a PTP/PHC reference: record that choice, \
+                             keep that check as health evidence, and never on a VM."
                         },
                     ),
                     _ => (

@@ -556,7 +556,8 @@ fn the_clocksource_finding_follows_the_gate() {
             .map(|f| (f.check, f.severity, f.message.as_str()));
         assert!(
             matches!(f, Some((Check::Clocksource, Severity::Warn, m)) if m.contains(source)
-                && m.contains("system call") && m.contains("clocksource=tsc tsc=reliable")),
+                && m.contains("system call") && m.contains("clocksource=tsc tsc=reliable")
+                && m.contains("Do not force it as a fix") && m.contains("never on a VM")),
             "{f:?}"
         );
     }
@@ -1203,17 +1204,36 @@ fn the_reports_findings_carry_the_clocksource() -> R {
     Ok(())
 }
 
-/// With the TSC's invariance unknown, the fix is still the boot option, not
-/// "the kernel's choice stands".
+/// Forcing the TSC is a hardware decision, never the fix for a source the
+/// kernel rejected. The message names the boot option so an operator knows
+/// what is meant, and says what it costs: `tsc=reliable` turns off the
+/// kernel's TSC checks. With invariance unknown it is the same caution, not
+/// "boot with it".
 #[test]
-fn an_unknown_invariant_tsc_still_gets_the_boot_fix() {
-    let x86 = HostFacts::unknown(Arch::X86_64, Os::Linux);
-    let f = x86.clocksource_finding(Some("hpet"));
-    assert!(
-        f.as_ref()
-            .is_some_and(|f| f.message.contains("clocksource=tsc tsc=reliable")),
-        "{f:?}"
-    );
+fn a_rejected_tsc_is_never_advised_as_a_boot_fix() {
+    for invariant in [None, Some(true), Some(false)] {
+        let x86 = HostFacts {
+            invariant_tsc: invariant,
+            ..HostFacts::unknown(Arch::X86_64, Os::Linux)
+        };
+        let f = x86.clocksource_finding(Some("hpet"));
+        let f = f.as_ref().map(|f| f.message.as_str());
+        match invariant {
+            Some(false) => assert!(
+                f.is_some_and(|m| m.contains("forcing the TSC would be wrong")),
+                "{invariant:?} {f:?}"
+            ),
+            _ => assert!(
+                f.is_some_and(|m| {
+                    m.contains("Do not force it as a fix")
+                        && m.contains("tsc=reliable")
+                        && m.contains("turns off the kernel's TSC checks")
+                        && m.contains("never on a VM")
+                }),
+                "{invariant:?} {f:?}"
+            ),
+        }
+    }
 }
 
 /// The `/proc` scan stops at `max_processes` entries, whatever the order

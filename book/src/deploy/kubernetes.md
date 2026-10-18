@@ -87,8 +87,12 @@ The node scripts (tested against fixtures by `just test-dpdk-bootstrap`):
 - **First boot** (`node/provision-node.sh`) sets the kernel command line,
   then reboots once before kubelet starts: every CPU but the reserved core
   isolated, interrupts on the reserved core, C-states capped at C1 on a VM,
-  `clocksource=tsc tsc=reliable`, `iommu=pt`, `transparent_hugepage=never`,
+  `iommu=pt`, `transparent_hugepage=never`,
   and 2 MiB hugepages, so kubelet's first start advertises `hugepages-2Mi`.
+  The clocksource is left to the kernel: a forced `clocksource=tsc
+  tsc=reliable` turns the kernel's TSC checks off, so bare metal takes it only
+  with `RUSTERON_FORCE_TSC=1`, after the TSC has been measured as the same
+  across cores against a PTP/PHC reference. A VM never gets it.
 - **Kubelet's reserved CPUs and the kernel's housekeeping CPUs are the same
   set.** That keeps interrupts and system daemons off the pods' cores.
 - **Every boot** (`node/bootstrap-dpdk-ena.sh`, before kubelet): interrupts on

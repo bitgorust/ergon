@@ -44,7 +44,7 @@ CPU is one core).
 | AWS x86 | `iommu=pt`, so `igb_uio` works on metal; harmless on a VM |
 | AWS Graviton | `iommu.passthrough=1` instead (metal) |
 | Azure | nothing |
-| EKS DPDK node (x86) | `clocksource=tsc tsc=reliable transparent_hugepage=never hugepagesz=2M hugepages=<n>`; on a VM also `intel_idle.max_cstate=1 processor.max_cstate=1` |
+| EKS DPDK node (x86) | `transparent_hugepage=never hugepagesz=2M hugepages=<n>`; on a VM also `intel_idle.max_cstate=1 processor.max_cstate=1`. `clocksource=tsc tsc=reliable` only on bare metal with `RUSTERON_FORCE_TSC=1` |
 
 ## Interrupts and the NIC
 
