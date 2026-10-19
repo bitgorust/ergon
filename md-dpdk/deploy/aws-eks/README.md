@@ -309,7 +309,8 @@ node path serves it, with two differences:
   there) puts every group in passthrough, and the preflight checks that each
   one is.
 - No C-state cap: holding C-states at C1 made plain kernel UDP's p50 2 µs
-  worse on metal and brought single-rep collapses under load, so
+  worse on metal and brought single-rep collapses under load
+  ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)), so
   `provision-node.sh` sets it only on a VM, where the EKS run measured it
   (`c7i.4xlarge` exposes C6, with a 190 µs exit, on the core that takes every
   interrupt).

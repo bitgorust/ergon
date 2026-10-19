@@ -9,8 +9,9 @@
 > understand well.
 >
 > **If you need kernel bypass for Aeron, use
-> [Aeron Premium](https://aeron.io/).** It is inexpensive, faster, handles the
-> edge cases, is battle-tested, and comes with support.
+> [Aeron Premium](https://aeron.io/).** It is inexpensive, handles the edge
+> cases, is battle-tested, and comes with support. No kernel-bypass product
+> was compared on this hardware, so no speed claim is made either way.
 >
 > In this crate **on localhost it seems slightly slower than the open-source Aeron C
 > driver** over kernel UDP: host-local channels run on ordinary kernel
@@ -19,7 +20,8 @@
 > (bare-metal c7i: p99.99 8.18 against 7.39 µs, max 10.73 against 8.86 µs;
 > Azure: p50 6.16 against 5.94 µs, p99.99 10.71 against 9.39 µs). On
 > Graviton5 its median was 0.4 µs lower (3.88 against 4.29 µs) but its max
-> higher (19 against 15 µs) ([the data](#localhost-no-gain)).
+> higher (19 against 15 µs) ([the data](#localhost-no-gain),
+> [runs](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)).
 
 ## Glossary
 
@@ -69,6 +71,8 @@ Terms this chapter uses. Host, Kubernetes and Java terms:
 | spot instance                                                        | spare AWS capacity, sold cheaper; AWS can take it back                                                                                  | pro: a `c9g.2xlarge` pair cost 0.306 against 0.696 $/h ([cost](../deploy/benchmarks.md#cost-per-hour)). Con: the price moves; the host can go  |
 | x86, Graviton                                                        | x86: Intel and AMD CPUs (mostly Intel here). Graviton: AWS's Arm CPUs                                                                   | Graviton5 had the lowest latency measured, at half the x86 pair's price; its median lead is not proven ([benchmarks](../deploy/benchmarks.md)) |
 | SMT, hyperthread, sibling, vCPU                                      | SMT runs two hyperthreads (siblings) on one core. A vCPU is a hyperthread on x86, a whole core on Graviton (no SMT)                     | on x86, leave each busy core's sibling idle                                                                                                    |
+
+Figures in this glossary: [md-dpdk/BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md).
 | bare metal                                                           | an instance with no hypervisor                                                                                                          | tighter tails and fewer stalls, not a lower median; 6 times a `c7i.4xlarge`'s price                                                            |
 | round trip (ping-pong)                                               | one message out and its reply back. Every latency here is a round trip                                                                  |                                                                                                                                                |
 | rep                                                                  | one repeat of a run; each cell is the median of 5 reps                                                                                  |                                                                                                                                                |

@@ -14,7 +14,7 @@ counter read and one multiply per read.
 ## What it does
 
 - **`calibrate`**: the one set-up call, at start-up (40–70 ms, plus up to
-  50 ms for the time-sync probe). It checks that the counter may be used,
+  50 ms for the time-sync probe; [data](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md)). It checks that the counter may be used,
   takes its rate, and returns the clock with a report of what it chose and
   why. It prints one line per problem: a slow fallback, a host clock not
   synchronised or not settled.
