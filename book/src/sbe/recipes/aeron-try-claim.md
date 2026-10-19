@@ -38,9 +38,9 @@ timeout.
 
 No encoder writes a block's padding (the bytes past its last field, up to the
 schema's `blockLength`), so they go out as the claimed region held them. An
-Aeron `try_claim` region starts zeroed, so this costs the claim path nothing.
-A `Claim` you implement over a region the transport reuses must hand it out
-zeroed, as `OfferClaim` (below) does.
+Aeron `try_claim` region starts zeroed by the transport; the cost of that
+zeroing is **not measured** here. A `Claim` you implement over a region the
+transport reuses must hand it out zeroed, as `OfferClaim` (below) does.
 
 ## Fixed-only messages: `send_fixed`
 

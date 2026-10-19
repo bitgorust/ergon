@@ -89,6 +89,7 @@ Do not choose between the polling and interrupt families on these numbers: adapt
 | cpuset via the kubelet's static CPU manager (whole physical cores) for the loop thread; cpu quotas sized so it is never throttled | busy-spin threads must not share a core or be throttled |
 | host settings on the node (`isolcpus`, `nohz_full`, `irqaffinity`, THP off); pod settings in the pod spec | never assume host housekeeping CPUs are available to the pod |
 | one connection per few streams | pack streams onto few connections (above) |
+| the loop under `SCHED_OTHER`, never `SCHED_FIFO`/`SCHED_RR` | no gain on an isolated CPU: an 8-minute AWS A/B measured p50 **+0.5/−1.8 µs** and p99.99 **+1/−45 µs** with a real-time policy, the CPU's tick stayed at 550/s against 18/s, and RT throttling can take the CPU away (`sched_rt_runtime_us` 950000 of 1000000 by default). Run `163114Z` row `r1-rt` — flagged in [lab notes](#lab-notes) as inflated by a sleeping sender, so the deltas are directional only and the "no gain" direction is what `ergon-tune` T7 checks. Source of the numbers: `tune/src/cpu.rs` `t7_sched_policy` |
 
 ### HTTP and connections
 

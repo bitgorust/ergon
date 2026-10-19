@@ -10,9 +10,9 @@ follows. It can be no closer to UTC than the host's own clock.
   second it samples the wall clock (the tightest of up to 8 brackets — each
   bracket is an ordered read, a `CLOCK_REALTIME` read, an ordered read, and
   its width bounds the error) and re-anchors the clock to follow it.
-- **Run the owner on a thread that never idles.** Slow updates on c7i
-  came after deep idle and are not confirmed; on Graviton the slowest is
-  the start update.
+- **Run the owner on a thread that never idles.** On c7i the slow updates
+  followed deep idle, but the C-state cause is **not confirmed**; on Graviton
+  the slowest is the start update.
 - **Rate cap:** ±500 ppm, NTP's and Linux's own limit.
 - **Never backwards:** a clock behind the wall clock runs faster until it
   catches up; one ahead runs slower.

@@ -67,7 +67,7 @@ Linux has.
 | `-XX:+TrustFinalNonStaticFields` (experimental) | The JIT treats final instance fields as constants. | `java-common`, benchmarks |
 | `-XX:GuaranteedSafepointInterval=300000` (diagnostic) | Removes the stop-the-world safepoint that otherwise runs every second only because one is due. | `java-common`, cluster scripts, wiki |
 | `-XX:+DebugNonSafepoints` | Profilers attribute samples to the right line. | benchmarks |
-| `-XX:+UseParallelGC` | Archive, Cluster and the driver allocate nothing in steady state, so the collector with the cheapest barriers wins. | every Aeron script |
+| `-XX:+UseParallelGC` | Archive, Cluster and the driver allocate nothing in steady state. The choice is convention, not a measured collector A/B: every Aeron script uses it. | every Aeron script |
 | `-Xms` = `-Xmx`, `-XX:+AlwaysPreTouch` | The heap never grows, and every page is faulted in at start rather than on the hot path. | benchmarks |
 | `-XX:MaxMetaspaceSize=1g`, `-XX:ReservedCodeCacheSize=1g` | Code-cache pressure never deoptimises hot code. | benchmarks |
 | `-Xlog:async`, `-Xlog:gc*,safepoint=info,...` | Every pause and safepoint is logged with its cause, by a background thread, to tmpfs. | benchmarks (to `/dev/shm`); `-Xlog:async` is ergon's addition |
@@ -125,10 +125,10 @@ When the JVM shares its cores, or runs in a container with a few hundred MiB:
 
 - Keep the backoff idle strategies. A spinning thread on a shared core takes
   the core from everything else.
-- Serial GC (`-XX:+UseSerialGC`) costs nothing extra with one core.
-  `-XX:TieredStopAtLevel=1` and a small code cache give up peak JIT speed to
-  save memory, which is the right trade for an Archive whose work is file
-  I/O.
+- Serial GC (`-XX:+UseSerialGC`) is the one-core collector; its cost against
+  ParallelGC here is **not measured**. `-XX:TieredStopAtLevel=1` and a small
+  code cache give up peak JIT speed to save memory, which is the right trade
+  for an Archive whose work is file I/O.
 - Set `-Xms` equal to `-Xmx`, and size `-XX:MaxDirectMemorySize`,
   `-XX:MaxMetaspaceSize` and `-XX:ReservedCodeCacheSize`. The container's
   limit must cover all of them, plus thread stacks and native memory.

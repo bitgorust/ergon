@@ -12,21 +12,21 @@ of these** — they are node settings.
 | CPU manager | `static` | exclusive CPUs for the loop | `cat /var/lib/kubelet/config.yaml \| grep -i cpumanager` or the nodeadm `NodeConfig` |
 | reserved CPUs | `0,1` on c8g (0 = system/shared, 1 = NIC IRQs) | kubelet, daemons and NIC IRQs stay off the hot cores | `cat /var/lib/kubelet/config.yaml \| grep reservedSystemCPUs` |
 | `strict-cpu-reservation` | **off** | on, it empties the shared pool of the reserved CPUs and starves the ingester's host-stats thread and fractional sidecars | `grep -r strict-cpu-reservation /etc/kubernetes/ /var/lib/kubelet/` |
-| `cpu.idle` | **off** for latency pods | deep C-states cost 3.5 µs per update from idle | `grep -r cpu.idle /etc/kubernetes/ /var/lib/kubelet/` |
+| `cpu.idle` | **off** for latency pods | a disciplined clock update costs **3.5 µs on c7i** (max **6.1–18.7**), set by waking from deep idle ([data](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md); the C-state cause is untraced there) | `grep -r cpu.idle /etc/kubernetes/ /var/lib/kubelet/` |
 | topology manager | `single-numa-node`, scope `pod` | memory lands on the NIC's NUMA node | `grep -i topology /var/lib/kubelet/config.yaml` |
 | `full-pcpus-only` | x86 with SMT only | c8g has no SMT; the option is a no-op there | `grep full-pcpus /var/lib/kubelet/config.yaml` |
 | kernel | `>= 6.2` (cgroup v2) | keeps a thread's requested affinity across cpuset changes | `uname -r`; `stat -fc %T /sys/fs/cgroup` |
 | cgroup v2 | mounted | the plugin refuses cgroup v1 | `test -f /sys/fs/cgroup/cgroup.controllers` |
 | `net.core.rmem_max` / `wmem_max` | 4–16 MiB | Aeron's 2 MiB receive window needs them; without them the window caps and frames drop | `sysctl net.core.rmem_max net.core.wmem_max` |
-| `net.core.busy_poll` / `busy_read` | **off** on Graviton | busy polling on Graviton was catastrophic (p50 4,973 µs, 61,488 NAKs) | `sysctl net.core.busy_poll net.core.busy_read` |
+| `net.core.busy_poll` / `busy_read` | **off** on Graviton | busy polling on Graviton was catastrophic: p50 **4,973 µs**, max **9,175 (8,544–102,826)**, **61,488 NAKs** ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)) | `sysctl net.core.busy_poll net.core.busy_read` |
 | `kernel.numa_balancing` | `0` | no automatic page migration under a latency pod | `sysctl kernel.numa_balancing` |
 | hugepages | boot `hugepagesz=2M hugepages=256` | `AERON_DIR` on hugetlbfs removes 4 KiB page faults | `grep HugePages /proc/meminfo` |
-| `transparent_hugepage` | `never` | THP off cut idle max 546 → 106 µs | `cat /sys/kernel/mm/transparent_hugepage/enabled` |
+| `transparent_hugepage` | `never` | THP off cut idle p99.99 **67 → 53** and idle max **546 → 106** µs ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)) | `cat /sys/kernel/mm/transparent_hugepage/enabled` |
 | `nohz_full` | every non-reserved CPU | keeps the tick off the loop's core | `cat /sys/devices/system/cpu/nohz_full` |
 | `rcu_nocbs` | every non-reserved CPU | RCU callbacks off the hot cores | `cat /sys/devices/system/cpu/rcu_nocbs 2>/dev/null` or `grep rcu_nocbs /proc/cmdline` |
 | `isolcpus=managed_irq` | every non-reserved CPU | no stray IRQ on the loop's core | `grep isolcpus /proc/cmdline` |
 | `irqaffinity` | the reserved CPUs | NIC IRQs on the kept CPU, never the loop's | `grep irqaffinity /proc/cmdline`; `grep eth0 /proc/interrupts` |
-| NIC IRQ CPU | CPU 1 (kept), **not** a shared CPU | IRQs on a busy housekeeping CPU: max 151 µs vs 79–93, and frame loss at 1 M/s | `md-dpdk/deploy/aws-eks/node/irq-affinity.sh` status |
+| NIC IRQ CPU | CPU 1 (kept), **not** a shared CPU | IRQs on a busy housekeeping CPU lose frames at 1 M/s, max **10.8 ms** ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md), Graviton only) | `md-dpdk/deploy/aws-eks/node/irq-affinity.sh` status |
 | `gro_flush_timeout`, `napi_defer_hard_irqs` | node unit writes `/sys/class/net/<dev>/…` | per-netdev sysfs, not a sysctl | `cat /sys/class/net/eth0/gro_flush_timeout` |
 | `/dev/ptp*` | present or not | a clock source only; ENA has no hardware packet stamps | `ls /dev/ptp*` |
 | chrony | running, synced | the clock discipline owner is the busy loop; the node keeps the PHC | `chronyc tracking` |

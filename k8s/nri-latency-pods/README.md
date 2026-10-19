@@ -147,10 +147,10 @@ scheduling policy.
 
 | item | why |
 |---|---|
-| `SCHED_FIFO` / any `sched_setscheduler` work, a `--fifo` wrapper, RT scheduling | measured not worth it on AWS (io/benches/BENCHMARK.md: loop deltas +0.5/−1.8 µs; RT throttle and RT-group-sched bite it) |
+| `SCHED_FIFO` / any `sched_setscheduler` work, a `--fifo` wrapper, RT scheduling | no gain on an isolated CPU on AWS ([data](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#host-and-network-aws-in-a-pod): p50 +0.5/−1.8 µs, p99.99 +1/−45 µs; RT throttle and RT group scheduling bite it) |
 | SR-IOV VF per pod | Nitro guests have one ENA per ENI, no in-guest VFs |
 | a netns-sysctl writer that pretends the knobs are per-netns | `busy_poll`/`busy_read` are global; `gro_flush_timeout` and `napi_defer_hard_irqs` are per-netdev sysfs; `rmem_max` is not writable per-netns. Node config instead (`node-checks.md`) |
-| an IRQ DaemonSet that pins the latency pod's NIC IRQs to the SHARED CPUs | our Graviton data says IRQs on a busy housekeeping CPU cost the tail and lose frames (max 151 µs vs 79–93, and lost frames at 1 M/s with a 10.8 ms max). The kept-CPU default stays |
+| an IRQ DaemonSet that pins the latency pod's NIC IRQs to the SHARED CPUs | IRQs on a busy housekeeping CPU lose frames at 1 M/s, max **10.8 ms** ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md), Graviton only). The kept-CPU default stays |
 
 ## Contract summary
 
@@ -249,8 +249,9 @@ test/e2e.sh
 - Whether c8g.xlarge exposes `/dev/ptp*`, and whether it is single-NUMA (the
   lab records both).
 - `/dev/cpu_dma_latency` in an EC2 guest at all, and whether enabling it ever
-  wins (our C1-cap rows say "not kept": idle max 445 → 196 µs but lost under
-  load; metal p50 2 µs worse).
+  wins (the C1 cap was **not kept** on `c7i.metal-24xl` and made plain kernel
+  UDP's p50 **2 µs** worse there, with single-rep collapses under load
+  ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/deploy/aws-eks/README.md#no-c-state-cap)).
 - The latency of `cpuset.cpus.partition=isolated` alone (the boot-arg
   **bundle** is measured; the partition alone is "measure first", the lab's
   job).

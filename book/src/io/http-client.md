@@ -82,8 +82,8 @@ use `Target::new("api.binance.com", 443, "")` and
 - **Responses:** `Content-Length` or chunked bodies. The body in
   `on_response` borrows the client's buffer: copy what you keep.
 - **libcurl:** `curl_drive` picks `curl_multi_perform` on every poll
-  (default, a little faster) or `curl_multi_socket_action`; both never
-  block.
+  (default) or `curl_multi_socket_action`; both never block. The two modes
+  were not compared.
   Trust comes from `curl_ca_file` or the system store, not from the rustls
   configuration.
 
@@ -96,8 +96,8 @@ the signature itself; `signed_request_at` takes the timestamp from you
 
 | signer | cost per request | use it for |
 |---|---|---|
-| `Signer::hmac_sha256` | well under a microsecond | signed REST requests |
-| `Signer::ed25519_pkcs8` | tens of microseconds; measure before putting it on a hot path | log-on, once per session; the private key never leaves the machine |
+| `Signer::hmac_sha256` | **262 ns** ([data](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md)) | signed REST requests |
+| `Signer::ed25519_pkcs8` | **21,558 ns**; measure before putting it on a hot path | log-on, once per session; the private key never leaves the machine |
 
 Checked against Binance's documented example:
 
@@ -118,7 +118,8 @@ Round trip, **1 connection**, one request in flight. More connections:
 
 - **Native beats libcurl** on the same path, and beats it by more when
   native polls the NIC. reqwest parks its thread between requests and is
-  far slower.
+  behind native on the same run; the two families are not compared across
+  interrupt and polling paths.
 - **`HttpClient` with a pool of 1** costs a little over a raw `HttpConn`.
   A larger pool was not measured.
 - **Interrupt-driven against NIC polling: no conclusion** on AWS (ENA's
@@ -141,9 +142,9 @@ supports for a pool of 20 on one loop, one request in flight:
 | `epoll-spin` | none: `epoll_wait` returns only the ready sockets |
 
 - **An estimate has no max.** Measure it (below).
-- **Of the polling backends, `per_queue` should be best on one core;**
-  `uring-sqpoll` needs a spare core. Poll costs:
-  [cost per poll](backends.md#cost-per-poll).
+- **Of the polling backends, `per_queue` is the one-core candidate**
+  (not measured at this pool size); `uring-sqpoll` needs a spare core. Poll
+  costs: [cost per poll](backends.md#cost-per-poll).
 - **Rule:** count the pool with every other socket the thread polls:
   feeds, order connections, other pools. Each `HttpClient` has its own
   `Driver`, so its poll adds to theirs. Plain `recv-busy` up to about 4

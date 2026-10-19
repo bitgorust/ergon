@@ -4,7 +4,8 @@ How to install and use `k8s/nri-shared-cpus` on a Kubernetes node.
 
 A busy-spinning pod gets whole cores of its own from the kubelet. Its
 helpers (dial, TLS, warnings, Aeron conductors) do not need a whole core,
-and running them on the loop's core costs latency. This is a containerd
+and running them on the loop's core is what this layout forbids (its
+latency cost is **not measured**). This is a containerd
 NRI plugin and a kubelet device plugin that give the pod the node's shared
 housekeeping CPUs as well, and start every thread there.
 
@@ -447,8 +448,9 @@ kubectl exec aeron-driver -- sh -c 'ps -L -o pid,tid,psr,comm | head'
   oversubscription 2, a node offers 4000; sixteen pods at 250 fit.
 - There is no hard cap. Helpers may use the whole shared CPU, shared with
   the kubelet, containerd, system daemons and other pods.
-- A helper wake-up on a shared CPU can wait milliseconds under node load.
-  That slows connects and the conductor, not the loop.
+- A helper wake-up on a shared CPU waits on the node's other load; the size
+  of that wait is **not measured**. It slows connects and the conductor, not
+  the loop.
 
 ## Fail closed
 

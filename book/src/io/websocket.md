@@ -166,7 +166,8 @@ of every figure, with its max:
   planned.
 - **On Azure, NIC polling was ahead** of `epoll-spin` at the median and at
   p99, with no lower max. That run did not record the NIC's interrupt
-  settings.
+  settings and is not published here, so treat it as **unquantified** until
+  the fair rerun.
 - **The max is not lower with polling.** On AWS a rare round trip takes
   about a millisecond on every backend and on bare metal too. Neither loop
   stalled: the network path or the sender VM

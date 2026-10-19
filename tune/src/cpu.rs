@@ -349,9 +349,10 @@ pub fn t1_isolation(host: &Host, cpus: &HotSet) -> Vec<Finding> {
     out
 }
 
-const T7_EVIDENCE: &str = "io/benches/BENCHMARK.md (Host and NIC settings on AWS); \
-     io/benches/results/flags-aws-20261014T163114Z (r1-rt); \
-     Linux Documentation/scheduler/sched-rt-group.rst";
+const T7_EVIDENCE: &str = "io/benches/BENCHMARK.md (Host and network on AWS); \
+     io/benches/results/flags-aws-20261014T163114Z (r1-rt — flagged in that \
+     file's lab notes as inflated by a sleeping sender, so the deltas are \
+     directional); Linux Documentation/scheduler/sched-rt-group.rst";
 
 /// T7: `thread`, in `role`, is not under `SCHED_FIFO` or `SCHED_RR`. The
 /// media driver checks its process before the agents start.

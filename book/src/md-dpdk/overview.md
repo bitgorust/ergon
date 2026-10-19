@@ -47,7 +47,7 @@ Terms this chapter uses. Host, Kubernetes and Java terms:
 | NIC, PCI address, MAC                                                | network interface card (virtual on a cloud VM); its slot on the host's bus; its hardware address                                        | the crate picks NICs by PCI address, on Azure by MAC                                                                                           |
 | ENA                                                                  | AWS's virtual NIC (Elastic Network Adapter)                                                                                             | each link-up restores its interrupt placement and moderation: re-apply them ([hosts](../deploy/hosts.md#interrupts-and-the-nic))               |
 | MANA, accelerated networking                                         | MANA: Azure's virtual NIC (Microsoft Azure Network Adapter). Accelerated networking gives the VM a slice of it (a VF, virtual function) | rings of at most 256 entries: set `RUSTERON_DPDK_TX_DESCRIPTORS=256`                                                                           |
-| [low-latency queue, BAR, write-combining](configuration.md#pitfalls) | ENA's fast send mode: the CPU writes each send into the NIC's memory window (the BAR). Write-combining batches those writes             | without write-combining the queue is off: sends about 100 times slower                                                                         |
+| [low-latency queue, BAR, write-combining](configuration.md#pitfalls) | ENA's fast send mode: the CPU writes each send into the NIC's memory window (the BAR). Write-combining batches those writes             | without write-combining the queue is off: sends about 100 times slower (Aeron Premium's DPDK notes, `md-dpdk/tests/dpdk_ena_llq.rs`)                                                                         |
 | `igb_uio`, `uio_hv_generic`, `vfio-pci`                              | kernel modules that hand a NIC to a user-space process                                                                                  | bound as root: `igb_uio` on AWS, `uio_hv_generic` on Azure. The kernel's tools then lose that NIC                                              |
 | interrupt                                                            | a NIC's signal that packets are waiting; the CPU stops its work to handle it                                                            | costs time on that core; DPDK polls instead                                                                                                    |
 | [interrupt moderation](../deploy/hosts.md#interrupts-and-the-nic)    | the NIC waits to batch several packets into one interrupt. Adaptive: the driver re-tunes the wait itself                                | less CPU, more latency: ENA's default added about 60 µs to the median at 100 k msgs/s                                                          |
@@ -201,8 +201,8 @@ round 7, 2026-10-15, run `aws-20261015-185813`
 ² With ENA's default 1,024 receive descriptors, as this round ran; 600 k
 with 4,096, the default now (round 6).
 
-- Every kernel mode had an idle max of 2–9 ms on this pair and round 6's;
-  not yet explained. DPDK's never passed 142 µs.
+- Every kernel mode had an idle max of 2–9 ms on this pair and round 6's.
+  **Open, no cause found.** DPDK's never passed 142 µs.
 - Kernel UDP with moderation off and the interrupts on their own core (the
   Graviton winner) has not been measured on `c7i`.
 

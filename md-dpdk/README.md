@@ -164,7 +164,9 @@ CPU 0 and shared one core: milliseconds per round trip.
 
 ENA's transmit path needs its low-latency queue (LLQ), which writes into the
 device's BAR 2; that BAR must be mapped write-combined. Without it a send
-costs about 100 times as much.
+costs about 100 times as much (Aeron Premium's DPDK notes, cited in
+`tests/dpdk_ena_llq.rs`; DPDK 24.11.0 and .1 turned LLQ off by default, fixed
+in 24.11.2).
 
 - **Every ENA port asks for LLQ:** `llq_policy=1` with DPDK 24.11+,
   `enable_llq=1` before.
@@ -369,10 +371,10 @@ transport would carry them. That is why localhost gains nothing.
   - `adaptive` (default): read only when flagged while idle, but every duty
     cycle for `RUSTERON_DPDK_LOCAL_HOT_US` (1000) after data. A hot socket
     leaves the epoll, since a registered one wakes that thread on every
-    datagram (a third of a busy localhost sender's time);
-    `RUSTERON_DPDK_LOCAL_UNWATCH=0` keeps it on.
-  - `epoll`: only when flagged; a thread wake-up per message, about twice the
-    localhost round trip.
+    datagram; `RUSTERON_DPDK_LOCAL_UNWATCH=0` keeps it on. The cost of that
+    wake-up is **not measured**.
+  - `epoll`: only when flagged; a thread wake-up per message. Cost **not
+    measured**.
   - `spin`: every duty cycle, a `recvmmsg` per socket, no epoll.
 
 ## Clocks
