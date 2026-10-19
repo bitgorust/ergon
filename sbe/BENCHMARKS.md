@@ -243,15 +243,17 @@ All 5 maintained scenarios passed at the time of recording:
 
 ### Root cause of prior cluster encode regression (FIXED)
 
-The two cluster encode scenarios (`session_keep_alive`, `claim_shaped`)
-previously failed at 1.19× and 1.28×. Generated field setters used
+History: the two cluster encode scenarios (`session_keep_alive`,
+`claim_shaped`) once failed at 1.19× and 1.28× (before-figures from the
+original report; the runs were not archived). Generated field setters used
 `self.buf[offset..offset+N].copy_from_slice(...)`, which re-checks bounds on
 every field write. After `wrap`/`wrap_and_apply_header` validates
 `buf.len() >= BLOCK_LENGTH`, field offsets are in-bounds by construction.
 
 **Fix:** field setters now use `get_unchecked_mut` after the trust boundary.
-`session_keep_alive` went from 1.19× slower to sub-1.00, and `claim_shaped`
-likewise.
+Both are sub-1.00 today — `encode/session_keep_alive` and
+`encode/claim_shaped_header_plus_app` in the [gate table](#the-gate), which
+is the artefact; re-run `just bench` for the current pair.
 
 ### Group encode and DTO bulk
 
@@ -330,9 +332,11 @@ cargo bench -p ergo-sbe-benchmarks --bench alignment_bench
 
 ### u32 compact tail-offset (removed)
 
-A `u32` compact tail-offset representation was measured and **removed**:
+A `u32` compact tail-offset representation was tried and **removed**:
 smaller structs, more instructions, slower under LTO. Cached tail ends stay
-absolute `usize`.
+absolute `usize` (see `tail_end` in `sbe/src/codegen/`). The measurement
+that decided it was not archived, so no figures are quoted here — re-derive
+it from `just bench` if the question comes back.
 
 ## Diagnostics (not gated)
 

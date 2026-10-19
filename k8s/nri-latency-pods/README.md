@@ -46,6 +46,23 @@ there, sets `AERON_FILE_PAGE_SIZE=$ERGON_HUGEPAGE_SIZE`, and does not set
 without a `size=`, and Aeron refuses an unsized hugetlbfs. A sized hugetlbfs
 on the node would need `hostPath`, which PSS Baseline forbids.
 
+`size=` is a **capacity, not a reservation**: the mount succeeds with
+`HugePages_Total=0` and `df` still shows `size`. Pages allocate on **fault**,
+and a fault needs a page source. Measured in a Debian bookworm container,
+2 MiB pagesize, `size=32M`, one page touched by `mmap`:
+
+| node state | first fault | evidence |
+|---|---|---|
+| `nr_hugepages=0`, `nr_overcommit_hugepages=0` | `ENOMEM` | no page taken; `HugePages_Surp=0` |
+| `nr_hugepages=0`, `nr_overcommit_hugepages=4` | allocates | surplus page; `HugePages_Surp=1` |
+| `nr_hugepages=4` | allocates | pool page; `HugePages_Free` 4 → 2 |
+
+So the node must carry a real pool (`hugepagesz=2M hugepages=N`, which is what
+the `hugepages-2Mi` request draws from) or `nr_overcommit_hugepages`. K8s
+accounts the preallocated pool, so size the request to the pool you actually
+have. Allocation is **mmap-only** — `write()` on hugetlbfs returns `EINVAL`
+even with a full pool, so the storage layer has to map and fault.
+
 ### Item 2: move-then-pin
 
 The child cgroup is a **remote partition**. The kernel needs
@@ -237,8 +254,6 @@ test/e2e.sh
 - The latency of `cpuset.cpus.partition=isolated` alone (the boot-arg
   **bundle** is measured; the partition alone is "measure first", the lab's
   job).
-- hugetlbfs with `size=` and 0 free pages (expected to work: `size=` is a
-  filesystem capacity and pages allocate on fault).
 - `AddMount` bind of `/run/ergon/node.json` into a pod (kind may not land the
   file; the e2e asserts the adjustment either way).
 - MutatingAdmissionPolicy JSON-Patch removal on this k8s version.

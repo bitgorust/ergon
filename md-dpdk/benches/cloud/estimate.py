@@ -45,7 +45,7 @@ out. The round trip: its warm-up and messages of 32 bytes, each way. A load
 point: (load_seconds + 1) s (the first second is warm-up) at its rate, echoed
 back the same size; a warm-up likewise, (warmup_seconds + 1) s at
 LAB_WARMUP_RATE, at the sweep's first size. A flat-out phase (none with LAB_NO_FLATOUT=1) is counted
-at one flow's ceiling, AWS's 8 Gbit/s (md-dpdk/BENCHMARKS.md), for the
+at one flow's ceiling, AWS's 7.8–8.0 Gbit/s (md-dpdk/BENCHMARKS.md), for the
 publisher's tput_seconds + 6 s: an upper bound, as is a fraction of a flat-out
 maximum (LAB_LOAD_FRACTIONS) taken of that ceiling. GB are 10^9 bytes.
 
@@ -99,7 +99,8 @@ CLOCK_STATE_S = {"pinned": 180, "isolated": 330, "isolated-poll": 330}
 MODE_S, RTT_S = 12, 85
 POINT_EXTRA_S, MIX_EXTRA_S, TPUT_EXTRA_S, MAX_EXTRA_S = 7, 7, 9, 11
 WIRE_OVERHEAD = 32 + 28  # Aeron's data header, IPv4 and UDP
-FLOW_CAP_BYTES_S = 7.8e9 / 8  # one flow's ceiling on AWS, 7.8-8.0 Gbit/s (BENCHMARKS.md)
+FLOW_CAP_BYTES_S = 8.0e9 / 8  # one flow's ceiling on AWS, 7.8-8.0 Gbit/s (BENCHMARKS.md).
+# The high end, so a flat-out phase's bytes are an upper bound.
 RTT_SIZE = 32
 TRANSFER_USD_GB = {"cluster": 0.0, "precision-time": 0.0, "cross-az": 0.02, "cross-region": 0.02}
 
@@ -268,7 +269,7 @@ def main():
     else:
         print(f"instances about ${e['instance_usd']:.2f} (on-demand, us-east-1: ${PRICES[a.type_a]}/h and "
               f"${PRICES[a.type_b]}/h); at most ${e['deadline_usd']:.2f} should they run to LAB_MAX_HOURS={a.max_hours}")
-    bound = " (flat-out phases at one flow's 8 Gbit/s: an upper bound)" if e["bound"] else ""
+    bound = " (flat-out phases at one flow's 7.8–8.0 Gbit/s ceiling: an upper bound)" if e["bound"] else ""
     print(f"between the hosts about {e['bytes_ab'] / 1e9:.3f} GB a to b and {e['bytes_ba'] / 1e9:.3f} GB b to a{bound}")
     rule = {"cross-az": "cross-AZ: $0.01/GB out of one zone and $0.01/GB into the other",
             "cross-region": "cross-region: $0.02/GB out of the sending region"}.get(a.placement, "none within one zone")

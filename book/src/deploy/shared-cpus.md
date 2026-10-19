@@ -146,8 +146,11 @@ Rules:
 ### 3. Build and load the image
 
 **Not released.** Nothing is on a registry yet. `k8s/nri-shared-cpus/RELEASE.md`
-is the gate: four code defects, the EKS lane and the latency benchmarks are
-open. The chart, the Dockerfile and the image workflow are ready, so the
+is the gate. The four code defects are fixed and signed off (2026-10-18, unit
+evidence plus the cgroup kernel lane and a 18-step kind e2e, `fails: 0`). What
+is still open is the EKS lane and the latency benchmarks — both are release
+blockers, because the claim of the plugin is that the exclusive CPUs stay
+quiet. The chart, the Dockerfile and the image workflow are ready, so the
 first push is one workflow run once that gate is clear.
 
 **Do not make this image public.** The plugin is root on the node and

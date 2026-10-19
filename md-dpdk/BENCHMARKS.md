@@ -23,8 +23,8 @@
   - Best x86 VM, c7i.4xlarge (round 7): idle p50 21.28, max 109 (52–116); 288 B at 1 M/s p50 30.38, max 152 (139–155).
   - The median lead (7 µs) is no more than placement alone moved c7i.4xlarge between rounds 6 and 7. Not proven.
   - The tail lead is clearer. At 100 k/s the max was lower on all three pairs (74–84 against 117, 109–123). At 1 M/s lower on two of three (G2 98, 95–105; G3 106, 93–114); G1's (107, 92–166) overlaps.
-  - Only x86 bare metal matched that tail (288 B at 1 M/s max 82, 77–103), at 12 times the price.
-  - A c9g.2xlarge pair costs $0.696 an hour on demand ($0.306 spot): the 8 cores of a c7i.4xlarge pair ($1.428) at half the price.
+  - Only x86 bare metal matched that tail (288 B at 1 M/s max 82, 77–103), at 12 times the price ($8.568 a pair-hour against $0.696; on-demand list, 2026-10-15).
+  - A c9g.2xlarge pair costs $0.696 an hour on demand ($0.306 spot): the 8 cores of a c7i.4xlarge pair ($1.428) at half the price (on-demand list, 2026-10-15; the [cost table](https://mimran1980.github.io/ergon/deploy/benchmarks.html#cost-per-hour) holds every size).
 - **Settings that matter most:**
   - Kernel UDP on AWS: ENA's interrupt moderation off. On by default since Linux 6.9; added about 60 µs to the median at 100 k/s on c7i.2xlarge (p50 106 against 47, max 606 against 538; 3 reps).
   - With moderation off, give the data NICs' interrupts a core of their own. On the housekeeping core they fall behind: c7i.2xlarge p99.9 12 ms at 500 k/s; c9g lost at 1 M/s in 5 of 5 reps (max 10.8 ms). Tested on Graviton only.

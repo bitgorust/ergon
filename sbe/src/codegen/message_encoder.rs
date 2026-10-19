@@ -1023,10 +1023,12 @@ pub(crate) fn generate_message_encoder(
             #fixed_doc_tokens
             // `inline(always)`, not `inline`: T-13 added a null-image `else`
             // arm per optional field, which pushed this body past LLVM's
-            // inline threshold and got the hint declined. Measured on
-            // `ergo_historic/null_option/encode_fixed`: 2.33ns baseline →
-            // 4.28ns (hint declined) → 1.92ns (forced). Re-verify with
-            // `just bench-historic` before weakening this.
+            // inline threshold and got the hint declined, which cost more
+            // than the baseline. The checkable figure is
+            // `ergo_historic/null_option/encode_fixed` in
+            // `sbe/benchmarks/ergo-historic-baseline.env` (2.33 ns); the
+            // gate is `just bench-historic`. Re-run it before weakening
+            // this.
             #[inline(always)]
             #[must_use]
             pub fn fixed(mut self, fixed: &#fixed_name) -> #name_encoder_ident<'a, H, sbe_rt::FieldsFixed> {
