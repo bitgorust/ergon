@@ -15,8 +15,10 @@ Ratios are ergon / sbe-tool. Target is **`1.00`**.
 | All other maintained comparisons, including SBE `optional_enum_nullify` | 1.00 | 1.00 |
 
 A gate pass is not literal `1.00` everywhere. Read the printed ratios. A
-ceiling above `1.00` records a repeatable sbe-tool win; it is not permission
-to add overhead.
+ceiling above `1.00` records a repeatable sbe-tool win on a placement-sensitive
+micro-op — a noise floor, not a real win (`NOISE_FLOOR_CEILING_EXCEPTIONS` in
+`sbe/benchmarks/tests/bench_gate_test.rs`). It is not permission to add
+overhead.
 
 Both LTO profiles are blocking. Consumers should still build with
 `lto = true` and `codegen-units = 1`. Generated hot-path methods carry

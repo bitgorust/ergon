@@ -191,10 +191,13 @@ literal `1.00` everywhere.
 | Cluster session-event decode | 1.05 | 1.01 |
 | All other maintained comparisons, including SBE `optional_enum_nullify` and every cluster encode | 1.00 | 1.00 |
 
-A ceiling above `1.00` records a repeatable, fair sbe-tool win; it is not
-permission to add overhead. Changing a ceiling requires a fresh fairness audit
-and recorded measurements. The cluster allowances are not proof of literal
-parity.
+A ceiling above `1.00` records a repeatable sbe-tool win on a placement-
+sensitive micro-op — a noise floor, not a real win. It is not permission to
+add overhead. Changing a ceiling requires a fresh fairness audit and recorded
+measurements. The cluster allowances are not proof of literal parity: the
+code names them `NOISE_FLOOR_CEILING_EXCEPTIONS`
+(`sbe/benchmarks/tests/bench_gate_test.rs`), and each was granted on a tie
+whose wall-clock ratio straddled 1.00 without converging.
 
 Both profiles are blocking. The no-LTO profile
 (`CARGO_PROFILE_BENCH_LTO=false CARGO_PROFILE_BENCH_CODEGEN_UNITS=1`) catches
@@ -452,6 +455,32 @@ and anything above fails, with no tolerance.
 | `encode/session_keep_alive` | 1.0018, 1.0009, 1.0054 | 1.00 | +0.0009 … +0.0054 |
 | `encode/claim_shaped_header_plus_app` | 0.9897, 1.0305, 1.0364 | 1.00 | −0.0103 … +0.0364 |
 
+The same three pairs, no-LTO, one run each: `session_message_header` **1.0742**,
+`session_keep_alive` 0.9850, `claim_shaped` 1.0301. The pre-fix no-LTO header
+figure was 1.0434, so the high no-LTO reading is the same placement effect.
+
+#### A 1.01 admission would not cover the measured walk
+
+The two existing noise-floor exceptions sit at `1.01`, and
+`no_maintained_ceiling_exceeds_one` bounds every allowlisted label at `1.01`
+except one profile-scoped override. Applying "the same treatment as the decode
+pairs" to these three would therefore set `1.01` — which the data already
+exceeds:
+
+| Measurement | | Admitted by 1.01? |
+|---|---|---|
+| `session_message_header` LTO | 1.0009–1.0038 | yes |
+| `session_keep_alive` LTO | 1.0009–1.0054 | yes |
+| `claim_shaped` LTO | 0.9897–**1.0364** | **no** |
+| `session_message_header` no-LTO | **1.0742** | **no** |
+| `claim_shaped` no-LTO | **1.0301** | **no** |
+
+Admitting the whole measured walk needs a ceiling near `1.08`, three times the
+margin the existing exceptions hold and eight times the `>1%` regression the
+`1.01` band is documented to catch. That is raising the exceptions
+`CONTRIBUTING.md` says not to raise further, and it would need the allowlist
+bound in `bench_gate_test.rs` loosened to match. Not taken.
+
 The aarch64 walk is the same distribution and crosses in both directions, and
 on that platform the documented `decode/session_event` 1.01 exception fails
 too (0.9755 then 1.0202). A zero-tolerance gate on a shared runner is a coin
@@ -468,9 +497,28 @@ in both profiles. `.p2align 6` pins the loop header's alignment but cannot pin
 which cache sets or pages the two functions occupy.
 
 Raising the ceiling is a governance decision, not a code one, and it has not
-been taken. The ceiling stands at 1.00 in `scripts/check-bench-gate.sh`; the
-documented exceptions there have not been raised. What follows is the evidence
-a decision would rest on, not a change.
+been taken. The ceiling stands at `1.00` in `scripts/check-bench-gate.sh`; the
+documented exceptions there have not been raised, and the allowlist bound in
+`sbe/benchmarks/tests/bench_gate_test.rs` is unchanged. The decision now has a
+concrete shape, because a `1.01` admission does not cover the walk:
+
+1. accept that the strict wall-clock gate cannot decide these three pairs, and
+   gate them on the instruction probes instead (`just bench-cluster-instructions`,
+   which already fails if ergon Ir/op exceeds sbe-tool and passes at equality);
+2. raise the ceiling to near `1.08` to admit the walk — past the documented
+   bound, and past the `>1%` regression the `1.01` band is meant to catch; or
+3. leave the gate as it is and accept that `just bench-cluster` fails on these
+   pairs whenever placement lands badly.
+
+There is also a runner mismatch to resolve on the same call.
+`CONTRIBUTING.md` states that noisy wall-clock ratios are **not** merge gates
+on shared GitHub runners and that the strict gate is run "locally or on a
+dedicated stable benchmark runner", but `release.yml` runs `just bench` and
+`just bench-cluster` — both of which invoke `check-bench-gate.sh` and exit
+non-zero — on `ubuntu-latest`. So the release is gated by an instrument the
+contributor guide says is not reliable on that class of machine.
+
+What follows is the evidence a decision would rest on, not a change.
 
 ### Root cause of prior cluster encode regression (FIXED)
 
