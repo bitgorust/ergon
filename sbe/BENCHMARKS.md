@@ -229,17 +229,234 @@ Conclusions and the numbers this repository keeps in prose. Unprovenanced
 diagnostics (no run-id manifest) are labelled as such: reproduce them and read
 the live numbers rather than treating a quoted figure as current.
 
-### Cluster codec ratios (gated suite)
+### SBE codec gate — run of record
 
-All 5 maintained scenarios passed at the time of recording:
+Run `b20261019T092320Z-61782-5282f06d15ce`, commit `5282f06d15ce`, host
+`aarch64-apple-darwin`, rustc 1.99.0 (Homebrew). Manifest sha256
+`3dccba57c3e8b57e…` (no-LTO) and `00b1f6323e8192f3…` (LTO). All 13 maintained
+comparisons pass both profiles. Ratios are ergo-sbe / sbe-tool, Criterion's
+regression estimate.
 
-| Scenario | Ratio | Status |
-|----------|-------|--------|
-| encode/session_message_header | 0.7464 | PASS |
-| encode/session_keep_alive | 0.6213 | PASS |
-| decode/session_message_header | 0.8968 | PASS |
-| decode/session_event | 0.8209 | PASS |
-| encode/claim_shaped_header_plus_app | 0.8288 | PASS |
+| Comparison | no-LTO | LTO |
+|---|---:|---:|
+| decode/scalar | 0.7831 | 0.7981 |
+| decode/array | 0.5205 | 0.5215 |
+| decode/composite | 0.4846 | 0.4766 |
+| decode/full_message | 0.9209 | 0.9108 |
+| decode/full_message_ordered | 0.8871 | 0.8773 |
+| decode/entry_point | 0.6793 | 0.6116 |
+| encode/scalar_header_and_body | 0.7504 | 0.7220 |
+| encode/scalar_body_only | 0.8014 | 0.8050 |
+| encode/throughput_10k | 0.9281 | 0.9238 |
+| throughput/batch_10k | 0.8950 | 0.9191 |
+| wire_parity/encode_full | 0.4988 | 0.5061 |
+| extended/optional_enum_nullify | 0.7382 | 0.7387 |
+| extended/group_with_data | 0.9655 | 0.9648 |
+
+The ordered lane is the fastest full-message decode arm in both profiles
+(18,432 ns LTO and 18,868 ns no-LTO, against sbe-tool's 21,010 and 21,270).
+Both ergo lanes observe the same fields; `EntryInfo` is built by both.
+
+**A gate failure that did not survive a re-run.** An earlier `just bench` on
+the same commit (run `b20261019T083750Z-82002-5282f06d15ce`, manifests
+`62959b1047368e64…` / `a50f49a06f760d1f…`) reported
+`decode_full_message_ordered` at **1.1090** under LTO, with non-overlapping
+confidence intervals. The machine was contended (load average 6–10: macOS
+Xprotect and Spotlight scanning, another crate's clippy, two Java test media
+drivers). The same arm's CI in that run was 5.8% wide against its siblings'
+0.4–0.9% — a noise signature. Three direct re-runs of that binary and the
+clean `just bench` above all put the ratio at 0.88–0.90. It was measurement
+noise, not a codegen defect. This is the case
+[the method](#the-gate) describes: re-run on an idle machine before
+investigating a single high ratio, and check the confidence intervals for
+overlap. A gate failure is not settled until it survives that.
+
+### Cluster codec ratios — mechanism check on `session_message_header`
+
+Five maintained scenarios: `encode/session_message_header`,
+`encode/session_keep_alive`, `decode/session_message_header`,
+`decode/session_event`, `encode/claim_shaped_header_plus_app`. The
+comparison arms are `ergo-sbe` and sbe-tool's generated codecs from the same
+cluster session schema. Quote a ratio by naming `just bench-cluster`'s
+`cluster-<stamp>-<commit>` run id.
+
+`session_message_header` is the smallest workload in the suite — three fixed
+stores, amplified 10,000x per batch — and so the one with the least work to
+hide. The release workflow gates on `ubuntu-latest` x86-64, so the run of
+record for the gate is x86-64; aarch64 is the development comparison.
+
+**x86-64, the gating architecture.** Three consecutive LTO runs and one no-LTO
+run on a dedicated `c7i.xlarge` (`us-east-1`, rustc 1.99.0,
+`x86_64-unknown-linux-gnu`), 2026-10-19, after the bench-fairness fix:
+
+| Arm | Ceil. | LTO R1 | LTO R2 | LTO R3 | no-LTO | Reading |
+|---|---:|---:|---:|---:|---:|---|
+| `encode/session_message_header` | 1.00 | 1.0023 | 1.0038 | 1.0009 | 1.0742 | proven tie, above ceiling |
+| `encode/session_keep_alive` | 1.00 | 1.0018 | 1.0009 | 1.0054 | 0.9850 | proven tie, above ceiling |
+| `decode/session_message_header` | 1.01 | 0.9355 | 0.9801 | 0.9496 | 0.9692 | pass |
+| `decode/session_event` | 1.01 (1.05 no-LTO) | 0.9998 | 1.0024 | 0.9983 | 1.0003 | pass at the ceiling |
+| `encode/claim_shaped_header_plus_app` | 1.00 | 0.9897 | 1.0305 | 1.0364 | 1.0301 | proven tie, above ceiling |
+
+The same run before the fix, for comparison:
+
+| Arm | LTO R1 | LTO R2 | LTO R3 | no-LTO |
+|---|---:|---:|---:|---:|
+| `encode/session_message_header` | 1.0006 | 1.0023 | 1.0022 | 1.0434 |
+| `encode/session_keep_alive` | 1.0217 | 1.0122 | 1.0435 | 1.0144 |
+| `decode/session_message_header` | 0.9296 | 0.9297 | 1.0140 | 0.9580 |
+| `decode/session_event` | 1.0001 | 1.0000 | 1.0000 | 0.9995 |
+| `encode/claim_shaped_header_plus_app` | 1.0020 | 1.0198 | 1.0786 | 0.9758 |
+
+The fix moved `keep_alive` from 1.02–1.04 to 1.0009–1.0054 and `claim_shaped`
+from up to 1.0786 to 0.99–1.04. Both are now instruction-identical pairs, so
+the residual is placement — see the mechanism check below.
+
+**aarch64, the development comparison.** Two consecutive `just bench-cluster`
+runs on 2026-10-19 (commit `5282f06d15ce`, `aarch64-apple-darwin`, rustc 1.99.0):
+
+| Arm | Ceil. | Run 1 LTO | Run 2 LTO | Run 2 CI width | Reading |
+|---|---:|---:|---:|---:|---|
+| `encode/session_message_header` | 1.00 | 1.0039 | 1.0036 | 0.4% | tight, but a proven tie |
+| `decode/session_message_header` | 1.01 | 1.0348 | 1.0293 | 2.5–3.0% | wide — noise signature |
+| `encode/session_keep_alive` | 1.00 | 0.8819 | 0.8919 | 0.3% | pass |
+| `decode/session_event` | 1.01 | 0.9912 | 0.9755 | 0.4% | pass |
+| `encode/claim_shaped_header_plus_app` | 1.00 | 0.9398 | 0.9263 | 0.6% | pass |
+
+`decode/session_message_header`'s aarch64 failure **was** noise: on x86 it is
+0.93 twice. Its confidence intervals are six times wider than its siblings',
+which is the same signature as
+[the SBE ordered-lane episode](#a-gate-failure-that-did-not-survive-a-re-run)
+and the walk already documented in `scripts/check-bench-gate.sh`.
+`encode/session_message_header` is tight on both platforms and was treated as a
+candidate codegen defect, so it got the mechanism check rather than a re-run.
+
+**Encode mechanism check — all three pairs are proven ties.**
+`cluster_perf_probe` carries both arms of every maintained encode scenario
+(`cluster/probes.tsv`, `just bench-cluster-instructions`). Each pair mirrors
+its bench closures exactly: same `wrap_unchecked` / `WriteBuf::wrap`, same
+setters, same payload copy where there is one, no MessageHeader write. The
+release workflow gates on `ubuntu-latest` x86-64, so the probes were built and
+disassembled for that architecture. x86-64, release:
+
+| Pair | Instr. ergo/tool | Stores | Calls | Store text | Checksum |
+|---|---:|---:|---:|---|---:|
+| `encode/session_message_header` | 80 / 80 | 7 / 7 | 0 / 0 | byte-identical | 5,415,000 |
+| `encode/session_keep_alive` | 75 / 75 | 5 / 5 | 0 / 0 | byte-identical | 545,000 |
+| `encode/claim_shaped_header_plus_app` | 72 / 72 | 9 / 9 | 0 / 0 | byte-identical | 9,765,923,333,140,794,032 |
+
+The counts are the same with LTO off (`CARGO_PROFILE_RELEASE_LTO=false`,
+`codegen-units=1`, the no-LTO gate's profile): 80/80, 75/75, 72/72. So the
+no-LTO wall-clock gap is not a codegen difference between the arms either.
+
+The three header field stores are `mov %rax,-0x18(%rdi,%rcx,1)`,
+`mov %rax,-0x10(%rdi,%rcx,1)`, `mov %rax,-0x8(%rdi,%rcx,1)`, identical in both
+arms of all three pairs. `claim_shaped` adds the 32-byte app payload as two
+`movdqu %xmm0,…` stores, also identical. Differing instruction texts are 14 per
+pair — 11 branch-target addresses and 3 register-allocation shuffles in the
+checksum-reduction tail — the same signature every time. On aarch64 the header
+pair is 78/78 with identical `stp`/`str` stores.
+
+Equal checksums prove equal work; equal instructions prove equal code. The
+sub-percent wall-clock gap on these pairs is measurement sensitivity on a
+three-store loop, not an ergon loss — and it cannot be closed by changing
+ergon's code, because the code is already the reference. Callgrind instruction
+counts need the pinned Linux/Valgrind lane
+(`scripts/run-cluster-instruction-probes.sh`); the disassembly and checksums
+above run anywhere and are what the decode arm's earlier mechanism check used.
+
+**`encode/session_keep_alive` was a bench-fairness defect, not an ergon loss.**
+It failed its 1.00 ceiling on x86-64 in all three LTO runs (1.0217, 1.0122,
+1.0435) while passing comfortably on aarch64 (0.8919). The two encoders do the
+same work — the parity assert proves byte-identical bodies — so the bench was
+re-audited against `encode/session_message_header`, which had already been
+brought under control. Three things the header bench does that keep-alive did
+not:
+
+| Control | `session_message_header` | `session_keep_alive` (before) |
+|---|---|---|
+| `.p2align 6` on both loop headers | yes | **no** |
+| ergon constructor | `wrap_unchecked` | **checked `wrap`** |
+| Field values opaque (`black_box`) | yes | **no** (literal `5`) |
+
+The header bench's own SAFETY comment names the second one: "`wrap` proves that
+extent and then panics; sbe-tool `wrap` does not, so the panic check is unequal
+work." `claim_shaped` had the same three defects.
+
+**What the pre-fix pair actually measured.** `cluster_perf_probe` carries a
+diagnostic pair (`cluster_encode_session_keep_alive_checked_wrap`) that replays
+the pre-fix closures verbatim — checked `wrap` on the ergon arm, slice length
+opaque on both — alongside the maintained pair, which uses `wrap_unchecked`
+with the slice length visible on both arms. x86-64, release:
+
+| Arm | Instructions | Stores | Calls |
+|---|---:|---:|---:|
+| maintained, length visible — ergon | 75 | 5 | 0 |
+| maintained, length visible — sbe-tool | 75 | 5 | 0 |
+| pre-fix, length opaque — ergon | 96 | 9 | 2 |
+| pre-fix, length opaque — sbe-tool | 113 | 7 | 2 |
+
+Both pre-fix arms pay for the opaque length; they just pay for different
+things. ergon's two calls are `panic_fmt` and
+`SessionKeepAliveEncoder::buffer_too_short`, reached from a `cmp`/`ja` whose
+cold path has to build a formatted `EncodeError` on the stack. sbe-tool's two
+calls are `slice_index_fail` (twice, one per field), reached from a simpler
+`mov $N,%edi`/`mov $N,%esi` payload. The shapes are unequal — 0/113
+instructions text-match — and neither arm carried the `.p2align 6` the header
+bench uses to stop the ratio following wherever the loop header lands. A 1–4%
+wall-clock gap between two unequal mechanisms with unpinned loop alignment is
+not evidence about either encoder.
+
+**The checked constructor's own cost is 21 instructions.** Holding the opaque
+length fixed and changing only the ergon constructor, `wrap_unchecked` is 75
+instructions and checked `wrap` is 96. The 21 are the formatted panic payload:
+`call panic_fmt`, `call buffer_too_short`, the stack frame opened to build the
+`EncodeError`, and the `cmp`/`ja` that guards it. The generated `wrap` doc
+comment already says this — "Only for proven-tight hot loops where the panic
+machinery is measurable in the critical path" — the bench just was not
+following it.
+
+**The check disappears when the slice length is visible.** `wrap`'s proof is
+`24 > buf.len().saturating_sub(msg_offset)`. With `buf.len()` the constant
+`ENCODED_LENGTH`, that is `24 > 24`, the branch vanishes, and the maintained
+ergon arm carries no `cmp`, no `ja` and no call — which is exactly the 75/0
+row above. The maintained benches therefore keep the slice length visible on
+**both** arms (so both drop their per-field checks) and make only the **values**
+opaque (so neither folds a constant store).
+
+After the fix the maintained keep-alive pair is a proven tie on x86-64: 75
+instructions each, 5 stores each, the two field stores byte-identical
+(`mov %rax,-0x10(%rdi,%rcx,1)`, `mov %rax,-0x8(%rdi,%rcx,1)`), 61/75 texts
+identical with the same 11 branch-target and 3 register-shuffle signature as
+the header pair.
+
+### Open: the 1.00 ceiling on a proven tie
+
+All three maintained encode pairs are proven ties — identical instruction
+counts and byte-identical field stores on x86-64, identical checksums on both
+architectures — whose wall-clock ratios nevertheless sit at 1.0009–1.0364 on
+LTO. No code change can move them, because the code is already the reference.
+Their `1.00` ceiling is therefore unachievable by construction: `1.0000` passes
+and anything above fails, with no tolerance.
+
+| Pair | LTO walk | Ceiling | Gap |
+|---|---|---:|---|
+| `encode/session_message_header` | 1.0023, 1.0038, 1.0009 | 1.00 | +0.0009 … +0.0038 |
+| `encode/session_keep_alive` | 1.0018, 1.0009, 1.0054 | 1.00 | +0.0009 … +0.0054 |
+| `encode/claim_shaped_header_plus_app` | 0.9897, 1.0305, 1.0364 | 1.00 | −0.0103 … +0.0364 |
+
+`claim_shaped`'s wider spread is the same 32-byte payload copy on both arms
+(`movdqu` ×2, byte-identical); a larger loop body leaves more ways for the two
+closures to sit relative to each other in the binary. The no-LTO
+`encode/session_message_header` ratio (1.0434 before the fix, 1.0742 after) is
+the same placement effect, not a codegen difference: the no-LTO instruction
+counts are identical to the LTO ones (80/80), so the arms retire the same work
+in both profiles. `.p2align 6` pins the loop header's alignment but cannot pin
+which cache sets or pages the two functions occupy.
+
+Raising the ceiling is a governance decision, not a code one, and it has not
+been taken. The ceiling stands at 1.00 in `scripts/check-bench-gate.sh`; the
+documented exceptions there have not been raised. What follows is the evidence
+a decision would rest on, not a change.
 
 ### Root cause of prior cluster encode regression (FIXED)
 
@@ -251,9 +468,12 @@ every field write. After `wrap`/`wrap_and_apply_header` validates
 `buf.len() >= BLOCK_LENGTH`, field offsets are in-bounds by construction.
 
 **Fix:** field setters now use `get_unchecked_mut` after the trust boundary.
-Both are sub-1.00 today — `encode/session_keep_alive` and
-`encode/claim_shaped_header_plus_app` in the [gate table](#the-gate), which
-is the artefact; re-run `just bench` for the current pair.
+Both are sub-1.00 today on aarch64 — `encode/session_keep_alive` and
+`encode/claim_shaped_header_plus_app` in the [gate table](#the-gate). On
+x86-64 they then failed at 1.01–1.04 and 1.00–1.08 respectively for the
+independent bench-fairness reason documented above; both benches now carry the
+same controls as `encode/session_message_header` and both pairs are
+instruction-identical on x86-64.
 
 ### Group encode and DTO bulk
 

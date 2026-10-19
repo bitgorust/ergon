@@ -232,14 +232,30 @@ fn bench_encode_keep_alive_ergo(c: &mut Criterion) {
     g.bench_function("ergo-sbe", |b| {
         let mut buf = vec![0u8; BATCH_SIZE * slot];
         b.iter(|| {
+            // Same 64-byte alignment as the sbe-tool arm. The no-LTO
+            // ratio otherwise follows where the loop header lands.
+            unsafe {
+                core::arch::asm!(".p2align 6", options(nomem, nostack, preserves_flags));
+            }
             for i in 0..BATCH_SIZE {
                 let off = i * slot;
-                let _ = ergo_aeron_cluster::cluster_codec_types::SessionKeepAliveEncoder::wrap(
-                    black_box(&mut buf[off..off + slot]),
-                    0,
-                )
-                .leadership_term_id(5)
-                .cluster_session_id((i % 100) as i64);
+                let term = black_box(5_i64);
+                let session = black_box((i % 100) as i64);
+                // SAFETY: each slice is `HDR + BLOCK_LENGTH` (`ENCODED_LENGTH`).
+                // `wrap` proves that extent and then panics; sbe-tool `wrap`
+                // does not, so the panic check is unequal work. The parity
+                // assert above already ran `wrap` on this shape. The slice
+                // length stays visible so both arms can drop per-field checks;
+                // the values are opaque so neither arm folds 5 into a constant
+                // store.
+                let _ = unsafe {
+                    ergo_aeron_cluster::cluster_codec_types::SessionKeepAliveEncoder::wrap_unchecked(
+                        &mut buf[off..off + slot],
+                        0,
+                    )
+                }
+                .leadership_term_id(term)
+                .cluster_session_id(session);
             }
             black_box(&buf);
         });
@@ -247,13 +263,18 @@ fn bench_encode_keep_alive_ergo(c: &mut Criterion) {
     g.bench_function("sbe-tool", |b| {
         let mut buf = vec![0u8; BATCH_SIZE * slot];
         b.iter(|| {
+            unsafe {
+                core::arch::asm!(".p2align 6", options(nomem, nostack, preserves_flags));
+            }
             use reference_sbe::{WriteBuf, session_keep_alive_codec::SessionKeepAliveEncoder};
             for i in 0..BATCH_SIZE {
                 let off = i * slot;
-                let wb = WriteBuf::new(black_box(&mut buf[off..off + slot]));
+                let term = black_box(5_i64);
+                let session = black_box((i % 100) as i64);
+                let wb = WriteBuf::new(&mut buf[off..off + slot]);
                 let mut enc = SessionKeepAliveEncoder::default().wrap(wb, HDR);
-                enc.leadership_term_id(5);
-                enc.cluster_session_id((i % 100) as i64);
+                enc.leadership_term_id(term);
+                enc.cluster_session_id(session);
             }
             black_box(&buf);
         });
@@ -633,16 +654,32 @@ fn bench_claim_shaped_write(c: &mut Criterion) {
     g.bench_function("ergo-sbe", |b| {
         let mut buf = vec![0u8; BATCH_SIZE * total];
         b.iter(|| {
+            // Same 64-byte alignment as the sbe-tool arm. The no-LTO
+            // ratio otherwise follows where the loop header lands.
+            unsafe {
+                core::arch::asm!(".p2align 6", options(nomem, nostack, preserves_flags));
+            }
             for i in 0..BATCH_SIZE {
                 let off = i * total;
                 let slot = &mut buf[off..off + total];
-                let _ = ergo_aeron_cluster::cluster_codec_types::SessionMessageHeaderEncoder::wrap(
-                    black_box(&mut slot[..hdr_slot]),
-                    0,
-                )
-                .leadership_term_id(5)
-                .cluster_session_id(42)
-                .timestamp(0);
+                let term = black_box(5_i64);
+                let session = black_box(42_i64);
+                let timestamp = black_box(0_i64);
+                // SAFETY: `hdr_slot` is exactly `HDR + BLOCK_LENGTH`. `wrap`
+                // proves that extent and then panics; sbe-tool `wrap` does not,
+                // so the panic check is unequal work. The parity assert above
+                // already ran `wrap` on this shape. The slice length stays
+                // visible so both arms can drop per-field checks; the values
+                // are opaque so neither arm folds them into constant stores.
+                let _ = unsafe {
+                    ergo_aeron_cluster::cluster_codec_types::SessionMessageHeaderEncoder::wrap_unchecked(
+                        &mut slot[..hdr_slot],
+                        0,
+                    )
+                }
+                .leadership_term_id(term)
+                .cluster_session_id(session)
+                .timestamp(timestamp);
                 slot[hdr_slot..].copy_from_slice(&CLAIM_APP_PAYLOAD);
             }
             black_box(&buf);
@@ -651,15 +688,21 @@ fn bench_claim_shaped_write(c: &mut Criterion) {
     g.bench_function("sbe-tool", |b| {
         let mut buf = vec![0u8; BATCH_SIZE * total];
         b.iter(|| {
+            unsafe {
+                core::arch::asm!(".p2align 6", options(nomem, nostack, preserves_flags));
+            }
             use reference_sbe::{WriteBuf, session_message_header_codec::SessionMessageHeaderEncoder};
             for i in 0..BATCH_SIZE {
                 let off = i * total;
                 let slot = &mut buf[off..off + total];
-                let wb = WriteBuf::new(black_box(&mut slot[..hdr_slot]));
+                let term = black_box(5_i64);
+                let session = black_box(42_i64);
+                let timestamp = black_box(0_i64);
+                let wb = WriteBuf::new(&mut slot[..hdr_slot]);
                 let mut enc = SessionMessageHeaderEncoder::default().wrap(wb, HDR);
-                enc.leadership_term_id(5);
-                enc.cluster_session_id(42);
-                enc.timestamp(0);
+                enc.leadership_term_id(term);
+                enc.cluster_session_id(session);
+                enc.timestamp(timestamp);
                 slot[hdr_slot..].copy_from_slice(&CLAIM_APP_PAYLOAD);
             }
             black_box(&buf);

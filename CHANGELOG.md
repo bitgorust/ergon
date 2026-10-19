@@ -56,6 +56,15 @@
 ### Fixed
 - ergo-sbe: a domain DTO's `encode` writes `NullVal` for a `None`
   domain-typed enum field instead of leaving whatever the buffer held.
+- Cluster codec benches: `encode/session_keep_alive` and
+  `encode/claim_shaped_header_plus_app` measured unequal mechanisms. Both
+  arms now carry the controls `encode/session_message_header` already used —
+  `.p2align 6` on both loop headers, `wrap_unchecked` on the ergon arm, field
+  values opaque and slice length visible on both arms. The pre-fix closures
+  are kept as a diagnostic probe pair in `cluster_perf_probe`, which shows
+  what the checked `wrap` costs when the slice length is opaque. All three
+  maintained encode pairs are now instruction-identical on x86-64 (80/80,
+  75/75, 72/72) with byte-identical stores.
 
 ## [0.1.30] — 2026-10-13
 
