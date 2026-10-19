@@ -138,9 +138,10 @@ sssh "sudo bash vm-setup.sh install $S_HK $S_CPU"
 log "building on the receiver"
 # The bench depends on ../ (ergon-io), which inherits from the workspace root
 # manifest; ship exactly those files.
+# `tune` is a path dependency of `ergon-io` (and its README is `include_str!`d),
+# so it has to travel with the snapshot or the build fails on the VM.
 ( cd ../.. && COPYFILE_DISABLE=1 tar --no-xattrs --exclude target --exclude results -czf "$OLDPWD/$OUT/src.tgz" \
-    Cargo.toml rust-toolchain.toml io/Cargo.toml io/src \
-    io/benches/Cargo.toml io/benches/Cargo.lock io/benches/src io/benches/tests io/benches/scripts )
+    Cargo.toml rust-toolchain.toml tune io )
 scp "${SSHO[@]}" "$OUT/src.tgz" "azureuser@$RCV:" >/dev/null
 rssh 'set -e; command -v cargo >/dev/null || (curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal >/dev/null); . ~/.cargo/env; mkdir -p ergon bin; tar -xzf src.tgz -C ergon; cd ergon/io/benches; cargo build --release --bins -q; cargo test --release -q 2>&1 | grep "test result"; cp target/release/{io_bench,replay_server,analyse} ~/bin/'
 mkdir -p "$OUT/bin"
