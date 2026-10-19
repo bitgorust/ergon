@@ -10,7 +10,7 @@ import (
 
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/config"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/cpuset"
-	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/hft"
+	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/latency"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/names"
 )
 
@@ -343,7 +343,7 @@ func TestHookShape(t *testing.T) {
 }
 
 func TestHookShapeWithPartition(t *testing.T) {
-	part := &hft.PartitionGrant{Child: "/sys/fs/cgroup/pod/ctr/ergon-isolated", Exclusive: "1,5"}
+	part := &latency.PartitionGrant{Child: "/sys/fs/cgroup/pod/ctr/ergon-isolated", Exclusive: "1,5"}
 	h := Hook("/opt/ergon/bin/ergon-cpus", cpuset.Set{}, part)
 	wantArgs := []string{
 		"/opt/ergon/bin/ergon-cpus", "hook",
@@ -361,7 +361,7 @@ func TestHookShapeWithPartition(t *testing.T) {
 }
 
 func TestHookShapeWithBoth(t *testing.T) {
-	part := &hft.PartitionGrant{Child: "/c/ergon-isolated", Exclusive: "1,5"}
+	part := &latency.PartitionGrant{Child: "/c/ergon-isolated", Exclusive: "1,5"}
 	h := Hook("/opt/ergon/bin/ergon-cpus", cpuset.New(0), part)
 	joined := strings.Join(h.Args, " ")
 	if !strings.Contains(joined, "--shared 0") || !strings.Contains(joined, "--isolated 1,5") {

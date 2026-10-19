@@ -24,7 +24,7 @@ import (
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/assign"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/config"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/cpuset"
-	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/hft"
+	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/latency"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/metrics"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/names"
 )
@@ -313,7 +313,7 @@ func (p *Plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr *ap
 	// one that wants those CPUs is refused.
 	needHook := d.Hook || (d.Grants != nil && d.Grants.CpuPartition)
 	if needHook {
-		var part *hft.PartitionGrant
+		var part *latency.PartitionGrant
 		if d.Grants != nil {
 			part = d.Grants.Partition
 		}
@@ -404,7 +404,7 @@ func (p *Plugin) applyGrants(adj *api.ContainerAdjustment, g *Grants, d *Decisio
 		if err != nil {
 			return err
 		}
-		g.Partition = &hft.PartitionGrant{Child: child, Exclusive: d.Exclusive.List()}
+		g.Partition = &latency.PartitionGrant{Child: child, Exclusive: d.Exclusive.List()}
 		p.metrics.Grant("partition", names.CpuPartitionValue)
 	}
 	for _, kv := range GrantEnv(g, p.cfg) {
@@ -435,7 +435,7 @@ func partitionChild(cgroupRoot, cgroupsPath string) (string, error) {
 // toAPISeccomp converts the pure policy to the NRI type. Every field is
 // carried across: what went in through requestSeccomp comes back out
 // unchanged apart from the one rule the plugin appends.
-func toAPISeccomp(s *hft.SeccompPolicy) *api.LinuxSeccomp {
+func toAPISeccomp(s *latency.SeccompPolicy) *api.LinuxSeccomp {
 	if s == nil {
 		return nil
 	}

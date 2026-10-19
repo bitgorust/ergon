@@ -1091,7 +1091,7 @@ fn arp_learns_reply_and_sends() {
     assert_no_leak();
 }
 
-/// A learned next hop is never withdrawn from the send path (HFT: no pause,
+/// A learned next hop is never withdrawn from the send path (latency: no pause,
 /// ever). After 30 s each send still goes to the cached MAC at once while a
 /// refresh request goes out in the background, retried at most once a second
 /// until answered; the answer restarts the 30 s.

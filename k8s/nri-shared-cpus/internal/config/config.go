@@ -17,7 +17,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/cpuset"
-	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/hft"
+	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/latency"
 )
 
 const (
@@ -103,7 +103,7 @@ type Config struct {
 	// MetricsAddress is the HTTP listen address.
 	MetricsAddress string
 	// Rlimits is the rlimit ceiling a pod may ask for (kinds, not values).
-	Rlimits hft.RlimitConfig
+	Rlimits latency.RlimitConfig
 	// SeccompIOUring enables the io_uring widening.
 	SeccompIOUring bool
 	// SeccompProfilePath is where the shipped io_uring profile lives on the
@@ -216,7 +216,7 @@ func Parse(data []byte) (*Config, error) {
 		c.MetricsAddress = f.MetricsAddress
 	}
 	if f.Rlimits != nil {
-		c.Rlimits = hft.RlimitConfig{
+		c.Rlimits = latency.RlimitConfig{
 			Memlock: f.Rlimits.Memlock,
 			Nofile:  f.Rlimits.Nofile,
 			RtPrio:  f.Rlimits.RtPrio,
@@ -296,7 +296,7 @@ func (s *SeccompFile) GetIOUring() string {
 // parseRlimitValueForConfig checks an rlimit value the same way the grant
 // table does, so a bad config fails at start not at create.
 func parseRlimitValueForConfig(s string) (uint64, error) {
-	return hft.ParseRlimitValue(s)
+	return latency.ParseRlimitValue(s)
 }
 
 // Load reads and checks the config file at path.

@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/config"
-	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/hft"
+	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/latency"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/names"
 )
 
@@ -31,7 +31,7 @@ func resolveGrants(cfg *config.Config, r *Request) (*Grants, error) {
 	g := &Grants{}
 
 	if ask, ok := lookup(r, names.RlimitsPrefix+r.Container); ok {
-		rls, err := hft.Table(cfg.Rlimits, ask)
+		rls, err := latency.Table(cfg.Rlimits, ask)
 		if err != nil {
 			return nil, err
 		}
@@ -40,25 +40,25 @@ func resolveGrants(cfg *config.Config, r *Request) (*Grants, error) {
 
 	seccompAsk, hasSeccomp := lookup(r, names.SeccompPrefix+r.Container)
 	if hasSeccomp {
-		if !cfg.SeccompIOUring && seccompAsk == hft.ModeIOUring {
+		if !cfg.SeccompIOUring && seccompAsk == latency.ModeIOUring {
 			return nil, refuse(0, "seccomp-off",
-				"seccomp.ergon.io: %q is asked for but this node has seccomp.ioUring: off", hft.ModeIOUring)
+				"seccomp.ergon.io: %q is asked for but this node has seccomp.ioUring: off", latency.ModeIOUring)
 		}
-		policy, err := hft.WithIOUring(r.SeccompPolicy, seccompAsk)
+		policy, err := latency.WithIOUring(r.SeccompPolicy, seccompAsk)
 		if err != nil {
 			return nil, err
 		}
 		g.SeccompMode = seccompAsk
-		if seccompAsk == hft.ModeIOUring {
+		if seccompAsk == latency.ModeIOUring {
 			g.Seccomp = policy
 		}
 	} else {
-		g.SeccompMode = hft.ModeRuntimeDefault
+		g.SeccompMode = latency.ModeRuntimeDefault
 	}
 
 	numaAsk, hasNuma := lookup(r, names.NumaPrefix+r.Container)
 	if hasNuma {
-		mems, _, err := hft.PickMems(numaAsk, cfg.NodeNumaNodes, cfg.NicNumaNode)
+		mems, _, err := latency.PickMems(numaAsk, cfg.NodeNumaNodes, cfg.NicNumaNode)
 		if err != nil {
 			return nil, err
 		}
@@ -67,7 +67,7 @@ func resolveGrants(cfg *config.Config, r *Request) (*Grants, error) {
 
 	ptpAsk, hasPtp := lookup(r, names.PtpPrefix+r.Container)
 	if hasPtp {
-		dev, err := hft.PickPtp(cfg.HostPtp, ptpAsk)
+		dev, err := latency.PickPtp(cfg.HostPtp, ptpAsk)
 		if err != nil {
 			return nil, err
 		}
@@ -89,7 +89,7 @@ func resolveGrants(cfg *config.Config, r *Request) (*Grants, error) {
 			// Priority comes from the rt-prio rlimit when present, else 50.
 			prio := 50
 			for _, rl := range g.Rlimits {
-				if rl.Type == "RLIMIT_RTPRIO" && rl.Soft != hft.Inf {
+				if rl.Type == "RLIMIT_RTPRIO" && rl.Soft != latency.Inf {
 					prio = int(rl.Soft)
 				}
 			}
@@ -103,10 +103,10 @@ func resolveGrants(cfg *config.Config, r *Request) (*Grants, error) {
 	// Item 1: a sized hugetlbfs mount for AERON_DIR. The size is the
 	// container's hugepages-2Mi limit, so two containers cannot overcommit.
 	if hugeAsk, hasHuge := lookup(r, names.HugepagesPrefix+r.Container); hasHuge {
-		if err := hft.CheckHugepageAnnotation(hugeAsk); err != nil {
+		if err := latency.CheckHugepageAnnotation(hugeAsk); err != nil {
 			return nil, err
 		}
-		spec, envs, err := hft.HugepageMount(r.HugepageLimitBytes)
+		spec, envs, err := latency.HugepageMount(r.HugepageLimitBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -117,7 +117,7 @@ func resolveGrants(cfg *config.Config, r *Request) (*Grants, error) {
 	// Item 2: cpuset.cpus.partition=isolated on the exclusive CPUs. The
 	// createRuntime hook creates the child cgroup and writes the files.
 	if partAsk, hasPart := lookup(r, names.CpuPartitionPrefix+r.Container); hasPart {
-		if err := hft.CheckCpuPartitionValue(partAsk); err != nil {
+		if err := latency.CheckCpuPartitionValue(partAsk); err != nil {
 			return nil, err
 		}
 		g.CpuPartition = true
@@ -125,7 +125,7 @@ func resolveGrants(cfg *config.Config, r *Request) (*Grants, error) {
 
 	// Item 5: PM QoS via /dev/cpu_dma_latency. x86 only.
 	if qosAsk, hasQos := lookup(r, names.CpuqosPrefix+r.Container); hasQos {
-		dev, err := hft.PickCpuQos(qosAsk, cfg.GOARCH, cfg.HostCpuDmaLatency)
+		dev, err := latency.PickCpuQos(qosAsk, cfg.GOARCH, cfg.HostCpuDmaLatency)
 		if err != nil {
 			return nil, err
 		}
@@ -153,11 +153,11 @@ func lookup(r *Request, key string) (string, bool) {
 }
 
 // GrantEnv is the env the plugin exports for the grants it gave.
-func GrantEnv(g *Grants, _ *config.Config) []hft.KV {
+func GrantEnv(g *Grants, _ *config.Config) []latency.KV {
 	if g == nil {
 		return nil
 	}
-	return hft.GrantEnv(hft.EnvGrant{
+	return latency.GrantEnv(latency.EnvGrant{
 		Rlimits:      g.Rlimits,
 		SchedFifo:    g.SchedFifo,
 		SeccompMode:  g.SeccompMode,
@@ -180,7 +180,7 @@ func FormatSchedFifo(prio int) string {
 
 // SysctlRefusal names the node setting for a candidate-7 request. The plugin
 // refuses these with this message so nobody expects a pod to raise rmem_max.
-func SysctlRefusal(name string) string { return hft.RefuseSysctl(name) }
+func SysctlRefusal(name string) string { return latency.RefuseSysctl(name) }
 
 // SplitCommaList is a tiny helper for the hook argument parser and tests.
 func SplitCommaList(s string) []string {

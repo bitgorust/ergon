@@ -11,7 +11,7 @@ import (
 
 	"github.com/containerd/nri/pkg/api"
 
-	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/hft"
+	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/latency"
 )
 
 // deviceNumbers returns the major and minor of a character device from its
@@ -34,12 +34,12 @@ func deviceNumbers(path string) (int64, int64) {
 // type. Every field is carried across: a policy the runtime built with
 // argument filters or a per-rule errno must come out of the plugin with
 // those restrictions still in force.
-func requestSeccomp(c *api.Container) *hft.SeccompPolicy {
+func requestSeccomp(c *api.Container) *latency.SeccompPolicy {
 	sp := c.GetLinux().GetSeccompPolicy()
 	if sp == nil {
 		return nil
 	}
-	out := &hft.SeccompPolicy{
+	out := &latency.SeccompPolicy{
 		DefaultAction:    sp.GetDefaultAction(),
 		Architectures:    append([]string(nil), sp.GetArchitectures()...),
 		Flags:            append([]string(nil), sp.GetFlags()...),
@@ -51,7 +51,7 @@ func requestSeccomp(c *api.Container) *hft.SeccompPolicy {
 		out.DefaultErrno = &v
 	}
 	for _, sc := range sp.GetSyscalls() {
-		rule := hft.SeccompSyscall{
+		rule := latency.SeccompSyscall{
 			Names:  append([]string(nil), sc.GetNames()...),
 			Action: sc.GetAction(),
 		}
@@ -60,7 +60,7 @@ func requestSeccomp(c *api.Container) *hft.SeccompPolicy {
 			rule.ErrnoRet = &v
 		}
 		for _, a := range sc.GetArgs() {
-			rule.Args = append(rule.Args, hft.SeccompArg{
+			rule.Args = append(rule.Args, latency.SeccompArg{
 				Index:    a.GetIndex(),
 				Value:    a.GetValue(),
 				ValueTwo: a.GetValueTwo(),

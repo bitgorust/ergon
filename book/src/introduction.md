@@ -1,5 +1,28 @@
 # Introduction
 
+## What to use
+
+One line per module: what it is for, and the call you make.
+
+| module | what it does | how you use it |
+|---|---|---|
+| `ergo-sbe` | schema XML → Rust SBE codecs | in `build.rs`: `ergo_sbe::generate_to_out_dir(...)`, then `ergo_sbe::sbe_mod!(name)` ([chapter](sbe/getting-started/depend.md)) |
+| `ergon-clock` | UTC nanoseconds from the CPU counter | `calibrate()` once at start-up, then `now_ns()` ([chapter](clock/overview.md)) |
+| `ergon-tune` | reads the host and names what will wreck your tail latency, and the fix | call at start-up; it changes nothing ([chapter](tune/overview.md)) |
+| `ergon-io` | WebSocket and HTTP/TLS on one busy-spinning thread | `poll()` from your loop; epoll or `io_uring` is configuration ([chapter](io/overview.md)) |
+| `ergo-aeron-cluster` | Aeron Cluster client | only if you need cluster; experimental, not a production substitute ([chapter](cluster/overview.md)) |
+| `ergon-md-dpdk` | DPDK transport for the Aeron media driver | Linux only; proof of concept — use [Aeron Premium](https://aeron.io/) for kernel bypass ([chapter](md-dpdk/overview.md)) |
+
+Kubernetes, if you deploy there:
+
+| module | what it does | how you use it |
+|---|---|---|
+| `k8s/nri-shared-cpus` | gives a pod its exclusive CPUs **and** the node's shared housekeeping CPUs, and starts every thread on the shared ones so the busy-spin loop keeps its core | deploy its Helm chart on a containerd node with NRI on; ask for `ergon.io/shared-millicpus` ([chapter](deploy/shared-cpus.md)) |
+| `k8s/nri-latency-pods` | the latency-pod setup: node tuning, an admission policy that refuses exec probes and always-restart sidecars, and the pod annotations for hugepages, CPU isolation, io_uring and PHC devices | apply the node and admission halves on **EKS AL2023** only. A pod author sets annotations and labels, nothing more. Not a crate — nothing to import ([chapter](deploy/latency-pods.md)) |
+
+Start with `ergo-sbe` + `ergon-clock` + `ergon-tune`. Add `ergon-io` if you talk
+to an exchange. The rest is optional.
+
 `ergo-sbe` generates zero-allocation Rust codecs from
 [Simple Binary Encoding](https://www.fixtrading.org/standards/sbe/) schemas.
 Wire layout matches official SBE for the

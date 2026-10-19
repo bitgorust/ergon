@@ -11,7 +11,7 @@ import (
 
 	"github.com/containerd/nri/pkg/api"
 
-	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/hft"
+	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/latency"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/names"
 )
 
@@ -52,12 +52,12 @@ func TestCreateHugepageMountSizedNoCgroupLimit(t *testing.T) {
 	}
 	var mount *api.Mount
 	for _, m := range adj.GetMounts() {
-		if m.GetDestination() == hft.HugepageMountPoint {
+		if m.GetDestination() == latency.HugepageMountPoint {
 			mount = m
 		}
 	}
 	if mount == nil {
-		t.Fatalf("no hugetlbfs mount at %s; mounts are %v", hft.HugepageMountPoint, adj.GetMounts())
+		t.Fatalf("no hugetlbfs mount at %s; mounts are %v", latency.HugepageMountPoint, adj.GetMounts())
 	}
 	if mount.GetType() != "hugetlbfs" {
 		t.Errorf("mount type = %q, want hugetlbfs", mount.GetType())
@@ -77,13 +77,13 @@ func TestCreateHugepageMountSizedNoCgroupLimit(t *testing.T) {
 		t.Errorf("hugepage limits are %v, want none: the cgroup limit comes from the pod spec, not from NRI", limits)
 	}
 	env := adjEnv(adj)
-	if env[names.EnvHugepagesDir] != hft.HugepageMountPoint {
-		t.Errorf("%s = %q, want %q", names.EnvHugepagesDir, env[names.EnvHugepagesDir], hft.HugepageMountPoint)
+	if env[names.EnvHugepagesDir] != latency.HugepageMountPoint {
+		t.Errorf("%s = %q, want %q", names.EnvHugepagesDir, env[names.EnvHugepagesDir], latency.HugepageMountPoint)
 	}
 	if env[names.EnvHugepageSize] != "2097152" {
 		t.Errorf("%s = %q, want 2097152", names.EnvHugepageSize, env[names.EnvHugepageSize])
 	}
-	if _, ok := env[hft.EnvAeronDir]; ok {
+	if _, ok := env[latency.EnvAeronDir]; ok {
 		t.Error("the app points AERON_DIR at $ERGON_HUGEPAGES_DIR/aeron itself; the plugin must not set it")
 	}
 }
@@ -115,7 +115,7 @@ func TestCreateHugepageMountSizeFromPodCgroup(t *testing.T) {
 	}
 	var mount *api.Mount
 	for _, m := range adj.GetMounts() {
-		if m.GetDestination() == hft.HugepageMountPoint {
+		if m.GetDestination() == latency.HugepageMountPoint {
 			mount = m
 		}
 	}

@@ -50,8 +50,8 @@ COPY tune ./tune
 COPY md-dpdk ./md-dpdk
 RUN cargo build --release -p ergon-md-dpdk-harness --features static --bin rtt --bin counters
 WORKDIR /src/md-dpdk/benches/cloud/aws
-RUN gcc -O2 -Wall -Wextra -o /out-prelock hft-prelock.c \
- && gcc -O2 -Wall -Wextra -o /out-io-uring-probe hft-io-uring-probe.c \
+RUN gcc -O2 -Wall -Wextra -o /out-prelock prelock.c \
+ && gcc -O2 -Wall -Wextra -o /out-io-uring-probe io-uring-probe.c \
  && gcc -O2 -Wall -Wextra -o /out-gapspin ../gapspin.c
 
 FROM debian:bookworm-slim

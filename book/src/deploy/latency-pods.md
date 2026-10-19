@@ -1,7 +1,7 @@
 # Latency Pods
 
 Five things a normal Kubernetes pod cannot do, and what to use instead.
-They live in `k8s/nri-hft` (node setup and the admission policy) and
+They live in `k8s/nri-latency-pods` (node setup and the admission policy) and
 `k8s/nri-shared-cpus` (the NRI plugin). This page is the contract; the
 numbers are in [Benchmarks](benchmarks.md).
 
@@ -152,7 +152,7 @@ scheduler policy, and the e2e asserts PID 1 stays `SCHED_OTHER`.
 
 ## Node setup
 
-The full check list is `k8s/nri-hft/node-checks.md`. The short version:
+The full check list is `k8s/nri-latency-pods/node-checks.md`. The short version:
 
 | setting | value |
 |---|---|

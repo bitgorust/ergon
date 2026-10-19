@@ -11,7 +11,7 @@ import (
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/assign"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/config"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/cpuset"
-	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/hft"
+	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/latency"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/names"
 )
 
@@ -32,7 +32,7 @@ type Request struct {
 	Shares         *uint64
 	// SeccompPolicy is the container's request policy, or nil. The io_uring
 	// widening clones it.
-	SeccompPolicy *hft.SeccompPolicy
+	SeccompPolicy *latency.SeccompPolicy
 	// HugepageLimitBytes is the container's hugepages-2Mi limit in bytes
 	// (0 when it asks for none). The sized hugetlbfs mount is exactly this
 	// size.
@@ -80,14 +80,14 @@ type Decision struct {
 // Grants is the latency-pod extension set for one container.
 type Grants struct {
 	// Rlimits are the POSIX rlimits to add (from the plugin config).
-	Rlimits []hft.Rlimit
+	Rlimits []latency.Rlimit
 	// SchedFifo is the SCHED_FIFO priority the hot thread may take, or 0.
 	// The plugin never sets a container-wide realtime policy.
 	SchedFifo int
-	// SeccompMode is hft.ModeIOUring or hft.ModeRuntimeDefault.
+	// SeccompMode is latency.ModeIOUring or latency.ModeRuntimeDefault.
 	SeccompMode string
 	// Seccomp is the policy to apply, or nil for "leave the request's".
-	Seccomp *hft.SeccompPolicy
+	Seccomp *latency.SeccompPolicy
 	// NumaMems is the cpuset.mems string, or "" for no binding.
 	NumaMems string
 	// PtpDevice is the /dev/ptp* path to add, or "" for none.
@@ -95,15 +95,15 @@ type Grants struct {
 	// CpuqosDevice is /dev/cpu_dma_latency (x86 only), or "" for none.
 	CpuqosDevice string
 	// Hugepage is the sized hugetlbfs mount, or nil for none.
-	Hugepage *hft.HugepageSpec
+	Hugepage *latency.HugepageSpec
 	// HugepageEnvs are the env pairs that go with Hugepage.
-	HugepageEnvs []hft.KV
+	HugepageEnvs []latency.KV
 	// CpuPartition asks the createRuntime hook for cpuset.cpus.partition=
 	// isolated on the exclusive CPUs.
 	CpuPartition bool
 	// Partition is filled in at apply time: the child cgroup the hook will
 	// create. Nil when CpuPartition is false.
-	Partition *hft.PartitionGrant
+	Partition *latency.PartitionGrant
 	// NodeFacts is the /run/ergon/node.json bind mount, or "" for none.
 	NodeFacts string
 }
@@ -268,7 +268,7 @@ const HookTimeoutSeconds = 5
 // Hook is the createRuntime hook. It starts the container on shared when that
 // set is not empty, and builds the isolated child cgroup when part is not nil.
 // At least one of the two must be set.
-func Hook(path string, shared cpuset.Set, part *hft.PartitionGrant) *api.Hook {
+func Hook(path string, shared cpuset.Set, part *latency.PartitionGrant) *api.Hook {
 	args := []string{path, "hook"}
 	if !shared.IsEmpty() {
 		args = append(args, "--shared", shared.List())
@@ -287,7 +287,7 @@ func Hook(path string, shared cpuset.Set, part *hft.PartitionGrant) *api.Hook {
 // its ancestor reservations back down once the container's processes are
 // gone. NRI delivers poststop outside the plugin's request handlers, where
 // the filesystem work cannot eat into the plugin's request timeout.
-func ReleaseHook(path string, part *hft.PartitionGrant) *api.Hook {
+func ReleaseHook(path string, part *latency.PartitionGrant) *api.Hook {
 	args := []string{path, "hook", "--isolated", part.Exclusive, "--release-child", part.Child}
 	return &api.Hook{
 		Path:    path,

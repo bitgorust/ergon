@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/hft"
+	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/latency"
 )
 
 // fakeNuma builds a sysfs node directory with the given node<N> directories
@@ -111,7 +111,7 @@ func TestParseNicNumaNodeUnknown(t *testing.T) {
 	}
 	// That default is what PickMems sees: on a multi-node machine the
 	// NIC's-node ask must be refused, never answered as node 0.
-	mems, nodes, err := hft.PickMems("", []int{0, 1}, c.NicNumaNode)
+	mems, nodes, err := latency.PickMems("", []int{0, 1}, c.NicNumaNode)
 	if err == nil {
 		t.Fatalf("PickMems(%q, [0 1], %d) = %q, %q: want a refusal, not node 0", "", c.NicNumaNode, mems, nodes)
 	}
@@ -123,7 +123,7 @@ func TestParseNicNumaNodeUnknown(t *testing.T) {
 // With no NIC node recorded, "" ("the NIC's node") is refused on a
 // multi-node machine: node 0 would be a guess.
 func TestNicNumaNodeUnknownRefusesOnMultiNode(t *testing.T) {
-	mems, nodes, err := hft.PickMems("", []int{0, 1}, -1)
+	mems, nodes, err := latency.PickMems("", []int{0, 1}, -1)
 	if err == nil {
 		t.Fatalf("PickMems(%q, [0 1], -1) = %q, %q: want a refusal, not node 0", "", mems, nodes)
 	}
@@ -134,7 +134,7 @@ func TestNicNumaNodeUnknownRefusesOnMultiNode(t *testing.T) {
 
 // A one-node machine has one answer, so an unknown NIC node still resolves.
 func TestNicNumaNodeUnknownStillAnswersOnOneNode(t *testing.T) {
-	mems, nodes, err := hft.PickMems("", []int{0}, -1)
+	mems, nodes, err := latency.PickMems("", []int{0}, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestNicNumaNodeUnknownStillAnswersOnOneNode(t *testing.T) {
 
 // A recorded NIC node answers its own node.
 func TestNicNumaNodeKnownAnswersItsNode(t *testing.T) {
-	mems, nodes, err := hft.PickMems("", []int{0, 1}, 1)
+	mems, nodes, err := latency.PickMems("", []int{0, 1}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/config"
-	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/hft"
+	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/latency"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/names"
 )
 
@@ -77,7 +77,7 @@ func TestResolveGrantsRlimitsRefused(t *testing.T) {
 		t.Fatal("want a refusal for an unknown rlimit kind")
 	}
 	var ref *Refusal
-	if !errors.As(err, &ref) && !errors.As(err, new(*hft.GrantError)) {
+	if !errors.As(err, &ref) && !errors.As(err, new(*latency.GrantError)) {
 		t.Errorf("want a typed error, got %T: %v", err, err)
 	}
 	if !strings.Contains(err.Error(), "bogus") {
@@ -88,7 +88,7 @@ func TestResolveGrantsRlimitsRefused(t *testing.T) {
 func TestResolveGrantsSeccompIOUring(t *testing.T) {
 	cfg := grantConfig(t)
 	r := baseRequest()
-	r.SeccompPolicy = &hft.SeccompPolicy{DefaultAction: "SCMP_ACT_ERRNO"}
+	r.SeccompPolicy = &latency.SeccompPolicy{DefaultAction: "SCMP_ACT_ERRNO"}
 	r.PodAnnotations = map[string]string{
 		names.SeccompPrefix + r.Container: "io-uring",
 	}
@@ -96,8 +96,8 @@ func TestResolveGrantsSeccompIOUring(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if g.SeccompMode != hft.ModeIOUring {
-		t.Errorf("mode %q, want %q", g.SeccompMode, hft.ModeIOUring)
+	if g.SeccompMode != latency.ModeIOUring {
+		t.Errorf("mode %q, want %q", g.SeccompMode, latency.ModeIOUring)
 	}
 	if g.Seccomp == nil {
 		t.Fatal("want a widened policy")
@@ -300,7 +300,7 @@ func TestResolveGrantsSeccompDefaultMode(t *testing.T) {
 	if g == nil {
 		t.Fatal("want grants")
 	}
-	if g.SeccompMode != hft.ModeRuntimeDefault {
+	if g.SeccompMode != latency.ModeRuntimeDefault {
 		t.Errorf("mode %q, want runtime-default when nothing is asked for", g.SeccompMode)
 	}
 }
@@ -476,7 +476,7 @@ func TestResolveGrantsCpuqosAMD64Grants(t *testing.T) {
 }
 
 // kvMapOf is the grants_test env helper.
-func kvMapOf(kvs []hft.KV) map[string]string {
+func kvMapOf(kvs []latency.KV) map[string]string {
 	m := make(map[string]string, len(kvs))
 	for _, kv := range kvs {
 		m[kv.Key] = kv.Value

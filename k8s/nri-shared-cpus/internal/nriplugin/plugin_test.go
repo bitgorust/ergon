@@ -14,7 +14,7 @@ import (
 
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/config"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/cpuset"
-	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/hft"
+	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/latency"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/metrics"
 	"github.com/mimran1980/ergon/k8s/nri-shared-cpus/internal/names"
 )
@@ -987,21 +987,21 @@ func TestSeccompRoundTripKeepsEveryField(t *testing.T) {
 // runtime put on the rest of the policy.
 func TestSeccompIOUringKeepsEveryRestriction(t *testing.T) {
 	e := func(v uint32) *uint32 { return &v }
-	in := &hft.SeccompPolicy{
+	in := &latency.SeccompPolicy{
 		DefaultAction:    "SCMP_ACT_ERRNO",
 		DefaultErrno:     e(1),
 		Architectures:    []string{"SCMP_ARCH_X86_64"},
 		Flags:            []string{"SECCOMP_FILTER_FLAG_TSYNC"},
 		ListenerPath:     "/run/nri/seccomp.bpf",
 		ListenerMetadata: "meta",
-		Syscalls: []hft.SeccompSyscall{{
+		Syscalls: []latency.SeccompSyscall{{
 			Names:    []string{"clone"},
 			Action:   "SCMP_ACT_ERRNO",
 			ErrnoRet: e(38),
-			Args:     []hft.SeccompArg{{Index: 0, Value: 1, Op: "SCMP_CMP_EQ"}},
+			Args:     []latency.SeccompArg{{Index: 0, Value: 1, Op: "SCMP_CMP_EQ"}},
 		}},
 	}
-	out, err := hft.WithIOUring(in, hft.ModeIOUring)
+	out, err := latency.WithIOUring(in, latency.ModeIOUring)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1015,7 +1015,7 @@ func TestSeccompIOUringKeepsEveryRestriction(t *testing.T) {
 		t.Errorf("listener %q/%q, want %q/%q",
 			out.ListenerPath, out.ListenerMetadata, in.ListenerPath, in.ListenerMetadata)
 	}
-	var clone *hft.SeccompSyscall
+	var clone *latency.SeccompSyscall
 	for i := range out.Syscalls {
 		if len(out.Syscalls[i].Names) > 0 && out.Syscalls[i].Names[0] == "clone" {
 			clone = &out.Syscalls[i]
@@ -1027,7 +1027,7 @@ func TestSeccompIOUringKeepsEveryRestriction(t *testing.T) {
 	if clone.ErrnoRet == nil || *clone.ErrnoRet != 38 {
 		t.Errorf("clone errno %v, want 38", clone.ErrnoRet)
 	}
-	if len(clone.Args) != 1 || clone.Args[0] != (hft.SeccompArg{Index: 0, Value: 1, Op: "SCMP_CMP_EQ"}) {
+	if len(clone.Args) != 1 || clone.Args[0] != (latency.SeccompArg{Index: 0, Value: 1, Op: "SCMP_CMP_EQ"}) {
 		t.Errorf("clone args %v, want the request's filter", clone.Args)
 	}
 	// The input is untouched, including its slices.

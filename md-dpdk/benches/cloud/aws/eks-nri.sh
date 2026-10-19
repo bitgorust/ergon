@@ -35,7 +35,7 @@
 # (price-capacity-optimized or capacity-optimized, OnDemandTargetCapacity=0).
 #
 # It deploys the shared-cpus DaemonSet + ConfigMap (sharedCpus 0, opt-in
-# annotations, namespace ergon-hft), the latency namespace's validating
+# annotations, namespace ergon-latency-pods), the latency namespace's validating
 # admission policy (no liveness probes, no exec readiness probes, no
 # sidecars), and a privileged probe DaemonSet for host commands. It records
 # the node facts the run depends on (containerd config dump, runc, kernel,
@@ -55,7 +55,7 @@
 #   EKS_CHECK_ONLY=1 stops after the estimate; EKS_DELETE=<stamp> deletes.
 #   RTT_MESSAGES (300000) RTT_WARMUP (50000) RTT_SECONDS (60)
 #
-# Modes (hft-build-plan.md §9). SCHED_FIFO is deliberately absent: measured
+# Modes (latency-build-plan.md §9). SCHED_FIFO is deliberately absent: measured
 # not worth it on AWS (io/benches/BENCHMARK.md). Rlimits (MEMLOCK) ride along
 # on the hugepage modes so the app can mlock the pages.
 #   M0 baseline   AERON_DIR on a plain emptyDir; no extension annotations
@@ -580,7 +580,7 @@ git -C "$repo" status --porcelain >"$out/dirty"
 plugin_src=$repo/k8s/nri-shared-cpus
 [[ -f $plugin_src/Dockerfile ]] || die "no $plugin_src/Dockerfile (the shared-cpus NRI plugin)"
 [[ -f $scripts/eks-nri-workload.Dockerfile ]] || die "no $scripts/eks-nri-workload.Dockerfile"
-[[ -f $scripts/hft-prelock.c && -f $scripts/hft-io-uring-probe.c ]] || die "the prelock and io_uring_probe sources are missing from $scripts"
+[[ -f $scripts/prelock.c && -f $scripts/io-uring-probe.c ]] || die "the prelock and io_uring_probe sources are missing from $scripts"
 
 build_image() { # <local name> <context> <Dockerfile>
     local img=ergon-nri/$1:$tag
@@ -940,7 +940,7 @@ data:
   config.yaml: |
     sharedCpus: "$shared_cpus"
     oversubscription: 1
-    namespaces: [ergon-hft, ergon-hft-probe]
+    namespaces: [ergon-latency-pods, ergon-latency-pods-probe]
     defaultAffinity: shared
     hookPath: /opt/ergon/bin/ergon-cpus
     annotationOptIn: true
@@ -965,9 +965,9 @@ YAML
 # The latency namespaces and the validating admission policy: no liveness
 # probes, readiness only httpGet/tcpSocket/grpc, no sidecars. The policy
 # matches PODS labelled ergon.io/latency: "hot", the same label the shipped
-# policy (k8s/nri-hft/admission/validating-admission-policy.yaml) matches
+# policy (k8s/nri-latency-pods/admission/validating-admission-policy.yaml) matches
 # and the bench manifests set. make_pod sets it on every mode but M5; M5
-# carries no such label and runs in ergon-hft-probe on purpose, so its
+# carries no such label and runs in ergon-latency-pods-probe on purpose, so its
 # livenessProbe is admitted and the lab measures the harm the policy removes
 # from a latency pod. admission_check below submits the refused case: the
 # label with a livenessProbe. The namespace label ergon.io/latency: "true"
@@ -976,14 +976,14 @@ cat >"$out/k8s/admission.yaml" <<'YAML'
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: ergon-hft
+  name: ergon-latency-pods
   labels:
     ergon.io/latency: "true"
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: ergon-hft-probe
+  name: ergon-latency-pods-probe
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -1053,7 +1053,7 @@ for n in a b; do
     [[ -n $(nv probe "$n") ]] || die "$n: no probe pod on $node"
 done
 on_host() { local n=$1; shift; kx -i "$(nv probe "$n")" -n "$(nv probe_ns "$n")" -- nsenter -t 1 -m -u -i -n -p -- timeout 600 bash -s -- "$@"; }
-in_pod() { local n=$1; shift; kx -n ergon-hft "$@"; }
+in_pod() { local n=$1; shift; kx -n ergon-latency-pods "$@"; }
 
 # The dead-man's switch: each node powers off (and so terminates with its
 # disk) 30 minutes past the watchdog's limit, should this machine never
@@ -1104,12 +1104,12 @@ done
 # CPU. SCHED_FIFO is deliberately absent (measured not worth it on AWS).
 make_pod() {
     local mode=$1 which=$2 ping_ep=$3 pong_ep=$4
-    local name=ergon-lab-$which-$mode ns=ergon-hft
+    local name=ergon-lab-$which-$mode ns=ergon-latency-pods
     local node=$node_a
     [[ $which == b ]] && node=$node_b
     local ann_hugepages="" ann_partition="" ann_seccomp="" ann_devices="" ann_rlimits=""
     local huge="" aeron_dir=/data/aeron page_size=""
-    [[ $mode == M5 ]] && ns=ergon-hft-probe
+    [[ $mode == M5 ]] && ns=ergon-latency-pods-probe
     case $mode in
     M1 | M6)
         # The plugin mounts a sized hugetlbfs at /dev/hugepages (NRI
@@ -1230,7 +1230,7 @@ YAML
 }
 
 # The admission policy proof: a livenessProbe in the labelled namespace is
-# rejected by name; the same pod in ergon-hft-probe is admitted (M5 runs).
+# rejected by name; the same pod in ergon-latency-pods-probe is admitted (M5 runs).
 admission_check() {
     local bad
     bad=$(k apply -f - 2>&1 <<'YAML' || true
@@ -1238,7 +1238,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: ergon-lab-admission-should-fail
-  namespace: ergon-hft
+  namespace: ergon-latency-pods
   labels:
     ergon.io/latency: "hot"
 spec:
@@ -1258,10 +1258,10 @@ YAML
     else
         log "ERROR: the admission policy did not reject a livenessProbe on a labelled pod: $bad"
         echo "admission: NOT rejected: $bad" >>"$out/admission.txt"
-        k delete pod ergon-lab-admission-should-fail -n ergon-hft --ignore-not-found >/dev/null 2>&1
+        k delete pod ergon-lab-admission-should-fail -n ergon-latency-pods --ignore-not-found >/dev/null 2>&1
         return 1
     fi
-    k delete pod ergon-lab-admission-should-fail -n ergon-hft --ignore-not-found >/dev/null 2>&1
+    k delete pod ergon-lab-admission-should-fail -n ergon-latency-pods --ignore-not-found >/dev/null 2>&1
 
     # The other side of the same rule: the same probe on a pod that carries
     # no latency label must be admitted, or M5 could not run its harm.
@@ -1271,7 +1271,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: ergon-lab-admission-should-pass
-  namespace: ergon-hft-probe
+  namespace: ergon-latency-pods-probe
 spec:
   restartPolicy: Never
   containers:
@@ -1283,7 +1283,7 @@ spec:
           command: ["true"]
 YAML
 )
-    k delete pod ergon-lab-admission-should-pass -n ergon-hft-probe --ignore-not-found >/dev/null 2>&1
+    k delete pod ergon-lab-admission-should-pass -n ergon-latency-pods-probe --ignore-not-found >/dev/null 2>&1
     if [[ $ok == *denied* || $ok == *Denied* || $ok == *Forbidden* || $ok == *ergon-latency-pods* ]]; then
         log "ERROR: the admission policy refused an unlabelled pod (M5 could not run): $ok"
         echo "admission: refused an unlabelled pod: $ok" >>"$out/admission.txt"
@@ -1316,7 +1316,7 @@ known=/dev/null # lib.sh's ssh options, unused here
 # lib.sh's loss_row appends to $results, set above
 
 # counters and /proc/vmstat of one lab pod (ns from the mode).
-pod_ns() { [[ $1 == M5 ]] && echo ergon-hft-probe || echo ergon-hft; }
+pod_ns() { [[ $1 == M5 ]] && echo ergon-latency-pods-probe || echo ergon-latency-pods; }
 pod_of() { k get pods -n "$2" -l "app=ergon-lab-$1" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null; }
 loss_now() { # <which> <ns>
     local pod

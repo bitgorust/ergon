@@ -9,6 +9,30 @@
 > Humans directed the problems, approved designs, and verified results. Process
 > notes: [AI-ASSISTANCE.md](https://github.com/mimran1980/ergon/blob/main/AI-ASSISTANCE.md).
 
+## What to use
+
+One line per module: what it is for, and the call you make.
+
+| module | what it does | how you use it |
+|---|---|---|
+| [`ergo-sbe`](sbe/) | schema XML → Rust SBE codecs | in `build.rs`: `ergo_sbe::generate_to_out_dir(...)`, then `ergo_sbe::sbe_mod!(name)` |
+| [`ergon-clock`](clock/) | UTC nanoseconds from the CPU counter | `calibrate()` once at start-up, then `now_ns()` |
+| [`ergon-tune`](tune/) | reads the host and names what will wreck your tail latency, and the fix | call at start-up; it changes nothing |
+| [`ergon-io`](io/) | WebSocket and HTTP/TLS on one busy-spinning thread | `poll()` from your loop; epoll or `io_uring` is configuration |
+| [`ergo-aeron-cluster`](cluster/) | Aeron Cluster client | only if you need cluster; experimental, not a production substitute |
+| [`ergon-md-dpdk`](md-dpdk/) | DPDK transport for the Aeron media driver | Linux only; proof of concept — use [Aeron Premium](https://aeron.io/) for kernel bypass |
+| `md-dpdk/harness`, `md-dpdk/device-plugin`, `sbe/benchmarks`, `clock/bench`, `cluster-test-harness` | benchmarks and test support | you do not call these from an app |
+
+Kubernetes, if you deploy there:
+
+| module | what it does | how you use it |
+|---|---|---|
+| [`k8s/nri-shared-cpus`](k8s/nri-shared-cpus/) | gives a pod its exclusive CPUs **and** the node's shared housekeeping CPUs, and starts every thread on the shared ones so the busy-spin loop keeps its core | deploy its Helm chart on a containerd node with NRI on; ask for `ergon.io/shared-millicpus` |
+| [`k8s/nri-latency-pods`](k8s/nri-latency-pods/) | the latency-pod setup: node tuning, an admission policy that refuses exec probes and always-restart sidecars, and the pod annotations for hugepages, CPU isolation, io_uring and PHC devices | apply the node and admission halves on **EKS AL2023** only. A pod author sets annotations and labels, nothing more. Not a crate — nothing to import |
+
+Start with `ergo-sbe` + `ergon-clock` + `ergon-tune`. Add `ergon-io` if you talk
+to an exchange. The rest is optional.
+
 ergon is an experimental Rust workspace for four related projects:
 
 - **ergo-sbe** generates Rust codecs from Simple Binary Encoding (SBE)
