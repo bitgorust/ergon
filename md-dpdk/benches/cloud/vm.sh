@@ -210,11 +210,14 @@ cnc_now() {
 # The driver's settings, as `export K='v'` lines the driver's shell sources;
 # common_env [threading mode]: the agents' threads, CPUs and idle strategies
 # for that Aeron threading mode (DEDICATED unless a mode says otherwise:
-# host.sh threading_env), and the duty-cycle thresholds Aeron counts each
-# agent's stalls against (Aeron 1.53.3's C names and duration syntax,
+# host.sh threading_env), and two of the duty-cycle thresholds Aeron counts
+# each agent's stalls against (Aeron 1.53.3's C names and duration syntax,
 # aeron_driver_context.c: AERON_DRIVER_*_CYCLE_THRESHOLD, 100 ms each by
-# default): the conductor's 1 ms, the sender's and receiver's 50 us. `loss`
-# reads them back with the agents' longest cycles (host.sh aeron_telemetry)
+# default): the sender's and receiver's 50 us. The conductor's is NOT set
+# here. It has to sit strictly above whatever park the idle strategy left in
+# play takes, so it is derived after the mode's overrides
+# (conductor_cycle_threshold_apply). `loss` reads them back with the agents'
+# longest cycles (host.sh aeron_telemetry)
 common_env() {
     local threads
     threads=$(threading_env "${1:-DEDICATED}" "$HK_CPU" "$SENDER_CPU" "$RECEIVER_CPU") || return 2
@@ -230,11 +233,139 @@ export AERON_MTU_LENGTH='1408'
 export AERON_SOCKET_SO_SNDBUF='2097152'
 export AERON_SOCKET_SO_RCVBUF='2097152'
 export AERON_RCV_INITIAL_WINDOW_LENGTH='2097152'
-export AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='1ms'
 export AERON_DRIVER_SENDER_CYCLE_THRESHOLD='50us'
 export AERON_DRIVER_RECEIVER_CYCLE_THRESHOLD='50us'
 export RUSTERON_MEDIA_DRIVER_DIR='$AERON_DIR'
 ENV
+}
+
+# duration_ns <value>: Aeron's aeron_parse_duration_ns
+# (aeron_parse_util.c): a bare number is nanoseconds, and the suffixes s, ms,
+# us and ns (any case) scale it. Integers only, and no more than 18 digits,
+# so the arithmetic below cannot overflow; anything else fails.
+duration_ns() {
+    local v=${1-} unit n lim
+    [[ $v =~ ^[0-9]+[A-Za-z]*$ ]] || return 1
+    unit=${v##*[0-9]}
+    n=${v%"$unit"}
+    unit=$(printf '%s' "$unit" | tr '[:upper:]' '[:lower:]')
+    ((${#n} <= 18)) || return 1
+    case $unit in
+    '' | ns) lim=9223372036854775807 ;;
+    us) lim=9223372036854775 ;;
+    ms) lim=9223372036 ;;
+    s) lim=9223372036 ;;
+    *) return 1 ;;
+    esac
+    ((10#$n <= lim)) || return 1
+    case $unit in
+    '' | ns) printf '%s\n' "$((10#$n))" ;;
+    us) printf '%s\n' "$((10#$n * 1000))" ;;
+    ms) printf '%s\n' "$((10#$n * 1000000))" ;;
+    s) printf '%s\n' "$((10#$n * 1000000000))" ;;
+    esac
+}
+
+# format_duration_ns <ns>: Aeron's aeron_format_duration_ns
+# (aeron_parse_util.c) — the largest unit it divides by exactly.
+format_duration_ns() {
+    local ns=$1
+    if ((ns >= 1000000000 && ns % 1000000000 == 0)); then
+        printf '%ss\n' "$((ns / 1000000000))"
+    elif ((ns >= 1000000 && ns % 1000000 == 0)); then
+        printf '%sms\n' "$((ns / 1000000))"
+    elif ((ns >= 1000 && ns % 1000 == 0)); then
+        printf '%sus\n' "$((ns / 1000))"
+    else
+        printf '%sns\n' "$ns"
+    fi
+}
+
+# conductor_max_park_ns <idle strategy> [init args]: the longest park that
+# strategy's idle can take, in nanoseconds — Aeron's backoff defaults
+# (aeron_agent.h AERON_IDLE_STRATEGY_BACKOFF_MAX_PARK_PERIOD_NS, 1 ms) with
+# no init args, the fourth of backoff's "maxSpins-maxYields-minPark-maxPark"
+# (aeron_agent.c aeron_idle_strategy_backoff_state_init_args), and 0 for the
+# strategies that never park (spin, noop). Anything else fails: a park this
+# lab cannot read is not a park it can place a threshold above.
+conductor_max_park_ns() {
+    local strategy=${1-} args=${2-}
+    case $strategy in
+    spin | noop)
+        printf '0\n'
+        return 0
+        ;;
+    backoff) ;;
+    *) return 1 ;;
+    esac
+    if [[ -z $args ]]; then
+        printf '1000000\n'
+        return 0
+    fi
+    [[ $args =~ ^[0-9]+-[0-9]+-[0-9A-Za-z]+-([0-9A-Za-z]+)$ ]] || return 1
+    duration_ns "${BASH_REMATCH[1]}"
+}
+
+# conductor_cycle_threshold <idle strategy> [init args]: the value for
+# AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD. Aeron's tracker reports a cycle
+# only when it is STRICTLY longer than the threshold
+# (aeron_duty_cycle_tracker.h: cycle_time_ns > threshold_ns), so a threshold
+# at or below the strategy's longest park turns every full park into a
+# reported stall and its "max cycle" into a nanosleep oversleep — what the
+# lab's fixed 1ms did to backoff's 1ms. Twice the park, and never below
+# 1 ms, so a spin or noop conductor still only reports real work.
+conductor_cycle_threshold() {
+    local park want
+    park=$(conductor_max_park_ns "$@") || return 1
+    ((park <= 4611686018427387903)) || return 1
+    want=$((park * 2))
+    if ((want < 1000000)); then want=1000000; fi
+    format_duration_ns "$want"
+}
+
+# conductor_cycle_threshold_apply <env file>: the conductor's duty-cycle
+# threshold for this run, written into the environment the driver (or
+# INVOKER's clients) will source if it does not already name one. Called
+# after the mode's @KEY=value overrides and before anything starts, because
+# the threshold has to clear the park of whatever idle strategy those
+# overrides left in play. An explicit threshold that does not is refused
+# before the driver starts, naming both values and the one to use.
+conductor_cycle_threshold_apply() {
+    local env_file=${1-} got strategy args threshold park want have
+    [[ -f $env_file ]] || return 2
+    # the file is `export K='v'` lines the driver's shell sources: read it
+    # that way, so a later line wins as it will at start
+    got=$(
+        set +eu
+        # shellcheck disable=SC1090
+        . "$env_file" >/dev/null 2>&1 || exit 2
+        printf '%s|%s|%s\n' \
+            "${AERON_CONDUCTOR_IDLE_STRATEGY-backoff}" \
+            "${AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS-}" \
+            "${AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD-}"
+    ) || return 2
+    IFS='|' read -r strategy args threshold <<<"$got" || true
+    if ! park=$(conductor_max_park_ns "$strategy" "$args"); then
+        if [[ $strategy == backoff ]]; then
+            echo "conductor: AERON_CONDUCTOR_IDLE_STRATEGY='$strategy' AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS='$args': the park is not readable (backoff's init args are maxSpins-maxYields-minPark-maxPark, e.g. 100-10-1us-20us)" >&2
+        else
+            echo "conductor: AERON_CONDUCTOR_IDLE_STRATEGY='$strategy': not one whose longest park this lab knows (backoff, spin, noop)" >&2
+        fi
+        return 2
+    fi
+    want=$(conductor_cycle_threshold "$strategy" "$args") || return 2
+    if [[ -n $threshold ]]; then
+        if ! have=$(duration_ns "$threshold"); then
+            echo "conductor: AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='$threshold': not an Aeron duration (bare ns, or the suffixes s, ms, us, ns)" >&2
+            return 2
+        fi
+        if ((have <= park)); then
+            echo "conductor: AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='$threshold' ($have ns) is not above $strategy's longest park ($park ns): every full park would count as a stall. Use '$want' or leave it unset." >&2
+            return 2
+        fi
+        return 0
+    fi
+    echo "export AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='$want'" >>"$env_file"
 }
 
 # "<mac> <ip> <prefix>" of each data NIC, lowest address first, from the
@@ -1495,6 +1626,14 @@ driver)
             host_setting "${pair%%=*}" "${pair#*=}" "$mode" && continue
             echo "export ${pair%%=*}='${pair#*=}'" >>"$env_file"
         done
+    fi
+    # The conductor's duty-cycle threshold, derived from whatever idle
+    # strategy the overrides above left in play: too low and every full park
+    # counts as a stall (conductor_cycle_threshold). Fail closed here, before
+    # anything this run placed is left behind.
+    if ! conductor_cycle_threshold_apply "$env_file"; then
+        echo "$mode: the conductor's duty-cycle threshold is not above its idle strategy's longest park: stopping" >&2
+        exit 2
     fi
     # what this run ran on, for its notes: the baseline as in effect now
     # (after any override) and whose binaries

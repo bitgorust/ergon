@@ -197,6 +197,12 @@
 #     type), vm.sh loss carrying them, lib.sh's aeron rows beside unchanged
 #     loss rows (INVOKER's ledger taking the longest cycle), analyse.py's
 #     table of them, never loss;
+#   * the conductor's duty-cycle threshold strictly above its idle strategy's
+#     longest park (vm.sh duration_ns, conductor_max_park_ns,
+#     conductor_cycle_threshold and conductor_cycle_threshold_apply: derived
+#     after the mode's overrides and before the driver or INVOKER's clients
+#     start, an explicit threshold that does not clear the park refused by
+#     name, common_env never hard-coding it);
 #   * each load point's histogram fetched (a stale one never), merged over its
 #     reps by analyse.py with HdrHistogram's percentiles; the warm-up once a
 #     mode and rep before its first ladder, recorded nowhere, and in
@@ -5010,6 +5016,11 @@ tele=$(
     eval "$(awk -v f="common_env() {" '$0 == f {on = 1} on {print} on && $0 == "}" {exit}' "$cloud/vm.sh")"
     AERON_DIR=/mnt/huge/aeron-bench HK_CPU=0 SENDER_CPU=2 RECEIVER_CPU=3
     echo "env: $(common_env DEDICATED | grep CYCLE_THRESHOLD | tr '\n' ' ' | sed 's/ $//')"
+    if common_env DEDICATED | grep -q AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD; then
+        echo "env hard-codes the conductor's threshold"
+    else
+        echo "env leaves the conductor's threshold to be derived"
+    fi
     ledger=$tmp/ledger-tele
     rm -rf "$ledger"
     invoker_ledger_record "$ledger" 1-1 "naks-sent=1;info-sender-max-cycle-ns=900;info-sender-cycles-over=2;info-sender-threshold-ns=50000"
@@ -5031,7 +5042,8 @@ tele=$(
 want="all: info-conductor-max-cycle-ns=812345;info-conductor-cycles-over=3;info-conductor-threshold-ns=1000000;info-sender-max-cycle-ns=41234;info-sender-cycles-over=1;info-sender-threshold-ns=50000;info-receiver-max-cycle-ns=61234;info-receiver-cycles-over=2;info-receiver-threshold-ns=50000;info-sender-fc-limits=40;info-sms-sent=120;info-sms-received=17;info-fc-under-runs=0;info-fc-over-runs=2
 shared: info-conductor-max-cycle-ns=700000;info-conductor-cycles-over=0;info-conductor-threshold-ns=2000000000
 none: []
-env: export AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='1ms' export AERON_DRIVER_SENDER_CYCLE_THRESHOLD='50us' export AERON_DRIVER_RECEIVER_CYCLE_THRESHOLD='50us'
+env: export AERON_DRIVER_SENDER_CYCLE_THRESHOLD='50us' export AERON_DRIVER_RECEIVER_CYCLE_THRESHOLD='50us'
+env leaves the conductor's threshold to be derived
 ledger: invoker-ledger=2;naks-sent=3;info-sender-max-cycle-ns=900;info-sender-cycles-over=5;info-sender-threshold-ns=50000
 1,loss,isolated:dpdk:288:r100000,a,naks-sent=3;short-sends=0;kernel-udp-InErrors=0;nic-kernel-drops=0;routes-missing=0
 1,aeron,isolated:dpdk:288:r100000,a,info-conductor-max-cycle-ns=812345;info-conductor-cycles-over=2;info-conductor-threshold-ns=1000000;info-sms-sent=20;info-fc-over-runs=0
@@ -5044,6 +5056,98 @@ if [[ $tele != "$want" ]]; then
     diff -u <(echo "$want") <(echo "$tele") >&2 || true
 else
     pass "Aeron's stall telemetry: the duty-cycle thresholds by Aeron's C names, the agents' longest cycles, cycles over threshold, back-pressure, status messages and flow control by their exact labels, an aeron row beside the loss row (which is as before)"
+fi
+# The conductor's duty-cycle threshold strictly above its idle strategy's
+# longest park. Aeron's tracker fires on cycle_time_ns > threshold_ns
+# (aeron_duty_cycle_tracker.h) and backoff parks up to 1 ms
+# (aeron_agent.h: AERON_IDLE_STRATEGY_BACKOFF_MAX_PARK_PERIOD_NS), so a 1 ms
+# threshold is met by every full park and the counter's max is a nanosleep
+# oversleep, not work: the round-11 overrun count, near enough load
+# independent. vm.sh derives the threshold from the park (duration_ns,
+# conductor_max_park_ns, conductor_cycle_threshold) and applies it after the
+# mode's @KEY=value overrides and before the driver or INVOKER's clients
+# start (conductor_cycle_threshold_apply), refusing an explicit threshold that
+# does not clear the park (Aeron's comparison is `>`, so equal is refused
+# too), and an idle strategy, init args or threshold it cannot read.
+thr=$(
+    set +e
+    exec 2>&1
+    eval "$(for f in duration_ns format_duration_ns conductor_max_park_ns conductor_cycle_threshold conductor_cycle_threshold_apply; do vm_fn "$f"; done)"
+    for f in duration_ns format_duration_ns conductor_max_park_ns conductor_cycle_threshold conductor_cycle_threshold_apply; do
+        if declare -F "$f" >/dev/null; then echo "defined $f"; else echo "missing $f"; fi
+    done
+    echo "duration: $(duration_ns 5), $(duration_ns 20us), $(duration_ns 1ms), $(duration_ns 2s), $(duration_ns 500ns), $(duration_ns 1MS), $(duration_ns 0)"
+    for v in '' 1x -1 1m 1.5ms ms 0x10 12s3 9223372036854775807ms; do
+        if duration_ns "$v" >/dev/null 2>&1; then echo "duration accepted [$v]"; else echo "duration refused [$v]"; fi
+    done
+    echo "park: $(conductor_max_park_ns backoff), $(conductor_max_park_ns backoff ''), $(conductor_max_park_ns backoff 100-10-1us-20us), $(conductor_max_park_ns backoff 10-20-1ms-1ms), $(conductor_max_park_ns spin), $(conductor_max_park_ns noop)"
+    for s in sleeping yield "backoff 1-2-3" "backoff 100-10-1us" "backoff a-b-c-d" "backoff 100-10-1us-"; do
+        if conductor_max_park_ns $s >/dev/null 2>&1; then echo "park accepted [$s]"; else echo "park refused [$s]"; fi
+    done
+    echo "threshold: $(conductor_cycle_threshold backoff), $(conductor_cycle_threshold backoff ''), $(conductor_cycle_threshold backoff 100-10-1us-20us), $(conductor_cycle_threshold backoff 10-20-1ms-1ms), $(conductor_cycle_threshold spin), $(conductor_cycle_threshold noop)"
+    threshold_case() {
+        local label=$1 f=$tmp/thr.env err=$tmp/thr.err before after
+        shift
+        if (($#)); then printf '%s\n' "$@" >"$f"; else : >"$f"; fi
+        before=$(wc -l <"$f" | tr -d ' ')
+        if conductor_cycle_threshold_apply "$f" 2>"$err"; then
+            after=$(wc -l <"$f" | tr -d ' ')
+            echo "apply $label: $([[ $after -gt $before ]] && echo appended || echo kept) $(sed -n "s/^export AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='\(.*\)'$/\1/p" "$f" | tail -1)"
+        else
+            echo "apply $label: refused $(cat "$err")"
+        fi
+    }
+    threshold_case default
+    threshold_case park20us "export AERON_CONDUCTOR_IDLE_STRATEGY='backoff'" "export AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS='100-10-1us-20us'"
+    threshold_case spin "export AERON_CONDUCTOR_IDLE_STRATEGY='spin'"
+    threshold_case keep "export AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='10ms'"
+    threshold_case equal "export AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='1ms'"
+    threshold_case clear-park "export AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='1ms'" "export AERON_CONDUCTOR_IDLE_STRATEGY='backoff'" "export AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS='100-10-1us-20us'"
+    threshold_case tight "export AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='1us'" "export AERON_CONDUCTOR_IDLE_STRATEGY='backoff'" "export AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS='100-10-1us-20us'"
+    threshold_case bad-init "export AERON_CONDUCTOR_IDLE_STRATEGY='backoff'" "export AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS='1-2-3'"
+    threshold_case bad-threshold "export AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='1x'"
+    threshold_case later-wins "export AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='1ms'" "export AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='10ms'"
+    threshold_case unknown-strategy "export AERON_CONDUCTOR_IDLE_STRATEGY='sleeping'"
+) || true
+want="defined duration_ns
+defined format_duration_ns
+defined conductor_max_park_ns
+defined conductor_cycle_threshold
+defined conductor_cycle_threshold_apply
+duration: 5, 20000, 1000000, 2000000000, 500, 1000000, 0
+duration refused []
+duration refused [1x]
+duration refused [-1]
+duration refused [1m]
+duration refused [1.5ms]
+duration refused [ms]
+duration refused [0x10]
+duration refused [12s3]
+duration refused [9223372036854775807ms]
+park: 1000000, 1000000, 20000, 1000000, 0, 0
+park refused [sleeping]
+park refused [yield]
+park refused [backoff 1-2-3]
+park refused [backoff 100-10-1us]
+park refused [backoff a-b-c-d]
+park refused [backoff 100-10-1us-]
+threshold: 2ms, 2ms, 1ms, 2ms, 1ms, 1ms
+apply default: appended 2ms
+apply park20us: appended 1ms
+apply spin: appended 1ms
+apply keep: kept 10ms
+apply equal: refused conductor: AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='1ms' (1000000 ns) is not above backoff's longest park (1000000 ns): every full park would count as a stall. Use '2ms' or leave it unset.
+apply clear-park: kept 1ms
+apply tight: refused conductor: AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='1us' (1000 ns) is not above backoff's longest park (20000 ns): every full park would count as a stall. Use '1ms' or leave it unset.
+apply bad-init: refused conductor: AERON_CONDUCTOR_IDLE_STRATEGY='backoff' AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS='1-2-3': the park is not readable (backoff's init args are maxSpins-maxYields-minPark-maxPark, e.g. 100-10-1us-20us)
+apply bad-threshold: refused conductor: AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='1x': not an Aeron duration (bare ns, or the suffixes s, ms, us, ns)
+apply later-wins: kept 10ms
+apply unknown-strategy: refused conductor: AERON_CONDUCTOR_IDLE_STRATEGY='sleeping': not one whose longest park this lab knows (backoff, spin, noop)"
+if [[ $thr != "$want" ]]; then
+    fail "the conductor's duty-cycle threshold above its idle strategy's longest park, derived after the overrides and refused where it does not clear it"
+    diff -u <(echo "$want") <(echo "$thr") >&2 || true
+else
+    pass "the conductor's duty-cycle threshold derived from the idle strategy's longest park (twice it, never below 1 ms), applied after the mode's overrides, and an explicit threshold that does not clear the park refused before the driver starts, naming both values and the one to use"
 fi
 # vm.sh loss in a sandbox (a media driver running; fake counters print a loss
 # line for `counters loss` and every counter for `counters ''`): the line

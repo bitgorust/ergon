@@ -100,7 +100,7 @@ Each item won an A/B and was reproduced on a second pair, unless the row says ot
 | DPDK: receiver IO vectors 16 (`AERON_RECEIVER_IO_VECTOR_CAPACITY=16`) | rounds 4–5: no NAK at 288 B up to 4.5 M msgs/s; bursts' max 2,808 → 1,000 µs (round 4) |
 | DPDK: the conductor's park capped at 20 µs (`AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`) with a receiver window the ring can hold, per channel (`rcv-wnd`): 256 × the channel's smallest datagram where loss matters more than peak rate (80 KiB for 288 B messages) | rounds 9–10: with 80 KiB no lossy rep at any point (idle max 104, 95–119); with 256 KiB, sustainable 1,344 B 400 k → 600 k msgs/s. Never use the faster park without the small window: it lost more than the default (round 9). A window carries at most about window ÷ (round trip + status-message delay). Round 11 set no `rcv-wnd` and fell back to `AERON_RCV_INITIAL_WINDOW_LENGTH=2 MiB`, 26× the proven window: its 288 B loss-free rate fell to 10% of flat-out on every DPDK mode. **Round 12 A/B on the window alone changes the recommendation:** the 80 KiB window by itself is a rate cap, not a loss fix. It cuts flat-out 6.5–6.8× at every size and **lowers** the 288 B loss-free ceiling (157 k → 121 k msgs/s); it raises only the 1,344 B ceiling (39 k → 56 k) and costs 734–1,490 µs spikes on localhost. Use it with the 20 µs park where 1,344 B rate or a smaller ring is the constraint; do not name `rcv-wnd=80k` on a 288 B channel unless the 6.5–6.8× rate cut is acceptable. The rounds 9–10 window **plus** park combination is not re-confirmed on round 12's pair |
 | kernel: busy polling (`net.core.busy_read`/`busy_poll` 50) with a 4,096-entry receive ring | round 5: no NIC drop or NAK in 5 reps, where the default ring dropped at 1 M msgs/s of 288 B; idle max 166 (138–2,851) |
-| Never set `AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD` to the conductor's max park | Aeron's duty-cycle counter times `do_work` entries, so it includes the park. At 1 ms against `backoff`'s 1 ms park the counter fires on every idle park and its max is a `nanosleep` oversleep, not work. Round 11: see [what the agents' duty cycles actually measured](#round-11-what-the-agents-duty-cycles-actually-measured) |
+| Never set `AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD` to the conductor's max park | Aeron's duty-cycle counter times `do_work` entries, so it includes the park. At 1 ms against `backoff`'s 1 ms park the counter fires on every idle park and its max is a `nanosleep` oversleep, not work. Round 11: see [what the agents' duty cycles actually measured](#round-11-what-the-agents-duty-cycles-actually-measured). **The lab now makes this impossible to set wrong** (2026-10-19): `vm.sh` derives the threshold from the park after the mode's overrides (twice the park, never below 1 ms — `backoff` gets 2 ms, the 20 µs park and `spin`/`noop` get 1 ms) and refuses one that does not clear it before the driver starts |
 
 ### Not recommended
 
@@ -582,6 +582,17 @@ happening: 40 ms on `isolated, kernel UDP`. Work does not behave like that. A
 conductor sits on the housekeeping CPU and is not on the data path, so none of
 these figures put a message at risk. They are the lab measuring a park as work.
 
+**Fixed in the lab on 2026-10-19.** `vm.sh common_env` no longer writes a fixed
+conductor threshold. `conductor_cycle_threshold_apply` derives it from the idle
+strategy's park after the mode's `@KEY=value` overrides — twice the park, never
+below 1 ms, so the default `backoff` gets 2 ms, the 20 µs park of
+`AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us` and `spin`/`noop` get
+1 ms — and refuses an explicit threshold at or below the park before the driver
+or INVOKER's clients start, naming both values. Rounds that named the 20 µs
+park already cleared the old 1 ms; the collision hit the default `backoff`. A
+later round's conductor maxima are therefore work, and the round-11 figures
+above are the last that are not.
+
 **The sender is quiet.** 594–1,914 µs, at most 521 over-threshold cycles in any
 mode's whole round. Not a spike source.
 
@@ -732,3 +743,4 @@ One change per experiment, A/B against the current best, 5 reps; kept only if th
 | 2026-10-19 | round 12, the window's mechanism | 80 KiB ÷ the ~1 ms status interval ≈ 80 MB/s: 60 k msgs/s at 1,344 B (measured 60 k), 284 k at 288 B (measured 240 k). Plain's 2 MiB default never binds | documented: a window carries at most window ÷ (round trip + status-message delay) |
 | 2026-10-19 | round 12, cross-host idle maxima | isolated per-rep 406–742 µs (plain) and 439–472 µs (window), every one unexplained. Pinned plain: 429 / 499 / **21,317** / 1,205 (pong stall) / 478 µs | **not traced.** Isolated localhost has more agent-loop gaps (52–60 a rep) and a 30 µs max, so the gaps are not the cause. The max is on the wire or on host b |
 | 2026-10-19 | round 12, `isolated-nic-irqs` | grew in 0 of 880 runs | IRQ pinning held every time |
+| 2026-10-19 | the lab's park/threshold collision, fixed | `common_env` wrote `AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD='1ms'`, the same number as `backoff`'s 1 ms max park, and Aeron's tracker fires on `cycle_time_ns > threshold_ns`, so only parks a `nanosleep` overslept counted and the conductor's "max cycle" was an oversleep | **fixed test-first.** `vm.sh` derives the threshold from the park (twice it, never below 1 ms) after the mode's overrides and refuses one at or below the park before the driver starts. `just test-dpdk-lab` green, 225 checks |
