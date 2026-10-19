@@ -92,7 +92,7 @@ warning thread take the other. Nothing to configure.
 What a busy sibling costs: a little at p50 against a CPU of its own, more
 at p99. On a `cpu: 2` x86 pod the sibling was still ahead of the other
 one-core polling backends at 100 connections. Tables:
-[`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#many-connections).
+[`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#smt-sibling-cost).
 
 - It needs both hyperthreads and nothing else on the sibling.
 - Never a second isolated full core just for SQPOLL.

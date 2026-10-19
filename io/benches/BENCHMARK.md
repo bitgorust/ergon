@@ -33,6 +33,19 @@ Run directories under `io/benches/results/`. The run ids are the surviving recor
   - Against `epoll-spin`, `uring-spin` and mio: **no conclusion** (adaptive moderation on). Until a fair rerun, do not choose against epoll on these numbers.
 - **`recv-busy,per_queue`** (one read per NIC queue, then the ready sockets) matched plain `recv-busy` at 1–16 sockets (whole path, same round: −5 to +3 µs, one round +11) and kept one poll at 2–6 µs up to 256 sockets. It is the safe single-core polling choice, but not the default.
 - **Many lines on one exchange:** pack the streams onto a few connections. 1,024 streams on 1 or 4 connections with `recv-busy`: arrival → decoded 2.3–2.7 / 6–13 / 33–150. On 256 connections with `uring-sqpoll`: 4.8 / 25 / 78–85.
+
+### SMT sibling cost
+
+Putting the `uring-sqpoll` kernel thread on the loop's hyperthread sibling, in
+one physical core as a Kubernetes `cpu: 2` x86 pod gets: about **+0.5 µs p50 at
+1 connection, +2.3–2.7 µs p50 and +9–12 µs p99 at 10–100 connections**
+(arrival → decoded) against a core of its own. At 100 connections it costs about
+1.5 µs at the median and 7 µs at p99, and still beats every single-vCPU option
+by about 8 µs.
+
+Run `flags-aws-20261015T122127Z`, three rounds, AWS Tokyo `c7i.2xlarge`. Full
+arrival → decoded and sender → decoded tables with maxima are in git history at
+`2517309d`. It needs both hyperthreads and nothing else on the sibling.
 - **mio (and so tokio's I/O) is the epoll path:** per round −16 to +24 µs from `epoll-spin` at the median (most rounds within ±5). Tokio itself was not measured as a spin loop.
 - **On AWS, turn ENA's adaptive receive moderation off**: its tuning work otherwise pre-empts the busy-polling loop about 40 times a second; off, `recv-busy`'s p99.99 falls by about 40 µs. That is the polling backends' setting (`rx-usecs` stays 20). For `epoll-spin`, `uring-spin` and mio, ergon-tune's interrupt-path setting is moderation fully off (`adaptive-rx off rx-usecs 0 tx-usecs 0`) with the NIC's interrupts on a core of their own; not yet measured with ergon-io.
 

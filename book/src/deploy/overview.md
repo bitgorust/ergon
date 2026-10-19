@@ -6,6 +6,7 @@ choice saves.
 
 | page | for |
 |---|---|
+| [Kubernetes HFT tuning](hft.md) | **start here**: every setting that won an A/B, its measured effect, copy-paste blocks, three checks |
 | [AWS and Azure hosts, x86 and Graviton](hosts.md) | every host setting: what it does, its measured effect, how to set it |
 | [Kubernetes](kubernetes.md) | whole cores, hugepages and the node bootstrap; the EKS manifests |
 | [Benchmarks: x86 and Graviton](benchmarks.md) | which platform: latency and cost per hour, side by side |

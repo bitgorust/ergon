@@ -25,6 +25,10 @@ One line per module: what it is for, and the call you make.
 
 Kubernetes, if you deploy there:
 
+**[Kubernetes HFT tuning](https://mimran1980.github.io/ergon/deploy/hft.html)** —
+every setting that won an A/B, its measured effect, and the two copy-paste
+blocks. Start there.
+
 | module | what it does | how you use it |
 |---|---|---|
 | [`k8s/nri-shared-cpus`](k8s/nri-shared-cpus/) | gives a pod its exclusive CPUs **and** the node's shared housekeeping CPUs, and starts every thread on the shared ones so the busy-spin loop keeps its core | deploy its Helm chart on a containerd node with NRI on; ask for `ergon.io/shared-millicpus` |

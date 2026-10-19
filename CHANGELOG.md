@@ -3,24 +3,24 @@
 ## [Unreleased]
 
 ### Added
-- `ergon-clock`, published: a hardware-counter clock for low-latency
+- `ergon-clock` (not yet on crates.io): a hardware-counter clock for low-latency
   threads. `calibrate` once at start-up returns a `Clock` (`rdtsc` or
   `CNTVCT_EL0`, else `CLOCK_MONOTONIC` with the reason), a `Follower` for
   other threads, and a `Report` with time-sync findings. `now_ns` is UTC
   nanoseconds by default (`Domain::Monotonic` is since boot).
-- `ergon-tune`, published: pure-function checks of a host's low-latency
+- `ergon-tune` (not yet on crates.io): pure-function checks of a host's low-latency
   settings (CPU isolation, interrupts off busy CPUs, hugepages, Aeron
   directory, cgroup CPU quota, NIC settings). Each finding names its
   effect and the exact fix. `ThrottleWatch` warns when a cgroup throttles.
-- `ergon-io` is published (`cargo add ergon-io --features webpki-roots`).
-  It gains a complete WebSocket client (close handshake, pings,
+- `ergon-io` (not yet on crates.io) gains a complete WebSocket client
+  (close handshake, pings,
   subprotocols, `Reconnect` with backoff), TCP keepalive on every
   connection, a quick-ACK route check per connection
   (`Config::quickack_check`), request outcomes (`ClientHandler::on_error`,
   `outcome::Verdict`), connect gates for venue limits
   (`Reconnect::poll_gated`, `defer`) and a send budget
   (`ergon_io::limit::Budget`).
-- `ergon-md-dpdk`, published: an experimental DPDK ENA kernel-bypass UDP
+- `ergon-md-dpdk` (not yet on crates.io): an experimental DPDK ENA kernel-bypass UDP
   transport for the Aeron media driver (Linux, `libdpdk >= 23.11`,
   `dpdk` feature), selected by `RUSTERON_MEDIA_DRIVER_TRANSPORT=dpdk-ena`
   or `DpdkTransport::install`. It interoperates with kernel peers. A

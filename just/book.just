@@ -21,10 +21,13 @@ book-build: book-deps
 book-serve: book-deps
     cd book && mdbook serve --open
 
-# Test all Rust code blocks in the book.
-book-test: book-deps
-    cargo build --workspace
-    cd book && mdbook test -L ../target/debug/deps
+# Test all Rust code blocks in the book, and build it.
+#
+# Not `mdbook test`: bare `mdbook test` has no generated codecs, so every
+# fence that names one fails there while compiling fine in CI. The gate CI
+# runs is `docs_validation_test`, which compiles the same fences against
+# generated codecs (and resolves {{#include}}). This recipe is that gate.
+book-test: book-ci
 
 # Build + test the book (CI equivalent).
 # Uses the strict docs_validation_test harness, not the permissive mdbook test.

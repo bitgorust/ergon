@@ -81,6 +81,7 @@
 # Deployment
 
 - [Low-Latency Hosts](./deploy/overview.md)
+  - [Kubernetes HFT tuning](./deploy/hft.md)
   - [AWS and Azure, x86 and Graviton](./deploy/hosts.md)
   - [Kubernetes](./deploy/kubernetes.md)
   - [Shared CPUs for Helper Threads (`k8s/nri-shared-cpus`)](./deploy/shared-cpus.md)

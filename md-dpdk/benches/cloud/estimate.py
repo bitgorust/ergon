@@ -99,7 +99,7 @@ CLOCK_STATE_S = {"pinned": 180, "isolated": 330, "isolated-poll": 330}
 MODE_S, RTT_S = 12, 85
 POINT_EXTRA_S, MIX_EXTRA_S, TPUT_EXTRA_S, MAX_EXTRA_S = 7, 7, 9, 11
 WIRE_OVERHEAD = 32 + 28  # Aeron's data header, IPv4 and UDP
-FLOW_CAP_BYTES_S = 8e9 / 8  # one flow's ceiling on AWS, 8 Gbit/s
+FLOW_CAP_BYTES_S = 7.8e9 / 8  # one flow's ceiling on AWS, 7.8-8.0 Gbit/s (BENCHMARKS.md)
 RTT_SIZE = 32
 TRANSFER_USD_GB = {"cluster": 0.0, "precision-time": 0.0, "cross-az": 0.02, "cross-region": 0.02}
 

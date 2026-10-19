@@ -564,7 +564,8 @@ fn sqpoll_with_loop(cpus: &HotSet, a: u32, b: u32) -> bool {
         || (rb.contains(&Role::Loop) && ra.contains(&Role::SqPoll) && !ra.contains(&Role::Loop))
 }
 
-const T10_EVIDENCE: &str = "io/benches/BENCHMARK.md (Many connections: the sibling cost); \
+const T10_EVIDENCE: &str = "io/benches/BENCHMARK.md (SMT sibling cost; run \
+     flags-aws-20261015T122127Z); \
      AWS instance-optimize-cpu and instance-specify-cpu-options (CpuOptions ThreadsPerCore); \
      kernel-parameters.txt (nosmt); ABI/testing/sysfs-devices-system-cpu (smt/active, smt/control); \
      Azure compute-optimized Fasv6/Falsv6/Famsv6 and general-purpose Dpsv6/Dplsv6 (no SMT)";

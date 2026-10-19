@@ -621,7 +621,8 @@ timestamp, so a max recorded at one load point cannot be pinned to the loss at
 another. They are the same order of magnitude. The window finding above stands
 on its own either way — the window decides how much a stall may cost.
 
-Still open, and not measured in round 11:
+Still open (round 11's list; the window A/B and the localhost leg closed in
+round 12):
 
 - Why host b's DPDK receiver runs 850,000 over-50 µs cycles a round and host
   a's runs a thousand. Same size, image and layout. Not measured to a cause.
@@ -633,13 +634,11 @@ Still open, and not measured in round 11:
   conductor's duty-cycle counter cannot mean anything as shipped. Either cap
   the park (rounds 9–10 used `AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`)
   or raise the threshold above it.
-- The 80 KiB window was never applied here, so the rounds 9–10 result is not
-  re-confirmed on this pair. The A/B is `dpdk@SUB_PARAMS=rcv-wnd=80k` against
-  plain `dpdk`, same ladder, same reps.
-- The 2 MiB default was never A/B'd against 80 KiB on this pair either, so the
-  26× figure above is from the two rounds' settings, not a side-by-side.
-- The localhost path was skipped ("no fifth core on VM a"), so the goal's
-  "across two hosts and on localhost" is still missing one leg.
+- The 80 KiB window and the 2 MiB default were A/B'd side by side in round 12
+  (`dpdk@SUB_PARAMS=rcv-wnd=80k` against plain `dpdk`): closed. The window is a
+  rate cap, not a loss fix — see [round 12](#azure-round-12-2026-10-19-the-window-ab-and-the-localhost-leg).
+- The localhost leg was run in round 12: closed. The goal's "across two hosts
+  and on localhost" is now measured on all three paths.
 
 ## How to run
 

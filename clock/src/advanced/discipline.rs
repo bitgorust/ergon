@@ -345,6 +345,27 @@ impl Discipline {
         self.consecutive_rejects
     }
 
+    /// The configuration this discipline was made with. An owner that hands
+    /// a [`DisciplineConfig`] to [`Discipline::new`] and needs the same
+    /// values later (a sampler's tries) reads them here rather than keeping
+    /// a second copy.
+    #[must_use]
+    pub const fn config(&self) -> &DisciplineConfig {
+        &self.cfg
+    }
+
+    /// The clock at the frequency estimate alone, re-anchored at `at_ticks`
+    /// with no phase term: what an owner hands to code that will not follow
+    /// (a benchmark's clock, another process, C code). It parts from the
+    /// disciplined clock at the wall clock's rate change since, never at a
+    /// slew's. The same clock an update that only holds would install.
+    #[must_use]
+    pub fn snapshot(&self, clock: &Clock, at_ticks: u64) -> Clock {
+        clock
+            .retuned(at_ticks, self.mult_at(self.held_rate()), 0)
+            .unwrap_or(*clock)
+    }
+
     /// One update from a sample taken by `sampler` from `src`, with the
     /// re-anchor at an ordered read of `src` taken after it, installed in
     /// `clock`: the whole of an owner's once-a-second step, against any

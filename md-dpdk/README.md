@@ -325,11 +325,16 @@ with the receiver window below.
 - **AWS caps one flow (one channel) at 7.8–8.0 Gbit/s** regardless, x86 and
   Graviton: spread a heavier stream over several channels on different ports
   ([data](BENCHMARKS.md#aws-one-flow-carries-about-8-gbits)).
-- **Size each channel's receiver window (`rcv-wnd`)** to its link's
-  bandwidth-delay product, so one stream cannot burst past it. On Azure, no
-  more than MANA's 256-descriptor ring holds: 256 × the smallest datagram
-  (80 KiB for 288 B), with the conductor's park capped at 20 µs
-  ([Azure](BENCHMARKS.md#azure-mana)).
+- **A small receiver window (`rcv-wnd`) is a rate cap, not a loss fix.**
+  Round 12 A/B, 80 KiB against the 2 MiB default: flat-out falls 6.5–6.8× at
+  every size, and the 288 B loss-free ceiling **drops** (157 k → 121 k msgs/s).
+  It raises only the 1,344 B ceiling (39 k → 56 k). Name `rcv-wnd=80k` on a
+  288 B channel only when that rate cut is acceptable, or when the ring cannot
+  hold more (Azure MANA: 256 × the smallest datagram, 80 KiB for 288 B). Pair
+  it with the conductor's park capped at 20 µs
+  (`AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`); never use the
+  faster park without the small window
+  ([round 12](BENCHMARKS.md#the-80-kib-rcv-wnd-is-a-rate-cap-not-a-loss-fix)).
 
 ## Host-local channels
 

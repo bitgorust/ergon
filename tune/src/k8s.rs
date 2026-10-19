@@ -12,7 +12,7 @@ use crate::host::{Host, ReadError};
 use crate::net::Nic;
 use crate::quota::{CpuCgroup, cpu_cgroup, t9_cpu_quota};
 
-const K_EVIDENCE: &str = "io/benches/BENCHMARK.md (Which backend; Many connections); \
+const K_EVIDENCE: &str = "io/benches/BENCHMARK.md (Which backend; SMT sibling cost); \
      Kubernetes documentation (Pod QoS, CPU Management Policies, Topology Management, \
      Linux capabilities); Linux kernel ABI (cgroup v2 memory.high, PSI)";
 
