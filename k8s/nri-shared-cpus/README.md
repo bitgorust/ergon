@@ -70,8 +70,7 @@ int pin_isolated(int i);   /* full code in examples/pin.c */
 ```
 
 See [examples/pin.c](examples/pin.c) (C) and
-[examples/pin.rs](examples/pin.rs) (Rust, std only). A planned typed Rust
-API in `ergon-tune` is not built yet.
+[examples/pin.rs](examples/pin.rs) (Rust, std only).
 
 Rules:
 

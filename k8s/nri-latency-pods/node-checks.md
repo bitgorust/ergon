@@ -33,7 +33,7 @@ of these** — they are node settings.
 | containerd | `>= 2.2`, NRI on | the plugin's socket | `containerd --version`; `ls /var/run/nri` |
 | runc | `>= 1.3.1` | earlier runc passes systemd `CPUAffinity` on to containers | `runc --version` |
 | `CONFIG_RT_GROUP_SCHED` | `n` if possible | `y` gates container real-time scheduling; we take no real-time policy (ergon-tune T7 checks nothing is under one) | `zcat /proc/config.gz \| grep RT_GROUP_SCHED` |
-| NUMA nodes | record `numactl -H` | c8g.xlarge is expected single-NUMA (unverified) | `numactl -H` |
+| NUMA nodes | record `numactl -H` | c8g.xlarge is expected single-NUMA; not measured, so confirm with the command | `numactl -H` |
 
 ## Why the named netns sysctls are node-only
 

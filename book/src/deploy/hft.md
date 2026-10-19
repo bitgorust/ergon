@@ -1,7 +1,9 @@
 # Kubernetes HFT tuning
 
-Every setting that won an A/B on a real pair, and what it cost when it
-was wrong. Numbers are medians of 5 reps in µs, max in brackets
+Every setting that either won an A/B on a real pair or is required for the
+pod to get its own cores, and what it cost when it was wrong. Rows with
+bold µs figures are measured; the rest are guarantees or fail-closed
+behaviours, and say so. Numbers are medians of 5 reps in µs, max in brackets
 ([method](benchmarks.md#method), [full tables](../md-dpdk/overview.md#measured-between-two-hosts)).
 Scan the tables, copy the two blocks, run the three checks.
 
@@ -9,7 +11,7 @@ Terms: [deployment glossary](overview.md#glossary).
 
 ## Do this
 
-| where | setting | value | measured effect |
+| where | setting | value | effect |
 |---|---|---|---|
 | node | CPU isolation | `isolcpus=nohz,domain,managed_irq,1-N nohz_full=1-N rcu_nocbs=1-N irqaffinity=0` | Azure DPDK idle max **216 (69–663) → 71 (65–447)** µs. Biggest single win |
 | node | transparent hugepages | `never` | Azure idle p99.99 **67 → 53**, idle max **546 → 106** µs |
@@ -104,7 +106,7 @@ while any check warns.
 | platform | pick | note |
 |---|---|---|
 | Graviton5 (`c9g`) | kernel UDP: moderation off, data NIC interrupts on a spare core, **no** busy polling | lowest latency measured. Idle p50 **18.93**, max **79 (76–168)**; 288 B at 1 M/s p50 **44.83**, max **204 (122–211)** |
-| AWS x86 (`c7i`) | kernel UDP: busy polling, 4,096-entry ring | idle p50 **28.22**, max **1,938 (349–4,846)**. Moderation off with its interrupts on a core of their own is untested on x86 |
+| AWS x86 (`c7i`) | kernel UDP: busy polling, 4,096-entry ring | idle p50 **28.22**, max **1,938 (349–4,846)**. Moderation off with its interrupts on a core of their own is not measured on x86 |
 | Azure | kernel UDP: busy polling, 4,096-entry ring | idle p50 **21.15**, max **99.52 (73.86–209.41)**. Some vCPUs stall once a minute — spin-test first |
 | any, both ends on one host | localhost | isolated DPDK idle p50 **9.81**, max **31.60 (29.92–32.80)**: a 3 µs spread across five reps |
 
