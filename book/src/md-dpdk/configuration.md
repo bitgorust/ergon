@@ -157,7 +157,7 @@ copy of every figure:
 | `AERON_RECEIVER_IO_VECTOR_CAPACITY=16` (the default under `dpdk-ena`) | the receiver takes up to 16 frames a cycle instead of 4; the DPDK path now drains whole bursts itself, so this mainly helps host-local sockets | before that drain, 16 frames a cycle removed NAKs under load where 4 lost frames |
 | `AERON_DIR` on a *sized* 2 MiB hugetlbfs, `AERON_FILE_PAGE_SIZE=2097152`, `AERON_TERM_BUFFER_SPARSE_FILE=false` | the log buffers sit on hugepages (hugetlbfs is a filesystem of them), allocated up front: no page faults | an unsized hugetlbfs reports no free space, and Aeron refuses every log buffer |
 | `AERON_CLIENT_PRE_TOUCH_MAPPED_MEMORY=true` on clients | clients fault their mappings in before the first message | not A/B'd |
-| `AERON_MTU_LENGTH=1408` (at most `RUSTERON_DPDK_MAX_AERON_MTU`) | every frame fits one packet buffer | jumbo frames: one run (Graviton) improved 1,344 B bursts and raised the ceiling a little. Only for bulk or bursty channels, after a second run |
+| `AERON_MTU_LENGTH=1408` (at most `RUSTERON_DPDK_MAX_AERON_MTU`) | every frame fits one packet buffer | jumbo frames: **one** Graviton run improved 1,344 B bursts and raised the ceiling a little. A second run has **not** been done, so it is a candidate for bulk or bursty channels only, not a default |
 | `AERON_RCV_INITIAL_WINDOW_LENGTH`, `AERON_SOCKET_SO_RCVBUF`, `_SNDBUF` all 2 MiB, `net.core.rmem_max`/`wmem_max` 16 MiB | the window fits the socket buffer | a 1 MiB window instead cut 32 B throughput hard |
 | Azure: `AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`, and per channel a receiver window (`rcv-wnd`) MANA's 256-entry ring can hold: 256 × the smallest datagram, 80 KiB for 288 B | status messages (the receiver's "send more") go out every 20 µs, and the sender never has more in flight than the ring holds | 80 KiB: no lossy rep anywhere, but a lower peak rate; 256 KiB: a higher loss-free 1,344 B rate. The fast park alone lost more than the default |
 | transparent hugepages off | the kernel stops pausing busy threads to merge pages | Azure idle max falls hard |
@@ -200,7 +200,7 @@ several channels on different ports
 |---|---|---|
 | crash in the driver's agents at shutdown | `DpdkTransport` dropped before the driver | drop the driver first |
 | start fails on Azure | transmit ring above MANA's 256 | `RUSTERON_DPDK_TX_DESCRIPTORS=256` |
-| start fails naming the ENA's BAR | the NIC's memory window (BAR) is not mapped write-combined (a CPU mode that batches writes to a device), so ENA's low-latency queue is off: sends about 100 times slower | `igb_uio` with `wc_activate=1`, or a write-combining `vfio-pci` with `RUSTERON_DPDK_VFIO_WC=1` |
+| start fails naming the ENA's BAR | the NIC's memory window (BAR) is not mapped write-combined (a CPU mode that batches writes to a device), so ENA's low-latency queue is off: sends about 100 times slower (Aeron Premium's DPDK notes, `md-dpdk/tests/dpdk_ena_llq.rs`) | `igb_uio` with `wc_activate=1`, or a write-combining `vfio-pci` with `RUSTERON_DPDK_VFIO_WC=1` |
 | Aeron refuses every log buffer | hugetlbfs mounted without `size=` | mount it sized |
 | window smaller than asked | `net.core.rmem_max` below 2 MiB | raise it to 16 MiB |
 | a channel stops at a fixed rate of 1,344 B on AWS | one flow's Gbit/s cap | more channels, on different ports |

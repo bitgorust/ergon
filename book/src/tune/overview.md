@@ -16,7 +16,8 @@ ergon-tune = { version = "0.1", features = ["nic"] }   # `nic` adds N1–N4
 
 ## Glossary
 
-In brackets: the check (T1–N4) and the run behind a number (A–G, in
+In brackets: the check (T1–N4) and, where a number is quoted, its lab: **A**
+= the AWS x86 runs, **G** = the Graviton runs (both in
 [Measured effect](#measured-effect)). Times are in µs.
 
 | term | what it is | pros / cons, or when it matters |
@@ -130,9 +131,10 @@ One A/B per check, with its max, lives in
 and
 [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md).
 The checks name the cost of the missing setting; the crate files hold the
-number. Not measured: T4, T5, T6 (every lab host had one NUMA node), T9,
-N2's timer wait and N3. T8's effect was weak. Their findings cite Aeron's,
-the kernel's or the vendor's documentation.
+number. Labs: **A** = the AWS x86 runs, **G** = the Graviton runs.
+Not measured: T4, T5, T6 (every lab host had one NUMA node), T9, N2's timer
+wait and N3. T8's effect was weak. Their findings cite Aeron's, the kernel's
+or the vendor's documentation.
 
 ## Where the checks run
 

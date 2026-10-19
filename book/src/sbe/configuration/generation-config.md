@@ -45,7 +45,7 @@ let decoder = decoder.memoized();            // lazy cache, no allocation
 
 Build it **once** and share `&` references. The base decoder is `Sync`; the
 memoized one is `Send` but not `Sync`. Compact `u32` tail-offset storage was
-measured and removed. Decision table:
+tried and removed; the deciding measurement was not archived. Lanes:
 [Decoder Lanes](../feature-tour/decode-stages.md).
 
 ## Typed error conversions

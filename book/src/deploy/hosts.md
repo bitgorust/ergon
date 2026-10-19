@@ -14,14 +14,14 @@ Terms: [deployment glossary](overview.md#glossary),
 
 | platform | measured on | notes |
 |---|---|---|
-| AWS x86 | `c7i.2xlarge` (4 cores × 2), `c7i.4xlarge` (8 × 2), `c7i.metal-24xl` | `c7a` was slower at the median for ergon-io, `r7iz` no better. Metal has the tightest tails, at 6 times a `c7i.4xlarge`'s price ([cost](benchmarks.md#cost-per-hour)). An EKS DPDK node needs 5 physical cores: `c7i.4xlarge` |
+| AWS x86 | `c7i.2xlarge` (4 cores × 2), `c7i.4xlarge` (8 × 2), `c7i.metal-24xl` | Metal has the tightest tails, at 6 times a `c7i.4xlarge`'s price ([cost](benchmarks.md#cost-per-hour)). An EKS DPDK node needs 5 physical cores: `c7i.4xlarge`. Other x86 types were not published |
 | AWS Graviton | `c8g.xlarge` (Graviton4), `c9g.xlarge`, `c9g.2xlarge` (Graviton5) | no SMT: a vCPU is a core. No C-states for the OS to manage |
 | Azure x86 | `Standard_D8s_v6`, `D8ds_v6`, `D16s_v6` (Xeon Platinum 8573C), accelerated networking (MANA) | some vCPUs stall once a minute, for milliseconds |
 
 - **Put both hosts in one cluster placement group** (AWS) or **proximity
-  placement group** (Azure). Even then the pair matters: on Azure two pairs
-  of the same instance type differed by nearly a factor of two at the DPDK
-  median.
+  placement group** (Azure). Even then the pair matters: placement alone
+  moved DPDK's idle p50 by about **7 µs** between two rounds on the same
+  instance type ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)).
 - **Pick the smallest size with enough cores** for the layout below. A
   bigger size buys quieter cores, not a faster network path.
 

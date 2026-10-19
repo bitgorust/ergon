@@ -39,7 +39,7 @@ Terms this chapter uses. Each links to the section that explains it.
 | [adaptive RX](#best-practice) | ENA (the AWS NIC) delays interrupts to batch packets (adaptive receive moderation). | On by default; pre-empts the loop about 40 times a second, and holds back the interrupts `epoll-spin`, `uring-spin` and mio wait for. Off: `ethtool -C <nic> adaptive-rx off` (interrupt-driven backends: also `rx-usecs 0`). |
 | [backend](backends.md) | How the `Driver` waits for and reads data; set in config: `Config::parse("recv-busy")`. | Pick by socket count and spare cores: [choosing a backend](#choosing-a-backend). |
 | [`epoll-spin`](backends.md) | Asks epoll (the kernel's list of ready sockets) every poll, without waiting; reads only those. | Pro: a cheap poll even at 256 sockets. Con: waits for the interrupt. |
-| [mio, tokio](backends.md) | Rust's usual async I/O. On Linux both use epoll, so they wait for the interrupt. | reqwest on tokio parks its thread between requests: slower than `epoll-spin` on the same interrupt path. |
+| [mio, tokio](backends.md) | Rust's usual async I/O. On Linux both use epoll, so they wait for the interrupt. | reqwest on tokio parks its thread between requests; it is behind `epoll-spin` in the HTTP table, but the two were **not compared on the same interrupt path**. |
 | [`recv-busy`](backends.md) | Reads every socket every poll; `SO_BUSY_POLL` makes each read poll the NIC too. | The polling pick at 1–4 sockets. Each socket adds to every poll. |
 | [`per_queue`](backends.md#cost-per-poll) | A `recv-busy` option: one read per NIC queue, then only the ready sockets. | Poll cost stops at the queue count. Use it past 4 sockets on one core. |
 | [`io_uring`](backends.md#kernel) | A Linux interface: requests and results pass through rings shared with the kernel. | Needs feature `uring` (on by default) and Linux 6.1+ (6.9+ for NAPI). |
@@ -175,11 +175,11 @@ Figures: [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/ma
   (`tls::client_config(roots)`); feature `webpki-roots` adds Mozilla's roots.
 - **Which TLS stack: stock rustls by default.** The in-place record layer
   (`tls::RecordLayer`) decrypts in the receive buffer with no allocation,
-  but its effect on a whole request is not yet measured. It also owns the
-  record cryptography that kTLS or rustls would own: post-handshake
-  messages, key updates and the cipher's confidentiality limit. Keep it
-  only while a whole-path measurement shows a material win; otherwise take
-  stock rustls.
+  but its effect on a whole request is **not measured** (only a decrypt-only
+  microbench exists). It also owns the record cryptography that kTLS or
+  rustls would own: post-handshake messages, key updates and the cipher's
+  confidentiality limit. Stock rustls is the default until a whole-path A/B
+  shows a material win.
 
 ## Defaults
 
@@ -230,11 +230,13 @@ Figures: [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/ma
   HTTP pools). Past 4, use `recv-busy,per_queue=true`, or `uring-sqpoll`
   with a spare core.
 - **Pack many streams onto a few connections.** A few combined-stream
-  connections decode far sooner than one connection per stream.
-- **Do not** run the loop under `SCHED_FIFO`, put NIC interrupts on its
-  CPU, cut the NIC to one queue, or cap the receiver's idle states: none
-  helped `recv-busy` on AWS, some hurt. Not measured fairly for the
-  interrupt-driven backends.
+  connections decode far sooner than one connection per stream
+  ([data](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md)).
+- **Do not** run the loop under `SCHED_FIFO` or put NIC interrupts on its
+  CPU: neither helped `recv-busy` on AWS, and the IRQ-on-loop tail blew up
+  under load ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)).
+  Cutting the NIC to one queue and capping the receiver's idle states are
+  **not measured**. Not measured fairly for the interrupt-driven backends.
 
 ## Verify
 

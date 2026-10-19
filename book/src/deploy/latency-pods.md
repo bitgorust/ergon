@@ -142,7 +142,7 @@ from idle; a C1 cap cut the idle **max** hard. Graviton (c8g) has no
 
 | item | why |
 |---|---|
-| `SCHED_FIFO`, any `sched_setscheduler`, a `--fifo` wrapper | measured not worth it on AWS: the loop got no better, and the RT throttle and RT group scheduling bite it (`io/benches/BENCHMARK.md`) |
+| `SCHED_FIFO`, any `sched_setscheduler`, a `--fifo` wrapper | no gain on an isolated CPU on AWS ([data](../io/overview.md)); the RT throttle and RT group scheduling bite it |
 | SR-IOV VF per pod | Nitro guests have one ENA per ENI; there are no in-guest VFs |
 | a netns-sysctl writer pretending the knobs are per-netns | `busy_poll`/`busy_read` are global; `gro_flush_timeout` and `napi_defer_hard_irqs` are per-netdev sysfs; `rmem_max` is not writable in a non-init netns. The node sets them (`node-checks.md`) |
 | an IRQ DaemonSet that pins the latency pod's NIC IRQs to the **shared** CPUs | our Graviton data: IRQs on a busy housekeeping CPU cost the tail and lose frames. The kept-CPU default stays |
