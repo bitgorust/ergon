@@ -95,7 +95,12 @@ holds them. Spot moves by the hour and the zone.
 `c7i.metal-24xl`, round 4: no hypervisor, so the tails tighten. DPDK's idle
 p99.99 was 38.72 µs against 56.06 on a `c7i.4xlarge` (round 3), and it lost
 nothing up to 1.25 M msgs/s of 288 B with every max under 140 µs. Still, 3 of
-10 DPDK reps had one round trip of 676–845 µs, not yet explained.
+10 DPDK reps had one round trip of 676–845 µs. No recommendation rests on it:
+the bare-metal pair is outside the platforms run since 2026-10-16 (Graviton
+spot and Azure), so it stands as a historical observation. On the VM pair the
+gap split classifies spikes of that size as the process being descheduled
+([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#what-the-gap-split-says));
+that class is not measured on metal.
 
 ## Kubernetes: EKS on `c7i.4xlarge`
 

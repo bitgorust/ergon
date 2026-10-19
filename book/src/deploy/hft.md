@@ -2,8 +2,9 @@
 
 Every setting that either won an A/B on a real pair or is required for the
 pod to get its own cores, and what it cost when it was wrong. Rows with
-bold µs figures are measured; the rest are guarantees or fail-closed
-behaviours, and say so. Numbers are medians of 5 reps in µs, max in brackets
+bold µs figures are measured; the rest are required for the pod to get whole
+cores of its own, or fail closed when missing. Numbers are medians of 5 reps
+in µs, max in brackets
 ([method](benchmarks.md#method), [full tables](../md-dpdk/overview.md#measured-between-two-hosts)).
 Scan the tables, copy the two blocks, run the three checks.
 
@@ -15,7 +16,7 @@ Terms: [deployment glossary](overview.md#glossary).
 |---|---|---|---|
 | node | CPU isolation | `isolcpus=nohz,domain,managed_irq,1-N nohz_full=1-N rcu_nocbs=1-N irqaffinity=0` | Azure DPDK idle max **216 (69–663) → 71 (65–447)** µs. Biggest single win |
 | node | transparent hugepages | `never` | Azure idle p99.99 **67 → 53**, idle max **546 → 106** µs |
-| node | SMT off (x86) | `ThreadsPerCore: 1`, or `nosmt` | one Kubernetes CPU is one physical core, as on Graviton. Without it `cpu: 1` shares a core with its twin |
+| node | SMT off (x86) | `ThreadsPerCore: 1`, or `nosmt` | one Kubernetes CPU is one physical core, as on Graviton. A busy sibling of the loop costs **+0.5 µs p50 at 1 connection, +2.3–2.7 µs p50 and +9–12 µs p99 at 10–100** ([data](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#smt-sibling-cost)) |
 | node | static CPU manager | `cpuManagerPolicy: static`, `full-pcpus-only: "true"` | a Guaranteed pod gets whole cores, never one hyperthread shared with another pod |
 | node | topology manager | `topologyManagerPolicy: single-numa-node` | a pod's CPUs and devices stay on one NUMA node |
 | node | reserved CPUs | `reservedSystemCPUs` = the housekeeping cores | interrupts and system daemons stay off the pods' cores |

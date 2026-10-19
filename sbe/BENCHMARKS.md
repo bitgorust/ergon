@@ -312,15 +312,23 @@ from up to 1.0786 to 0.99–1.04. Both are now instruction-identical pairs, so
 the residual is placement — see the mechanism check below.
 
 **aarch64, the development comparison.** Two consecutive `just bench-cluster`
-runs on 2026-10-19 (commit `5282f06d15ce`, `aarch64-apple-darwin`, rustc 1.99.0):
+runs on 2026-10-19, two before the bench-fairness fix (commit `5282f06d15ce`)
+and one after it (commit `961390266cb`), `aarch64-apple-darwin`, rustc 1.99.0:
 
-| Arm | Ceil. | Run 1 LTO | Run 2 LTO | Run 2 CI width | Reading |
+| Arm | Ceil. | R1 LTO (pre) | R2 LTO (pre) | R3 LTO (post) | Reading |
 |---|---:|---:|---:|---:|---|
-| `encode/session_message_header` | 1.00 | 1.0039 | 1.0036 | 0.4% | tight, but a proven tie |
-| `decode/session_message_header` | 1.01 | 1.0348 | 1.0293 | 2.5–3.0% | wide — noise signature |
-| `encode/session_keep_alive` | 1.00 | 0.8819 | 0.8919 | 0.3% | pass |
-| `decode/session_event` | 1.01 | 0.9912 | 0.9755 | 0.4% | pass |
-| `encode/claim_shaped_header_plus_app` | 1.00 | 0.9398 | 0.9263 | 0.6% | pass |
+| `encode/session_message_header` | 1.00 | 1.0039 | 1.0036 | 1.0208 | proven tie, above ceiling every run |
+| `decode/session_message_header` | 1.01 | 1.0348 | 1.0293 | 1.0069 | wide — noise signature |
+| `encode/session_keep_alive` | 1.00 | 0.8819 | 0.8919 | 1.0488 | walks both ways; a proven tie |
+| `decode/session_event` | 1.01 | 0.9912 | 0.9755 | 1.0202 | crosses its own 1.01 ceiling |
+| `encode/claim_shaped_header_plus_app` | 1.00 | 0.9398 | 0.9263 | 0.9999 | walks both ways; a proven tie |
+
+Run 3 is `cluster-20261019T163400Z-96139026` and it failed three of five
+maintained ratios. The fix did not make the encode pairs stable on aarch64 —
+`keep_alive` went from 0.89 to 1.0488 across it — and `decode/session_event`
+crossed the ceiling it already holds as a documented exception. This is the
+same random walk `scripts/check-bench-gate.sh` records for the decode pairs,
+now affecting the exception itself.
 
 `decode/session_message_header`'s aarch64 failure **was** noise: on x86 it is
 0.93 twice. Its confidence intervals are six times wider than its siblings',
@@ -443,6 +451,12 @@ and anything above fails, with no tolerance.
 | `encode/session_message_header` | 1.0023, 1.0038, 1.0009 | 1.00 | +0.0009 … +0.0038 |
 | `encode/session_keep_alive` | 1.0018, 1.0009, 1.0054 | 1.00 | +0.0009 … +0.0054 |
 | `encode/claim_shaped_header_plus_app` | 0.9897, 1.0305, 1.0364 | 1.00 | −0.0103 … +0.0364 |
+
+The aarch64 walk is the same distribution and crosses in both directions, and
+on that platform the documented `decode/session_event` 1.01 exception fails
+too (0.9755 then 1.0202). A zero-tolerance gate on a shared runner is a coin
+flip for these five pairs whatever the ceiling; the encode ceiling is the only
+part of that which is unachievable by construction.
 
 `claim_shaped`'s wider spread is the same 32-byte payload copy on both arms
 (`movdqu` ×2, byte-identical); a larger loop body leaves more ways for the two
