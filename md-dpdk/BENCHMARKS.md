@@ -679,6 +679,8 @@ timestamp, so a max recorded at one load point cannot be pinned to the loss at
 another. They are the same order of magnitude. The window finding above stands
 on its own either way — the window decides how much a stall may cost.
 
+#### What the gap split says
+
 **Measured 2026-10-19, Azure `Standard_D8s_v6` ×2, `LAB_STATES=isolated`,
 `LAB_MODES="dpdk dpdk@RUSTERON_DPDK_GAP_ATTRIB=1"`, 3 reps** (`target/md-dpdk-bench/20261019-164532`).
 
