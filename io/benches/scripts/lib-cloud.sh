@@ -289,7 +289,11 @@ prepare_hosts() {
     done
   fi
   # Whether the receiver has idle states to cap (the cstate condition).
-  RCV_DEEP_IDLE=$(rssh "cat /sys/devices/system/cpu/cpu0/cpuidle/state*/latency 2>/dev/null" | awk '$1 > 1 {n++} END {print n ? "yes" : "no"}')
+  # The remote `|| true` matters: an arm64 `nohlt` boot registers no cpuidle
+  # states, the glob matches nothing, and `cat` would return 1 — which this
+  # script's `set -e -o pipefail` turns into an abort mid-run. No states is
+  # the answer "no", not an error.
+  RCV_DEEP_IDLE=$(rssh "cat /sys/devices/system/cpu/cpu0/cpuidle/state*/latency 2>/dev/null || true" | awk '$1 > 1 {n++} END {print n ? "yes" : "no"}')
   log "receiver: arch $RARCH, boot profile $RCV_BOOT, NIC $NIC, idle states deeper than 1 µs: $RCV_DEEP_IDLE"
   log "receiver isolated CPUs: $(rssh cat /sys/devices/system/cpu/isolated)"
   cpu_map
