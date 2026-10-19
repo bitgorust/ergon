@@ -249,7 +249,8 @@ periodic runs on them.
   (`nic-rx-errors`, `nic-rx-missed`, `nic-rx-nombuf`), PMD extended
   statistics (on ENA an admin command each) and the mempool.
   `RUSTERON_DPDK_NIC_STATS_MS` sets the interval (1000 to 3600000; `0` stops
-  the reads).
+  the reads). Measured: no latency difference at the median and none in
+  throughput either way ([BENCHMARKS](BENCHMARKS.md)).
 - **Housekeeping placement:** `RUSTERON_DPDK_HOUSEKEEPING_CPU`, else the
   conductor's CPU unless the conductor spins, else the EAL main lcore's CPU;
   never a busy agent's core or its SMT sibling. The EAL's own threads are
