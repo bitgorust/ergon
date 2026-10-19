@@ -449,15 +449,37 @@ same uniform `short-sends=4, dpdk-arp-miss=4` startup ARP. It is one sample
 in one rep on a host the check already flags. **Not attributed to a
 mechanism.**
 
-#### Conductor max duty cycle is unchanged
+#### Conductor max duty cycle: the NIC stats read is not the cause
 
 The latched conductor high-water mark is 11.8–14.5 ms in every arm of this
 round — the same order as rounds 11–12, so neither the window nor the park
-moves it. It counts from the driver's start, not per run. The standing
-hypothesis (`rusteron_dpdk_housekeeping_tick` holding `housekeeping_lock`
-during a 1 Hz ENA admin stats read, with the conductor taking the same lock
-on transport create/close) is **not yet tested**: the A/B is
-`RUSTERON_DPDK_NIC_STATS_MS=0`.
+moves it. It counts from the driver's start, not per run. The hypothesis was
+that `rusteron_dpdk_housekeeping_tick` holds `housekeeping_lock` through a
+1 Hz ENA admin stats read while the conductor takes the same lock on transport
+create/close.
+
+**Refuted 2026-10-19**, Azure `Standard_D8s_v6` ×2, `LAB_STATES=isolated`,
+`LAB_MODES="dpdk dpdk@RUSTERON_DPDK_NIC_STATS_MS=0"`, 3 reps
+(`target/md-dpdk-bench/20261019-173045`). Stopping the reads entirely leaves
+the mark where it was:
+
+| arm | conductor max µs (a idle, b idle, a full, b full) | round trip p50 / p99.99 / max µs | M msgs/s | dropped |
+|---|---|---|---|---|
+| `dpdk` (1 Hz stats) | 10874 / 11115 / 10953 / 11115 | 30.22 (30.22–30.24) / 36.64 (36.48–39.17) / 73.34 (69.38–281.86) | 22.93 | 0 |
+| `dpdk@RUSTERON_DPDK_NIC_STATS_MS=0` | 11241 / 10869 / 11749 / 10869 | 30.21 (30.18–30.25) / 36.51 (36.48–36.51) / 71.04 (55.45–73.60) | 22.93 | 0 |
+
+The two ranges overlap completely. The mark is something else — a guest vCPU
+preemption of the conductor, which is what the gap split later called
+descheduling — and it is off the data path either way.
+
+**The flag has no measurable latency cost or benefit at the median.** p50
+30.22 against 30.21 µs, p99.99 36.64 against 36.51, throughput 22.93 M msgs/s
+both, 0 dropped. The only separation is in the tail and the loss counters, and
+both are one-sided on 3 reps: the stats-on arm took the round's single 282 µs
+spike (the stats-off arm's worst rep was 73.60 µs), and the stats-off arm took
+156 NAKs and 156 retransmits during flat-out where stats-on took none. Neither
+is enough to recommend the setting either way. Leave it at the default (1 Hz)
+unless the counters themselves are unwanted; `0` costs nothing.
 
 
 ### AWS c7i.4xlarge, round 7 (p50 / p99.9 / max, median across reps)
