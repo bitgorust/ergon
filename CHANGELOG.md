@@ -25,6 +25,13 @@
   `dpdk` feature), selected by `RUSTERON_MEDIA_DRIVER_TRANSPORT=dpdk-ena`
   or `DpdkTransport::install`. It interoperates with kernel peers. A
   proof of concept, not for production.
+- `ergon-md-dpdk`: `RUSTERON_DPDK_GAP_ATTRIB=1` splits each agent loop gap
+  into work and descheduling, by the thread's own CPU time across it against
+  its wall length (half or more on the CPU is work). Four counters —
+  `poll-cycle-gaps-work`, `poll-cycle-gaps-desched` and their two maxima —
+  answer whether a receiver's long gaps are the agent working or the host
+  descheduling its vCPU. Off by default, so the hot path never reads the CPU
+  clock for it.
 - ergo-sbe: generated mappings between SBE and application types
   (`with_enum_mapping`, `with_composite_mapping`) with exhaustive
   `TryFromSbe` / `TryToSbe` matches and `sbe_rt::MappingError`.

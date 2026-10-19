@@ -182,6 +182,10 @@ typedef struct rusteron_dpdk_port_stct
     uint32_t gateway_ip;          /* parsed gateway IPv4, network order */
     char driver[64];              /* dev_info PMD name (labels, port-info) */
     uint64_t last_poll_ns;        /* clock at the end of the last receive poll, 0 before the first */
+    /* Thread CPU time at that poll, 0 while RUSTERON_DPDK_GAP_ATTRIB is off or
+     * before the first attributed poll: together with last_poll_ns it splits a
+     * poll gap into work and descheduling. */
+    uint64_t last_poll_cpu_ns;
     int tx_udp_csum_offload;      /* NIC completes the UDP checksum; else software */
     int open_transports;          /* DPDK transports open on this NIC (housekeeping_lock) */
     /* DPDK transports open on this NIC whose channel asks for media receive
@@ -794,6 +798,13 @@ void rusteron_dpdk_test_set_clock_ns(uint64_t ns);
 /* Move the pinned clock on by `ns` at every read from the calling thread (0:
  * it stays put), so a wait spun on it ends; reset clears it. */
 void rusteron_dpdk_test_set_clock_step_ns(uint64_t ns);
+/* CLOCK_THREAD_CPUTIME_ID in ns, the clock gap attribution splits a poll gap
+ * with; pinned by the test hook below. */
+uint64_t rusteron_dpdk_thread_cpu_ns(void);
+/* Pin the thread CPU clock at `ns`; reset clears the pin. */
+void rusteron_dpdk_test_set_thread_cpu_ns(uint64_t ns);
+/* Whether RUSTERON_DPDK_GAP_ATTRIB=1 turned poll-gap attribution on (0 default). */
+int rusteron_dpdk_gap_attributing(void);
 
 /* CLOCK_REALTIME in ns, the clock NIC RX timestamps are compared against
  * (chrony disciplines it to the NIC's PTP hardware clock), and the media

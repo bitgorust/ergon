@@ -105,6 +105,13 @@ enum rusteron_dpdk_counter_kind
     RD_COUNTER_POLL_CYCLE_GAPS_20US, /* 87   such gaps of 20 to 50 µs */
     RD_COUNTER_POLL_CYCLE_GAPS_50US, /* 87   such gaps of 50 to 100 µs */
     RD_COUNTER_POLL_CYCLE_GAPS_100US, /* 87  such gaps of 100 µs or more */
+    /* RUSTERON_DPDK_GAP_ATTRIB=1: the same gaps split by whether the thread
+     * spent at least half of one on the CPU (work) or not (descheduling). 0
+     * while attribution is off. */
+    RD_COUNTER_POLL_CYCLE_GAPS_WORK,   /* 87   gaps of 20 µs or more the thread spent at least half of on the CPU */
+    RD_COUNTER_POLL_CYCLE_GAPS_DESCHED, /* 87  gaps of 20 µs or more the thread spent less than half of on the CPU */
+    RD_COUNTER_POLL_CYCLE_GAP_WORK_MAX,   /* 87 longest such gap that was work, ns */
+    RD_COUNTER_POLL_CYCLE_GAP_DESCHED_MAX, /* 87 longest such gap that was descheduling, ns */
     RD_COUNTER_TX_QUEUED,            /* 78   frames the TX ring refused, queued to go first next */
     RD_COUNTER_RX_BACKLOG_MAX,       /* 87   most frames one poll drained */
     RD_COUNTER_RX_RING_FULL_SUSPECTED, /* 87 polls that drained within a burst of a full ring */

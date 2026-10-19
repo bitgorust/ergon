@@ -792,6 +792,229 @@ fn a_host_local_channel_away_from_its_poller_is_not_a_loop_gap() {
     assert_no_leak();
 }
 
+// ---------------------------------------------------------------------------
+// Poll-cycle gap attribution: work or descheduling
+// ---------------------------------------------------------------------------
+
+/// A gap is either the agent working between receive polls or the agent off
+/// the CPU. The split is the thread's own CPU time across the gap against its
+/// wall length: half or more on the CPU is work, less is the host descheduling
+/// the vCPU. Attribution is opt-in (`RUSTERON_DPDK_GAP_ATTRIB=1`) so the hot
+/// path never reads the CPU clock for it.
+fn attrib_read(h: &Harness, rx: &str) -> (i64, i64, i64, i64) {
+    (
+        h.counter(TYPE_POLLER, &format!("{rx} poll-cycle-gaps-work")),
+        h.counter(TYPE_POLLER, &format!("{rx} poll-cycle-gaps-desched")),
+        h.counter(TYPE_POLLER, &format!("{rx} poll-cycle-gap-work-max-ns")),
+        h.counter(TYPE_POLLER, &format!("{rx} poll-cycle-gap-desched-max-ns")),
+    )
+}
+
+/// The reference poll records the thread's CPU time as well as the wall
+/// clock, so the next gap can be attributed.
+#[test]
+#[serial]
+fn a_gap_the_thread_ran_through_is_work() {
+    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+    let _attrib = EnvGuard::set("RUSTERON_DPDK_GAP_ATTRIB", "1");
+    let mut h = Harness::new();
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    pin_clock_ns(1_000_000);
+    pin_thread_cpu_ns(1_000_000);
+    p.poll(16, clientd, &mut bytes); // the reference
+    pin_clock_ns(1_100_000);
+    pin_thread_cpu_ns(1_100_000); // on the CPU for all of the 100 µs
+    p.poll(16, clientd, &mut bytes);
+    assert_eq!(
+        attrib_read(&h, RX),
+        (1, 0, 100_000, 0),
+        "the whole gap on the CPU is work"
+    );
+    assert_eq!(
+        h.counter(TYPE_POLLER, &format!("{RX} poll-cycle-gaps-over-100us")),
+        1,
+        "the existing bucket still counts it (100 µs lands in over-100)"
+    );
+    assert_no_leak();
+}
+
+/// The mirror case: the wall gap is the agent off the CPU, not the agent
+/// working. This is the spike signature — a descheduled vCPU, not a slow poll.
+#[test]
+#[serial]
+fn a_gap_the_thread_was_off_the_cpu_for_is_descheduling() {
+    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+    let _attrib = EnvGuard::set("RUSTERON_DPDK_GAP_ATTRIB", "1");
+    let mut h = Harness::new();
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    pin_clock_ns(1_000_000);
+    pin_thread_cpu_ns(1_000_000);
+    p.poll(16, clientd, &mut bytes); // the reference
+    pin_clock_ns(1_100_000);
+    pin_thread_cpu_ns(1_001_000); // 1 µs of the 100 µs
+    p.poll(16, clientd, &mut bytes);
+    assert_eq!(
+        attrib_read(&h, RX),
+        (0, 1, 0, 100_000),
+        "almost none of the gap on the CPU is descheduling"
+    );
+    assert_no_leak();
+}
+
+/// Half the gap on the CPU is work: the line is `cpu * 2 >= wall`, so it is
+/// drawn at "the thread was running at least as much as it was not".
+#[test]
+#[serial]
+fn half_a_gap_on_the_cpu_counts_as_work() {
+    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+    let _attrib = EnvGuard::set("RUSTERON_DPDK_GAP_ATTRIB", "1");
+    let mut h = Harness::new();
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    pin_clock_ns(1_000_000);
+    pin_thread_cpu_ns(1_000_000);
+    p.poll(16, clientd, &mut bytes);
+    pin_clock_ns(1_100_000);
+    pin_thread_cpu_ns(1_050_000); // 50 µs of 100 µs
+    p.poll(16, clientd, &mut bytes);
+    assert_eq!(attrib_read(&h, RX), (1, 0, 100_000, 0));
+    assert_no_leak();
+}
+
+/// One nanosecond under half is descheduling. The line is strict at 50%.
+#[test]
+#[serial]
+fn just_under_half_a_gap_on_the_cpu_counts_as_descheduling() {
+    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+    let _attrib = EnvGuard::set("RUSTERON_DPDK_GAP_ATTRIB", "1");
+    let mut h = Harness::new();
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    pin_clock_ns(1_000_000);
+    pin_thread_cpu_ns(1_000_000);
+    p.poll(16, clientd, &mut bytes);
+    pin_clock_ns(1_100_000);
+    pin_thread_cpu_ns(1_049_999); // 49_999 ns of 100_000 ns
+    p.poll(16, clientd, &mut bytes);
+    assert_eq!(attrib_read(&h, RX), (0, 1, 0, 100_000));
+    assert_no_leak();
+}
+
+/// The longest gap of each class is kept separately, so a run's maxima say
+/// which class the long ones were without a timestamp per gap.
+#[test]
+#[serial]
+fn each_class_keeps_its_own_longest_gap() {
+    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+    let _attrib = EnvGuard::set("RUSTERON_DPDK_GAP_ATTRIB", "1");
+    let mut h = Harness::new();
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    pin_clock_ns(1_000_000);
+    pin_thread_cpu_ns(1_000_000);
+    p.poll(16, clientd, &mut bytes);
+    pin_clock_ns(1_100_000);
+    pin_thread_cpu_ns(1_100_000); // 100 µs of work
+    p.poll(16, clientd, &mut bytes);
+    pin_clock_ns(1_300_000);
+    pin_thread_cpu_ns(1_101_000); // 200 µs of descheduling
+    p.poll(16, clientd, &mut bytes);
+    pin_clock_ns(1_350_000);
+    pin_thread_cpu_ns(1_200_000); // 50 µs of work, shorter than the first
+    p.poll(16, clientd, &mut bytes);
+    pin_clock_ns(1_380_000);
+    pin_thread_cpu_ns(1_201_000); // 30 µs of descheduling, shorter than the first
+    p.poll(16, clientd, &mut bytes);
+    assert_eq!(
+        attrib_read(&h, RX),
+        (2, 2, 100_000, 200_000),
+        "each class counts its own gaps and keeps its own maximum"
+    );
+    assert_eq!(
+        h.counter(TYPE_POLLER, &format!("{RX} poll-cycle-gap-max-ns")),
+        200_000,
+        "the undivided maximum is still the longest gap of either class"
+    );
+    assert_no_leak();
+}
+
+/// Attribution is off unless asked for, so a production agent never reads the
+/// CPU clock on the hot path. The undivided gap counters are unaffected.
+#[test]
+#[serial]
+fn gap_attribution_is_off_unless_asked_for() {
+    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+    let mut h = Harness::new();
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    pin_clock_ns(1_000_000);
+    pin_thread_cpu_ns(1_000_000);
+    p.poll(16, clientd, &mut bytes);
+    pin_clock_ns(1_100_000);
+    pin_thread_cpu_ns(1_000_000);
+    p.poll(16, clientd, &mut bytes);
+    assert_eq!(attrib_read(&h, RX), (0, 0, 0, 0), "nothing attributed without the flag");
+    assert_eq!(
+        h.counter(TYPE_POLLER, &format!("{RX} poll-cycle-gap-max-ns")),
+        100_000,
+        "the undivided gap is still counted"
+    );
+    assert_no_leak();
+}
+
+/// A port that leaves its poller comes back unattributed too: the time it was
+/// away is neither work nor descheduling.
+#[test]
+#[serial]
+fn a_port_away_from_its_poller_is_not_attributed() {
+    const RX: &str = "role=receiver bdf=0000:00:02.0 port=1 q=0 dir=rx";
+    let _attrib = EnvGuard::set("RUSTERON_DPDK_GAP_ATTRIB", "1");
+    let mut h = Harness::new();
+    h.init_rx(RECEIVER_IP, 60000, 1472);
+    let mut p = h.poller();
+    p.add(&mut *h.rx);
+    let mut bytes = 0i64;
+    let clientd = &mut h.rx_dgrams as *mut Vec<RxDatagram> as *mut c_void;
+    pin_clock_ns(1_000_000);
+    pin_thread_cpu_ns(1_000_000);
+    p.poll(16, clientd, &mut bytes);
+    p.remove(&mut *h.rx);
+    pin_clock_ns(9_000_000_000);
+    pin_thread_cpu_ns(9_000_000_000);
+    p.add(&mut *h.rx);
+    p.poll(16, clientd, &mut bytes); // the reference again
+    assert_eq!(attrib_read(&h, RX), (0, 0, 0, 0), "9 s away is not attributed");
+    pin_clock_ns(9_000_150_000);
+    pin_thread_cpu_ns(9_000_000_000);
+    p.poll(16, clientd, &mut bytes);
+    assert_eq!(
+        attrib_read(&h, RX),
+        (0, 1, 0, 150_000),
+        "attribution resumes once it is back"
+    );
+    assert_no_leak();
+}
+
 /// The receive poller records the longest gap between consecutive polls that
 /// found frames waiting, how many of those gaps reached 100 µs, and how many
 /// polls came back with a full burst: the evidence for a receive ring

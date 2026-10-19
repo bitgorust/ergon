@@ -62,6 +62,14 @@ static uint64_t rusteron_dpdk_test_clock_ns_value = 0;
 /* How far each of this thread's reads moves a pinned clock on: the test's
  * own, so the local-I/O thread's reads never move it under the test. */
 static _Thread_local uint64_t rusteron_dpdk_test_clock_step_ns = 0;
+/* The thread CPU clock, pinned by tests so a poll gap's split into work and
+ * descheduling is deterministic (0: it is not pinned). */
+static uint64_t rusteron_dpdk_test_thread_cpu_ns_value = 0;
+static int rusteron_dpdk_test_thread_cpu_pinned = 0;
+/* RUSTERON_DPDK_GAP_ATTRIB=1: read the thread CPU clock every receive poll and
+ * split each poll gap into work and descheduling. Off by default, so the hot
+ * path never reads it. */
+static int rusteron_dpdk_gap_attrib = 0;
 
 static uint64_t rusteron_dpdk_monotonic_ns(void)
 {
@@ -194,6 +202,28 @@ void rusteron_dpdk_test_set_clock_step_ns(uint64_t ns)
     rusteron_dpdk_test_clock_step_ns = ns;
 }
 
+uint64_t rusteron_dpdk_thread_cpu_ns(void)
+{
+    if (rusteron_dpdk_test_thread_cpu_pinned)
+    {
+        return rusteron_dpdk_test_thread_cpu_ns_value;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+void rusteron_dpdk_test_set_thread_cpu_ns(uint64_t ns)
+{
+    rusteron_dpdk_test_thread_cpu_ns_value = ns;
+    rusteron_dpdk_test_thread_cpu_pinned = 1;
+}
+
+int rusteron_dpdk_gap_attributing(void)
+{
+    return rusteron_dpdk_gap_attrib;
+}
+
 /* Whether runtime init starts the housekeeping thread: production yes; the
  * test reset turns it off so tests drive housekeeping with the tick hook. */
 static int rusteron_dpdk_housekeeping_enabled = 1;
@@ -278,6 +308,9 @@ void rusteron_dpdk_test_reset(void)
     rusteron_dpdk_eal_ever_initialized = 0;
     rusteron_dpdk_port_ops_override = NULL;
     rusteron_dpdk_test_clock_unpin();
+    rusteron_dpdk_test_thread_cpu_pinned = 0;
+    rusteron_dpdk_test_thread_cpu_ns_value = 0;
+    rusteron_dpdk_gap_attrib = 0;
     rusteron_dpdk_housekeeping_enabled = 0;
     rusteron_dpdk_transport_test_reset();
     /* Clear the thread-local error state so last_error()/last_error_code()
@@ -1210,6 +1243,22 @@ static int rusteron_dpdk_runtime_net_init(rusteron_dpdk_transport_t *native)
             return -1;
         }
         native->nic_stats_ns = ms * 1000000ULL;
+    }
+    /* Split poll-cycle gaps into work and descheduling: off by default, so
+     * the hot path never reads the thread CPU clock for it. */
+    rusteron_dpdk_gap_attrib = 0;
+    const char *gap_attrib = getenv("RUSTERON_DPDK_GAP_ATTRIB");
+    if (NULL != gap_attrib && '\0' != gap_attrib[0])
+    {
+        if (0 == strcmp(gap_attrib, "1"))
+        {
+            rusteron_dpdk_gap_attrib = 1;
+        }
+        else if (0 != strcmp(gap_attrib, "0"))
+        {
+            rusteron_dpdk_set_error("RUSTERON_DPDK_GAP_ATTRIB must be 0 or 1");
+            return -1;
+        }
     }
     /* How many bursts one poll drains while they come back full: by default
      * as many as fill the receive ring, at most 8, so a backlog a stall left
