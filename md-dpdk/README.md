@@ -13,8 +13,9 @@
 > accumulates over years.
 >
 > **If you need kernel bypass for Aeron, use
-> [Aeron Premium](https://aeron.io/).** It is inexpensive, faster, handles the
-> edge cases, is battle-tested, and comes with support.
+> [Aeron Premium](https://aeron.io/).** It is inexpensive, handles the edge
+> cases, is battle-tested, and comes with support. No kernel-bypass product
+> was compared on this hardware, so no speed claim is made either way.
 >
 > **On localhost it seems slightly slower than the open-source Aeron C
 > driver** over kernel UDP: host-local channels run on ordinary kernel
@@ -339,7 +340,8 @@ with the receiver window below.
   ([data](BENCHMARKS.md#aws-one-flow-carries-about-8-gbits)).
 - **A small receiver window (`rcv-wnd`) is a rate cap, not a loss fix.**
   Round 12 A/B, 80 KiB against the 2 MiB default: flat-out falls 6.5–6.8× at
-  every size, and the 288 B loss-free ceiling **drops** (157 k → 121 k msgs/s).
+  every size, and the 288 B loss-free ceiling **drops** (157 k → 121 k msgs/s;
+  [data](BENCHMARKS.md)).
   It raises only the 1,344 B ceiling (39 k → 56 k). Name `rcv-wnd=80k` on a
   288 B channel only when that rate cut is acceptable, or when the ring cannot
   hold more (Azure MANA: 256 × the smallest datagram, 80 KiB for 288 B). Pair

@@ -97,7 +97,7 @@ the signature itself; `signed_request_at` takes the timestamp from you
 | signer | cost per request | use it for |
 |---|---|---|
 | `Signer::hmac_sha256` | **262 ns** ([data](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md)) | signed REST requests |
-| `Signer::ed25519_pkcs8` | **21,558 ns**; measure before putting it on a hot path | log-on, once per session; the private key never leaves the machine |
+| `Signer::ed25519_pkcs8` | **21,558 ns** ([data]([io/benches/BENCHMARK.md](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md)#signing)); measure before putting it on a hot path | log-on, once per session; the private key never leaves the machine |
 
 Checked against Binance's documented example:
 

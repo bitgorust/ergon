@@ -181,7 +181,8 @@ A ban, step by step:
 `try_charge`, the check before each request: `io/benches` `limit_bench`,
 `--samples 200000 --batch 64`, 3 runs. Apple M1 Pro, macOS, thread not
 pinned. 0 connections (pure code). p50 and p99 per call in ns (the mean of
-a 64-call batch); max: the slowest batch of 64 calls, in µs.
+a 64-call batch); max: the slowest batch of 64 calls, in µs. A local
+microbench; the run is **not archived** — reproduce with `limit_bench`.
 
 | case | p50 ns | p99 ns | max batch µs |
 |---|---|---|---|

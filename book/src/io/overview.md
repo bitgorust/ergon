@@ -139,7 +139,8 @@ decide it:
   plain `uring-sqpoll`.
 - **The loop's CPU time in the kernel matters:** `uring-spin`
   (interrupt-driven like `epoll-spin`; about 800 syscalls/s against
-  `epoll-spin`'s 4.1 million at 800 msg/s, Azure).
+  `epoll-spin`'s 4.1 million at 800 msg/s, Azure;
+  [data](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md)).
 - **The thread may nap:** `uring-napi` or `epoll-busy`. They poll the NIC
   only inside a timed wait.
 - How each one waits, every key, and how to find the crossover on your own

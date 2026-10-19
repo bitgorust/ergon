@@ -184,15 +184,10 @@ throughput/checked) are ergon-only or DTO-vs-DTO — not ergon/sbe-tool ratios.
 
 ### Cluster codec gate — `just bench-cluster`
 
-All 5 maintained scenarios pass:
-
-| Scenario | Ratio | Status |
-|----------|-------|--------|
-| encode/session_message_header | 0.7464 | PASS |
-| encode/session_keep_alive | 0.6213 | PASS |
-| decode/session_message_header | 0.8968 | PASS |
-| decode/session_event | 0.8209 | PASS |
-| encode/claim_shaped_header_plus_app | 0.8288 | PASS |
+Five maintained scenarios, ratios ergo-sbe / sbe-tool, each against its
+ceiling in `scripts/check-bench-gate.sh`. Run `just bench-cluster` and read
+the gate's printed table: a ratio in prose is only evidence for the tree
+that produced it, so no point estimates are kept here.
 
 Cluster encode arms locally assert exact sbe-tool byte parity before timing,
 use identical exact message lengths, make both mutable buffer inputs opaque,

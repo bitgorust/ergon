@@ -32,6 +32,8 @@ Terms: [deployment glossary](overview.md#glossary).
 | app | keep-alive | about 1 kHz on sparse, latency-critical streams | a lost frame is noticed only at Aeron's next heartbeat: one lost ping cost **134 ms** |
 | app | quiet cores only | two-minute spin at pod start; pin to cores that never stalled 300 µs | some Azure vCPUs stop for up to **3.7 ms** once a minute |
 
+Figures in this table: [md-dpdk/BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md) (SMT row: [io/benches/BENCHMARK.md](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md)).
+
 ## Never do this
 
 | setting | why not | measured |
@@ -43,6 +45,8 @@ Terms: [deployment glossary](overview.md#glossary).
 | `mlockall`, pacing, an RX burst of 64, a 1 MiB receive window, C-states at C1 on metal | each lost its A/B | see [not recommended](../md-dpdk/overview.md) |
 | `AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD` = the conductor's park | the counter includes the park, so it fires on every idle `nanosleep` | the lab now derives it from the park and refuses a bad value |
 | `rcv-wnd=80k` on a 288 B channel | a rate cap, not a loss fix | flat-out falls **6.5–6.8×**, and the 288 B loss-free ceiling **drops** 157 k → 121 k msgs/s |
+
+Figures in this table: [md-dpdk/BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md).
 
 ## Copy-paste
 
@@ -110,6 +114,8 @@ while any check warns.
 | AWS x86 (`c7i`) | kernel UDP: busy polling, 4,096-entry ring | idle p50 **28.22**, max **1,938 (349–4,846)**. Moderation off with its interrupts on a core of their own is not measured on x86 |
 | Azure | kernel UDP: busy polling, 4,096-entry ring | idle p50 **21.15**, max **99.52 (73.86–209.41)**. Some vCPUs stall once a minute — spin-test first |
 | any, both ends on one host | localhost | isolated DPDK idle p50 **9.81**, max **31.60 (29.92–32.80)**: a 3 µs spread across five reps |
+
+Figures in this table: [md-dpdk/BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md).
 
 - **One AWS flow tops out at 7.8–8.0 Gbit/s.** A channel is one flow; spread
   a heavier stream over several channels.
