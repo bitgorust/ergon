@@ -2,11 +2,15 @@
 
 > **Not recommended for production use.**
 >
-> This crate is a proof of concept. I wrote it to get a better understanding
-> of how a kernel-bypass transport for Aeron can be written. Of all of ergon's
-> modules, it is the one where I relied on AI the most, and I could not verify
-> that what it does is correct, unlike the other modules, whose domains I
-> understand well.
+> This crate is a proof of concept: a kernel-bypass UDP transport for Aeron,
+> written to learn how one is put together. It is verified by the `dpdk` test
+> lane — 15 test files, each under no features, `dpdk` and `static,dpdk` —
+> including `dpdk_interop`'s §8 contract (byte-identical payloads, the
+> connected/unconnected addressing rules, port-0 handling, reconnect,
+> interceptors and role-frame dispatch), plus the ENA and MANA acceptance
+> scripts on real instances. [BENCHMARKS.md](BENCHMARKS.md) reports the
+> measurements. What it lacks is the edge-case handling a production transport
+> accumulates over years.
 >
 > **If you need kernel bypass for Aeron, use
 > [Aeron Premium](https://aeron.io/).** It is inexpensive, faster, handles the
@@ -268,7 +272,12 @@ periodic runs on them.
   (`rx-poll-gap-max-ns`, and how many reached 100 µs), full-burst polls
   (`rx-burst-full`), and the agent's own loop gap (`poll-cycle-gap-max-ns`,
   counted in 20–50, 50–100 and over 100 µs), to match a latency spike to the
-  agent not running.
+  agent not running. `RUSTERON_DPDK_GAP_ATTRIB=1` additionally splits each
+  loop gap by the thread's own CPU time across it — half or more of the wall
+  length is work (`poll-cycle-gaps-work`, `poll-cycle-gap-work-max-ns`), less
+  is the host descheduling the vCPU (`poll-cycle-gaps-desched`,
+  `poll-cycle-gap-desched-max-ns`). Off by default, so the hot path never
+  reads the CPU clock for it.
 
 ## Kernel socket semantics
 

@@ -451,6 +451,7 @@ unsafe extern "C" {
     pub fn rusteron_dpdk_fake_released() -> c_int;
     pub fn rusteron_dpdk_test_set_clock_ns(ns: u64);
     pub fn rusteron_dpdk_test_set_clock_step_ns(ns: u64);
+    pub fn rusteron_dpdk_test_set_thread_cpu_ns(ns: u64);
     pub fn rusteron_dpdk_clock_ns() -> u64;
     pub fn rusteron_dpdk_clock_source() -> c_int;
     /// Adopt ergon-clock's calibration as the transport's clock, as create
@@ -558,6 +559,13 @@ pub fn pin_clock_ns(ns: u64) {
 /// leave it where it is. `TestEnv::new` clears it.
 pub fn step_pinned_clock_ns(ns: u64) {
     unsafe { rusteron_dpdk_test_set_clock_step_ns(ns) };
+}
+
+/// Pin the thread's CPU-time clock at `ns` nanoseconds; `TestEnv::new` clears
+/// the pin. Gap attribution compares this against the transport clock across
+/// a poll gap to split it into work and descheduling.
+pub fn pin_thread_cpu_ns(ns: u64) {
+    unsafe { rusteron_dpdk_test_set_thread_cpu_ns(ns) };
 }
 
 /// The mbuf pool must be balanced after every test (allocated == released).

@@ -523,8 +523,12 @@ static int rusteron_dpdk_dispatch_frame(
 }
 
 /* Counts a gap of 20 µs or more since the agent's last cycle on `port`
- * (poll-cycle-gap-*); the caller sets last_poll_ns. */
-static inline void rusteron_dpdk_poll_cycle(rusteron_dpdk_port_t *port, uint64_t now_ns)
+ * (poll-cycle-gap-*); the caller sets last_poll_ns. With attribution on it
+ * also splits the gap: the thread's own CPU time across it, half or more of
+ * the wall length being the agent working between polls and less being the
+ * host descheduling its vCPU (RUSTERON_DPDK_GAP_ATTRIB=1; `now_cpu_ns` is 0
+ * and last_poll_cpu_ns stays 0 otherwise). */
+static inline void rusteron_dpdk_poll_cycle(rusteron_dpdk_port_t *port, uint64_t now_ns, uint64_t now_cpu_ns)
 {
     if (0 != port->last_poll_ns && now_ns - port->last_poll_ns >= 20000)
     {
@@ -536,6 +540,17 @@ static inline void rusteron_dpdk_poll_cycle(rusteron_dpdk_port_t *port, uint64_t
             : cycle >= 50000 ? RD_COUNTER_POLL_CYCLE_GAPS_50US
                              : RD_COUNTER_POLL_CYCLE_GAPS_20US,
             1);
+        if (0 != port->last_poll_cpu_ns)
+        {
+            const uint64_t cpu = now_cpu_ns - port->last_poll_cpu_ns;
+            const int work = cpu >= cycle || cpu * 2 >= cycle;
+            rusteron_dpdk_counters_add(
+                &port->counters, work ? RD_COUNTER_POLL_CYCLE_GAPS_WORK : RD_COUNTER_POLL_CYCLE_GAPS_DESCHED, 1);
+            rusteron_dpdk_counters_max(
+                &port->counters,
+                work ? RD_COUNTER_POLL_CYCLE_GAP_WORK_MAX : RD_COUNTER_POLL_CYCLE_GAP_DESCHED_MAX,
+                (int64_t)cycle);
+        }
     }
 }
 
@@ -764,7 +779,8 @@ int rusteron_dpdk_poller_receive(
     /* The agent's own loop: any gap since the port's last poll of 20 µs or
      * more is the agent not running (preempted, or its vCPU descheduled), so
      * a latency spike can be matched to it. The clock is read here anyway. */
-    rusteron_dpdk_poll_cycle(port, now_ns);
+    const uint64_t now_cpu_ns = rusteron_dpdk_gap_attributing() ? rusteron_dpdk_thread_cpu_ns() : 0;
+    rusteron_dpdk_poll_cycle(port, now_ns, now_cpu_ns);
     if (total > 0 && 0 != port->last_poll_ns)
     {
         const int64_t gap = (int64_t)(now_ns - port->last_poll_ns);
@@ -779,6 +795,7 @@ int rusteron_dpdk_poller_receive(
         rusteron_dpdk_counters_add(&port->counters, RD_COUNTER_RX_BURST_FULL, 1);
     }
     port->last_poll_ns = now_ns;
+    port->last_poll_cpu_ns = now_cpu_ns;
     /* The 1 Hz statistics sample runs on the housekeeping thread, never here. */
     return work_count;
 }
@@ -888,6 +905,7 @@ static void rusteron_dpdk_poller_port_unref(
             /* no longer polled here: the time until a transport of it comes
              * back is not the agent's loop, so its timing starts afresh */
             client->port->last_poll_ns = 0;
+            client->port->last_poll_cpu_ns = 0;
             state->ports[i] = state->ports[--state->port_count];
             return;
         }
@@ -1031,6 +1049,7 @@ int rusteron_dpdk_poller_remove(
         if (state->kernel_count > 0 && state->kernel[0] == transport && NULL != client && NULL != client->port)
         {
             client->port->last_poll_ns = 0;
+            client->port->last_poll_cpu_ns = 0;
         }
         rusteron_dpdk_poller_kernel_remove(state, transport);
         if (NULL != client && NULL != client->port && !client->delegated)
@@ -1079,8 +1098,10 @@ int rusteron_dpdk_poller_poll(
         if (NULL != first && NULL != first->port)
         {
             const uint64_t now = rusteron_dpdk_clock_now();
-            rusteron_dpdk_poll_cycle(first->port, now);
+            const uint64_t now_cpu = rusteron_dpdk_gap_attributing() ? rusteron_dpdk_thread_cpu_ns() : 0;
+            rusteron_dpdk_poll_cycle(first->port, now, now_cpu);
             first->port->last_poll_ns = now;
+            first->port->last_poll_cpu_ns = now_cpu;
         }
     }
 

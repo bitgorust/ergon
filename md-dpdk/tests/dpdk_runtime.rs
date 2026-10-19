@@ -900,6 +900,38 @@ fn nic_stats_interval_is_validated() {
     }
 }
 
+/// RUSTERON_DPDK_GAP_ATTRIB splits poll-cycle gaps into work and descheduling;
+/// it takes 0 (off, the default) or 1, and anything else fails creation
+/// naming the variable.
+#[test]
+#[serial]
+fn gap_attribution_is_validated() {
+    let env = TestEnv::new();
+    env.eal_skip();
+    for (value, ok) in [
+        ("", true),
+        ("0", true),
+        ("1", true),
+        ("2", false),
+        ("on", false),
+        ("-1", false),
+    ] {
+        let _attrib = EnvGuard::set("RUSTERON_DPDK_GAP_ATTRIB", value);
+        match create(&rusteron_dpdk_config_t::valid()) {
+            Ok(native) => {
+                assert!(ok, "{value:?} accepted");
+                close(native);
+            }
+            Err(e) => {
+                assert!(!ok, "{value:?}: {e}");
+                assert!(e.contains("RUSTERON_DPDK_GAP_ATTRIB"), "{e}");
+            }
+        }
+        env.reset();
+        env.eal_skip();
+    }
+}
+
 /// RUSTERON_DPDK_RX_MAX_BURSTS, the most bursts one poll drains, takes 1 to
 /// 64 (unset: as many as fill the receive ring, at most 8); anything else
 /// fails creation, naming the variable.

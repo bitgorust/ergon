@@ -29,7 +29,7 @@
   - Kernel UDP on AWS: ENA's interrupt moderation off. On by default since Linux 6.9; added about 60 µs to the median at 100 k/s on c7i.2xlarge (p50 106 against 47, max 606 against 538; 3 reps).
   - With moderation off, give the data NICs' interrupts a core of their own. On the housekeeping core they fall behind: c7i.2xlarge p99.9 12 ms at 500 k/s; c9g lost at 1 M/s in 5 of 5 reps (max 10.8 ms). Tested on Graviton only.
   - Every platform: isolated CPUs with pinned agents (Azure DPDK max 216 → 71 µs), transparent hugepages off (Azure idle max 546 → 106 µs), busy threads only on cores the pre-flight finds quiet.
-  - Azure DPDK: receiver IO vectors 16. A small receiver window (`rcv-wnd`) is a rate cap, not a default: see the 80 KiB result below.
+  - Azure DPDK: receiver IO vectors 16. A small receiver window (`rcv-wnd`) only with the conductor's 20 µs park — the window alone is a rate cap: see the 80 KiB result below.
 - **Zero loss comes first.** One lost frame on a sparse stream costs about 100 ms, Aeron's heartbeat (one lost ping cost 134 ms). Send a keep-alive at about 1 kHz on sparse, latency-critical streams.
 - **One AWS flow carries at most 7.8–8.0 Gbit/s,** on x86 and Graviton, kernel or DPDK. A channel is one flow: spread a heavier stream over several channels.
 - **What did not help:**
@@ -37,7 +37,7 @@
   - x86 and Azure: `mlockall`, no NIC statistics reads, C-states capped at C1 on metal, a 1 MiB receive window, an RX burst of 64, re-offering refused transmits, pacing to 7.9 Gbit/s.
 - **CPU isolation is the biggest single win on Azure.** Round 11 (2026-10-18), same binary, same pair, `pinned` against `isolated`: DPDK idle max 91.84 (58.02–102.02) → **57.89 (49.47–64.22)**, p99.99 34.40 → 26.35. Round trips of 200 µs or more: **0** in the whole isolated-DPDK idle run, against 39 in isolated kernel UDP. Of 100–250 µs: 0 in 4 of 5 isolated-DPDK reps, against 10–40 in every kernel-UDP rep. The full table is under [round 11](#azure-round-11-2026-10-18-d8s_v6-pair--idle-round-trip-p50--p90--p99--p999--p9999--max).
 - **Localhost is the cleanest path measured on Azure.** Round 12 (2026-10-19), isolated localhost DPDK: idle p50 9.81 µs, **max 31.60 (29.92–32.80)** — a 3 µs spread across five reps — and 0 of 5 reps lost anything at any size or load point. The same path pinned is max 160.13 (45.09–389.38): isolation is what does it. If both ends fit on one host with a spare core, prefer localhost.
-- **The 80 KiB `rcv-wnd` is a rate cap, not a loss fix.** Round 12 A/B, window against plain: flat-out falls 6.5–6.8× at every size, and the 288 B loss-free ceiling **drops** (157 k → 121 k msgs/s). It raises only the 1,344 B ceiling (39 k → 56 k). The window's clean reps are all below plain's loss-free rate — it is clean because it never goes fast enough to lose. See [round 12](#azure-round-12-2026-10-19-the-window-ab-and-the-localhost-leg).
+- **The 80 KiB `rcv-wnd` is a rate cap; the park is what buys it back.** Round 13 (2026-10-19), three arms on one pair, cross-host 32 B flat-out / idle p99.99 / max: plain **7.25 M msgs/s** / 330 / 844 (416–2,206); window alone **1.21** / 183 / 1,493 (654–**52,265**); window **with** the conductor's 20 µs park **7.14** / 194 / 857 (557–1,164). The window alone keeps the tail win and costs a sixth of the throughput; the park restores it and keeps the tail. Round 12's window-alone A/B agrees (flat-out falls 6.5–6.8× at every size). **Set window and park together, or neither.** See [round 13](#azure-round-13-2026-10-19-the-three-arm-ab-plain-window-windowpark).
 - **Media receive timestamps cost nothing measurable** on Graviton DPDK (G3): p50 within 0.07 µs at idle and every steady rate; idle max 74 (62–153) against 75 (73–79). Repeat once before making them a default: one rep a point reached 152–183 µs.
 
 ## Recommended configuration
@@ -51,7 +51,7 @@ Each item won an A/B and was reproduced on a second pair, unless the row says ot
 | platform | kernel UDP: best measured | DPDK (lab only) |
 | --- | --- | --- |
 | AWS Graviton5, c9g.2xlarge (G1–G3) | interrupt moderation off, data NIC interrupts on a spare core, no busy polling: idle p50 18.93, max 79 (76–168); 288 B at 1 M/s p50 44.83, max 204 (122–211). No lossy rep in G1 or G3; 1 of 5 in G2 (63 NAKs) | 4,096 RX descriptors: idle p50 13.97, max 75 (73–79); 288 B at 1 M/s p50 19.36, max 106 (93–114). No NAK or retransmit below the flow ceiling in G1–G3 |
-| AWS x86, c7i.4xlarge (rounds 5–7) | busy polling, 4,096-entry ring: idle p50 28.22, max 1,938 (349–4,846); 288 B at 1 M/s p50 43.74, max 599, 1 lossy rep of 5 (round 7). Not converged: moderation off with its interrupts on a core of their own is untested on x86 | 4,096 RX descriptors, receiver IO vectors 16: idle p50 21.28, max 109 (52–116); 288 B at 1 M/s p50 30.38, max 152 (139–155), no lossy rep (round 7) |
+| AWS x86, c7i.4xlarge (rounds 5–7) | busy polling, 4,096-entry ring: idle p50 28.22, max 1,938 (349–4,846); 288 B at 1 M/s p50 43.74, max 599, 1 lossy rep of 5 (round 7). Not converged: moderation off with its interrupts on a core of their own is not measured on x86 | 4,096 RX descriptors, receiver IO vectors 16: idle p50 21.28, max 109 (52–116); 288 B at 1 M/s p50 30.38, max 152 (139–155), no lossy rep (round 7) |
 | AWS x86 bare metal, c7i.metal-24xl (round 4) | busy polling: idle p50 33.70, max 67 (55–307); 288 B at 1 M/s p50 42.94, max 592 (114–1,150) | idle p50 28.13, max 71 (48–845); 288 B at 1 M/s p50 34.30, max 82 (77–103) |
 | Azure D16s_v6 + D8ds_v6 (rounds 4–10) | busy polling, 4,096-entry ring: idle p50 25.82, max 167 (100–1,246) (round 8); no NIC drop or NAK in round 5 | receiver IO vectors 16; the conductor's park capped at 20 µs with a ring-sized window: idle p50 23.73, max 63 (59–796) (round 8); 288 B at 1 M/s p50 72.70, max 129 (127–205) (round 5, a farther pair) |
 | Azure D8s_v6 pair, **isolated** (round 11) | busy polling: idle p50 21.15, p99.99 31.79, max 99.52 (73.86–209.41). Plain kernel UDP: idle p50 32.03, max 354.81 (272.13–2,203.65), 39 spikes of 200 µs or more and 10–40 of 100–250 µs a rep — **do not use** | **idle p50 19.90, p99.99 26.35, max 57.89 (49.47–64.22)**, **0 spikes of 200 µs or more in the whole round**, 0 of 100–250 µs in 4 of 5 reps. 32 B at 50% of flat-out: p50 26.51, max 90.50. Loss under load at 288 B is the receiver window regressed to the 2 MiB driver default, 26× the 80 KiB rounds 9–10 proved loss-free: see [round 11: the 288 B loss under load](#round-11-the-288-b-loss-under-load) |
@@ -76,7 +76,7 @@ Each item won an A/B and was reproduced on a second pair, unless the row says ot
 | --- | --- |
 | kernel: interrupt moderation off on the data NICs (`ethtool -C <if> adaptive-rx off rx-usecs 0 tx-usecs 0`) | G1–G3: no lossy rep to 1 M msgs/s in G1 and G3 (one in G2, 63 NAKs). Transmit moderation kept at 64 µs (`COALESCE=0/64`) is not kept: G2's one lossy rep without it did not recur in G3, and it added its own tails (288 B at 1 M/s max 289, 178–569) |
 | kernel: the data NICs' interrupts on a core of their own | G1, one A/B: on the housekeeping core, 1 M/s lost in 5 of 5 reps (max 10.8 ms); on the receiver's core it collapsed from 500 k/s. Graviton's idle is WFI, so the spare core never sleeps deep |
-| kernel: no busy polling | G1, one A/B: the best kernel idle (p50 16.98, max 94, 76–127), but at 288 B, 1 M/s p50 4,973 µs, max 9,175 (8,544–102,826) and 61,488 NAKs. Threaded NAPI busy polling is untested: G2's setup was wrong |
+| kernel: no busy polling | G1, one A/B: the best kernel idle (p50 16.98, max 94, 76–127), but at 288 B, 1 M/s p50 4,973 µs, max 9,175 (8,544–102,826) and 61,488 NAKs. Threaded NAPI busy polling is not measured: G2's setup was wrong |
 | DPDK: dedicated threading (sender and receiver on cores of their own) | G1, one A/B: SHARED_NETWORK's 1,344 B bursts p50 522 against 234, max 748 (723–886) against 493 (465–745) |
 | DPDK: 4,096 RX descriptors (the default: min(4,096, the NIC's limit)) | no measurable effect on c9g (G1: idle max 73, 60–88, against 75, 68–155); kept for c7i (round 6) |
 | Aeron MTU 1,408; jumbo frames only on bulk or bursty channels, after a second run | G2, one run: DPDK 1,344 B bursts p50 242 → 210, max 664 (466–954) → 561 (455–1,533), ceiling +2.6%; idle unchanged (max 68, 61–100) |
@@ -98,7 +98,7 @@ Each item won an A/B and was reproduced on a second pair, unless the row says ot
 | --- | --- |
 | DPDK on the netvsc PMD, ports selected by MAC, `vdev_netvsc` ignored, 256 descriptors | see [what got DPDK working on Azure](#what-got-dpdk-working-on-azure) |
 | DPDK: receiver IO vectors 16 (`AERON_RECEIVER_IO_VECTOR_CAPACITY=16`) | rounds 4–5: no NAK at 288 B up to 4.5 M msgs/s; bursts' max 2,808 → 1,000 µs (round 4) |
-| DPDK: the conductor's park capped at 20 µs (`AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`) with a receiver window the ring can hold, per channel (`rcv-wnd`): 256 × the channel's smallest datagram where loss matters more than peak rate (80 KiB for 288 B messages) | rounds 9–10: with 80 KiB no lossy rep at any point (idle max 104, 95–119); with 256 KiB, sustainable 1,344 B 400 k → 600 k msgs/s. Never use the faster park without the small window: it lost more than the default (round 9). A window carries at most about window ÷ (round trip + status-message delay). Round 11 set no `rcv-wnd` and fell back to `AERON_RCV_INITIAL_WINDOW_LENGTH=2 MiB`, 26× the proven window: its 288 B loss-free rate fell to 10% of flat-out on every DPDK mode. **Round 12 A/B on the window alone changes the recommendation:** the 80 KiB window by itself is a rate cap, not a loss fix. It cuts flat-out 6.5–6.8× at every size and **lowers** the 288 B loss-free ceiling (157 k → 121 k msgs/s); it raises only the 1,344 B ceiling (39 k → 56 k) and costs 734–1,490 µs spikes on localhost. Use it with the 20 µs park where 1,344 B rate or a smaller ring is the constraint; do not name `rcv-wnd=80k` on a 288 B channel unless the 6.5–6.8× rate cut is acceptable. The rounds 9–10 window **plus** park combination is not re-confirmed on round 12's pair |
+| DPDK: the conductor's park capped at 20 µs (`AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`) **together with** a receiver window the ring can hold, per channel (`rcv-wnd`): 256 × the channel's smallest datagram where loss matters more than peak rate (80 KiB for 288 B messages) | The two are one setting. Round 13 (2026-10-19), three arms on one pair: cross-host 32 B flat-out 7.25 M msgs/s plain, **1.21** with the window alone, **7.14** with window+park; idle p99.99 330 / 183 / 194 µs; max 844 / 1,493 / 857. The window alone is a rate cap (rounds 12–13) and the park is what buys the throughput back while keeping the tail. Never the park without the small window: it lost more than the default (round 9). A window carries at most about window ÷ (round trip + status-message delay). Round 11 set no `rcv-wnd` and fell back to `AERON_RCV_INITIAL_WINDOW_LENGTH=2 MiB`, 26× the proven window: its 288 B loss-free rate fell to 10% of flat-out on every DPDK mode. Set both, or neither |
 | kernel: busy polling (`net.core.busy_read`/`busy_poll` 50) with a 4,096-entry receive ring | round 5: no NIC drop or NAK in 5 reps, where the default ring dropped at 1 M msgs/s of 288 B; idle max 166 (138–2,851) |
 | Never set `AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD` to the conductor's max park | Aeron's duty-cycle counter times `do_work` entries, so it includes the park. At 1 ms against `backoff`'s 1 ms park the counter fires on every idle park and its max is a `nanosleep` oversleep, not work. Round 11: see [what the agents' duty cycles actually measured](#round-11-what-the-agents-duty-cycles-actually-measured). **The lab now makes this impossible to set wrong** (2026-10-19): `vm.sh` derives the threshold from the park after the mode's overrides (twice the park, never below 1 ms — `backoff` gets 2 ms, the 20 µs park and `spin`/`noop` get 1 ms) and refuses one that does not clear it before the driver starts |
 
@@ -391,7 +391,7 @@ recommended from any of these maxima until they are.
 #### What round 12 did not measure
 
 - The window **with** the conductor's 20 µs park — the rounds 9–10 combination —
-  on this pair.
+  on this pair. **Round 13 below runs it.**
 - The 288 B loss-free ceiling between 157 k and 786 k msgs/s. The ladder only
   samples 10/50/80/95/100% of each mode's own flat-out: plain's 10% step
   (157 k) lost nothing and its 50% step (786 k) lost in 5 of 5, so the ceiling
@@ -400,6 +400,64 @@ recommended from any of these maxima until they are.
 - Why this pair's cross-host round trip is 63.77 µs against round 11's 19.90.
   The hosts differ (AMD against Intel) and may sit farther apart even inside one
   proximity placement group. **Not measured.**
+
+### Azure round 13 (2026-10-19), the three-arm A/B: plain, window, window+park
+
+Closes round 12's first gap. Same pair as round 12 (`Standard_F8as_v6` +
+`Standard_D8s_v6`, northcentralus, one proximity placement group), same
+ladder and 5 reps, `isolated` only. Three arms, cross-host and localhost:
+
+| arm | settings |
+| --- | --- |
+| plain | `dpdk` |
+| window | `dpdk`, `SUB_PARAMS=rcv-wnd=80k` |
+| window+park | `dpdk`, `SUB_PARAMS=rcv-wnd=80k`, `AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us` |
+
+Artefact: `target/md-dpdk-bench/20261019-071438/` (`results.csv`, `summary.md`).
+
+#### Idle round trip (p50 / p99.99 / max, µs, across 5 reps)
+
+| arm | cross-host | localhost |
+| --- | --- | --- |
+| plain | 70.21 / 329.73 / 843.77 (416–2,206) | 9.89 / 25.98 / 33.95 (31–117) |
+| window | 68.03 / 183.17 / **1,492.99 (654–52,265)** | 9.92 / 18.57 / 23.12 (23–25) |
+| window+park | 71.17 / 193.53 / 857.09 (557–1,164) | 9.92 / 18.69 / 26.89 (23–188) |
+
+#### 32 B flat-out (M msgs/s)
+
+| arm | cross-host | localhost |
+| --- | --- | --- |
+| plain | **7.25** (7.06–7.73) | 8.85 |
+| window | **1.21** (1.21–1.21) | 8.44 |
+| window+park | 7.14 (6.88–7.31) | 8.40 |
+
+**The window alone is a rate cap, and the park is what buys it back.**
+`rcv-wnd=80k` alone cuts cross-host 32 B throughput to a sixth of plain
+(7.25 → 1.21 M msgs/s, every rep identical) while improving p99.99
+(330 → 183 µs). Adding the conductor's 20 µs park restores throughput to
+7.14 M msgs/s and keeps the p99.99 improvement (194 µs), with a max that
+is not worse than plain's (857 against 844) and far tighter (557–1,164
+against 416–2,206).
+
+**Do not set `rcv-wnd=80k` on its own.** The rounds 9–10 pair stands:
+window **and** park together, or neither.
+
+The window-alone max is the round's worst (52.3 ms in one rep). That single
+sample was investigated: host b reported `noisy_cpus 2 3 4 5` and
+`hostcheck b = warning` (SMT on) in all four reps, and both hosts show the
+same uniform `short-sends=4, dpdk-arp-miss=4` startup ARP. It is one sample
+in one rep on a host the check already flags. **Not attributed to a
+mechanism.**
+
+#### Conductor max duty cycle is unchanged
+
+The latched conductor high-water mark is 11.8–14.5 ms in every arm of this
+round — the same order as rounds 11–12, so neither the window nor the park
+moves it. It counts from the driver's start, not per run. The standing
+hypothesis (`rusteron_dpdk_housekeeping_tick` holding `housekeeping_lock`
+during a 1 Hz ENA admin stats read, with the conductor taking the same lock
+on transport create/close) is **not yet tested**: the A/B is
+`RUSTERON_DPDK_NIC_STATS_MS=0`.
 
 
 ### AWS c7i.4xlarge, round 7 (p50 / p99.9 / max, median across reps)
@@ -621,24 +679,48 @@ timestamp, so a max recorded at one load point cannot be pinned to the loss at
 another. They are the same order of magnitude. The window finding above stands
 on its own either way — the window decides how much a stall may cost.
 
-Still open (round 11's list; the window A/B and the localhost leg closed in
-round 12):
+**Measured 2026-10-19, Azure `Standard_D8s_v6` ×2, `LAB_STATES=isolated`,
+`LAB_MODES="dpdk dpdk@RUSTERON_DPDK_GAP_ATTRIB=1"`, 3 reps** (`target/md-dpdk-bench/20261019-164532`).
 
-- Why host b's DPDK receiver runs 850,000 over-50 µs cycles a round and host
-  a's runs a thousand. Same size, image and layout. Not measured to a cause.
-- Whether the receiver's long maxima are work or descheduling. 1344 B carries
-  1.0 message per frame against 288 B's 4.0, so a full 16-vector poll is *less*
-  work at 1344 B, yet the maxima grow with size — which points at descheduling.
-  Not separated. The counter carries no timestamp and no cycle index.
-- The lab sets the conductor's threshold equal to the default park, so the
-  conductor's duty-cycle counter cannot mean anything as shipped. Either cap
-  the park (rounds 9–10 used `AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`)
-  or raise the threshold above it.
-- The 80 KiB window and the 2 MiB default were A/B'd side by side in round 12
-  (`dpdk@SUB_PARAMS=rcv-wnd=80k` against plain `dpdk`): closed. The window is a
-  rate cap, not a loss fix — see [round 12](#azure-round-12-2026-10-19-the-window-ab-and-the-localhost-leg).
-- The localhost leg was run in round 12: closed. The goal's "across two hosts
-  and on localhost" is now measured on all three paths.
+**The receiver's long maxima are descheduling, not work.** Every gap maximum
+above 100 µs has `poll-cycle-gap-desched-max-ns` equal to the undivided
+`poll-cycle-gap-max-ns`; every gap maximum under 60 µs has it equal to
+`poll-cycle-gap-work-max-ns` instead. The split is discriminating, not
+"everything is desched".
+
+| host | rep | gaps 20-50 / 50-100 / >100 µs | work | desched | work max µs | desched max µs | undivided max µs | class |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| a | 1 | 40 / 8 / 5 | 36 | 17 | 568.5 | **914.5** | 914.5 | descheduling |
+| a | 2 | 14 / 1 / 0 | 13 | 2 | **57.3** | 26.1 | 57.3 | work |
+| a | 3 | 23 / 1 / 5 | 17 | 12 | 138.5 | **567.9** | 567.9 | descheduling |
+| b | 1 | 22 / 5 / 4 | 25 | 6 | 453.6 | **796.5** | 796.5 | descheduling |
+| b | 2 | 13 / 0 / 0 | 9 | 4 | **44.8** | 42.3 | 44.8 | work |
+| b | 3 | 8 / 0 / 0 | 7 | 1 | **47.0** | 37.4 | 47.0 | work |
+
+The run's two long round-trip maxima line up with the receiver's descheduling
+maxima of the same rep: 915 µs against 914.5 µs (a, rep 1) and 602 µs against
+567.9 µs (a, rep 3; the 35 µs remainder is about one base round trip). The
+counters carry no timestamp, so the pairing is by magnitude and rep, not by a
+shared stamp — but it is the same rep and the same order, and the summary's
+"unexplained" label on those spikes is now answered as descheduling.
+
+**The 850,000-over-50-µs anomaly did not reproduce.** This round's
+over-50-µs counts are single digits to tens on both hosts (totals above),
+not hundreds of thousands. Host a and host b are comparable throughout. The
+split answers the *class* of a gap, not why one host ever counted more of
+them; that remains **not measured to a cause**.
+
+**What the flag costs.** Throughput is identical: 22.89 M msgs/s (22.89–22.90)
+both modes, 0 dropped. Round trip p50 43.65 µs (43.49–44.09) off against
+44.26 µs (44.09–45.22) on — +0.61 µs, the rep ranges touching at one endpoint.
+p99.99 goes the other way (78.33 against 74.75). The cost is under a
+microsecond at the median and nothing in throughput; leave the flag off
+unless the split is needed.
+
+Everything else on round 11's list is closed: the window A/B and the
+localhost leg in round 12, the conductor threshold above, and the counter
+that could not tell the two apart. `RUSTERON_DPDK_GAP_ATTRIB` is off by
+default, so a run that does not set it leaves the four counters at 0.
 
 ## How to run
 
