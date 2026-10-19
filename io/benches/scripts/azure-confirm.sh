@@ -24,9 +24,10 @@ CURL_SRC=${CURL_SRC:-8.23.0}
 OUT=results/confirm-$STAMP
 mkdir -p "$OUT/ssh"
 # Snapshot the source now: later edits in the working tree must not reach this run.
+# `tune` is a path dependency of `ergon-io` (and its README is `include_str!`d),
+# so it has to travel with the snapshot or the build fails on the VM.
 ( cd ../.. && COPYFILE_DISABLE=1 tar --no-xattrs --exclude target --exclude results -czf "$OLDPWD/$OUT/src.tgz" \
-    Cargo.toml rust-toolchain.toml io/Cargo.toml io/src \
-    io/benches/Cargo.toml io/benches/Cargo.lock io/benches/src io/benches/tests io/benches/scripts )
+    Cargo.toml rust-toolchain.toml tune io )
 LOG=$OUT/run.log
 exec > >(trap '' INT TERM; exec tee -a "$LOG") 2>&1
 MAX_S=${MAX_S:-7200}

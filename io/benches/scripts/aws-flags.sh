@@ -55,9 +55,10 @@ ANALYSE=$PWD/target/release/analyse
 cargo build --release -q --bin analyse || { echo "analyse does not build; nothing created"; exit 1; }
 cp "$ANALYSE" "$OUT/analyse.bin" && ANALYSE=$PWD/$OUT/analyse.bin
 # Snapshot the source now: later edits in the working tree must not reach this run.
+# `tune` is a path dependency of `ergon-io` (and its README is `include_str!`d),
+# so it has to travel with the snapshot or the build fails on the VM.
 ( cd ../.. && COPYFILE_DISABLE=1 tar --no-xattrs --exclude target --exclude results -czf "$OLDPWD/$OUT/src.tgz" \
-    Cargo.toml rust-toolchain.toml io/Cargo.toml io/src \
-    io/benches/Cargo.toml io/benches/Cargo.lock io/benches/src io/benches/tests io/benches/scripts )
+    Cargo.toml rust-toolchain.toml tune io )
 # The shared scripts too: this run sources and copies its own snapshot.
 mkdir -p "$OUT/scripts"
 cp scripts/lib-cloud.sh scripts/lib-matrix.sh scripts/vm-setup.sh "$OUT/scripts/"
