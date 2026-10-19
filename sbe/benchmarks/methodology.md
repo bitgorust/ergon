@@ -281,9 +281,10 @@ comparison must:
 - stay within the strict `1.00` per-scenario ceiling in
   `scripts/check-bench-gate.sh`.
 
-A ceiling above `1.00` records a repeatable, fair sbe-tool win; it is not
-permission to add overhead. Changing a ceiling requires a fresh fairness audit
-and recorded measurements, not merely a failing gate.
+A ceiling above `1.00` records a repeatable sbe-tool win on a placement-
+sensitive micro-op — a noise floor, not a real win. It is not permission to
+add overhead. Changing a ceiling requires a fresh fairness audit and recorded
+measurements, not merely a failing gate.
 
 ## Expanded codec matrix
 
