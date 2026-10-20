@@ -176,8 +176,8 @@ How Aeron uses them: the media driver keeps three cache-line-padded
 `aeron_clock_cache_t` (conductor, sender, receiver). Each agent reads the clock
 once per duty cycle and stores it; the epoch half is refreshed at most once a
 millisecond. Everything on the hot path — publications, images, loss detectors
-— reads the cached `int64`, one acquire load. The clock's own cost is not on
-the hot path.
+— reads the cached `int64`, one acquire load. One underlying read per duty
+cycle; no workload benefit demonstrated from replacing it.
 
 Cost of the underlying kernel reads, measured on c8g.xlarge
 ([BENCHMARKS.md](BENCHMARKS.md), slowest batch in brackets):

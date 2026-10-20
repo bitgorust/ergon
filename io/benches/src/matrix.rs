@@ -13,7 +13,10 @@ use std::path::Path;
 
 use crate::record::read_records;
 use crate::stalls::{self, Attribution, StallSummary};
-use crate::stats::{Summary, WORK_HEADER, Work, summarize, us, work_row};
+use crate::stats::{
+    SEND_SCHEDULE_HEADER, SendSchedule, Summary, WORK_HEADER, Work, send_schedule_row, summarize,
+    us, work_row,
+};
 
 /// One run's results.
 #[derive(Debug, Clone, Default)]
@@ -64,6 +67,10 @@ pub struct Run {
     /// (which are over [`Work::completed`] alone). `None` for a run recorded
     /// before the counts were.
     pub work: Option<Work>,
+    /// The sender's batch schedule beside that: whether the traffic was the
+    /// planned traffic. A different population from [`Work::late`] (see
+    /// [`SendSchedule`]). `None` for a run with no sender account.
+    pub send: Option<SendSchedule>,
 }
 
 /// The interrupts that show tick and IPI work on a CPU: local timer,
@@ -289,6 +296,11 @@ pub fn load_run(dir: &Path, warmup_s: i64) -> Result<Run, String> {
     // claims counts that cannot hold, or more completions than it recorded,
     // is named here rather than reported beside the percentiles.
     let work = Work::load(&m, records.len())?;
+    // Beside the work counts: the sender's batch schedule, which says whether
+    // the traffic was the planned traffic. `Work::late` cannot say that (see
+    // [`SendSchedule`]), and a run whose sender fell behind measures a load it
+    // was not offered on purpose.
+    let send = SendSchedule::from_meta(&m)?;
     let t0 = records.iter().map(|r| r.user_ns).min().unwrap_or(0);
     let mut due = None;
     let mut due_over = [0; 4];
@@ -397,6 +409,7 @@ pub fn load_run(dir: &Path, warmup_s: i64) -> Result<Run, String> {
         irqs,
         clock_bound_ns: clock_bound,
         work,
+        send,
     })
 }
 
@@ -639,6 +652,36 @@ fn work_table(out: &mut String, tags: &[Tag], kind: &str) {
     let _ = writeln!(out);
 }
 
+/// The sender's schedule beside `kind`'s percentiles: whether the offered
+/// traffic was the planned traffic. Reported separately from the work counts
+/// because it counts a different population (see [`SendSchedule`]).
+fn send_schedule_table(out: &mut String, tags: &[Tag], kind: &str) {
+    if !tags
+        .iter()
+        .any(|t| t.runs.get(kind).and_then(|r| r.send).is_some())
+    {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "### Sender schedule behind those percentiles\n\n\
+         `batches` are the due times the sender had traffic for — the order connection and the feeds \
+         together, the first message of each — and `late >100 µs` is the part that began over 100 µs \
+         after its due time. This is not `late` above: that counts the paced order slots filled when \
+         the next slot was already due, and a run can show 2 of those and tens of thousands of late \
+         batches at once. Traffic sent late is not the traffic planned (a saturated sender also slows \
+         down with a slow receiver), so a row that is over 1% is measuring a load the run was not \
+         offered on purpose.\n\n\
+         {SEND_SCHEDULE_HEADER}"
+    );
+    for t in tags {
+        let Some(r) = t.runs.get(kind) else { continue };
+        let Some(s) = r.send else { continue };
+        let _ = writeln!(out, "{}", send_schedule_row(&t.name, &s));
+    }
+    let _ = writeln!(out);
+}
+
 /// Interrupts per second on the loop CPU and the receiving CPU, every run.
 fn irq_table(out: &mut String, tags: &[Tag]) {
     let mut kinds: Vec<&String> = tags
@@ -784,6 +827,7 @@ pub fn report(tags: &[Tag], skipped: &[(String, String)]) -> String {
             view_table(&mut out, tags, &kind, &title, view);
         }
         work_table(&mut out, tags, &kind);
+        send_schedule_table(&mut out, tags, &kind);
     }
     irq_table(&mut out, tags);
     // The worst samples themselves, each with when and why.

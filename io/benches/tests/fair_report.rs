@@ -93,6 +93,19 @@ fn run(dir: &std::path::Path, mode: &str, rx_us: i64, user_us: i64) -> R {
     run_with(dir, mode, rx_us, user_us, "")
 }
 
+/// A run that also reports its sender's batch schedule. `work` is the
+/// `work.*` block and `send` the `send.*` one; either may be empty.
+fn run_sched(
+    dir: &std::path::Path,
+    mode: &str,
+    rx_us: i64,
+    user_us: i64,
+    work: &str,
+    send: &str,
+) -> R {
+    run_with(dir, mode, rx_us, user_us, &format!("{work}{send}"))
+}
+
 /// `--fair` compares backends against each other, so a reader needs the work
 /// behind each comparison beside it: what the schedule owed, what went out,
 /// what produced a sample and what was left censored. A run with no counts is
@@ -141,6 +154,145 @@ fn every_fair_comparison_shows_the_work_behind_it() -> R {
     assert!(
         !text.contains("| `md-epoll-spin-c16` | 0 | 0 |"),
         "a run with no counts is reported as zeros:\n{text}"
+    );
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
+
+/// The work table's `late` counts paced **order slots**. It cannot say whether
+/// the offered traffic was the traffic the run planned: that is the sender's
+/// batch schedule, a different population. A comparison shows both, and never
+/// prints one number as if it were the other.
+#[test]
+fn a_comparison_shows_the_send_schedule_beside_the_work_not_in_place_of_it() -> R {
+    let root = std::env::temp_dir().join(format!("fair-send-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(
+        root.join("fair-env.txt"),
+        "run=20261019T120000Z\ncloud=aws\nregion=us-east-1\narch=x86\npriority=Spot\n\
+         receiver=c7i.2xlarge\nsender=c7i.xlarge\nimage=debian-13\n\
+         receiver_cpu=Intel Xeon (Sapphire Rapids)\nkernel=6.1.0\nlayout=own-cores\n\
+         housekeeping_cpu=0\nirq_cpu=1\nloop_cpu=2\nsqpoll_cpu=3\nspare_cpu=none\nreceiver_boot=full-pollidle\n",
+    )?;
+    let core = root.join("f1-irqcore");
+    // Two order slots late, and 39 464 batches began over 100 µs late. Both
+    // are true at once; a report that prints one figure for both is lying.
+    run_sched(
+        &core.join("rt-recv-busy-n4-r10000"),
+        "pingpong",
+        0,
+        45,
+        "work.scheduled=20010\nwork.issued=20008\nwork.completed=20000\nwork.late=2\nwork.rejected=0\nwork.censored=8\n",
+        "send.sent=3060455\nsend.batches=1586374\nsend.late_100us=39464\nsend.late_max_us=178\n",
+    )?;
+    run_sched(
+        &core.join("rt-uring-spin-n4-r10000"),
+        "pingpong",
+        0,
+        40,
+        "",
+        "",
+    )?;
+    let (tags, skipped) = matrix::load(&root, 0)?;
+    let text = report(&root, &tags, &skipped);
+    assert!(
+        text.contains("### Work behind the comparison"),
+        "no work table:\n{text}"
+    );
+    assert!(
+        text.contains("### Sender schedule behind the comparison"),
+        "no sender schedule beside the comparison:\n{text}"
+    );
+    assert!(
+        text.contains("| `rt-recv-busy-n4-r10000` | 20010 | 20008 | 20000 | 2 | 0 | 8 |"),
+        "the order-slot count is missing:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "| `rt-recv-busy-n4-r10000` | 3060455 | 1586374 | 39464 (2.49%) | 178 | over 1%: not the planned traffic |"
+        ),
+        "the batch-schedule count is missing:\n{text}"
+    );
+    assert!(
+        text.contains("not the order slots"),
+        "the two populations are not distinguished:\n{text}"
+    );
+    assert!(
+        text.contains("not yet measured"),
+        "a run with no sender account is not named as such:\n{text}"
+    );
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
+
+/// A row whose sender fell behind is not a like-for-like ranking against rows
+/// whose senders did not. The comparison names those rows rather than leaving
+/// the reader to spot a percentage in a column.
+#[test]
+fn a_comparison_names_the_rows_whose_sender_was_not_the_planned_traffic() -> R {
+    let root = std::env::temp_dir().join(format!("fair-slip-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(
+        root.join("fair-env.txt"),
+        "run=20261019T120000Z\ncloud=aws\nregion=us-east-1\narch=x86\npriority=Spot\n\
+         receiver=c7i.2xlarge\nsender=c7i.xlarge\nimage=debian-13\n\
+         receiver_cpu=Intel Xeon (Sapphire Rapids)\nkernel=6.1.0\nlayout=own-cores\n\
+         housekeeping_cpu=0\nirq_cpu=1\nloop_cpu=2\nsqpoll_cpu=3\nspare_cpu=none\nreceiver_boot=full-pollidle\n",
+    )?;
+    let core = root.join("f1-irqcore");
+    let clean = "send.sent=3056573\nsend.batches=1584354\nsend.late_100us=0\nsend.late_max_us=62\n";
+    let slipped =
+        "send.sent=3060455\nsend.batches=1586374\nsend.late_100us=39464\nsend.late_max_us=178\n";
+    run_sched(
+        &core.join("rt-epoll-spin-n4-r10000"),
+        "pingpong",
+        0,
+        40,
+        "",
+        clean,
+    )?;
+    run_sched(&core.join("rt-mio-n4-r10000"), "pingpong", 0, 41, "", clean)?;
+    run_sched(
+        &core.join("rt-uring-spin-n4-r10000"),
+        "pingpong",
+        0,
+        42,
+        "",
+        slipped,
+    )?;
+    run_sched(
+        &core.join("rt-recv-busy-n4-r10000"),
+        "pingpong",
+        0,
+        43,
+        "",
+        clean,
+    )?;
+    let (tags, skipped) = matrix::load(&root, 0)?;
+    let text = report(&root, &tags, &skipped);
+    assert!(
+        text.contains("Do not treat those rows as a like-for-like ranking"),
+        "a slipped row is left for the reader to rank anyway:\n{text}"
+    );
+    assert!(
+        text.contains("`rt-uring-spin-n4-r10000`"),
+        "the slipped row is not named:\n{text}"
+    );
+    assert!(
+        !text.contains("`rt-epoll-spin-n4-r10000`, `rt-mio-n4-r10000`"),
+        "a clean row is listed as slipped:\n{text}"
+    );
+    // A comparison with no slipped row carries no such warning.
+    let md = root.join("f1-irqcore");
+    run_sched(&md.join("md-epoll-spin-c4"), "lab", 27, 30, "", clean)?;
+    let (tags, skipped) = matrix::load(&root, 0)?;
+    let text = report(&root, &tags, &skipped);
+    let market = &text[..text.find("## The WebSocket").unwrap_or(text.len())];
+    assert!(
+        !market.contains("Do not treat those rows as a like-for-like ranking"),
+        "a clean comparison carries a slip warning:\n{market}"
     );
     std::fs::remove_dir_all(&root)?;
     Ok(())

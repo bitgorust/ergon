@@ -5,6 +5,46 @@
 - **Receiver CPUs:** layout own-cores; housekeeping 0, NIC interrupts 1, loop 7, SQPOLL 4, spare 6; boot profile full-pollidle
 - **Every figure:** µs, as n (samples) | p50 | p99 | p99.9 | max, per round; the connection count is in each heading.
 
+> **Added 2026-10-20, after the run — read this before ranking any row.**
+>
+> This file is a frozen artefact. The raw `records.bin` were left on the lab VM
+> and the VM is terminated, so it cannot be regenerated; the generator
+> (`analyse --fair`) has since been fixed to emit the two accounts below beside
+> every comparison, and will do so on the next run.
+>
+> Two accounts, never one number. `work.late` (in
+> [`work-counts.md`](work-counts.md)) counts paced **order slots** filled when
+> the next slot was already due. The sender's schedule counts **batches** across
+> all the traffic a sender had to send (order connection and feeds together, the
+> first message of each due time). A point can report `work.late = 2` and 39,464
+> late sender batches at once.
+>
+> **Six of this run's 144 points sent traffic the run did not plan** — more than
+> 1 % of their sender batches began over 100 µs late. All six are in the
+> interrupt family; the polling family has none:
+>
+> | point | batches over 100 µs late |
+> |---|---|
+> | `f1-irqlocal/rt-uring-spin-n4` | 39,464 (2.49 %) |
+> | `f1-irqlocal/rt-uring-spin-n16` | 20,077 (1.27 %) |
+> | `f2-irqcore/rt-epoll-spin-n4` | 15,966 (1.01 %) |
+> | `f2-irqcore/rt-uring-spin-n4` | 25,728 (1.62 %) |
+> | `f2-irqcore/rt-uring-spin-n64` | 19,334 (1.22 %) |
+> | `f2-irqlocal/rt-mio-n4` | 21,888 (1.38 %) |
+>
+> Do not treat those six rows as a like-for-like ranking against the rest. Each
+> sits inside its family's unslipped range on p50 and p99, so no published claim
+> moves; two endpoints are set by a slipped row and both ranges are in
+> [`BENCHMARK.md`](../../BENCHMARK.md).
+>
+> Separately: every `md-mio-c1` point shows a sender `late >100 µs` **max** of
+> 36,059–40,180 µs on 0.07 % of batches (next largest anywhere in the run:
+> 197 µs). Confined to `mio` at one connection across every flag combination.
+> No latency sample saw it, so the `md-mio-c1` latency figures stand. The
+> mechanism consistent with the evidence is a multi-ms `mio` read loop closing
+> the TCP window on a single-connection run's only socket; that link is **not
+> traced** — see `BENCHMARK.md`.
+
 **Settings every backend shares** (held, and checked before and after every point):
 
 - net.core.busy_poll 0, net.core.busy_read 0 (no global busy polling: the interrupt-driven backends are purely interrupt driven; recv-busy and uring-sqpoll set their own per socket or ring)

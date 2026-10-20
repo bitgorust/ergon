@@ -24,7 +24,10 @@ use std::process::ExitCode;
 
 use io_bench::record::{Record, read_records};
 use io_bench::stalls::{self, Attribution, StallSummary};
-use io_bench::stats::{HEADER, Summary, WORK_HEADER, Work, row, summarize, us, work_row};
+use io_bench::stats::{
+    HEADER, SEND_SCHEDULE_HEADER, SendSchedule, Summary, WORK_HEADER, Work, row, send_schedule_row,
+    summarize, us, work_row,
+};
 
 type BoxResult<T> = Result<T, Box<dyn Error>>;
 type Meta = HashMap<String, String>;
@@ -94,6 +97,7 @@ fn main() -> ExitCode {
     let mut out = String::new();
     let mut pingpong_rows = Vec::new();
     let mut work_rows = Vec::new();
+    let mut send_rows = Vec::new();
     let mut summary_rows = Vec::new();
     for d in &dirs {
         if let Err(e) = analyse(
@@ -102,6 +106,7 @@ fn main() -> ExitCode {
             &mut out,
             &mut pingpong_rows,
             &mut work_rows,
+            &mut send_rows,
             &mut summary_rows,
         ) {
             eprintln!("{d}: {e}");
@@ -136,6 +141,25 @@ fn main() -> ExitCode {
             WORK_HEADER.replacen("| |", "| variant @ rate |", 1)
         );
         for r in &work_rows {
+            let _ = writeln!(out, "{r}");
+        }
+        let _ = writeln!(out);
+    }
+    if !send_rows.is_empty() {
+        let _ = writeln!(
+            out,
+            "### Sender schedule behind those percentiles\n\n\
+             `batches` are the due times the sender had traffic for — the order connection and the feeds \
+             together, the first message of each — and `late >100 µs` is the part that began over 100 µs \
+             after its due time. This is not `late` above: that counts the paced order slots filled when \
+             the next slot was already due, and a run can show 2 of those and tens of thousands of late \
+             batches at once. Traffic sent late is not the traffic planned (a saturated sender also slows \
+             down with a slow receiver), so a row that is over 1% is measuring a load the run was not \
+             offered on purpose.\n\n\
+             {}",
+            SEND_SCHEDULE_HEADER.replacen("| |", "| variant @ rate |", 1)
+        );
+        for r in &send_rows {
             let _ = writeln!(out, "{r}");
         }
         let _ = writeln!(out);
@@ -180,6 +204,7 @@ fn analyse(
     out: &mut String,
     pingpong: &mut Vec<String>,
     work_rows: &mut Vec<String>,
+    send_rows: &mut Vec<String>,
     summary: &mut Vec<String>,
 ) -> BoxResult<()> {
     let meta = load_meta(dir)?;
@@ -210,6 +235,9 @@ fn analyse(
     // can read as a faster one. The error propagates: those latency rows are
     // not published, and the process does not exit 0.
     let work = Work::load(&meta, all.len())?;
+    // Beside the work counts: the sender's batch schedule, which is the only
+    // account that says whether the offered traffic was the planned traffic.
+    let send = SendSchedule::from_meta(&meta)?;
     let variants: Vec<String> = get(&meta, "variants")
         .split(',')
         .map(str::to_owned)
@@ -252,6 +280,15 @@ fn analyse(
             work_rows.push(work_row(
                 &format!("{name}: {} @ {}/s", variants[0], get(&meta, "rate")),
                 &w,
+            ));
+        }
+        // And whether that offered traffic was the planned traffic. `Work::late`
+        // cannot say (see `SendSchedule`), so a table that prints only the work
+        // counts can read a slipped sender as a clean run.
+        if let Some(s) = send {
+            send_rows.push(send_schedule_row(
+                &format!("{name}: {} @ {}/s", variants[0], get(&meta, "rate")),
+                &s,
             ));
         }
         // HTTP client runs (http_bench) carry no full loop counters.
@@ -311,6 +348,25 @@ fn analyse(
              {}\n{}",
             WORK_HEADER.replacen("| |", "| run |", 1),
             work_row(&name, &w)
+        );
+        let _ = writeln!(out);
+    }
+    if let Some(s) = send {
+        // Whether the offered traffic was the planned traffic. A different
+        // population from `work.late` above: this counts every batch the
+        // sender owed (order and feeds together) and reports the part that
+        // began over 100 µs late.
+        let _ = writeln!(
+            out,
+            "### Sender schedule behind those percentiles\n\n\
+             `batches` are the due times the sender had traffic for — the order connection and the \
+             feeds together, the first message of each — and `late >100 µs` is the part that began \
+             over 100 µs after its due time. Traffic sent late is not the traffic planned (a \
+             saturated sender also slows down with a slow receiver), so a row that is over 1% is \
+             measuring a load the run was not offered on purpose.\n\n\
+             {}\n{}",
+            SEND_SCHEDULE_HEADER.replacen("| |", "| run |", 1),
+            send_schedule_row(&name, &s)
         );
         let _ = writeln!(out);
     }

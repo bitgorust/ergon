@@ -400,3 +400,136 @@ fn a_run_without_the_counts_is_not_reported_as_six_zeros() -> R {
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
+
+/// The sender's batch schedule is a different population from [`Work::late`].
+/// `Work` counts the paced order slots: `late` is a slot filled when the next
+/// one was already due. The sender counts **batches** across all of its
+/// traffic — the order connection and the feeds together, the first message
+/// of each due time — and `late_100us` is a batch that began over 100 µs
+/// late. A run can show `work.late` = 2 and 39 464 late batches at once, and
+/// only the second says the offered traffic was not the planned traffic.
+mod send_schedule {
+    use io_bench::stats::SendSchedule;
+    use std::collections::HashMap;
+
+    type R = Result<(), Box<dyn std::error::Error>>;
+
+    fn meta(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn it_is_the_send_side_of_the_traffic_not_the_order_slots() {
+        let w = io_bench::stats::Work::round_trip(10, 8, 7, 2, 1);
+        assert_eq!(w.late, Some(2), "two order slots were filled a slot late");
+        let s = SendSchedule {
+            sent: Some(3_060_455),
+            batches: Some(1_586_374),
+            late_100us: Some(39_464),
+            late_max_us: Some(178),
+        };
+        assert_eq!(
+            s.late_100us,
+            Some(39_464),
+            "39 464 batches began over 100 µs late"
+        );
+        assert_ne!(
+            s.late_100us, w.late,
+            "the two count different things and must never be printed as one"
+        );
+    }
+
+    #[test]
+    fn an_absent_sender_schedule_stays_not_measured() -> R {
+        assert_eq!(SendSchedule::from_meta(&meta(&[]))?, None);
+        // A partial one is kept as recorded: `late_max_us` is the only field
+        // the sender can have when no batch was late.
+        let s = SendSchedule::from_meta(&meta(&[
+            ("send.sent", "3060455"),
+            ("send.batches", "1586374"),
+            ("send.late_100us", "0"),
+            ("send.late_max_us", "0"),
+        ]))?
+        .expect("present counts load");
+        assert_eq!(s.late_100us, Some(0));
+        assert_eq!(s.cells(), "3060455 | 1586374 | 0 | 0 | ok");
+        Ok(())
+    }
+
+    #[test]
+    fn a_present_but_unreadable_count_is_malformed_not_missing() {
+        let err = SendSchedule::from_meta(&meta(&[
+            ("send.batches", "1586374"),
+            ("send.late_100us", "lots"),
+        ]))
+        .expect_err("garbage is not an honest hole");
+        assert!(err.contains("send.late_100us"), "{err}");
+    }
+
+    #[test]
+    fn batches_without_late_counts_is_malformed() {
+        // `sent` and `batches` alone cannot say whether the traffic was the
+        // planned traffic, so they are not a usable schedule account.
+        let err = SendSchedule::from_meta(&meta(&[
+            ("send.sent", "3060455"),
+            ("send.batches", "1586374"),
+        ]))
+        .expect_err("a schedule that cannot be judged is not reported");
+        assert!(err.contains("send.late_100us"), "{err}");
+    }
+
+    #[test]
+    fn a_sender_over_one_percent_of_batches_late_is_flagged() {
+        // The threshold the harness warns at: more than 1% of batches.
+        let ok = SendSchedule {
+            sent: Some(100),
+            batches: Some(10_000),
+            late_100us: Some(99),
+            late_max_us: Some(150),
+        };
+        assert_eq!(ok.verdict(), "ok");
+        assert_eq!(ok.late_pct(), Some(0.99));
+        let slipped = SendSchedule {
+            sent: Some(100),
+            batches: Some(10_000),
+            late_100us: Some(101),
+            late_max_us: Some(178),
+        };
+        assert_eq!(slipped.verdict(), "over 1%: not the planned traffic");
+        assert_eq!(slipped.late_pct(), Some(1.01));
+    }
+
+    #[test]
+    fn a_zero_batch_run_is_judged_on_nothing() {
+        let none = SendSchedule {
+            sent: Some(0),
+            batches: Some(0),
+            late_100us: Some(0),
+            late_max_us: Some(0),
+        };
+        assert_eq!(none.verdict(), "not yet measured");
+        assert_eq!(none.late_pct(), None);
+    }
+
+    #[test]
+    fn the_verdict_sits_next_to_the_counts() {
+        let s = SendSchedule {
+            sent: Some(3_060_455),
+            batches: Some(1_586_374),
+            late_100us: Some(39_464),
+            late_max_us: Some(178),
+        };
+        assert_eq!(
+            io_bench::stats::send_schedule_row("rt-uring-spin-n4 @ 10000/s", &s),
+            "| rt-uring-spin-n4 @ 10000/s | 3060455 | 1586374 | 39464 (2.49%) | 178 | over 1%: not the planned traffic |"
+        );
+        assert_eq!(
+            io_bench::stats::SEND_SCHEDULE_HEADER,
+            "| | sent | batches | late >100 µs | latest µs | verdict |\n\
+             |---|---|---|---|---|---|"
+        );
+    }
+}

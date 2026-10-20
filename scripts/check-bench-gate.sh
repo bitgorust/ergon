@@ -78,21 +78,26 @@ verify_manifest() {
 import json, sys
 
 path, expected = sys.argv[1], sys.argv[2]
+def refuse(message):
+    print(message)
+    raise SystemExit(1)
+
+
 try:
     with open(path, encoding="utf-8") as handle:
         manifest = json.load(handle)
 except (OSError, ValueError) as error:
-    sys.exit(f"  FAIL provenance (unreadable manifest {path}: {error})")
+    refuse(f"  FAIL provenance (unreadable manifest {path}: {error})")
 
-missing = [key for key in ("run_id", "profile", "commit", "rustc", "target") if not manifest.get(key)]
+missing = [key for key in ("run_id", "profile", "commit", "rustc", "target", "host") if not manifest.get(key)]
 if missing:
-    sys.exit(f"  FAIL provenance (manifest {path} is incomplete: missing {', '.join(missing)})")
+    refuse(f"  FAIL provenance (manifest {path} is incomplete: missing {', '.join(missing)})")
 if manifest["run_id"] != expected:
-    sys.exit(
+    refuse(
         f"  FAIL provenance (manifest run id {manifest['run_id']!r} != expected {expected!r} — stale results)"
     )
 print(
-    "  provenance ok: run {run_id} profile {profile} commit {commit} rustc {rustc} target {target}".format(
+    "  provenance ok: run {run_id} profile {profile} commit {commit} rustc {rustc} target {target} host {host}".format(
         **manifest
     )
 )
@@ -100,33 +105,28 @@ PY
     return 0
 }
 
-# Every estimate the reader will consume carries this run's id: the single-run
-# `new/` stamp, and each `repeats/<k>/` stamp where the runner produced them.
-# A repeat from another run would widen the envelope with foreign evidence.
+# Every estimate the reader will consume carries this run's id. An arm with
+# estimates but no stamp is refused, not skipped: a stampless arm is either
+# stale or produced outside this run, and either way it is not evidence this
+# run took. A repeat from another run would widen the envelope with foreign
+# evidence — or, as an A/A control, turn any regression into "harness noise".
+#
+# An arm with no estimates at all is not a provenance failure: there is nothing
+# to verify. A control the run simply did not take leaves the null unmeasured,
+# which is reported; a maintained pair with no estimates fails on "missing
+# estimates" before it ever gets here.
 verify_estimate_run_id() {
     local key="$1" run_id="$2" label="$3"
     python3 - "$CRITERION_DIR" "$key" "$run_id" "$label" <<'PY' || return 1
 import os, sys
 
 root, key, expected, label = sys.argv[1:5]
-stamps = []
-repeats = os.path.join(root, "repeats")
-if os.path.isdir(repeats):
-    for name in sorted(
-        (n for n in os.listdir(repeats) if os.path.isdir(os.path.join(repeats, n))),
-        key=lambda n: (0, int(n)) if n.isdigit() else (1, n),
-    ):
-        path = os.path.join(repeats, name, key, "run-id.txt")
-        if os.path.isfile(path):
-            stamps.append(path)
-if not stamps:
-    path = os.path.join(root, key, "new", "run-id.txt")
-    if os.path.isfile(path):
-        stamps.append(path)
-if not stamps:
-    print(f"  FAIL {label} (estimate has no run id — stale or externally produced)")
-    raise SystemExit(1)
-for stamp in stamps:
+
+
+def check(stamp, where):
+    if not os.path.isfile(stamp):
+        print(f"  FAIL {label} ({where} has estimates but no run id — stale or externally produced)")
+        raise SystemExit(1)
     with open(stamp, encoding="utf-8") as handle:
         actual = handle.read().strip()
     if actual != expected:
@@ -135,61 +135,130 @@ for stamp in stamps:
             " — mixed-run results)"
         )
         raise SystemExit(1)
+
+
+checked = 0
+repeats = os.path.join(root, "repeats")
+if os.path.isdir(repeats):
+    for name in sorted(
+        (n for n in os.listdir(repeats) if os.path.isdir(os.path.join(repeats, n))),
+        key=lambda n: (0, int(n)) if n.isdigit() else (1, n),
+    ):
+        arm = os.path.join(repeats, name, key)
+        if not os.path.isfile(os.path.join(arm, "estimates.json")):
+            continue
+        check(os.path.join(arm, "run-id.txt"), f"repetition {name}")
+        checked += 1
+if checked == 0:
+    arm = os.path.join(root, key, "new")
+    if os.path.isfile(os.path.join(arm, "estimates.json")):
+        check(os.path.join(arm, "run-id.txt"), "the single-run estimate")
 PY
     return 0
 }
 
 # Every independent invocation of one estimate key, one row per invocation:
 # "point lo hi", or "point" where the estimate carries no confidence interval.
-# Empty when the key is absent.
+# Empty when the key is absent entirely.
 #
 # Prefers `repeats/<k>/<key>/estimates.json`, the per-invocation snapshots the
 # runner takes, and falls back to the single-run `<key>/new/estimates.json`.
 # Reading every invocation is the point: one invocation's confidence interval
 # is not the harness's resolution, so a pair graded on one of them claims a
 # separation the measurement does not have.
+#
+# All-or-nothing. A malformed or missing invocation is printed as `@ERROR` and
+# nothing else: a reader that dropped the unreadable rows and kept the rest
+# would grade the pair on a thinner envelope than the run took, and two
+# identical arms graded on one invocation look like a clean pass. Every value
+# must be finite and positive — `NaN`, infinity and non-positive counts are
+# accepted by Python's JSON reader and by `float()`, and none of them is a
+# measurement.
 repeated_estimates() {
     python3 - "$CRITERION_DIR" "$1" <<'PY'
-import json, os, sys
+import json, math, os, sys
 
 root, key = sys.argv[1], sys.argv[2]
-paths = []
+
+
+def refuse(message):
+    print(f"@ERROR {message}")
+    raise SystemExit(2)
+
+
+def finite_positive(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def load(path, where):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            estimates = json.load(handle)
+        # Criterion writes `slope` as JSON null for flat-sampling benchmarks,
+        # where it runs no regression. `dict.get('slope', default)` returns that
+        # null rather than the default, because the key is present — so the old
+        # reader crashed on `None['point_estimate']` and the pair reported
+        # "missing estimates". Test for a usable object, then fall back to the
+        # **mean**, which is the estimator Criterion displays under flat
+        # sampling: `Estimates::typical()` is
+        # `self.slope.as_ref().unwrap_or(&self.mean)` (criterion 0.8.2
+        # `src/estimate.rs:116`). Not the median — these samples are
+        # right-skewed, so the two disagree and grading the median would let a
+        # real regression through.
+        est = estimates.get("slope") or estimates.get("mean")
+        if not isinstance(est, dict) or "point_estimate" not in est:
+            raise ValueError("no slope or mean point estimate")
+        point = est["point_estimate"]
+        if not finite_positive(point):
+            raise ValueError(f"point estimate {point!r} is not a finite positive measurement")
+        ci = est.get("confidence_interval") or {}
+        lo, hi = ci.get("lower_bound"), ci.get("upper_bound")
+        if lo is None or hi is None:
+            return (point, None, None)
+        if not (finite_positive(lo) and finite_positive(hi)):
+            raise ValueError(f"confidence interval [{lo!r}, {hi!r}] is not finite and positive")
+        if lo > hi:
+            raise ValueError(f"confidence interval is inverted: [{lo!r}, {hi!r}]")
+        return (point, lo, hi)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        refuse(f"{where} is unreadable ({error}) — refusing the pair rather than dropping it")
+
+
+rows = []
 repeats = os.path.join(root, "repeats")
+names = []
 if os.path.isdir(repeats):
     names = sorted(
         (n for n in os.listdir(repeats) if os.path.isdir(os.path.join(repeats, n))),
         key=lambda n: (0, int(n)) if n.isdigit() else (1, n),
     )
+if names:
+    # Every invocation the run produced must carry this key. A key present in
+    # some invocations and absent from others is incomplete evidence: grading
+    # the ones that are there claims a resolution the run does not have.
     for name in names:
         path = os.path.join(repeats, name, key, "estimates.json")
-        if os.path.isfile(path):
-            paths.append(path)
-if not paths:
+        if not os.path.isfile(path):
+            refuse(
+                f"repetition {name} has no estimate for {key} — incomplete evidence"
+                " (every declared invocation of every pair is required)"
+            )
+        rows.append(load(path, f"repetition {name} of {key}"))
+else:
     path = os.path.join(root, key, "new", "estimates.json")
     if os.path.isfile(path):
-        paths.append(path)
-for path in paths:
-    with open(path, encoding="utf-8") as handle:
-        estimates = json.load(handle)
-    # Criterion writes `slope` as JSON null for flat-sampling benchmarks, where
-    # it runs no regression. `dict.get('slope', default)` returns that null
-    # rather than the default, because the key is present — so the old reader
-    # crashed on `None['point_estimate']` and the pair reported "missing
-    # estimates". Test for a usable object, then fall back to the **mean**,
-    # which is the estimator Criterion displays under flat sampling:
-    # `Estimates::typical()` is `self.slope.as_ref().unwrap_or(&self.mean)`
-    # (criterion 0.8.2 `src/estimate.rs:116`). Not the median — these samples
-    # are right-skewed, so the two disagree and grading the median would let a
-    # real regression through.
-    est = estimates.get("slope") or estimates.get("mean")
-    if not isinstance(est, dict) or "point_estimate" not in est:
-        raise SystemExit(1)
-    ci = est.get("confidence_interval") or {}
-    lo, hi = ci.get("lower_bound"), ci.get("upper_bound")
-    if lo is None or hi is None:
-        print(est["point_estimate"])
+        rows.append(load(path, key))
+
+for point, lo, hi in rows:
+    if lo is None:
+        print(point)
     else:
-        print(f"{est['point_estimate']} {lo} {hi}")
+        print(f"{point} {lo} {hi}")
 PY
 }
 
@@ -206,6 +275,15 @@ check_ratio() {
     # fail closed on an empty result.
     ergo_rows=$(repeated_estimates "$ergo_key" 2>/dev/null || true)
     ref_rows=$(repeated_estimates "$ref_key" 2>/dev/null || true)
+    # The reader refuses rather than drops: an unreadable or incomplete
+    # invocation is reported and nothing else is used. Grading the rows it
+    # happened to parse would thin the envelope and claim a resolution the run
+    # does not have.
+    if printf '%s\n%s\n' "$ergo_rows" "$ref_rows" | grep -q '^@ERROR'; then
+        printf '%s\n%s\n' "$ergo_rows" "$ref_rows" | sed -n 's/^@ERROR /  /p'
+        echo "  $label: FAIL — the evidence under this pair is incomplete or malformed. Fail closed."
+        return 1
+    fi
     out=$(python3 - "$label" "$ceiling" "$tolerance" "$aa_band" "$ergo_rows" "$ref_rows" <<'PY'
 import sys
 
@@ -271,6 +349,12 @@ if aa_band and ratio_ci is not None:
     a_lo, a_hi = (float(x) for x in aa_band.split())
     inside_aa = not (ratio_ci[1] < a_lo or ratio_ci[0] > a_hi)
 
+# The ladder is strict about what "inconclusive" means. Only a **measured**
+# A/A null band that reaches as far as the pair excuses an over-ceiling ratio;
+# that is the harness saying identical code looks the same here. Everything
+# else above the ceiling is either a resolved breach or unproven — and unproven
+# is not a pass, because "the measurement could not resolve it" is not "the
+# ceiling was met".
 if ratio_ci is None:
     resolution, res_key = "uncertainty not measured", "unknown"
 elif ratio_ci[1] <= ceiling:
@@ -280,10 +364,15 @@ elif point_hi <= ceiling:
         "ceiling met in every invocation; the envelope straddles it",
         "ok_unresolved",
     )
-elif ratio_ci[0] > ceiling and not inside_aa:
+elif inside_aa:
+    resolution, res_key = "inconclusive — no winner", "inconclusive"
+elif ratio_ci[0] > ceiling:
     resolution, res_key = "resolved breach", "resolved"
 else:
-    resolution, res_key = "inconclusive — no winner", "inconclusive"
+    resolution, res_key = (
+        "unproven — no measured A/A null band reaches it",
+        "unproven",
+    )
 
 if aa_band:
     if ratio_ci is None:
@@ -294,11 +383,16 @@ else:
     band_note = "A/A null not measured"
 
 n = len(ratios)
-verdict = (
-    "FAIL"
-    if over and res_key != "inconclusive"
-    else ("above ceiling" if over else "ok")
-)
+if not over:
+    verdict = "ok"
+elif res_key == "inconclusive":
+    # Reported below and not counted as a breach: the harness cannot separate
+    # these two arms at this resolution, so no winner is established.
+    verdict = "above ceiling"
+elif res_key == "unproven":
+    verdict = "unproven — blocking"
+else:
+    verdict = "FAIL"
 if n > 1:
     # The verdict is graded on the envelope of the invocations, so the graded
     # line has to show that envelope. Printing the last invocation's ratio
@@ -366,8 +460,26 @@ estimate_dir() { printf '%s/%s/new' "$CRITERION_DIR" "$1"; }
 # single control is narrower than the noise it is meant to represent. The
 # envelope of the invocations is what the harness actually does to a pair of
 # identical arms.
+#
+# The control is evidence like any other, so it is provenance-checked like any
+# other. A band read off estimates this run did not produce is not harness
+# noise — it is foreign evidence, and it would turn any regression into an
+# "inconclusive" pair. That is the whole reason a control can excuse a breach,
+# so it must be this run's own.
 aa_band() {
-    python3 - "$(repeated_estimates "$1/$2")" "$(repeated_estimates "$1/$3")" <<'PY'
+    local group="$1" arm_a="$2" arm_b="$3"
+    local a_rows b_rows
+    if [ -n "$EXPECTED_RUN_ID" ]; then
+        verify_estimate_run_id "$group/$arm_a" "$EXPECTED_RUN_ID" "$group/$arm_a" || return 1
+        verify_estimate_run_id "$group/$arm_b" "$EXPECTED_RUN_ID" "$group/$arm_b" || return 1
+    fi
+    a_rows=$(repeated_estimates "$group/$arm_a" 2>/dev/null || true)
+    b_rows=$(repeated_estimates "$group/$arm_b" 2>/dev/null || true)
+    if printf '%s\n%s\n' "$a_rows" "$b_rows" | grep -q '^@ERROR'; then
+        printf '%s\n%s\n' "$a_rows" "$b_rows" | sed -n 's/^@ERROR /  /p'
+        return 1
+    fi
+    python3 - "$a_rows" "$b_rows" <<'PY'
 import sys
 
 
@@ -473,7 +585,14 @@ if [[ "$SUITE" == "sbe" || "$SUITE" == "all" ]]; then
     fi
     verify_repeats "$CRITERION_DIR" || failures=$((failures + 1))
 
-    SBE_AA_BAND=$(aa_band "parity_control_aa_encode_throughput" "arm_a" "arm_b")
+    SBE_AA_BAND=""
+    aa_rc=0
+    SBE_AA_BAND=$(aa_band "parity_control_aa_encode_throughput" "arm_a" "arm_b") || aa_rc=$?
+    if [ "$aa_rc" -ne 0 ]; then
+        echo "  FAIL A/A null (parity/control/aa_encode_throughput) — the control's run id is not this run's, or its estimates are unreadable. Fail closed."
+        failures=$((failures + 1))
+        SBE_AA_BAND=""
+    fi
     report_aa_null "parity/control/aa_encode_throughput" "$SBE_AA_BAND"
 
     # Maintained SBE parity pairs
@@ -543,9 +662,16 @@ if [[ "$SUITE" == "cluster" || "$SUITE" == "all" ]]; then
     fi
     verify_repeats "$CRITERION_DIR" || failures=$((failures + 1))
 
-    CLUSTER_AA_BAND=$(widest_band \
-        "$(aa_band "cluster_control_aa_encode_keep_alive" "arm_a" "arm_b")" \
-        "$(aa_band "cluster_control_aa_encode_claim_shaped" "arm_a" "arm_b")")
+    CLUSTER_AA_BAND=""
+    band_keep="" band_claim="" aa_rc=0
+    band_keep=$(aa_band "cluster_control_aa_encode_keep_alive" "arm_a" "arm_b") || aa_rc=$?
+    band_claim=$(aa_band "cluster_control_aa_encode_claim_shaped" "arm_a" "arm_b") || aa_rc=$?
+    if [ "$aa_rc" -ne 0 ]; then
+        echo "  FAIL A/A null (cluster controls) — a control's run id is not this run's, or its estimates are unreadable. Fail closed."
+        failures=$((failures + 1))
+    else
+        CLUSTER_AA_BAND=$(widest_band "$band_keep" "$band_claim")
+    fi
     report_aa_null "cluster/control aa_encode_keep_alive + aa_encode_claim_shaped" "$CLUSTER_AA_BAND"
 
     # (group|ergo_fn|sbe_fn|ceiling). Every maintained pair is literal 1.00
@@ -653,11 +779,14 @@ fi
 echo ""
 if [ -n "$INCONCLUSIVE" ]; then
     echo "inconclusive — no winner established for:$INCONCLUSIVE"
-    echo "  the measurement cannot separate these two arms at this resolution: either"
-    echo "  the ratio CI straddles the ceiling, or it overlaps the measured A/A null"
-    echo "  band (the harness's own noise for a pair of identical arms). They are not"
-    echo "  reported as an ergon loss and not as an ergon win. Ceilings are unchanged,"
-    echo "  and a ratio whose CI leaves the A/A null band is still graded as a breach."
+    echo "  A **measured** A/A null band (the harness's own noise for a pair of identical"
+    echo "  arms) reaches as far as these pairs, so the measurement cannot separate the two"
+    echo "  code objects at this resolution. They are not reported as an ergon loss and not"
+    echo "  as an ergon win. Ceilings are unchanged."
+    echo ""
+    echo "  An over-ceiling pair the band does not reach is not inconclusive: it is either a"
+    echo "  resolved breach or unproven, and unproven blocks. \"The measurement could not"
+    echo "  resolve it\" is not \"the ceiling was met\"."
     echo ""
 fi
 if [ "$failures" -gt 0 ]; then

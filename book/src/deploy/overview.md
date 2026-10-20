@@ -48,7 +48,7 @@ Kubernetes and Java terms:
 | LTS | a Java release with long-term support (17, 21, 25) | run Archive and Cluster on 25 |
 | JIT | the JVM's compiler: it turns hot code into machine code while the program runs | code-cache pressure can undo its work (deoptimise) |
 | GC, barrier | GC: the garbage collector, which frees objects no longer used. Barrier: the extra work it adds to the program's memory accesses | `ParallelGC` is what every Aeron script uses: convention, not a measured collector A/B |
-| safepoint | a pause in which every Java thread stops | `GuaranteedSafepointInterval` raises the guaranteed-safepoint interval from the default 1 s to 300 s; effect **not measured** ([Java](java.md)) |
+| safepoint | a pause in which every Java thread stops | every one is logged with its cause to tmpfs (`-Xlog:gc*,safepoint`, [Java](java.md)) |
 | duty cycle | one pass of an agent's work loop | `*.cycle.threshold=1ms` counts each one over 1 ms, so stalls show |
 | spy | a subscription that reads a publication on its own host, from its log buffer, not the network | see `aeron.spies.simulate.connection` ([Java](java.md#the-aeron-properties)) |
 | sparse file, pre-touch | sparse: disk pages appear only on first write. Pre-touch: every page is faulted in at start | no first-write page faults, but pre-touched terms count against a container's memory limit |

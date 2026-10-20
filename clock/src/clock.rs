@@ -234,8 +234,7 @@ impl CounterClock {
     }
 
     /// The counter for a measurement bracket's begin: ordered after earlier
-    /// work and before the region's work can start
-    /// ([`OrderedRead::read_begin`]).
+    /// work and before the region's work can start ([`OrderedRead`]).
     #[inline]
     #[must_use]
     pub fn ticks_begin(&self) -> u64 {

@@ -64,9 +64,6 @@ Linux has.
 |---|---|---|
 | `--add-opens java.base/jdk.internal.misc=ALL-UNNAMED` | Required. Agrona 2.x reaches `jdk.internal.misc.Unsafe`; without this option the JVM fails with `IllegalAccessError`. | Aeron's scripts and `build.gradle` |
 | `--add-opens java.base/java.util.zip=ALL-UNNAMED` | Required once Archive checksums are on (`aeron.archive.record.checksum`); without it they throw `InaccessibleObjectException`. | Aeron's scripts and `build.gradle` |
-| `-XX:+TrustFinalNonStaticFields` (experimental) | The JIT treats final instance fields as constants. | `java-common`, benchmarks |
-| `-XX:GuaranteedSafepointInterval=300000` (diagnostic) | Raises the guaranteed-safepoint interval from the default 1 s to 300 s. Aeron's scripts set it; the effect on the recommended JDK is **not measured**. | `java-common`, cluster scripts, wiki |
-| `-XX:+DebugNonSafepoints` | Profilers attribute samples to the right line. | benchmarks |
 | `-XX:+UseParallelGC` | Archive, Cluster and the driver allocate nothing in steady state. The choice is convention, not a measured collector A/B: every Aeron script uses it. | every Aeron script |
 | `-Xms` = `-Xmx`, `-XX:+AlwaysPreTouch` | The heap never grows, and every page is faulted in at start rather than on the hot path. | benchmarks |
 | `-XX:MaxMetaspaceSize=1g`, `-XX:ReservedCodeCacheSize=1g` | Code-cache pressure never deoptimises hot code. | benchmarks |

@@ -37,7 +37,10 @@ Terms: [deployment glossary](overview.md#glossary).
 Figures in this table: [md-dpdk/BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)
 (SMT row: [io/benches/BENCHMARK.md](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md);
 the two `app` network rows: the Graviton fair run
-[`20261019T175248Z`](https://github.com/mimran1980/ergon/blob/main/io/benches/results/flags-aws-20261019T175248Z/fair.md)).
+[`20261019T175248Z`](https://github.com/mimran1980/ergon/blob/main/io/benches/results/flags-aws-20261019T175248Z/fair.md),
+whose [note at the top](https://github.com/mimran1980/ergon/blob/main/io/benches/results/flags-aws-20261019T175248Z/fair.md)
+names the six points whose sender fell behind and what that does and does not
+move).
 
 ## Never do this
 

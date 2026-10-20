@@ -18,7 +18,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::matrix::{Run, Tag};
-use crate::stats::{Summary, WORK_HEADER, us, work_row};
+use crate::stats::{SEND_SCHEDULE_HEADER, Summary, WORK_HEADER, send_schedule_row, us, work_row};
 
 /// The backends in report order: interrupt-driven, then polling.
 pub const BACKENDS: [&str; 6] = [
@@ -138,6 +138,12 @@ fn cells(s: &Summary) -> String {
 /// over `completed` alone and drop the warm-up, so `n` is not the run's work.
 /// Every run in the comparison gets a row; one recorded before the counts were
 /// is "not yet measured" in every column, never zeros.
+///
+/// Two accounts, never printed as one. `work.late` counts the paced **order
+/// slots** filled when the next slot was already due. The sender's schedule
+/// counts **batches** across all the traffic it had to send, and says whether
+/// the offered load was the load the run planned. A comparison whose rows
+/// disagree on that is not a like-for-like ranking, so it names those rows.
 fn work_beside(out: &mut String, rows: &[(usize, u32, String, &str, &Run)]) {
     if rows.is_empty() {
         return;
@@ -165,6 +171,38 @@ fn work_beside(out: &mut String, rows: &[(usize, u32, String, &str, &Run)]) {
         }
     }
     let _ = writeln!(out);
+
+    // The second account. `late` above counts the order slots — **not the
+    // order slots'** share of the traffic, which is what this measures.
+    let _ = writeln!(
+        out,
+        "### Sender schedule behind the comparison\n\n\
+         `late >100 µs` counts the **batches** the sender began over 100 µs after their due time, \
+         across all the traffic it had to send (the order connection and the feeds together, the \
+         first message of each due time) — **not the order slots** that `late` above counts. A run \
+         can report `late = 2` and 39 464 late batches at once. Traffic sent late is not the traffic \
+         planned (a saturated sender also slows down with a slow receiver), so the receiver measures \
+         a load the run was not offered on purpose. `not yet measured` is a run with no sender \
+         account, never a zero.\n\n\
+         {SEND_SCHEDULE_HEADER}"
+    );
+    let mut slipped: Vec<String> = Vec::new();
+    for (_, _, _, name, r) in rows {
+        let label = format!("`{name}`");
+        let s = r.send.unwrap_or_default();
+        let _ = writeln!(out, "{}", send_schedule_row(&label, &s));
+        if s.verdict().starts_with("over 1%") {
+            slipped.push(label);
+        }
+    }
+    let _ = writeln!(out);
+    if !slipped.is_empty() {
+        let _ = writeln!(
+            out,
+            "Not the planned traffic: {}. Do not treat those rows as a like-for-like ranking.\n",
+            slipped.join(", ")
+        );
+    }
 }
 
 /// Every point of a kind: (condition, connections, rate) → rows of
