@@ -190,7 +190,10 @@ impl TryFromSbe<TimestampNanos> for chrono::DateTime<chrono::Utc> {
 impl TryToSbe<TimestampNanos> for chrono::DateTime<chrono::Utc> {
     type Error = &'static str;
     fn try_to_sbe(&self) -> Result<TimestampNanos, Self::Error> {
-        let ns = self.timestamp_nanos_opt().ok_or("overflow")? as u64;
+        // The wire type is uint64: pre-epoch has no representation, so it is
+        // an error. `as u64` on a negative i64 would wrap silently.
+        let ns = self.timestamp_nanos_opt().ok_or("overflow")?;
+        let ns = u64::try_from(ns).map_err(|_| "timestamp before 1970")?;
         Ok(TimestampNanos(ns.to_le_bytes()))
     }
 }
@@ -206,7 +209,8 @@ impl TryFromSbe<TimestampMicros> for chrono::DateTime<chrono::Utc> {
 impl TryToSbe<TimestampMicros> for chrono::DateTime<chrono::Utc> {
     type Error = &'static str;
     fn try_to_sbe(&self) -> Result<TimestampMicros, Self::Error> {
-        Ok(TimestampMicros((self.timestamp_micros() as u64).to_le_bytes()))
+        let us = u64::try_from(self.timestamp_micros()).map_err(|_| "timestamp before 1970")?;
+        Ok(TimestampMicros(us.to_le_bytes()))
     }
 }
 
@@ -221,7 +225,8 @@ impl TryFromSbe<TimestampMillis> for chrono::DateTime<chrono::Utc> {
 impl TryToSbe<TimestampMillis> for chrono::DateTime<chrono::Utc> {
     type Error = &'static str;
     fn try_to_sbe(&self) -> Result<TimestampMillis, Self::Error> {
-        Ok(TimestampMillis((self.timestamp_millis() as u64).to_le_bytes()))
+        let ms = u64::try_from(self.timestamp_millis()).map_err(|_| "timestamp before 1970")?;
+        Ok(TimestampMillis(ms.to_le_bytes()))
     }
 }
 ```

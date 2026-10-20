@@ -239,12 +239,15 @@ fn analyse(
                 &s,
             ));
         }
-        // The work those percentiles are over, next to them.
-        if let Some(w) = Work::from_meta(&meta) {
-            work_rows.push(work_row(
+        // The work those percentiles are over, next to them. Counts that
+        // contradict each other are named and left out, never reported.
+        match Work::from_meta(&meta) {
+            Ok(Some(w)) => work_rows.push(work_row(
                 &format!("{name}: {} @ {}/s", variants[0], get(&meta, "rate")),
                 &w,
-            ));
+            )),
+            Ok(None) => {}
+            Err(e) => eprintln!("{name}: malformed work counts: {e}"),
         }
         // HTTP client runs (http_bench) carry no full loop counters.
         if meta.contains_key("loop.0.spins") {
@@ -288,7 +291,8 @@ fn analyse(
     loop_table(&meta, &variants, out, &name);
     queue_table(&meta, &variants, out);
     copy_table(&meta, &variants, out);
-    if let Some(w) = Work::from_meta(&meta) {
+    match Work::from_meta(&meta) {
+        Ok(Some(w)) => {
         // What arrived and what produced no sample. The tables drop the
         // warm-up, so `n` is smaller than `completed`. A receive-only run does
         // not see the sender's schedule, so those counts are "not yet measured"
@@ -305,6 +309,11 @@ fn analyse(
             work_row(&name, &w)
         );
         let _ = writeln!(out);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let _ = writeln!(out, "### Work behind the percentiles\n\nMalformed work counts: {e}\n");
+        }
     }
 
     let label = |v: usize| -> String {

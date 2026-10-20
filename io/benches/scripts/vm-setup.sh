@@ -60,7 +60,7 @@
 #                         amazon-ssm-agent and the CloudWatch agent), restarted by `off`
 #           nodim         adaptive interrupt moderation off (ethtool adaptive-rx off), nothing else:
 #                         ENA's DIM work otherwise runs as a kworker on the CPU that polls the
-#                         queue, pre-empting the busy-polling loop about 40 times a second
+#                         queue, pre-empting the busy-polling loop
 #           onequeue      every NIC down to one combined queue: the busy-polled queue then also
 #                         carries the flow's transmit completions, and no other queue interrupts
 #           noautocork    net.ipv4.tcp_autocorking=0: a send never waits for the previous one to

@@ -20,11 +20,14 @@
 > **On localhost it seems slightly slower than the open-source Aeron C
 > driver** over kernel UDP: host-local channels run on ordinary kernel
 > sockets in this driver too, so bypass cannot help there.
-> Round trips on one host, p50 / p99.99 / max: 5.48 / 8.18 / 10.73 µs against
-> the C driver's 5.58 / 7.39 / 8.86 µs on AWS `c7i.metal-24xl`, and
-> 6.16 / 10.71 / 54 µs against 5.94 / 9.39 / 49 µs on Azure
+> Round trips on one host (32 B, one in flight, 300,000 a rep, 5 reps;
+> p50 and p99.99 are the median across reps, **max is the largest single
+> round trip in any rep**): 5.48 / 8.18 / 664.6 µs against the C driver's
+> 5.58 / 7.39 / 9.5 µs on AWS `c7i.metal-24xl` — the 664.6 µs is one
+> unexplained rep of five, the other four 9.97–11.2 µs — and
+> 6.16 / 10.71 / 56.8 µs against 5.94 / 9.39 / 56.5 µs on Azure
 > `Standard_D16s_v6`. On AWS Graviton5 (`c9g.2xlarge`) its median was lower,
-> 3.88 / 9.51 / 19 µs against 4.29 / 10.54 / 15 µs, and its max higher
+> 3.88 / 9.51 / 35.1 µs against 4.29 / 10.54 / 20.3 µs, and its max higher
 > ([BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md),
 > AWS round 4, Azure round 8 and Graviton round G1).
 
@@ -149,9 +152,9 @@ CPU 0 and shared one core: milliseconds per round trip.
   used as given; start fails on a NIC that cannot take it. The `port-info`
   label reports it (`rx-desc=`).
 - **4096 against ENA's 1024** (AWS
-  [round 6](BENCHMARKS.md#aws-c7i4xlarge-rounds-6-and-7-2026-10-15)): loss-free
-  1,344 B rate 400 k → 600 k msgs/s, two 288 B flows 5,070 NAKs → none, idle
-  unchanged. On Graviton (c9g, round G1) no measurable effect.
+  [round 6](BENCHMARKS.md#aws-c7i4xlarge-round-7-p50--p999--max-median-across-reps)): loss-free
+  1,344 B rate 400 k → 600 k msgs/s, idle unchanged. The two-flow NAK
+  effect is not measured. On Graviton (c9g, round G1) no measurable effect.
 - **`RUSTERON_DPDK_MBUFS_PER_PORT`** (default 16384) must hold both rings,
   four bursts and two lcores' mempool caches (1.5 ×
   `RUSTERON_DPDK_MEMPOOL_CACHE` each): 5,504 with the defaults. Start fails,
@@ -337,7 +340,7 @@ with the receiver window below.
   It costs a refill, a sum and a charge on every send.
 - **AWS caps one flow (one channel) at 7.8–8.0 Gbit/s** regardless, x86 and
   Graviton: spread a heavier stream over several channels on different ports
-  ([data](BENCHMARKS.md#aws-one-flow-carries-about-8-gbits)).
+  ([data](BENCHMARKS.md#aws-c7i4xlarge-round-7-p50--p999--max-median-across-reps)).
 - **A small receiver window (`rcv-wnd`) is a rate cap, not a loss fix.**
   Round 12 A/B, 80 KiB against the 2 MiB default: flat-out falls 6.5–6.8× at
   every size, and the 288 B loss-free ceiling **drops** (157 k → 121 k msgs/s;
@@ -348,7 +351,7 @@ with the receiver window below.
   it with the conductor's park capped at 20 µs
   (`AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us`); never use the
   faster park without the small window
-  ([round 12](BENCHMARKS.md#the-80-kib-rcv-wnd-is-a-rate-cap-not-a-loss-fix)).
+  ([round 12](BENCHMARKS.md#the-80-kib-window-is-a-rate-cap-not-a-loss-fix)).
 
 ## Host-local channels
 
@@ -421,7 +424,7 @@ transport would carry them. That is why localhost gains nothing.
   `channel-rcv-ts-offset` needs nothing from the transport.
 - **Cost:** none measurable. On Graviton DPDK they moved p50 by at most
   0.07 µs; one run
-  ([G3](BENCHMARKS.md#aws-graviton5-c9g2xlarge-round-g3-2026-10-16)).
+  ([G3](BENCHMARKS.md#graviton5-c9g2xlarge-round-g3--best-measured-p50--p9999--max)).
 
 ## Lifetime
 

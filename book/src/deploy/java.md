@@ -65,7 +65,7 @@ Linux has.
 | `--add-opens java.base/jdk.internal.misc=ALL-UNNAMED` | Required. Agrona 2.x reaches `jdk.internal.misc.Unsafe`; without this option the JVM fails with `IllegalAccessError`. | Aeron's scripts and `build.gradle` |
 | `--add-opens java.base/java.util.zip=ALL-UNNAMED` | Required once Archive checksums are on (`aeron.archive.record.checksum`); without it they throw `InaccessibleObjectException`. | Aeron's scripts and `build.gradle` |
 | `-XX:+TrustFinalNonStaticFields` (experimental) | The JIT treats final instance fields as constants. | `java-common`, benchmarks |
-| `-XX:GuaranteedSafepointInterval=300000` (diagnostic) | Removes the stop-the-world safepoint that otherwise runs every second only because one is due. | `java-common`, cluster scripts, wiki |
+| `-XX:GuaranteedSafepointInterval=300000` (diagnostic) | Raises the guaranteed-safepoint interval from the default 1 s to 300 s. Aeron's scripts set it; the effect on the recommended JDK is **not measured**. | `java-common`, cluster scripts, wiki |
 | `-XX:+DebugNonSafepoints` | Profilers attribute samples to the right line. | benchmarks |
 | `-XX:+UseParallelGC` | Archive, Cluster and the driver allocate nothing in steady state. The choice is convention, not a measured collector A/B: every Aeron script uses it. | every Aeron script |
 | `-Xms` = `-Xmx`, `-XX:+AlwaysPreTouch` | The heap never grows, and every page is faulted in at start rather than on the hot path. | benchmarks |
@@ -87,9 +87,11 @@ Linux has.
 These settings are left at their defaults:
 
 - `aeron.archive.file.sync.level` and `aeron.archive.catalog.file.sync.level`
-  stay at `0` (write only). `1` adds fdatasync and `2` adds fsync. Keep the
-  catalog's level at least the archive's. A cluster's durability comes from
-  its quorum, not from fsync.
+  stay at `0`: writes go to the OS page cache only. `1` adds fdatasync and `2`
+  adds fsync. Keep the catalog's level at least the archive's. In a 3- or
+  5-member cluster the quorum is the durability mechanism, so sync level 0 is
+  the usual choice. A single-node cluster has no quorum, so its durability is
+  fsync: raise both sync levels together there.
 - `aeron.archive.file.io.max.length` stays at `1m`.
 - `aeron.archive.control.term.buffer.sparse` stays at `true`.
 - `aeron.spies.simulate.connection` stays `false`. It is a media driver
@@ -126,9 +128,7 @@ When the JVM shares its cores, or runs in a container with a few hundred MiB:
 - Keep the backoff idle strategies. A spinning thread on a shared core takes
   the core from everything else.
 - Serial GC (`-XX:+UseSerialGC`) is the one-core collector; its cost against
-  ParallelGC here is **not measured**. `-XX:TieredStopAtLevel=1` and a small
-  code cache give up peak JIT speed to save memory, which is the right trade
-  for an Archive whose work is file I/O.
+  ParallelGC here is **not measured**.
 - Set `-Xms` equal to `-Xmx`, and size `-XX:MaxDirectMemorySize`,
   `-XX:MaxMetaspaceSize` and `-XX:ReservedCodeCacheSize`. The container's
   limit must cover all of them, plus thread stacks and native memory.

@@ -52,13 +52,15 @@ One copy of every figure, with its max and slowest batch, is in
 
 ## Do I need it?
 
-`std::time::Instant` is enough for durations at low rates. It has no UTC.
+One option among four, not a requirement. Choose by contract, not by read
+rate.
 
 | your code | use |
 |---|---|
-| times requests, functions or tests; under about 100,000 reads a second | `std::time::Instant` |
-| needs UTC stamps, to compare with an exchange, a NIC or another host | ergon-clock |
-| a busy-spin thread: millions of reads a second | ergon-clock |
+| durations in one process (times requests, functions or tests) | `std::time::Instant` (monotonic, no UTC) |
+| durations in one process, where one process's own rate is enough | quanta (equally fast inside one process) |
+| durations in one process on x86 | minstant (x86: a plain `_rdtsc`; on Arm and macOS it reads `SystemTime`, a wall clock that can go back) |
+| UTC at counter cost, or stamps compared across processes or hosts | ergon-clock |
 | dates and time zones | `std::time::SystemTime` and a calendar crate |
 
 ## What does `now_ns` return?
@@ -72,6 +74,9 @@ One copy of every figure, with its max and slowest batch, is in
 
 ## Why is it faster?
 
+`Instant::now()` is already fast: it runs in the **vDSO**, so there is no
+system call. The counter is faster still, because it skips the vDSO.
+
 ```text
 Instant::now()   in the vDSO: check the kernel's time data ─► read the counter (ordered)
                  ─► scale ─► add ─► check again
@@ -83,6 +88,45 @@ clock.now_ns()   read the counter ─► one multiply, by numbers set at start-u
 The kernel checks twice because NTP may change its numbers mid-read.
 ergon-clock's numbers change only between reads: the owner thread rewrites
 them in `update`, readers see one consistent set at a time.
+
+Measured, node a, LTO (median, slowest batch in brackets) — full rows in
+[`clock/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md#read-cost-ns-median-of-batch-means-slowest-batch-in-brackets):
+
+| read | c8g.xlarge | c9g.2xlarge | how |
+|---|---|---|---|
+| `now_ns` (counter + one multiply) | **12.17** (12.47) | **10.92** (11.25) | `CNTVCT_EL0` or `rdtsc`, then one multiply |
+| `clock_gettime(CLOCK_MONOTONIC)` | 30.92 (31.22) | 20.78 (21.30) | vDSO |
+| `Instant::now()` | 31.69 (33.35) | 21.29 (21.68) | vDSO |
+| `clock_gettime(CLOCK_REALTIME)` | 30.94 (31.97) | 21.09 (21.65) | vDSO |
+| `SystemTime::now()`, as ns | 39.66 (40.58) | 28.51 (28.92) | vDSO + the `SystemTime` → ns conversion |
+
+Two things fall out of that table. The counter is **2.6–2.9× faster than
+the vDSO**, and the vDSO is not the slow part of `SystemTime`: a bare
+`clock_gettime(CLOCK_REALTIME)` costs the same as `CLOCK_MONOTONIC`
+(30.94 against 30.92), so the extra 8.7 ns is Rust's `SystemTime` →
+`Duration` → `as_nanos` surface. `CLOCK_REALTIME` is a vDSO read, not a
+system call.
+
+## Are these clocks monotonic?
+
+Contract and observation are different things. **The contract** is what the
+clock promises:
+
+| clock | monotonic? | why |
+|---|---|---|
+| `Instant` / `CLOCK_MONOTONIC` | yes | the kernel never steps it back |
+| `CLOCK_MONOTONIC_RAW` | yes | same, without NTP's slew |
+| the hardware counter (`rdtsc`, `CNTVCT_EL0`) | yes, where invariant | it only counts up; Linux must keep time with it (see [Calibration](#calibration-and-the-fallback)) |
+| `now_ns`, and `Domain::Monotonic` | yes | it slews within ±500 ppm and never steps |
+| `SystemTime` / `CLOCK_REALTIME` | **no** | NTP or an admin can step it back |
+| minstant on Arm | **no** | it is `SystemTime` (see [Which read when](#which-read-when)) |
+
+**The observation:** across 1,000,000 back-to-back reads per clock (200,000
+on c9g), no read went backwards on any node — `backwards=0` in every
+`delta` row, including the wall clocks. That does not make a wall clock
+monotonic; it means no step happened during the window. A clock whose
+contract allows a backward step will still take one outside it. Measure
+durations with a monotonic clock.
 
 ## Ordered reads
 
@@ -130,11 +174,14 @@ the NIC's transmit timestamp and the peer's receive stamp.
 |---|---|
 | `now_ns` | event stamps, deadlines, ages. Never a measurement |
 | `now_ns_begin` | the start of a measurement |
-| `now_ns_ordered` | the end of a measurement; stamps that must never be earlier than another thread's (a follower can still be about 1 ns early at an update) |
+| `now_ns_ordered` | the end of a measurement; stamps that must never be earlier than another thread's |
 
 - **Unordered, like `now_ns`:** quanta's reads, and minstant's
   `Instant::now()` and `elapsed()` (minstant 0.1.7 reads a plain
-  `_rdtsc()`; `elapsed()` is `Instant::now() - self`).
+  `_rdtsc()` on x86 Linux only. On Arm and macOS its `current_cycle()` is
+  `web_time::SystemTime::now()`, which is `std::time::SystemTime` —
+  `CLOCK_REALTIME`, a wall clock that can go back. `elapsed()` is minstant's
+  own `Instant::now() - self`, so the same clock.)
 - **Ordered, like `now_ns_ordered`:** `std::time::Instant` on Linux (the
   vDSO uses `rdtsc_ordered` on x86, `isb` or `CNTVCTSS_EL0` on Arm).
 
@@ -157,7 +204,7 @@ Not speed: on x86 all read at about the same cost. The reasons:
 | | ergon-clock | quanta | minstant |
 |---|---|---|---|
 | one rate in every process, and in C | yes: the same calibration in every process | no: measured per process, and the rates differ | x86: measured per process |
-| ordered read | yes | no | no |
+| ordered read | yes | no | x86 no / Arm yes (wall clock) |
 | UTC stamps kept on UTC, at counter cost | yes | no | no: a fixed offset |
 | on Graviton | the counter | the counter | the wall clock, and it can go back |
 | checks that Linux keeps time with the counter | yes | no: x86 CPU flags only, nothing on Arm | only that `tsc` is listed in `available_clocksource` |
@@ -210,7 +257,8 @@ by default.
 
 - **Call `clock.update()` from idle time**, as often as you like. At most
   once a second it samples `CLOCK_REALTIME` and steers the clock (a few
-  microseconds, more after deep idle: [UTC and Time Sync](wall-clock.md)).
+  microseconds, more on c7i and untraced:
+  [UTC and Time Sync](wall-clock.md)).
   Every other call is one counter read, a compare and the health maths; on
   the fallback it is one `clock_gettime` too. It never prints, blocks or
   allocates.
@@ -254,10 +302,10 @@ never prints.
 
 A read is a few tens of nanoseconds on every host measured; an ordered
 end costs more than an unordered read. The longest stall between two
-`now_ns` reads was 7.4 µs (c7i), 3.2 µs (c8g) and 3.9 µs (c9g) — the VM
-pausing the vCPU. No read went backwards. One copy of every figure, with
-its max and slowest batch, is in
-[`clock/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md#aws-c7i-c8g-and-c9g-with-chrony-2026-10-16).
+`now_ns` reads on one node reached single-digit microseconds — the cause is
+unexplained in the guest; the platform's vCPU is suspected. No read went
+backwards. One copy of every figure, with its max and slowest batch, is in
+[`clock/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md#stall-between-consecutive-reads-ns).
 
 ### Fake time for tests
 
@@ -286,7 +334,7 @@ time-sync probe.
   only when `health.sampled` is true. The owner/follower picture is in
   [UTC and Time Sync](wall-clock.md).
 - One `Follower` per other thread; no lock, no `Arc`.
-- Under about 1 µs, bracket with
+- To bracket a span in raw ticks, use
   `advanced::segment(&clock).ticks_ordered()` at both ends and convert the
   difference once: raw ordered ticks, no UTC conversion. For a start and an
   end that must be UTC stamps, use `now_ns` then `now_ns_ordered` as usual.

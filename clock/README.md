@@ -13,8 +13,9 @@ counter read and one multiply per read.
 
 ## What it does
 
-- **`calibrate`**: the one set-up call, at start-up (40–70 ms, plus up to
-  50 ms for the time-sync probe; [data](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md)). It checks that the counter may be used,
+- **`calibrate`**: the one set-up call, at start-up (40–70 ms, plus a
+  short time-sync probe (50 ms chronyd answer timeout; duration not
+  measured); [data](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md)). It checks that the counter may be used,
   takes its rate, and returns the clock with a report of what it chose and
   why. It prints one line per problem: a slow fallback, a host clock not
   synchronised or not settled.
@@ -41,7 +42,7 @@ counter read and one multiply per read.
 
 | Use it for | Use something else for |
 |---|---|
-| UTC stamps and durations on hot threads: event time, timeouts, latency histograms | Under about 100,000 reads a second: `std::time::Instant` is enough for durations (it has no UTC) |
+| UTC stamps and durations on hot threads: event time, timeouts, latency histograms | Durations in one process: `std::time::Instant` is enough (it has no UTC); quanta is equally fast inside one process |
 | Stamps compared with an exchange's, a NIC's or another host's | Dates and time zones: `std::time::SystemTime` and a calendar crate |
 | Code that must run the same live, in a replay and in a test | Stamps compared across hosts more closely than their time sync allows: nothing local can give you that |
 

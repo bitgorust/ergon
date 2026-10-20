@@ -3,9 +3,10 @@
 Every setting that either won an A/B on a real pair or is required for the
 pod to get its own cores, and what it cost when it was wrong. Rows with
 bold µs figures are measured; the rest are required for the pod to get whole
-cores of its own, or fail closed when missing. Numbers are medians of 5 reps
-in µs, max in brackets
-([method](benchmarks.md#method), [full tables](../md-dpdk/overview.md#measured-between-two-hosts)).
+cores of its own, or fail closed when missing.
+A `X (a–b)` cell is the median of the five per-rep maxima X with the five in
+brackets; the bracket's upper end is the absolute worst round trip in any rep
+([aggregation](benchmarks.md#how-figures-are-aggregated), [full tables](../md-dpdk/overview.md#measured-between-two-hosts)).
 Scan the tables, copy the two blocks, run the three checks.
 
 Terms: [deployment glossary](overview.md#glossary).
@@ -14,8 +15,8 @@ Terms: [deployment glossary](overview.md#glossary).
 
 | where | setting | value | effect |
 |---|---|---|---|
-| node | CPU isolation | `isolcpus=nohz,domain,managed_irq,1-N nohz_full=1-N rcu_nocbs=1-N irqaffinity=0` | Azure DPDK idle max **216 (69–663) → 71 (65–447)** µs. Biggest single win |
-| node | transparent hugepages | `never` | Azure idle p99.99 **67 → 53**, idle max **546 → 106** µs |
+| node | CPU isolation | `isolcpus=nohz,domain,managed_irq,1-N nohz_full=1-N rcu_nocbs=1-N irqaffinity=0` | Azure DPDK idle median of rep maxima **216 (69–663) → 71 (65–447)** µs. Biggest single win |
+| node | transparent hugepages | `never` | Azure idle p99.99 **67.01 (51.84–87.23) → 53.15 (51.81–82.24)** (round 4); idle median of rep maxima **545.79 (82.37–632.32) → 106.50 (98.11–286.21)** (round 6), absolute idle max **632 → 286** |
 | node | SMT off (x86) | `ThreadsPerCore: 1`, or `nosmt` | one Kubernetes CPU is one physical core, as on Graviton. A busy sibling of the loop costs **+0.5 µs p50 at 1 connection, +2.3–2.7 µs p50 and +9–12 µs p99 at 10–100** ([data](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#smt-sibling-cost)) |
 | node | static CPU manager | `cpuManagerPolicy: static`, `full-pcpus-only: "true"` | a Guaranteed pod gets whole cores, never one hyperthread shared with another pod |
 | node | topology manager | `topologyManagerPolicy: single-numa-node` | a pod's CPUs and devices stay on one NUMA node |
@@ -27,7 +28,7 @@ Terms: [deployment glossary](overview.md#glossary).
 | pod | each busy thread | pinned to one CPU of the pod's cpuset | a thread outside the cpuset never starts (`EINVAL`) |
 | pod | Aeron directory | hugetlbfs `hostPath`, `AERON_FILE_PAGE_SIZE=2097152`, `AERON_TERM_BUFFER_SPARSE_FILE=false` | no first-write page faults on the log buffers |
 | pod | SIGTERM | handled | a PID 1 with no handler is SIGKILLed, closing nothing |
-| app | ENA interrupt moderation (busy-polling) | `ethtool -C <if> adaptive-rx off` | added about **60 µs** to the median at 100 k/s when left on (Linux 6.9+ default) |
+| app | ENA interrupt moderation (busy-polling) | `ethtool -C <if> adaptive-rx off` | Linux 6.9+ default. The c7i cost of leaving it on is not measured (an earlier "about 60 µs at 100 k/s" A/B is withdrawn as untraceable); Graviton G1–G3 supports it off |
 | app | ENA RX ring | `ethtool -G <if> rx 4096` | Azure: no NIC drop or NAK, where the default ring dropped at 1 M msgs/s of 288 B |
 | app | keep-alive | about 1 kHz on sparse, latency-critical streams | a lost frame is noticed only at Aeron's next heartbeat: one lost ping cost **134 ms** |
 | app | quiet cores only | two-minute spin at pod start; pin to cores that never stalled 300 µs | some Azure vCPUs stop for up to **3.7 ms** once a minute |
@@ -39,9 +40,9 @@ Figures in this table: [md-dpdk/BENCHMARKS.md](https://github.com/mimran1980/erg
 | setting | why not | measured |
 |---|---|---|
 | `cpuCFSQuota: false` | node-wide: every pod loses its CPU limit, including log collectors | a busy-spinning container that hits the quota is stopped for the rest of the 100 ms period |
-| plain kernel UDP with no isolation | interrupts and the tick land on the busy cores | Azure idle max **354.81 (272.13–2,203.65)**, 39 spikes ≥200 µs a rep — against **57.89 (49.47–64.22)** isolated DPDK |
-| `SHARED_NETWORK` (driver sender+receiver on one thread) | saves a core, costs the tail | Graviton 1,344 B bursts p50 **522 vs 234**, max **748 (723–886) vs 493 (465–745)** |
-| busy polling on Graviton at 288 B, 1 M/s | collapses | p50 **4,973 µs**, max **9,175 (8,544–102,826)**, **61,488 NAKs** |
+| plain kernel UDP with no isolation | interrupts and the tick land on the busy cores | Azure idle median of rep maxima **354.81 (272.13–2,203.65)** (absolute 2,203.65), 39 spikes ≥200 µs a rep — against **57.89 (49.47–64.22)** (absolute 64.22) isolated DPDK |
+| `SHARED_NETWORK` (driver sender+receiver on one thread) | saves a core, costs the tail | Graviton 1,344 B bursts p50 **522 vs 234**, median of rep maxima **748 (723–886) vs 493 (465–745)**, absolute **886 vs 745** |
+| busy polling on Graviton at 288 B, 1 M/s | collapses | p50 **4,973 µs**, median of rep maxima **9,175 (8,544–102,826)** (absolute 102,826), **61,488 NAKs** |
 | `mlockall`, pacing, an RX burst of 64, a 1 MiB receive window, C-states at C1 on metal | each lost its A/B | see [not recommended](../md-dpdk/overview.md) |
 | `AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD` = the conductor's park | the counter includes the park, so it fires on every idle `nanosleep` | the lab now derives it from the park and refuses a bad value |
 | `rcv-wnd=80k` on a 288 B channel | a rate cap, not a loss fix | flat-out falls **6.5–6.8×**, and the 288 B loss-free ceiling **drops** 157 k → 121 k msgs/s |
@@ -110,18 +111,18 @@ while any check warns.
 
 | platform | pick | note |
 |---|---|---|
-| Graviton5 (`c9g`) | kernel UDP: moderation off, data NIC interrupts on a spare core, **no** busy polling | lowest latency measured. Idle p50 **18.93**, max **79 (76–168)**; 288 B at 1 M/s p50 **44.83**, max **204 (122–211)** |
-| AWS x86 (`c7i`) | kernel UDP: busy polling, 4,096-entry ring | idle p50 **28.22**, max **1,938 (349–4,846)**. Moderation off with its interrupts on a core of their own is not measured on x86 |
-| Azure | kernel UDP: busy polling, 4,096-entry ring | idle p50 **21.15**, max **99.52 (73.86–209.41)**. Some vCPUs stall once a minute — spin-test first |
-| any, both ends on one host | localhost | isolated DPDK idle p50 **9.81**, max **31.60 (29.92–32.80)**: a 3 µs spread across five reps |
+| Graviton5 (`c9g`) | kernel UDP: moderation off, data NIC interrupts on a spare core, **no** busy polling | lowest latency measured. Idle p50 **18.93**, median of rep maxima **79 (76–168)**; 288 B at 1 M/s p50 **44.83**, median of rep maxima **204 (122–211)** |
+| AWS x86 (`c7i`) | kernel UDP: busy polling, 4,096-entry ring | idle p50 **28.22**, median of rep maxima **1,938 (349–4,846)**. Moderation off with its interrupts on a core of their own is not measured on x86 |
+| Azure | kernel UDP: busy polling, 4,096-entry ring | idle p50 **21.15**, median of rep maxima **99.52 (73.86–209.41)**. Some vCPUs stall once a minute — spin-test first |
+| any, both ends on one host | localhost | isolated DPDK idle p50 **9.81**, median of rep maxima **31.60 (29.92–32.80)**: a 3 µs spread across five reps |
 
 Figures in this table: [md-dpdk/BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md).
 
 - **One AWS flow tops out at 7.8–8.0 Gbit/s.** A channel is one flow; spread
   a heavier stream over several channels.
 - **Run below the loss-free rate,** never at flat-out. Flat-out always loses.
-- **Latency figures come with their max.** Every max above was investigated;
-  the ones still open are listed in
+- **Latency figures come with their max.** Every absolute maximum above (a
+  bracket's upper end) was investigated; the ones still open are listed in
   [`md-dpdk/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md).
 
 ## More

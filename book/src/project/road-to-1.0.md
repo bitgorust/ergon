@@ -83,7 +83,8 @@ A claimed 1.0 streak tag must be an ancestor of `main`
 ## 1.0 API migrations (still 1.0-only)
 
 These remain scheduled for 1.0 and are **not** shipped on 0.x. `cargo
-semver-checks` against the 0.1.21 baseline must stay green.
+semver-checks` against the `v0.1.26` baseline (the `baseline_tag` in
+`api/public-api-baseline.toml`) must stay green.
 
 - `Schema` identity as one private `Ir` (no duplicate public
   `package`/`id`/`version` beside `ir`). 0.x keeps the public fields.

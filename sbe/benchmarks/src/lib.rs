@@ -85,11 +85,15 @@ pub fn sbe_tool_car_body_decoder(
 
 // ─── Untimed extent preflights ─────────────────────────────────────────────
 //
-// Maintained pairs run in validation class `none`: sbe-tool's `wrap` performs
-// no bounds, header, or version check, so timing ergon's validating `wrap`
-// against it would charge ergon for work its reference never does. The timed
-// regions therefore call `wrap_unchecked`, whose safety contract is that the
-// message extent is already proven.
+// Body-wrap decode and body-only encode pairs run in validation class `none`:
+// sbe-tool's `wrap` performs no bounds, header, or version check, so timing
+// ergon's validating `wrap` against it would charge ergon for work its
+// reference never does. Their timed regions therefore call `wrap_unchecked`,
+// whose safety contract is that the message extent is already proven.
+//
+// The entry-point pair is not class `none`: its ergon arm runs the checked
+// constructor, so the two sides do different work. That pair is not a gate
+// winner; see BENCHMARKS.md.
 //
 // These helpers are that proof. They run once, outside every timed region, and
 // panic before any measurement is taken — so a benchmark can never report a

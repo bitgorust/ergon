@@ -57,11 +57,13 @@ just check-mutation
 ```
 
 Coverage runs on every pull request and may not fall below the checked-in
-region/function/line baseline. Mutation testing runs weekly over parser,
-resolver, sizing, and dynamic-tail code; missing or empty mutation output is a
-failure. Nightly CI runs every fuzz target for ten minutes and executes the
-LE/BE/nested fixture crate under Miri. Pull requests also execute codec library
-tests on 32-bit x86 and big-endian s390x through `cross`/QEMU.
+region/function/line baseline. Mutation testing is manual (`just check-mutation`)
+over parser, resolver, sizing, and dynamic-tail code; CI enforces only the
+mutation configuration, and the ratchet fails when mutation output is missing or
+empty. A weekly schedule (Sundays) runs every fuzz target for ten minutes and
+executes the LE/BE/nested fixture crate under Miri. Pull requests execute that
+fixture crate as ordinary tests. Codec tests on 32-bit x86 and big-endian s390x
+are not run in CI.
 
 ## Performance
 

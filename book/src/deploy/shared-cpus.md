@@ -122,9 +122,9 @@ annotationOptIn: false
 # Each one is a node-level permission: the pod still opts in by annotation,
 # and a pod that asks for a grant this field does not allow is refused.
 seccomp.ioUring: "allow"  # default "off". Without it, a pod asking for
-                          # seccomp.ergon.io/<ctr>: "io-uring" is refused, and
-                          # Aeron's conductor cannot use io_uring (RuntimeDefault
-                          # blocks it: containerd issue 9320)
+                          # seccomp.ergon.io/<ctr>: "io-uring" is refused.
+                          # For apps that use io_uring (ergon-io's uring
+                          # backends). Aeron's C media driver does not use it
 ptp: "auto"               # default "off". Without it, a pod asking for
                           # ptp.ergon.io/<ctr>: "auto" is refused, and the app
                           # has no NIC hardware clock. Use "auto" for the NIC's
@@ -365,7 +365,7 @@ metadata:
   annotations:
     required-plugins.noderesource.dev: '["ergon-shared-cpus"]'
     hugepages.ergon.io/app: "2M"          # sized hugetlbfs for AERON_DIR
-    seccomp.ergon.io/app: "io-uring"      # the conductor uses io_uring
+    seccomp.ergon.io/app: "io-uring"      # for apps that use io_uring; Aeron does not
     ptp.ergon.io/app: "auto"              # the NIC's PHC
 spec:
   nodeSelector: { ergon.io/shared-cpus: "true" }
@@ -397,7 +397,7 @@ spec:
 | `AERON_THREADING_MODE=DEDICATED` | sender, receiver and conductor on their own threads |
 | `hugepages.ergon.io/app: "2M"` + `hugepages-2Mi` | a **sized** hugetlbfs mounted at `/dev/hugepages` |
 | `AERON_DIR` on that hugetlbfs | the CnC file and the terms are 2 MiB pages, not 4 KiB |
-| `seccomp.ergon.io/app: "io-uring"` | the profile gains the `io_uring_*` calls the conductor needs; never `Unconfined` |
+| `seccomp.ergon.io/app: "io-uring"` | the profile gains the `io_uring_*` calls an app's uring backend needs; never `Unconfined` |
 | `ptp.ergon.io/app: "auto"` | the NIC's PHC, for clock work. x86 also gets `cpuqos` (`/dev/cpu_dma_latency`) to cap C-states |
 | `ergon.io/latency: "hot"` (pod label) | the admission policy refuses exec probes and `restartPolicy: Always` sidecars |
 | `isolcpus=managed_irq,domain,2-3` on the boot line | CPUs 2-3 leave the scheduler's load-balancing domains. This is what keeps the sender's and receiver's cores quiet; a cpuset partition cannot do it per-thread |

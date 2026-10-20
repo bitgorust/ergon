@@ -178,38 +178,25 @@ A ban, step by step:
 
 ## Cost
 
-`try_charge`, the check before each request: `io/benches` `limit_bench`,
-`--samples 200000 --batch 64`, 3 runs. Apple M1 Pro, macOS, thread not
-pinned. 0 connections (pure code). p50 and p99 per call in ns (the mean of
-a 64-call batch); max: the slowest batch of 64 calls, in µs. A local
-microbench; the run is **not archived** — reproduce with `limit_bench`.
+`try_charge`, the check before each request, is on the send path. **Not
+measured:** no archived run holds its cost, so this section quotes no
+figures. The table that used to be here came from a local microbench whose
+run is not archived, and its percentiles were means of 64-call batches,
+not per-call costs. Reproduce with `io/benches` `limit_bench`:
 
-| case | p50 ns | p99 ns | max batch µs |
-|---|---|---|---|
-| loop only (subtract it) | 2.6–3.3 | 2.6–5.2 | 17.8–39.5 |
-| 1 rolling bucket | 6.5 | 7.2–7.8 | 20.8–57.5 |
-| 4 rolling buckets | 14.3 | 15.0–16.3 | 31.0–37.6 |
-| 8 rolling buckets | 22.8–24.1 | 24.7–26.0 | 25.0–61.7 |
-| 1 draining bucket | 7.2–7.8 | 8.5 | 31.7–42.3 |
-| 8 rolling, first charge after 20 s idle | 87.2–91.8 | 94.4–97.7 | 53.4–100.0 |
-| ring 1442 (a day bucket), catch-up walk | 1,448–1,540 | 1,756–4,977 | 919–93,825 |
-| ring 6002, catch-up walk | 6,156–6,193 | 6,805–7,105 | 1,410–53,844 |
-| refused: 8 buckets, the last full | 78.8–80.7 | 86.6–371.1 | 1,002–16,129 |
+```sh
+cargo build --release --manifest-path io/benches/Cargo.toml --bin limit_bench
+io/benches/target/release/limit_bench --samples 200000 --batch 64   # Linux: --cpu <isolated cpu>
+```
 
-- No allocation in any timed loop.
+- The bench reports ns per call (the mean of a `--batch`-call batch),
+  the slowest batch, stalls and `allocs` (allocations in the timed loop;
+  must be 0).
 - **Catch-up walk.** A ring stepped just under one full turn walks every
-  slot instead of taking the `fill(0)` path a longer idle would. 1,442
-  slots (a day bucket's shape) costs 1.5 µs; 6,002 slots costs 6.2 µs.
+  slot instead of taking the `fill(0)` path a longer idle would.
   `Budget::tick` during idle keeps this off the send path: the send path
-  only ever pays for the slots since the last charge. The "after 20 s
-  idle" row is the cheap path (8 buckets, each fully expired).
-- **Max:** the host, not the code. macOS cannot pin or isolate the
-  thread. A loop that only read the counter, run as long right after each
-  case, saw gaps of 14 µs to 223 ms in these runs, and every large max
-  batch came with a large gap. The 1,442-ring p99 spread is one
-  preemption storm in run 3 (884 stalled batches); the clean runs sat at
-  1.8–2.0 µs. p50 is the number to use.
-- **Linux on an isolated core: not measured yet.** Run
-  `limit_bench --samples 200000 --batch 64 --cpu <isolated cpu>`.
+  only ever pays for the slots since the last charge.
+- macOS cannot pin or isolate the thread; a quiet max needs an isolated
+  CPU. **Linux on an isolated core: not measured yet.**
 - Inside ergon-io the send path adds one store per request and one add per
   `send` (for `Sent`), and one add per automatic WebSocket frame.

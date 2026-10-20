@@ -96,8 +96,8 @@ the signature itself; `signed_request_at` takes the timestamp from you
 
 | signer | cost per request | use it for |
 |---|---|---|
-| `Signer::hmac_sha256` | **262 ns** ([data](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md)) | signed REST requests |
-| `Signer::ed25519_pkcs8` | **21,558 ns** ([data]([io/benches/BENCHMARK.md](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md)#signing)); measure before putting it on a hot path | log-on, once per session; the private key never leaves the machine |
+| `Signer::hmac_sha256` | **262 ns** (best of 7, max not recorded; [data](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md)) | signed REST requests |
+| `Signer::ed25519_pkcs8` | **21,558 ns** (best of 7, max not recorded; [data](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#conclusions)); measure before putting it on a hot path | log-on, once per session; the private key never leaves the machine |
 
 Checked against Binance's documented example:
 
@@ -113,8 +113,8 @@ platform.)*
 ## Measured results
 
 Round trip, **1 connection**, one request in flight. More connections:
-[not measured](#many-connections). One copy of every figure, with its max:
-[`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#4-http-clients).
+[not measured](#many-connections). Figures, with their max, in
+[`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#conclusions).
 
 - **Native beats libcurl** on the same path, and beats it by more when
   native polls the NIC. reqwest parks its thread between requests and is
@@ -122,12 +122,14 @@ Round trip, **1 connection**, one request in flight. More connections:
   interrupt and polling paths.
 - **`HttpClient` with a pool of 1** costs a little over a raw `HttpConn`.
   A larger pool was not measured.
-- **Interrupt-driven against NIC polling: no conclusion** on AWS (ENA's
-  adaptive moderation was left on). A fair rerun is planned.
+- **Interrupt-driven against NIC polling:** no conclusion from the x86 runs
+  (ENA's adaptive moderation was left on). The Graviton
+  [fair run](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#interrupt-against-nic-polling-the-fair-run-graviton)
+  turns it off for every backend and compares them.
 - **Maxima** are network, hypervisor or untraced; Azure's traced runs put
   every maximum in a once-a-minute hypervisor stall.
 - Why native is faster:
-  [BENCHMARK.md](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#how-the-ergon-io-http-client-differs-from-libcurl-and-why-it-is-faster).
+  [BENCHMARK.md](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#how-the-ergon-io-http-client-differs-from-libcurl).
 
 ## Many connections
 

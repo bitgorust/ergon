@@ -146,9 +146,8 @@ pub fn read_records(path: &Path) -> std::io::Result<Vec<Record>> {
     loop {
         // Read one byte first: read_exact alone cannot tell "no more records"
         // from "the file was cut inside a record".
-        match r.read(&mut b[..1])? {
-            0 => return Ok(out),
-            _ => {}
+        if r.read(&mut b[..1])? == 0 {
+            return Ok(out);
         }
         r.read_exact(&mut b[1..]).map_err(|e| {
             std::io::Error::new(

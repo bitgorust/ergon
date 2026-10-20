@@ -211,16 +211,19 @@ impl Work {
 
     /// `issued = completed + censored` and `scheduled >= issued`, wherever both
     /// sides of each are known. `Ok` when they hold or when a count is missing.
+    /// The reason names the `work.*` keys, so it can be pasted under a table.
     pub fn check(&self) -> Result<(), String> {
         if let (Some(i), Some(c), Some(x)) = (self.issued, self.completed, self.censored)
             && i != c + x
         {
-            return Err(format!("issued {i} is not completed {c} + censored {x}"));
+            return Err(format!(
+                "work.issued {i} is not work.completed {c} + work.censored {x}"
+            ));
         }
         if let (Some(s), Some(i)) = (self.scheduled, self.issued)
             && s < i
         {
-            return Err(format!("scheduled {s} is below issued {i}"));
+            return Err(format!("work.scheduled {s} is below work.issued {i}"));
         }
         Ok(())
     }
@@ -243,10 +246,13 @@ impl Work {
     }
 
     /// The counts a `meta.txt` map holds; a missing or unreadable key is
-    /// "not yet measured". `None` when the run wrote none of them (a run
+    /// "not yet measured". `Ok(None)` when the run wrote none of them (a run
     /// recorded before the counts were).
-    #[must_use]
-    pub fn from_meta(m: &HashMap<String, String>) -> Option<Self> {
+    ///
+    /// Counts that contradict each other are reported, not accepted: a run
+    /// that claims `1 scheduled, 8 issued, 7 completed, 5 censored` is
+    /// malformed metadata, and its numbers must not sit beside percentiles.
+    pub fn from_meta(m: &HashMap<String, String>) -> Result<Option<Self>, String> {
         let get = |k: &str| m.get(k).and_then(|v| v.parse().ok());
         let w = Self {
             scheduled: get(WORK_KEYS[0]),
@@ -265,12 +271,12 @@ impl Work {
             w.censored,
         ]
         .iter()
-        .any(Option::is_some)
+        .all(Option::is_none)
         {
-            Some(w)
-        } else {
-            None
+            return Ok(None);
         }
+        w.check()?;
+        Ok(Some(w))
     }
 
     /// The counts as table cells: their values, or "not yet measured".

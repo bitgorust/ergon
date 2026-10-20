@@ -143,11 +143,22 @@ NRI `AddRlimit` may raise limits for an opted-in container. These are
 `RLIMIT_RTPRIO` as a **limit value only**. Nothing here takes a real-time
 scheduling policy.
 
+## Real-time scheduling: built, default off
+
+`SCHED_FIFO` is not one of the five grants. It lives in
+`k8s/nri-shared-cpus`, off unless a node turns it on:
+
+| path | what it does | default |
+|---|---|---|
+| `ergon-cpus --fifo <prio>` | the exec wrapper takes `SCHED_FIFO` on the thread before exec | off (no flag) |
+| `sched-fifo.ergon.io/<container>: "thread"` | the NRI plugin grants `RLIMIT_RTPRIO` and `ERGON_SCHED_FIFO`; the app or `prelock` takes the policy on the hot thread only | `schedFifo: "off"` — the node refuses the annotation |
+
+Why it is off: no gain on an isolated CPU on AWS ([data](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#host-and-network-aws-in-a-pod): p50 +0.5/−1.8 µs, p99.99 +1/−45 µs, directional only — a sleeping sender inflated that run). The RT throttle and RT group scheduling bite it. This project's latency-pods path never takes a policy: the e2e asserts PID 1 stays `SCHED_OTHER` and `ERGON_SCHED_FIFO` is empty.
+
 ## Deliberately not built
 
 | item | why |
 |---|---|
-| `SCHED_FIFO` / any `sched_setscheduler` work, a `--fifo` wrapper, RT scheduling | no gain on an isolated CPU on AWS ([data](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#host-and-network-aws-in-a-pod): p50 +0.5/−1.8 µs, p99.99 +1/−45 µs; RT throttle and RT group scheduling bite it) |
 | SR-IOV VF per pod | Nitro guests have one ENA per ENI, no in-guest VFs |
 | a netns-sysctl writer that pretends the knobs are per-netns | `busy_poll`/`busy_read` are global; `gro_flush_timeout` and `napi_defer_hard_irqs` are per-netdev sysfs; `rmem_max` is not writable per-netns. Node config instead (`node-checks.md`) |
 | an IRQ DaemonSet that pins the latency pod's NIC IRQs to the SHARED CPUs | IRQs on a busy housekeeping CPU lose frames at 1 M/s, max **10.8 ms** ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md), Graviton only). The kept-CPU default stays |
@@ -251,7 +262,7 @@ test/e2e.sh
 - `/dev/cpu_dma_latency` in an EC2 guest at all, and whether enabling it ever
   wins (the C1 cap was **not kept** on `c7i.metal-24xl` and made plain kernel
   UDP's p50 **2 µs** worse there, with single-rep collapses under load
-  ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/deploy/aws-eks/README.md#no-c-state-cap)).
+  ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/deploy/aws-eks/README.md#bare-metal)).
 - The latency of `cpuset.cpus.partition=isolated` alone (the boot-arg
   **bundle** is measured; the partition alone is "measure first", the lab's
   job).

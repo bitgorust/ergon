@@ -20,7 +20,7 @@ Kubernetes and Java terms:
 
 | term | what it is | pros / cons, when it matters |
 |---|---|---|
-| [C-state](hosts.md#c-states) | how deeply an idle CPU sleeps | deeper saves power but wakes later, up to hundreds of microseconds. A spinning core never idles |
+| [C-state](hosts.md#c-states) | how deeply an idle CPU sleeps | deeper saves power but wakes later; the wake delay is the vendor's C-state exit latency, not measured here. A spinning core never idles |
 | [timer tick, RCU callbacks](hosts.md#kernel-command-line) | kernel work on every CPU: a regular timer interrupt; deferred clean-up | `isolcpus` keeps tasks off, `nohz_full` stops the tick, `rcu_nocbs` moves the callbacks; that cut Azure DPDK's worst percentiles hard |
 | [interrupt affinity, `irqbalance`](hosts.md#interrupts-and-the-nic) | the CPUs an interrupt may run on; `irqbalance` is a daemon that moves interrupts around | stop `irqbalance`, pin interrupts to housekeeping, pin again after every NIC reset |
 | IOMMU passthrough | IOMMU: the unit that checks which memory a device may reach. Passthrough (`iommu=pt`; Graviton `iommu.passthrough=1`) skips it for the host's own drivers | lets `igb_uio` work on metal; harmless on a VM |
@@ -47,8 +47,8 @@ Kubernetes and Java terms:
 | Agrona | the Java library of buffers and agents that Aeron is built on | its use of `jdk.internal.misc.Unsafe` is why the JVM needs the first `--add-opens` |
 | LTS | a Java release with long-term support (17, 21, 25) | run Archive and Cluster on 25 |
 | JIT | the JVM's compiler: it turns hot code into machine code while the program runs | code-cache pressure can undo its work (deoptimise) |
-| GC, barrier | GC: the garbage collector, which frees objects no longer used. Barrier: the extra work it adds to the program's memory accesses | Aeron allocates nothing in steady state, so `ParallelGC`, with the cheapest barriers, wins |
-| safepoint | a pause in which every Java thread stops | `GuaranteedSafepointInterval` removes the one that runs every second only because it is due |
+| GC, barrier | GC: the garbage collector, which frees objects no longer used. Barrier: the extra work it adds to the program's memory accesses | `ParallelGC` is what every Aeron script uses: convention, not a measured collector A/B |
+| safepoint | a pause in which every Java thread stops | `GuaranteedSafepointInterval` raises the guaranteed-safepoint interval from the default 1 s to 300 s; effect **not measured** ([Java](java.md)) |
 | duty cycle | one pass of an agent's work loop | `*.cycle.threshold=1ms` counts each one over 1 ms, so stalls show |
 | spy | a subscription that reads a publication on its own host, from its log buffer, not the network | see `aeron.spies.simulate.connection` ([Java](java.md#the-aeron-properties)) |
 | sparse file, pre-touch | sparse: disk pages appear only on first write. Pre-touch: every page is faulted in at start | no first-write page faults, but pre-touched terms count against a container's memory limit |

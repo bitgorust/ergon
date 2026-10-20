@@ -35,11 +35,11 @@ webpki-roots = ["dep:webpki-roots"]
 curl = ["dep:curl"]
 
 [dependencies]
-rustls = { version = "0.23.45", default-features = false, features = ["std", "ring"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring"] }
 ring = "0.17"
 libc = "0.2"
 httparse = "1.10"
-base64 = "0.22"
+base64 = "0.23"
 socket2 = { version = "0.6", features = ["all"] }
 webpki-roots = { version = "1", optional = true }
 # The host and NIC checks (`checks`): `Driver::new` runs T1, T3, T7 and T8;
@@ -54,7 +54,7 @@ curl = { version = "0.4.51", optional = true, default-features = false, features
 [dev-dependencies]
 rcgen = "0.14"
 # TLS 1.2 only in tests: proves a TLS 1.2 handshake is refused clearly.
-rustls = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
 # Test-only: the docs say mio is the interrupt path and so is tokio's I/O.
 # `driver.rs` proves that by reading SO_BUSY_POLL off a socket mio owns, and
 # off one tokio's reactor owns. `os-poll` and `net` are mio's Poll and its

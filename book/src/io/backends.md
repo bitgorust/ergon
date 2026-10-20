@@ -136,7 +136,7 @@ $B/analyse --warmup-s 2 res/c100-*
 
 Measured against plain `recv-busy`: level at 1 and 10 connections, and
 ahead at 100 on the whole path. Figures:
-[`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#many-connections).
+[`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#limits).
 
 ## Kernel
 
@@ -159,7 +159,7 @@ missing at start-up.
 ## Cost per poll
 
 One poll is 1 ÷ the loop's polls per second. Tables:
-[`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#cost-per-poll).
+[`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#aws-tokyo).
 
 One poll per backend. Where the NIC's NAPI pass runs is what separates
 them:
@@ -237,5 +237,5 @@ $B/analyse --warmup-s 2 res/c20-*
   `adaptive-rx off rx-usecs 0 tx-usecs 0`, with the NIC's interrupts on a
   core of their own ([ergon-tune N1](../tune/overview.md)). Otherwise the
   interrupt waits for moderation and `epoll-spin` looks slower than it is.
-- HTTP with a pool: [HTTP with many connections](http-client.md#many-connections).
+- HTTP with a pool: [HTTP with many connections](http-client.md#limits).
 - Everything about the method: [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md).

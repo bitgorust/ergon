@@ -59,12 +59,13 @@ fn run_names_parse_with_their_backend_and_connections() {
 }
 
 /// A run: `mode`, and records sent at t, in the kernel `rx_us` later (0: no
-/// kernel stamp), decoded `user_us` after sending.
-fn run(dir: &std::path::Path, mode: &str, rx_us: i64, user_us: i64) -> R {
+/// kernel stamp), decoded `user_us` after sending. `work` is the `work.*` block
+/// for `meta.txt`, or empty for a run recorded before the counts were.
+fn run_with(dir: &std::path::Path, mode: &str, rx_us: i64, user_us: i64, work: &str) -> R {
     std::fs::create_dir_all(dir)?;
     std::fs::write(
         dir.join("meta.txt"),
-        format!("mode={mode}\nduration_s=60\nrate=10000\n"),
+        format!("mode={mode}\nduration_s=60\nrate=10000\n{work}"),
     )?;
     let records: Vec<Record> = (0..20_000)
         .map(|i| {
@@ -85,6 +86,63 @@ fn run(dir: &std::path::Path, mode: &str, rx_us: i64, user_us: i64) -> R {
         ..StallSummary::default()
     };
     std::fs::write(dir.join("stalls-0.txt"), format_stalls(&sum, &[]))?;
+    Ok(())
+}
+
+fn run(dir: &std::path::Path, mode: &str, rx_us: i64, user_us: i64) -> R {
+    run_with(dir, mode, rx_us, user_us, "")
+}
+
+/// `--fair` compares backends against each other, so a reader needs the work
+/// behind each comparison beside it: what the schedule owed, what went out,
+/// what produced a sample and what was left censored. A run with no counts is
+/// "not yet measured", never a row of zeros.
+#[test]
+fn every_fair_comparison_shows_the_work_behind_it() -> R {
+    let root = std::env::temp_dir().join(format!("fair-work-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(
+        root.join("fair-env.txt"),
+        "run=20261019T120000Z\ncloud=aws\nregion=us-east-1\narch=x86\npriority=Spot\n\
+         receiver=c7i.2xlarge\nsender=c7i.xlarge\nimage=debian-13\n\
+         receiver_cpu=Intel Xeon (Sapphire Rapids)\nkernel=6.1.0\nlayout=own-cores\n\
+         housekeeping_cpu=0\nirq_cpu=1\nloop_cpu=2\nsqpoll_cpu=3\nspare_cpu=none\nreceiver_boot=full-pollidle\n",
+    )?;
+    let core = root.join("f1-irqcore");
+    // The helper writes 20,000 records; the counts must say so. 10 scheduled,
+    // 8 issued, 20,000 completed is not this run — use counts that hold:
+    // 20,010 scheduled, 20,008 issued, 20,000 completed, 8 censored. The
+    // second and third runs recorded before the counts were.
+    run_with(
+        &core.join("md-recv-busy-c16"),
+        "lab",
+        27,
+        30,
+        "work.scheduled=20010\nwork.issued=20008\nwork.completed=20000\nwork.late=2\nwork.rejected=0\nwork.censored=8\n",
+    )?;
+    run_with(&core.join("md-epoll-spin-c16"), "lab", 35, 40, "")?;
+    run_with(&core.join("rt-recv-busy-n4-r10000"), "pingpong", 0, 45, "")?;
+    let (tags, skipped) = matrix::load(&root, 0)?;
+    let text = report(&root, &tags, &skipped);
+    assert!(
+        text.contains("### Work behind the comparison"),
+        "no completeness beside the comparisons:\n{text}"
+    );
+    // The counts that were recorded are shown; the one that was not is named.
+    assert!(
+        text.contains("| `md-recv-busy-c16` | 20010 | 20008 | 20000 | 2 | 0 | 8 |"),
+        "the recorded counts are missing:\n{text}"
+    );
+    assert!(
+        text.contains("not yet measured"),
+        "an unrecorded run is not named as such:\n{text}"
+    );
+    assert!(
+        !text.contains("| `md-epoll-spin-c16` | 0 | 0 |"),
+        "a run with no counts is reported as zeros:\n{text}"
+    );
+    std::fs::remove_dir_all(&root)?;
     Ok(())
 }
 

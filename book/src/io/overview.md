@@ -25,7 +25,7 @@ Terms this chapter uses. Each links to the section that explains it.
 | [busy-spin thread](#when-to-use-it) | A thread that loops on its own core and never sleeps. | Pro: no wake-up delay. Con: uses a whole core all the time. |
 | [poll](backends.md#cost-per-poll) | One non-blocking pass of `Driver::poll`: receive, decrypt, decode, deliver, send. | A message can wait up to one whole poll for its turn. |
 | [isolated core](#best-practice) | A CPU the kernel keeps other work off. The rest are housekeeping CPUs. | Pin the loop to one. Helper threads (`connect_background`) run on housekeeping CPUs — in a pod, on its other CPUs ([Kubernetes](kubernetes.md)). |
-| [hyperthread (SMT) sibling](#by-number-of-connections) | The other logical CPU on the same physical core. | Can host the SQPOLL thread, a little slower at p50 than a CPU of its own. Never a second isolated full core just for SQPOLL. |
+| [hyperthread (SMT) sibling](#choosing-a-backend) | The other logical CPU on the same physical core. | Can host the SQPOLL thread, a little slower at p50 than a CPU of its own. Never a second isolated full core just for SQPOLL. |
 | [cpuset](kubernetes.md#why-a-pod-has-no-housekeeping-cpus) | The CPUs a process may run on: its cgroup's `cpuset.cpus.effective`. A pod's is what the kubelet gave it. | Helper threads and SQPOLL must land inside it; the kernel refuses a mask outside (`EINVAL`). |
 | [static CPU manager](kubernetes.md#pod-layouts) | The kubelet policy that gives a Guaranteed pod whole CPUs of its own. | What makes a second CPU the loop does not share possible; x86 with SMT: also `full-pcpus-only`. |
 | [Graviton](#when-to-use-it) | AWS's Arm CPUs. | Builds, not measured. Each vCPU is a whole core, so there is no hyperthread sibling. |
@@ -36,7 +36,7 @@ Terms this chapter uses. Each links to the section that explains it.
 | [NIC polling (busy polling)](backends.md) | The reading thread checks the NIC queue itself instead of waiting for an interrupt. | Pro: skips the interrupt path. Con: CPU; plain `recv-busy` pays it per socket. |
 | [NAPI](backends.md#kernel) | The kernel code that takes packets off a NIC queue; busy polling calls it directly. | `uring-sqpoll` and `uring-napi` register their queues with it: Linux 6.9+. |
 | [NIC queue](backends.md#cost-per-poll) | One of the NIC's receive queues (`c7i.2xlarge`: 8); each connection lands on one. | `per_queue` and the SQPOLL thread poll queues, not sockets, so their cost stops growing with sockets. |
-| [adaptive RX](#best-practice) | ENA (the AWS NIC) delays interrupts to batch packets (adaptive receive moderation). | On by default; pre-empts the loop about 40 times a second, and holds back the interrupts `epoll-spin`, `uring-spin` and mio wait for. Off: `ethtool -C <nic> adaptive-rx off` (interrupt-driven backends: also `rx-usecs 0`). |
+| [adaptive RX](#best-practice) | ENA (the AWS NIC) delays interrupts to batch packets (adaptive receive moderation). | On by default; its tuning work pre-empts the busy-polling loop and holds back the interrupts `epoll-spin`, `uring-spin` and mio wait for. Off, `recv-busy`'s p99.99 falls by 43–47 µs (runs `062428Z`, `070339Z`). Off: `ethtool -C <nic> adaptive-rx off` (interrupt-driven backends: also `rx-usecs 0`). |
 | [backend](backends.md) | How the `Driver` waits for and reads data; set in config: `Config::parse("recv-busy")`. | Pick by socket count and spare cores: [choosing a backend](#choosing-a-backend). |
 | [`epoll-spin`](backends.md) | Asks epoll (the kernel's list of ready sockets) every poll, without waiting; reads only those. | Pro: a cheap poll even at 256 sockets. Con: waits for the interrupt. |
 | [mio, tokio](backends.md) | Rust's usual async I/O. On Linux both use epoll, so they wait for the interrupt. | reqwest on tokio parks its thread between requests; it is behind `epoll-spin` in the HTTP table, but the two were **not compared on the same interrupt path**. |
@@ -53,7 +53,7 @@ Terms this chapter uses. Each links to the section that explains it.
 | [TCP keepalive](#defaults) | The kernel probes an idle connection to find a dead peer. | Default: 10 s idle, then every 5 s, 3 probes. One kernel timer per socket; WebSocket Pings already do this. |
 | [`TCP_USER_TIMEOUT`](#defaults) | How long sent data may stay unacknowledged before the kernel drops the connection. | 25 s here; the kernel default is about 15 minutes. |
 | [TLS 1.3](#connecting) | The encryption on every connection. | TLS 1.2 is refused with a clear error. |
-| [TLS handshake](#connection-set-up) | The key exchange when a connection opens. | A full one costs a fraction of a millisecond of CPU; later ones resume the session. Keep it off the loop: `connect_background`. |
+| [TLS handshake](#connecting) | The key exchange when a connection opens. | A full one costs a fraction of a millisecond of CPU; later ones resume the session. Keep it off the loop: `connect_background`. |
 | [TLS record](#when-to-use-it) | TLS's unit of encrypted data. | A native HTTP request is one record; a large WebSocket message goes out over several. |
 | [in place](#how-it-works) | Decrypted and parsed in the buffer the kernel wrote into: one copy per byte. | Pro: no extra copy. Con: the slice lives only during the call; copy what you keep. |
 | [WebSocket](websocket.md) | A two-way message stream over one TCP connection, opened by an HTTP upgrade (status 101). | No compression here: it would break in-place parsing. |
@@ -61,7 +61,7 @@ Terms this chapter uses. Each links to the section that explains it.
 | [Ping / Pong](websocket.md#options) | Control frames that check the other side is alive. | Ping after 10 s with nothing received; nothing back in 5 s: timeout. Any byte received counts as the answer. |
 | [close handshake](websocket.md#close) | Each side sends a Close frame, then TCP closes. | Waits up to 1 s (`close_timeout_ms`). `Driver::close` skips it. |
 | [HTTP/1.1 keep-alive](http-client.md#rules) | One connection reused for many requests. | No handshake per request. One request in flight per connection; a timed-out request closes its connection. |
-| [connection pool](http-client.md#many-connections) | The warm keep-alive connections an `HttpClient` keeps. | All busy: `Error::Busy`. Each one is one more socket the loop polls. |
+| [connection pool](http-client.md#limits) | The warm keep-alive connections an `HttpClient` keeps. | All busy: `Error::Busy`. Each one is one more socket the loop polls. |
 | [libcurl](http-client.md) | The common C HTTP library: `HttpImpl::Curl` (feature `curl`). | Pro: redirects, proxies, HTTP/2, compression. Con: slower than native on the same interrupt path. |
 | [rate limit](rate-limits.md#what-venues-do) | A venue's cap on requests, orders or connects per window: per IP, account, instrument or connection. | Break it: refused (429). Keep going: your IP is banned. |
 | [budget, bucket](rate-limits.md#what-ergon-io-gives-you) | `limit::Budget`: one bucket per venue limit, checked before each request. | Never sleeps or queues: a refusal says when to try again. Sees only this process. |
@@ -123,14 +123,17 @@ decide it:
 | 5–16 | **`recv-busy,per_queue=true`** | **`uring-sqpoll`** |
 | more than 16 | **`recv-busy,per_queue=true`** | **`uring-sqpoll`** |
 
-- **The table picks among the NIC-polling backends.** `epoll-spin`,
-  `uring-spin` and mio are not yet measured fairly against them: every AWS
-  comparison ran with ENA's adaptive interrupt moderation on, which holds
-  back the interrupts they wait for. A fair rerun is planned; until then,
-  do not choose against epoll on these numbers.
+- **The table picks among the NIC-polling backends.** The x86 runs left
+  ENA's adaptive interrupt moderation on, which holds back the interrupts
+  `epoll-spin`, `uring-spin` and mio wait for, so they choose nothing. The
+  Graviton [fair run](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#interrupt-against-nic-polling-the-fair-run-graviton)
+  compares them properly: polling is a few µs ahead at 1 connection and
+  level after that.
 - **Plain `recv-busy` reads every socket on every poll**, so a message
   waits longer for its socket's turn as sockets grow. It stops winning
-  against `uring-sqpoll` at about 10 sockets (p99).
+  against `uring-sqpoll` at about 10 sockets (p99). At 16 sockets
+  (`flags-aws-20261015T…`): 28–29 µs p99, max 92–157, against
+  `uring-sqpoll`'s 18–20, max 76–89.
 - **`per_queue`** reads one socket per NIC queue, so its poll cost stops
   growing at the queue count. It matched plain `recv-busy` from 1 to 16
   sockets. It is not the default: set it when the count can pass 4.
@@ -161,7 +164,7 @@ Figures: [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/ma
 | order round trip (WebSocket API) | 1 | `recv-busy` or `uring-sqpoll` |
 | order round trip next to N feed sockets | 1 + N | as for 1 + N sockets (not measured) |
 | HTTP | 1 | `recv-busy` |
-| HTTP | about 20, plus the rest | `per_queue`, or `uring-sqpoll` with a spare CPU (not measured: [HTTP with many connections](http-client.md#many-connections)) |
+| HTTP | about 20, plus the rest | `per_queue`, or `uring-sqpoll` with a spare CPU (not measured: [HTTP with many connections](http-client.md#limits)) |
 
 ## Connecting
 
@@ -174,13 +177,16 @@ Figures: [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/ma
 - **TLS 1.3 only.** TLS 1.2 is refused with a clear error.
 - **Trust** is the rustls configuration you pass
   (`tls::client_config(roots)`); feature `webpki-roots` adds Mozilla's roots.
-- **Which TLS stack: stock rustls by default.** The in-place record layer
-  (`tls::RecordLayer`) decrypts in the receive buffer with no allocation,
-  but its effect on a whole request is **not measured** (only a decrypt-only
-  microbench exists). It also owns the record cryptography that kTLS or
-  rustls would own: post-handshake messages, key updates and the cipher's
-  confidentiality limit. Stock rustls is the default until a whole-path A/B
-  shows a material win.
+- **Which TLS stack: the in-place `tls::RecordLayer`, on every native
+  connection.** rustls does the handshake (`UnbufferedClientConnection`,
+  then `dangerous_into_kernel_connection`); the custom layer then does the
+  record cryptography in place in the receive buffer, no allocation per
+  record. Native connections (`TlsStream`, `WsConn`) take it
+  unconditionally — there is no stock-rustls record path to choose. The
+  layer owns the record cryptography that rustls would own after the
+  handshake: post-handshake messages, key updates and the cipher's
+  confidentiality limit. Its effect on a whole request is **not measured**
+  (only a decrypt-only microbench exists).
 
 ## Defaults
 
@@ -221,7 +227,8 @@ Figures: [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/ma
 - **Reconnect off the loop:** `connect_background` (the `Reconnect` default).
 - **On AWS, turn ENA's adaptive receive moderation off**
   (`ethtool -C <nic> adaptive-rx off`), again after each reset of the
-  interface: it pre-empts the polling loop about 40 times a second.
+  interface: off, `recv-busy`'s p99.99 falls by 43–47 µs (runs `062428Z`,
+  `070339Z`).
 - **With `epoll-spin`, `uring-spin` or mio,** use ergon-tune's
   interrupt-path setting instead: `adaptive-rx off rx-usecs 0 tx-usecs 0`,
   with the NIC's interrupts on a core of their own
@@ -258,13 +265,17 @@ What the runs support, without repeating the tables:
   `uring-sqpoll` do not. Past 4 sockets take `per_queue`, or
   `uring-sqpoll` if a second CPU is free.
 - **`uring-sqpoll` had the lowest p99 of the polling backends from about
-  10 connections.**
-- **Interrupt-driven against NIC polling: no conclusion.** Every AWS
-  comparison left ENA's adaptive moderation on, which delays the
-  interrupts `epoll-spin`, `uring-spin` and mio wait for. A fair rerun is
-  planned.
-- **Round trips were measured on one connection only.** Many-connection
-  data is market data, 1 to 256 sockets, AWS only. Graviton: not measured.
+  10 connections** (`flags-aws-20261015T…`, 16 sockets: p99 18–20 µs,
+  max 76–89, against plain `recv-busy`'s 28–29, max 92–157).
+- **Interrupt-driven against NIC polling:** no conclusion from the x86
+  runs (ENA's adaptive moderation was left on). The Graviton
+  [fair run](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#interrupt-against-nic-polling-the-fair-run-graviton)
+  turns it off for every backend: polling is about 2.5–3 µs ahead at 1
+  connection, level at 4, and plain `recv-busy` collapses past that while
+  the interrupt family stays at 39–40 µs p50 to 64 sockets.
+- **Round trips on x86 were measured on one connection only.** The Graviton
+  fair run covers 1, 4, 16 and 64. Many-connection market data is AWS only.
+  Graviton against x86: not measured.
 - **Maxima** mostly come from a message waiting while the loop decoded a
   burst, or from a hypervisor stall. Whole-path figures use two hosts'
   clocks: compare within one round only.

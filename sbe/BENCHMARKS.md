@@ -54,14 +54,19 @@ Most of the measured difference between ergo-sbe and sbe-tool comes down to
 handing back an encoder or decoder whose accessors are unchecked. Timing those
 against sbe-tool would charge ergon for work its reference never does.
 
-Every maintained pair is therefore in one **validation class**, currently
-`none` for all of them: the extent proof runs once in an untimed preflight
-(`assert_baseline_wrap_extent`, `assert_stream_wrap_extent`,
-`assert_encode_extent`), and the timed region calls the matching unchecked
-constructor. `fairness_policy_test` enforces this mechanically. Checked
-constructors are still benchmarked as separately labelled diagnostic arms
-(`ergo-sbe_wrap_checked`, `ergo-sbe_try_from`,
-`ergo-sbe_header_and_body_checked`); the gate does not read them.
+Every maintained pair keeps its arms in one **validation class**. The body-wrap
+decode pairs and body-only encode pairs run in class `none`: the extent proof
+runs once in an untimed preflight (`assert_baseline_wrap_extent`,
+`assert_stream_wrap_extent`, `assert_encode_extent`), and the timed region
+calls the matching unchecked constructor; `fairness_policy_test` enforces this
+for the composite, full-message and entry-point decode arms. The full-wire
+encode pairs are not class `none` — they time ergon's capacity-checked
+`wrap_and_apply_header` against sbe-tool's `parent()` Result
+([pair modes](#maintained-pair-modes)).
+
+Checked constructors are benchmarked as separately labelled diagnostic arms
+only where such an arm exists: `ergo-sbe_try_from` (header + schema-id
+validation every call). The gate does not read it.
 
 Dynamic tails still validate their dimensions and lengths while being
 consumed. The staged decoder obtains each dynamic entry's end from the
@@ -157,7 +162,7 @@ Every gated ergon/sbe-tool pair uses the same header mode on both arms:
 | encode/throughput 10k | full wire | apply-header + 2 fields | wrap+header+parent + 2 fields |
 | wire_parity encode full | full wire | apply-header + full Car | wrap+header+parent + full Car |
 | decode scalar/array/composite | accessors only | prebuilt decoder | prebuilt decoder |
-| decode entry wrap | body wrap | `wrap(…, 8, …)` | body decoder at `msg+8` |
+| decode entry wrap | body wrap | `wrap_unchecked(…, 8, …)`, extent proved untimed | body decoder at `msg+8` |
 | decode full / batch 10k | body wrap + same fields | same | same |
 | cluster encode (all 3+claim) | **body only** | `wrap(0)` + fields | `wrap(8)` + fields, no header |
 | cluster decode | header+body parse | `wrap_and_apply_header` | MessageHeaderDecoder + body + equal checks |
@@ -260,7 +265,9 @@ The ordered lane is the fastest full-message decode arm in both profiles
 (18,432 ns LTO and 18,868 ns no-LTO, against sbe-tool's 21,010 and 21,270).
 Both ergo lanes observe the same fields; `EntryInfo` is built by both.
 
-**A gate failure that did not survive a re-run.** An earlier `just bench` on
+#### A gate failure that did not survive a re-run
+
+An earlier `just bench` on
 the same commit (run `b20261019T083750Z-82002-5282f06d15ce`, manifests
 `62959b1047368e64…` / `a50f49a06f760d1f…`) reported
 `decode_full_message_ordered` at **1.1090** under LTO, with non-overlapping
@@ -349,15 +356,15 @@ setters, same payload copy where there is one, no MessageHeader write. The
 release workflow gates on `ubuntu-latest` x86-64, so the probes were built and
 disassembled for that architecture. x86-64, release:
 
-| Pair | Instr. ergo/tool | Stores | Calls | Store text | Checksum |
+| Pair | Disasm. instr. ergo/tool | Stores | Calls | Store text | Checksum |
 |---|---:|---:|---:|---|---:|
 | `encode/session_message_header` | 80 / 80 | 7 / 7 | 0 / 0 | byte-identical | 5,415,000 |
 | `encode/session_keep_alive` | 75 / 75 | 5 / 5 | 0 / 0 | byte-identical | 545,000 |
 | `encode/claim_shaped_header_plus_app` | 72 / 72 | 9 / 9 | 0 / 0 | byte-identical | 9,765,923,333,140,794,032 |
 
-The counts are the same with LTO off (`CARGO_PROFILE_RELEASE_LTO=false`,
-`codegen-units=1`, the no-LTO gate's profile): 80/80, 75/75, 72/72. So the
-no-LTO wall-clock gap is not a codegen difference between the arms either.
+The disassembled static text sizes are the same with LTO off
+(`CARGO_PROFILE_RELEASE_LTO=false`, `codegen-units=1`, the no-LTO gate's
+profile): 80/80, 75/75, 72/72. Retired work in either profile: not measured.
 
 The three header field stores are `mov %rax,-0x18(%rdi,%rcx,1)`,
 `mov %rax,-0x10(%rdi,%rcx,1)`, `mov %rax,-0x8(%rdi,%rcx,1)`, identical in both
@@ -367,11 +374,10 @@ pair — 11 branch-target addresses and 3 register-allocation shuffles in the
 checksum-reduction tail — the same signature every time. On aarch64 the header
 pair is 78/78 with identical `stp`/`str` stores.
 
-Equal checksums prove equal work; equal instructions prove equal code. The
-sub-percent wall-clock gap on these pairs is measurement sensitivity on a
-three-store loop, not an ergon loss — and it cannot be closed by changing
-ergon's code, because the code is already the reference. Callgrind instruction
-counts need the pinned Linux/Valgrind lane
+Equal checksums prove equal work; equal disassembly text proves equal code.
+The sub-percent wall-clock gap on these pairs is not explained by the
+disassembly above. Retired work: not measured — Callgrind instruction counts
+need the pinned Linux/Valgrind lane
 (`scripts/run-cluster-instruction-probes.sh`); the disassembly and checksums
 above run anywhere and are what the decode arm's earlier mechanism check used.
 
@@ -399,7 +405,7 @@ the pre-fix closures verbatim — checked `wrap` on the ergon arm, slice length
 opaque on both — alongside the maintained pair, which uses `wrap_unchecked`
 with the slice length visible on both arms. x86-64, release:
 
-| Arm | Instructions | Stores | Calls |
+| Arm | Disasm. instructions | Stores | Calls |
 |---|---:|---:|---:|
 | maintained, length visible — ergon | 75 | 5 | 0 |
 | maintained, length visible — sbe-tool | 75 | 5 | 0 |
@@ -417,14 +423,17 @@ bench uses to stop the ratio following wherever the loop header lands. A 1–4%
 wall-clock gap between two unequal mechanisms with unpinned loop alignment is
 not evidence about either encoder.
 
-**The checked constructor's own cost is 21 instructions.** Holding the opaque
-length fixed and changing only the ergon constructor, `wrap_unchecked` is 75
-instructions and checked `wrap` is 96. The 21 are the formatted panic payload:
-`call panic_fmt`, `call buffer_too_short`, the stack frame opened to build the
-`EncodeError`, and the `cmp`/`ja` that guards it. The generated `wrap` doc
-comment already says this — "Only for proven-tight hot loops where the panic
-machinery is measurable in the critical path" — the bench just was not
-following it.
+**The checked constructor's static text is 21 instructions larger — not 21
+instructions of executed cost.** Holding the opaque length fixed and changing
+only the ergon constructor, the disassembled text is 75 instructions for
+`wrap_unchecked` and 96 for checked `wrap`. The 21 are mostly the cold panic
+path — `call panic_fmt`, `call buffer_too_short`, the stack frame opened to
+build the `EncodeError` — which never executes on success, plus the `cmp`/`ja`
+that guards it. Only that `cmp`/`ja` executes on the success path. Executed
+cost not measured: these are disassembly text sizes, not Callgrind Ir/op. The
+generated `wrap_unchecked` doc comment already says this — "Only for
+proven-tight hot loops where the panic machinery is measurable in the critical
+path" — the bench just was not following it.
 
 **The check disappears when the slice length is visible.** `wrap`'s proof is
 `24 > buf.len().saturating_sub(msg_offset)`. With `buf.len()` the constant
@@ -490,11 +499,11 @@ part of that which is unachievable by construction.
 `claim_shaped`'s wider spread is the same 32-byte payload copy on both arms
 (`movdqu` ×2, byte-identical); a larger loop body leaves more ways for the two
 closures to sit relative to each other in the binary. The no-LTO
-`encode/session_message_header` ratio (1.0434 before the fix, 1.0742 after) is
-the same placement effect, not a codegen difference: the no-LTO instruction
-counts are identical to the LTO ones (80/80), so the arms retire the same work
-in both profiles. `.p2align 6` pins the loop header's alignment but cannot pin
-which cache sets or pages the two functions occupy.
+`encode/session_message_header` ratio was 1.0434 before the fix and 1.0742
+after. The no-LTO static text sizes are identical to the LTO ones (80/80
+disassembled instructions per arm). Retired work in either profile: not
+measured. `.p2align 6` pins the loop header's alignment but cannot pin which
+cache sets or pages the two functions occupy.
 
 Raising the ceiling is a governance decision, not a code one, and it has not
 been taken. The ceiling stands at `1.00` in `scripts/check-bench-gate.sh`; the
@@ -576,11 +585,13 @@ passed — only the self-comparison caught it.
 
 Not a ≤1.00 gate. Compares flyweight vs wire-image value vs
 `#[repr(C, packed)]` for a single mid-block field on a 256-byte composite
-(`BigBlock`, field `f15`). **Conclusion:** single-field access is one load for
-flyweight, preheld `[u8; N]` wire image, and packed overlay alike. Packing does
-**not** beat the wire-image design. Materialising the whole composite first
-(`value_copy_then_f15`) is ~60x slower than any single-field access — the
-expensive path is the copy, not the read. Unprovenanced. See
+(`BigBlock`, field `f15`). **Conclusion for this case only:** on `f15` here,
+single-field access is one load for flyweight, preheld `[u8; N]` wire image,
+and packed overlay alike, and packing did not beat the wire image. Packing
+beating the wire-image design on other shapes: not measured. Materialising the
+whole composite first (`value_copy_then_f15`) is the expensive path — the copy,
+not the read; the size of that gap is not measured (the run was not archived).
+Unprovenanced. See
 [Composite layout & little-endian](https://mimran1980.github.io/ergon/sbe/core-concepts/composite-layout.html).
 
 ```sh

@@ -184,4 +184,4 @@ of every figure, with its max:
   scale with the sockets, plus the time on their messages. Past 4 sockets
   in all, use `recv-busy,per_queue=true` or `uring-sqpoll`.
 - **Feeds** (market data, 1 to 256 connections):
-  [by number of connections](overview.md#by-number-of-connections).
+  [by number of connections](overview.md#by-workload).

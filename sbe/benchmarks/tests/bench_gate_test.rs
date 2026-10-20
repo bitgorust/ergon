@@ -369,8 +369,9 @@ const PROFILE_SCOPED_OVERRIDE_MAX: &[(&str, f64)] = &[
 /// Ceilings raised for a single profile are applied by a conditional in the
 /// gate script, not by the pairs table, so `parse_maintained_ceilings` cannot
 /// see them. Audit them directly: every such override must name an allowlisted
-/// label and stay within 1.01, or a ceiling could creep up unnoticed — which is
-/// precisely what the ceiling audit exists to prevent.
+/// label and stay within its documented maximum in `PROFILE_SCOPED_OVERRIDE_MAX`,
+/// or a ceiling could creep up unnoticed — which is precisely what the ceiling
+/// audit exists to prevent.
 #[test]
 fn profile_scoped_ceiling_overrides_are_allowlisted_and_bounded()
 -> Result<(), Box<dyn std::error::Error>> {
