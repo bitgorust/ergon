@@ -19,12 +19,124 @@ does not establish it).
 `correct` (replace with artifact values), `remove` (delete the claim),
 `unverified` (label explicitly; never invent a number).
 
-**Status at time of writing.** Stage 1 evidence restoration is in
-progress; stage 2 benchmark-validity repairs are open; stages 3 and 4 are
-open. Rows whose fix has landed are marked in the tables below where that
-is already known. Nothing in this file certifies every historical
-experiment, and nothing here establishes that any library meets an
-unspecified HFT latency budget.
+**Status, 2026-10-20, second entry.** Stage 1: the io rows below have
+landed and were re-checked against the run artifacts; the clock and
+cluster-md rows are open. Stage 2: `Work::from_meta` accounting, flat
+sampling in the parity and cluster benches, the `slope: null` → median
+estimator reader, the A/A verdict semantics, the unequal-validation-work
+fix and the `sbe/BENCHMARKS.md` rows have landed. The AWS
+polling-versus-interrupt recommendation is reconciled against the Graviton
+fair run `20261019T175248Z` and scoped to it, with x86 labelled not
+measured.
+
+**Validation class is now matched, and it is enforced.** The gated body-wrap
+decode pairs and body-only encode pairs time `wrap_unchecked` against
+sbe-tool's zero-check wrap, with the extent proved once in an untimed
+preflight (`assert_baseline_wrap_extent`, `assert_stream_wrap_extent`,
+`assert_encode_extent`). `bench_decode_entry_point`'s gated arm is
+`ergo-sbe_wrap`; the checked constructor is a separate informational arm,
+`ergo-sbe_try_from`, which the gate does not read. `fairness_policy_test`
+enforces the class for the composite, full-message and entry-point decode
+arms, so the next pair cannot silently reintroduce a validating wrap in the
+timer. Observation barriers are matched the same way
+(`parity_arms_use_identical_observation_barriers`): every value one arm
+makes opaque, its partner makes opaque at the same number of barriers and
+the same program points.
+
+**The clock-bench gap pass now measures its own memory, not the process's.**
+`the_gap_pass_takes_no_page_faults_while_it_times` failed once under a
+full-suite load with 226 page faults. Its fault count is `getrusage`'s
+`ru_minflt`, which is the calling thread's only on Linux
+(`RUSAGE_THREAD`); Darwin has no `RUSAGE_THREAD`, so the count there is the
+whole process's and another thread's faults fail the test. Its gap assertion
+could not see a fault at all: the read under test is an atomic counter, so
+gaps are differences of the counter, not of time (a mutation that left
+8,387,584 of 8,388,608 pages cold still reported `max_ns: 1.0`). The pass
+now proves its buffer is resident with `mincore` — scoped to the buffer, so
+nothing else in the process moves it — by probing the unvisited tail as it
+runs, and only asserts the fault count where the kernel scopes it to the
+thread. `mincore` is tested against a fresh anonymous mapping, which is
+guaranteed cold, because a heap buffer may land on recycled resident pages.
+30/30 runs of the crate suite held under ~3.2 TB of allocation churn.
+
+**Keep-alive repeatability — the 1.0191 did not repeat.** A second full
+`just bench-cluster` on the same host (run `cluster-20261020T072915Z-e565d087`,
+commit `e565d087`, rustc 1.99.0, `aarch64-apple-darwin`) measures
+no-LTO `cluster_encode_session_keep_alive` at **1.0001** (ergo 6985.70 ns /
+sbe-tool 6984.90 ns, ratio CI [0.9968, 1.0039]) against the previous run's
+**1.0191** (CI [1.0144, 1.0242]). The 1.9% gap is run-to-run, not a code
+property. Both profiles now pass the gate with three pairs each marked
+inconclusive and no established winner. A repeatable sbe-tool win has not
+been shown on this host.
+
+**Harness resolution on this host is about 2%.** The A/A control's own
+ratio walked with it: the no-LTO null band moved from [0.9970, 1.0129]
+(centre 1.005) to [0.9752, 0.9946] (centre 0.985) between the two runs.
+Under LTO the same effect is visible inside one run — an identical keep-alive
+closure measures **7.3092 µs** in `cluster/control/aa_encode_keep_alive`
+against **7.3760 µs** in `cluster/encode/session_keep_alive`, 0.9% on
+identical code, which is larger than that pair's own 0.63% spread. Every
+maintained ratio difference (0.01%–1.1%) sits at or below that, so no
+maintained cluster pair is resolvable on `aarch64-apple-darwin` today.
+
+**Landed and re-verified since the first entry.** The clock rows
+`clock/README.md:44` and `book/src/clock/overview.md:59` (the read-rate
+cutoff and the mandatory recommendation): the cutoff is gone and the page
+now reads "One option among four, not a requirement. Choose by contract,
+not by read rate", with `Instant`/quanta/minstant/`SystemTime` each scoped
+to what they actually give. The stage-4 example rows: mixed-scale price
+comparison (`samples/l3-book/tests/l3_tests.rs` `mixed_scale_book` and
+`best_bid_compares_prices_across_scales`, which assert `99` outranks
+`1.00`), checked timestamp conversion (`book/src/sbe/recipes/timestamps.md`
+`try_from_sbe` → `Result`, `timestamp_*_opt().ok_or(...)`), fallible DTO
+decoding (`book/src/sbe/recipes/domain-dtos.md` `try_from_decoder` /
+`try_from_slice_with_header` → `Result`, "materialisation is never
+infallible"), and OUT_DIR as the product default (`book/src/samples/build-patterns.md`
+and `samples/README.md` both label `src/generated/` "samples default
+(gitignored, unpublished)" and `generate_to_out_dir` + `sbe_mod!` "product
+default"). The three `scripts/book-fence-allowlist.txt` line numbers for
+`book/src/tune/overview.md` (190, 198, 237) match the live fences.
+`just policy` passes.
+
+**Open, stage 2.** (a) The Callgrind instruction-count check
+(`just bench-cluster-instructions`, `./scripts/run-cluster-instruction-probes.sh
+--all-profiles`) needs Linux + Valgrind + `llvm-objdump` and fails closed;
+it has not run, so `cluster_encode_session_keep_alive` has no mechanism
+check. (b) The A/A null band is order-sensitive: its centre drifts by about
+2% between runs because each control is a single `arm_a`-then-`arm_b`
+pairing. The work order asks for *repeated* A/A controls; only single-run
+controls exist. The band is not widened to hide this — a pair outside a
+measured band still fails.
+
+**Open, stage 3.** Clock is done (above). TLS: `io/src/tls.rs` already
+drives `UnbufferedClientConnection` for the handshake, then
+`dangerous_into_kernel_connection` hands the secrets to a custom
+`RecordLayer` that runs ring AEAD in place and owns post-handshake parsing,
+reassembly, KeyUpdate and the confidentiality limit. The work order asks
+for rustls's maintained unbuffered API and the removal of that custom
+record-layer API. Open, and performance-sensitive: the only evidence for
+keeping it is a decrypt-only microbench whose aggregation this audit has
+already rejected (`io/benches/BENCHMARK.md:122`), so the custom layer is
+not currently justified by a repeatable application-level improvement.
+Deployment: `md-dpdk/deploy/aws-eks/media-driver-daemonset.yaml` is
+`privileged: true` for DPDK; `k8s/nri-latency-pods` already states "no
+IPC_LOCK, no capabilities, no privileged, and no scheduler change: RT
+scheduling is not built", and `latency-pods.md` already scopes the io_uring
+grant to apps that use it ("Aeron's C media driver does not use io_uring").
+Still open there: the `SCHED_FIFO` plumbing in `k8s/nri-shared-cpus`
+(`ergon-cpus --fifo`, `sched-fifo.ergon.io`, `ERGON_SCHED_FIFO`), which no
+ergon component consumes, and the three experimental/diagnostic JVM flags
+in `cluster-test-harness/jvm/aeron.jvm` (`TrustFinalNonStaticFields`,
+`GuaranteedSafepointInterval=300000`, `DebugNonSafepoints`) whose effect on
+the recommended JDK `book/src/deploy/java.md:68` already records as not
+measured.
+
+**Open, stage 4.** The example rows are done (above). What remains is the
+reconciliation sweep: README, rustdoc, the disclosure, the charts and the
+CI descriptions against each other, and a disposition line for every book
+chapter. Nothing in this file certifies every historical experiment, and
+nothing here establishes that any library meets an unspecified HFT latency
+budget.
 
 ---
 
@@ -81,11 +193,11 @@ Root: `/Users/mimra/RustroverProjects/project/ergon`. Evidence quotes are artifa
 
 | file:line | claim | verdict | evidence | disposition | exact fix |
 |---|---|---|---|---|---|
-| `sbe/benchmarks/benches/perf_parity_bench.rs:16` | "Fair comparison uses `wrap` (sbe-tool's `wrap` does no bounds check)" | contradicted-by-code | ergo arm :333 runs the version-aware extent proof + panic branch inside the timer (`codegen/message_decoder.rs:346-371`); sbe-tool arm :352 is field assigns only. Violates the keep-alive rule quoted at BENCHMARKS.md:394-396 and the validation-class rule :57-64 | rewrite | Pair `wrap_unchecked` against sbe-tool's zero-check wrap (extent proven in the untimed preflight), or charge both arms the check; replace :16 with the keep-alive rule; correct the :329 "lean wrap (4 field assigns)" comment. |
-| `sbe/BENCHMARKS.md:62` | Diagnostic arms `ergo-sbe_wrap_checked`, `ergo-sbe_try_from`, `ergo-sbe_header_and_body_checked`; "the gate does not read them" | wrong-fact | `ergo-sbe_wrap_checked` / `ergo-sbe_header_and_body_checked` exist only in this sentence and methodology.md:53. The gate reads `ergo-sbe_wrap`, which runs the checked constructor | rewrite | List only `ergo-sbe_try_from`; state that until the entry-point arm is swapped, the gated `ergo-sbe_wrap` runs the checked constructor. |
-| `sbe/BENCHMARKS.md:422` | "The checked constructor's own cost is 21 instructions" | overstated | 21 is llvm-objdump static text size, mostly never-executed cold panic path; success path delta is `cmp`/`ja` | relabel not-measured | "static text-size delta of 21 instructions (mostly never-executed cold panic path)"; executed cost "not measured" or cite Callgrind Ir/op. |
-| `sbe/BENCHMARKS.md:497` | equal 80/80 counts prove "the arms retire the same work" and exonerate the wall-clock gap | unsupported | Static text sizes only; line 365-367 "Differing instruction texts are 14 per pair"; Callgrind lane still needed | relabel not-measured | State only that static text sizes match across profiles; drop the exoneration, or write "retired work not measured". |
-| `sbe/BENCHMARKS.md:582` | "Packing does **not** beat the wire-image design … ~60x slower than any single-field access" | overstated | Unprovenanced run: one composite, one field, test buffer | rewrite | Scope to the measured case ("in this unprovenanced run, for the f15 field, …") or "not measured". |
+| `sbe/benchmarks/benches/perf_parity_bench.rs:16` | "Fair comparison uses `wrap` (sbe-tool's `wrap` does no bounds check)" | contradicted-by-code | ergo arm :333 runs the version-aware extent proof + panic branch inside the timer (`codegen/message_decoder.rs:346-371`); sbe-tool arm :352 is field assigns only. Violates the keep-alive rule quoted at BENCHMARKS.md:394-396 and the validation-class rule :57-64 | rewrite | Pair `wrap_unchecked` against sbe-tool's zero-check wrap (extent proven in the untimed preflight), or charge both arms the check; replace :16 with the keep-alive rule; correct the :329 "lean wrap (4 field assigns)" comment. **Fixed 2026-10-20.** |
+| `sbe/BENCHMARKS.md:62` | Diagnostic arms `ergo-sbe_wrap_checked`, `ergo-sbe_try_from`, `ergo-sbe_header_and_body_checked`; "the gate does not read them" | wrong-fact | `ergo-sbe_wrap_checked` / `ergo-sbe_header_and_body_checked` exist only in this sentence and methodology.md:53. The gate reads `ergo-sbe_wrap`, which runs the checked constructor | rewrite | List only `ergo-sbe_try_from`; state that until the entry-point arm is swapped, the gated `ergo-sbe_wrap` runs the checked constructor. **Fixed 2026-10-20.** |
+| `sbe/BENCHMARKS.md:422` | "The checked constructor's own cost is 21 instructions" | overstated | 21 is llvm-objdump static text size, mostly never-executed cold panic path; success path delta is `cmp`/`ja` | relabel not-measured | "static text-size delta of 21 instructions (mostly never-executed cold panic path)"; executed cost "not measured" or cite Callgrind Ir/op. **Fixed 2026-10-20.** |
+| `sbe/BENCHMARKS.md:497` | equal 80/80 counts prove "the arms retire the same work" and exonerate the wall-clock gap | unsupported | Static text sizes only; line 365-367 "Differing instruction texts are 14 per pair"; Callgrind lane still needed | relabel not-measured | State only that static text sizes match across profiles; drop the exoneration, or write "retired work not measured". **Fixed 2026-10-20.** |
+| `sbe/BENCHMARKS.md:582` | "Packing does **not** beat the wire-image design … ~60x slower than any single-field access" | overstated | Unprovenanced run: one composite, one field, test buffer | rewrite | Scope to the measured case ("in this unprovenanced run, for the f15 field, …") or "not measured". **Fixed 2026-10-20** (claim removed). |
 | `sbe/benchmarks/tests/bench_gate_test.rs:372` | overrides "stay within 1.01" | wrong-fact | Test enforces `PROFILE_SCOPED_OVERRIDE_MAX` with `session_event` → 1.05 (`scripts/check-bench-gate.sh`) | correct | "stay within its documented maximum in `PROFILE_SCOPED_OVERRIDE_MAX`". Do not change any ceiling. |
 
 ### cluster-md
@@ -135,10 +247,10 @@ Wrong aggregation, no artifact, mixed runs.
 ### (2) Repair benchmark validity
 Accounting, completeness, barriers, ceilings preserved.
 
-- `sbe/benchmarks/benches/perf_parity_bench.rs:16` (unequal validation work inside the timer)
-- `sbe/BENCHMARKS.md:62` (nonexistent diagnostic arms; gate runs the checked constructor)
-- `sbe/BENCHMARKS.md:422`, `:497` (static text size sold as executed cost / retired work)
-- `sbe/benchmarks/tests/bench_gate_test.rs:372` (comment says 1.01; ceilings untouched)
+- `sbe/benchmarks/benches/perf_parity_bench.rs:16` (unequal validation work inside the timer) — landed
+- `sbe/BENCHMARKS.md:62` (nonexistent diagnostic arms; gate runs the checked constructor) — landed
+- `sbe/BENCHMARKS.md:422`, `:497` (static text size sold as executed cost / retired work) — landed
+- `sbe/benchmarks/tests/bench_gate_test.rs:372` (comment says 1.01; ceilings untouched) — landed
 - `io/benches/src/stats.rs` (`Work::from_meta` accounting)
 - Preserve: `PROFILE_SCOPED_OVERRIDE_MAX` ceilings, `NOISE_FLOOR_CEILING_EXCEPTIONS`, bench-gate ratios ≤ 1.00
 
@@ -181,9 +293,14 @@ l3 price compare, timestamps, DTOs, OUT_DIR, links, categorical claims.
 | file:line | claim | verdict | evidence | fix |
 |---|---|---|---|---|
 | `samples/README.md:42` | OUT_DIR "fine for apps; **poor IDE go-to-def**"; `src/generated/` implied default | contradicted-by-code | Same text as `book/src/samples/build-patterns.md:9`, which the inventory covers; this copy is not in any row | Same fix as build-patterns.md:9 (product default is OUT_DIR + `sbe_mod!`). |
-| `book/src/deploy/benchmarks.md:37` | Table header "idle … max \| 1 M msgs/s … max" with method "max is the slowest single round trip" | wrong-aggregation | Confirmed defect covered only the metal 71 µs cell. Every max cell in this table is a median of 5 rep maxima under the same absolute definition | Apply the overview.md:222 fix to all rows of this table, not just the metal cell. |
-| `io/benches/BENCHMARK.md:56,62,116,149` | HTTP client latency "10–11 µs against libcurl's 28–30 (p50)" | quantitative | p50 only, no max, against the file's own rule at :3 ("every latency figure keeps its max"). Pre-cut git history had the maxima (e.g. libcurl `79.7 / 95.7 / 126.6 / 269`) | Restore the maxima beside the p50s, or label "p50 only; maxima in git history". |
-| `book/src/md-dpdk/overview.md:237-238` | Localhost method prose | wrong-aggregation | Same "median of 5 reps / max is the slowest" contradiction as :159-161; noted as adjacent in verification, never given a row | Same caveat as the :243 fix. |
-| `sbe/BENCHMARKS.md:160` | Gate table row lists `wrap(…, 8, …)` for the entry-point pair | wrong-fact | Contradicts the same validation-class rule that the perf_parity finding enforces; the bare `wrap` runs the extent proof | Update the row once `perf_parity_bench.rs:16` is fixed. |
-| `CONTRIBUTING.md:60-64` | "Nightly CI runs every fuzz target …" | wrong-fact | `nightly.yml` is weekly (`cron: "23 17 * * 0"`); the workflow name lies | Change "Nightly CI" to "Weekly CI (Sundays)" wherever it appears. |
-| `book/src/io/kubernetes.md:92-93`; `book/src/io/overview.md:133,260` | "a little at p50 … more at p99"; "lowest p99 of the polling backends from about 10 sockets" | quantitative | Directional p50/p99 claims with no max, no run id, no numbers | Give the figures with their max and the run, or delete the comparative claim. |
+| `book/src/deploy/benchmarks.md:37` | Table header "idle … max \| 1 M msgs/s … max" with method "max is the slowest single round trip" | wrong-aggregation | Confirmed defect covered only the metal 71 µs cell. Every max cell in this table is a median of 5 rep maxima under the same absolute definition | Apply the overview.md:222 fix to all rows of this table, not just the metal cell. **Fixed 2026-10-20**: the page now defines max as the largest single round trip in any rep and names the five per-rep maxima. |
+| `io/benches/BENCHMARK.md:56,62,116,149` | HTTP client latency "10–11 µs against libcurl's 28–30 (p50)" | quantitative | p50 only, no max, against the file's own rule at :3 ("every latency figure keeps its max"). Pre-cut git history had the maxima (e.g. libcurl `79.7 / 95.7 / 126.6 / 269`) | Restore the maxima beside the p50s, or label "p50 only; maxima in git history". **Fixed 2026-10-20**: the HTTP table is p50 / p99 / max on both platforms. |
+| `book/src/md-dpdk/overview.md:237-238` | Localhost method prose | wrong-aggregation | Same "median of 5 reps / max is the slowest" contradiction as :159-161; noted as adjacent in verification, never given a row | Same caveat as the :243 fix. **Fixed 2026-10-20**: the five per-rep maxima are printed beside the max column. |
+| `sbe/BENCHMARKS.md:160` | Gate table row lists `wrap(…, 8, …)` for the entry-point pair | wrong-fact | Contradicts the same validation-class rule that the perf_parity finding enforces; the bare `wrap` runs the extent proof | Update the row once `perf_parity_bench.rs:16` is fixed. **Fixed 2026-10-20**: the row now reads `wrap_unchecked(…, 8, …)`, extent proved untimed. |
+| `CONTRIBUTING.md:60-64` | "Nightly CI runs every fuzz target …" | wrong-fact | `nightly.yml` is weekly (`cron: "23 17 * * 0"`); the workflow name lies | Change "Nightly CI" to "Weekly CI (Sundays)" wherever it appears. **Fixed 2026-10-20.** |
+| `book/src/io/kubernetes.md:92-93`; `book/src/io/overview.md:133,260` | "a little at p50 … more at p99"; "lowest p99 of the polling backends from about 10 sockets" | quantitative | Directional p50/p99 claims with no max, no run id, no numbers | Give the figures with their max and the run, or delete the comparative claim. **Fixed 2026-10-20**: maxes and run ids restored in `kubernetes.md` and `overview.md`. |
+| `io/benches/BENCHMARK.md:21,52,136,139,243,247` | "Round trips … 1 connection only"; "Graviton: not measured"; "HTTP many connections — estimates only"; "Graviton comparison — not measured" | contradicted-by-artifact | `results/flags-aws-20261019T175248Z/fair.md` holds WebSocket round trips at N = 1/4/16/64 and an HTTP pool of 1 and 20, on Graviton, in the same file | Scoped to x86 and pointed at the fair run; the status table gained a 2026-10-19 row. Fixed 2026-10-20. |
+| `io/benches/BENCHMARK.md` fair-run work sentence | "every point issued and completed 600,000 of 600,001 scheduled" | wrong-aggregation | `tables.md`: scheduled 600,001–600,265, issued/completed 599,994–600,005, late 0–47, censored 0–1 | Quote the ranges and name `tables.md` as the source. Fixed 2026-10-20. |
+| `scripts/check-bench-gate.sh` A/A verdict | "a pair inside it has no established winner" was printed but the pair was still graded FAIL | contradicted-by-code | The A/A band only produced a note; `resolution` came from the ratio CI against the ceiling alone. `cluster_encode_claim_shaped_header_plus_app` printed "resolved breach" and "inside A/A null band" in the same breath | The band now decides: a ratio above its ceiling whose ratio CI overlaps a measured band is inconclusive, not a breach. A pair with no measured control still fails closed. Ceilings unchanged. Fixed 2026-10-20. |
+| A/A control placement (cluster encode) | the null band is not placed like the pair it grades | unsupported-as-a-null | The same ergon keep-alive loop measures 7,061–7,068 ns in `cluster/control/aa_encode_keep_alive` and 7,250 ns in `cluster/encode/session_keep_alive` — 2.7 % between two copies of identical code. Re-run `cluster-20261020T072915Z-e565d087` measures it again under LTO: 7.3092 µs in the control against 7.3760 µs in the pair's ergo arm, 0.9 % on identical code and larger than that pair's own 0.63 % spread. The control's two arms sit next to each other; the pair's two arms sit in different groups | Open. The control understates placement sensitivity, so "inside the band" is weaker evidence than it looks. Fixing it means placing the control arms like the pair (or per-arm processes), not widening a ceiling. |
+| `scripts/check-bench-gate.sh` A/A band, second property | one `arm_a`-then-`arm_b` pairing per control, so the band's centre carries arm-order bias | wrong-aggregation | The no-LTO null band moves from [0.9970, 1.0129] (centre 1.005) to [0.9752, 0.9946] (centre 0.985) between two runs of identical code on one host. With the band sitting entirely below 1.0, a pair at 1.0001 is reported "outside A/A null band" | Open. The work order asks for *repeated* A/A controls. Running each control with the arms in both orders would centre the band on the true null without widening a ceiling. |

@@ -134,8 +134,16 @@ pub struct Deltas {
     /// pass (Linux).
     pub switches: (u64, u64),
     /// Page faults over the pass (the thread's on Linux, the process's
-    /// elsewhere): none where the pass paid nothing for its own memory.
+    /// elsewhere): none where the pass paid nothing for its own memory. Off
+    /// Linux the count is the whole process's (`sys::minor_faults`), so a
+    /// non-zero delta cannot be laid at this pass's door — see `resident`.
     pub faults: u64,
+    /// Pages of the sample buffer resident just before the timed pass and
+    /// just after it (`sys::pages_resident`). Scoped to the buffer, so
+    /// nothing else in the process moves it. Every page at both ends where
+    /// the pass paid nothing for its own memory. A refused `mincore`
+    /// records 0, so a caller that expects every page fails closed.
+    pub resident: (usize, usize),
 }
 
 /// Records `reads` back-to-back reads (one store each), then the gaps
@@ -150,11 +158,16 @@ pub fn deltas<F: Fn() -> u64>(read: &F, ns_per_unit: f64, reads: usize) -> Delta
     for v in &mut values {
         *v = read();
     }
+    // Residency of the buffer is read outside the timing bracket: it is the
+    // uncontaminated statement of what the warm-up achieved, and of what the
+    // timed pass could still fault on.
+    let resident_before = sys::pages_resident(&values);
     let (v0, s0, f0) = (realtime_ns(), sys::context_switches(), sys::minor_faults());
     for v in &mut values {
         *v = read();
     }
     let (s1, f1) = (sys::context_switches(), sys::minor_faults());
+    let resident_after = sys::pages_resident(&values);
     let first = values[0];
     let mut gaps = Vec::with_capacity(values.len() - 1);
     let (mut zeros, mut backwards, mut max_back) = (0, 0, 0_u64);
@@ -192,6 +205,7 @@ pub fn deltas<F: Fn() -> u64>(read: &F, ns_per_unit: f64, reads: usize) -> Delta
         gaps: long,
         switches: (s1.0 - s0.0, s1.1 - s0.1),
         faults: f1.saturating_sub(f0),
+        resident: (resident_before, resident_after),
     }
 }
 
@@ -402,13 +416,52 @@ mod tests {
     /// p99.99s near a microsecond where the same instructions measured later
     /// showed 12 to 156 ns.) 64 MB, above any allocator's reuse threshold
     /// (glibc's rises to 32 MB at most), so its pages are fresh.
+    ///
+    /// The evidence is the buffer's own residency, read with `mincore`:
+    /// scoped to the buffer, so nothing else in the process can move it, and
+    /// unlike a gap it cannot be mistaken for an interrupt (a clean pass of
+    /// a real clock here already gaps 30 to 47 us, with no faults at all).
     #[test]
     fn the_gap_pass_takes_no_page_faults_while_it_times() {
         let _alone = crate::faults_alone();
         let next = AtomicU64::new(0);
-        let d = deltas(&|| next.fetch_add(1, Ordering::Relaxed), 1.0, 8 << 20);
-        assert_eq!(d.faults, 0, "{} page faults in the timed pass", d.faults);
-        assert!((d.max_ns - 1.0).abs() < 1e-9 && d.backwards == 0, "{d:?}");
+        let read = || next.fetch_add(1, Ordering::Relaxed);
+        let page_u64s = sys::page_size() / std::mem::size_of::<u64>();
+        assert!(page_u64s > 0, "no page size");
+        let mut values = vec![0_u64; 8 << 20];
+        for v in &mut values {
+            *v = read();
+        }
+        let whole = values.len() / page_u64s;
+        assert_eq!(
+            sys::pages_resident(&values),
+            whole,
+            "the warm-up left a page of the sample buffer cold"
+        );
+        // Walk it again, and every 256 pages check that the pages still
+        // ahead of the cursor are resident: a reclaimed page there is one
+        // the pass is about to fault in.
+        let mut cold = 0;
+        let mut i = 0;
+        while i < values.len() {
+            values[i] = read();
+            let tail = &values[i + 1..];
+            let want = tail.len() / page_u64s;
+            if want > 0 && sys::pages_resident(tail) < want {
+                cold += 1;
+            }
+            i += page_u64s * 256;
+        }
+        assert_eq!(cold, 0, "{cold} stretches of the pass ran over a cold page");
+        // And what deltas itself records around its timed pass.
+        let d = deltas(&read, 1.0, 8 << 20);
+        assert_eq!(d.resident, (whole, whole), "{d:?}");
+        // A cross-check where the counter is the calling thread's. Darwin
+        // has no RUSAGE_THREAD, so there the delta is the whole process's
+        // and asserting it would be asserting something else entirely.
+        if sys::minor_faults_are_thread_local() {
+            assert_eq!(d.faults, 0, "{} page faults in the timed pass", d.faults);
+        }
     }
 
     /// A clock that counts nothing is 100% slow; one that counts twice as

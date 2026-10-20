@@ -203,6 +203,13 @@ fn analyse(
         return Ok(());
     }
     let all = read_records(&dir.join("records.bin"))?;
+    // Checked before a single percentile is printed, and against the records
+    // on disk before any warm-up is dropped. A run whose counts contradict
+    // each other, claim more completions than it recorded, or report a count
+    // that is not a number has no trustworthy sample — and a shorter sample
+    // can read as a faster one. The error propagates: those latency rows are
+    // not published, and the process does not exit 0.
+    let work = Work::load(&meta, all.len())?;
     let variants: Vec<String> = get(&meta, "variants")
         .split(',')
         .map(str::to_owned)
@@ -239,15 +246,13 @@ fn analyse(
                 &s,
             ));
         }
-        // The work those percentiles are over, next to them. Counts that
-        // contradict each other are named and left out, never reported.
-        match Work::from_meta(&meta) {
-            Ok(Some(w)) => work_rows.push(work_row(
+        // The work those percentiles are over, next to them. Checked above:
+        // only counts that parsed and reconciled with `records.bin` get here.
+        if let Some(w) = work {
+            work_rows.push(work_row(
                 &format!("{name}: {} @ {}/s", variants[0], get(&meta, "rate")),
                 &w,
-            )),
-            Ok(None) => {}
-            Err(e) => eprintln!("{name}: malformed work counts: {e}"),
+            ));
         }
         // HTTP client runs (http_bench) carry no full loop counters.
         if meta.contains_key("loop.0.spins") {
@@ -291,8 +296,7 @@ fn analyse(
     loop_table(&meta, &variants, out, &name);
     queue_table(&meta, &variants, out);
     copy_table(&meta, &variants, out);
-    match Work::from_meta(&meta) {
-        Ok(Some(w)) => {
+    if let Some(w) = work {
         // What arrived and what produced no sample. The tables drop the
         // warm-up, so `n` is smaller than `completed`. A receive-only run does
         // not see the sender's schedule, so those counts are "not yet measured"
@@ -309,11 +313,6 @@ fn analyse(
             work_row(&name, &w)
         );
         let _ = writeln!(out);
-        }
-        Ok(None) => {}
-        Err(e) => {
-            let _ = writeln!(out, "### Work behind the percentiles\n\nMalformed work counts: {e}\n");
-        }
     }
 
     let label = |v: usize| -> String {

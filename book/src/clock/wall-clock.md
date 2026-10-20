@@ -16,14 +16,18 @@ follows. It can be no closer to UTC than the host's own clock.
   no update in those runs ran on a core back from idle. On Graviton the
   slowest is the start update.
 - **Rate cap:** ±500 ppm, NTP's and Linux's own limit.
-- **Never backwards:** a clock behind the wall clock runs faster until it
-  catches up; one ahead runs slower.
+- **The owner never goes back:** a clock behind the wall clock runs
+  faster until it catches up; one ahead runs slower. It only slews, so its
+  own reads never go back.
 - **Bad samples:** a sample taken across an interrupt (too wide a bracket)
   is rejected, and the clock keeps its rate.
 - **Followers:** the owner publishes each update through a seqlock (a
   lock-free publish; readers never wait). A follower's read costs what the
-  owner's does and sees one consistent published set at a time. Neither
-  read goes back: the owner only slews.
+  owner's does and sees one consistent published set at a time — but it
+  **can go back by about 1 ns at an update**, and by more while the clock
+  slews at the cap and the thread loses milliseconds between its check and
+  its read. Take durations with `since_ns` / `elapsed_ns` (they stop at
+  zero), not by subtracting two raw stamps.
 - **The fallback** is kept the same way: `CLOCK_MONOTONIC` plus a
   disciplined offset, never the raw `CLOCK_REALTIME`.
 

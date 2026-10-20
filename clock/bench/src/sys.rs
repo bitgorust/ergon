@@ -108,6 +108,61 @@ pub fn minor_faults() -> u64 {
     0
 }
 
+/// Whether [`minor_faults`] counts only the calling thread.
+///
+/// Linux `getrusage(RUSAGE_THREAD)` does. Darwin has no `RUSAGE_THREAD`, so
+/// there the count is the whole process's: a delta over a measurement cannot
+/// be attributed to that measurement, and must not be asserted as if it
+/// were. Where this is `false`, use [`pages_resident`] instead — it is
+/// scoped to the buffer, so nothing else in the process moves it.
+#[must_use]
+pub const fn minor_faults_are_thread_local() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// The kernel's page size in bytes (0 where it will not say).
+#[must_use]
+pub fn page_size() -> usize {
+    // SAFETY: sysconf is a pure query; _SC_PAGESIZE is a valid name.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(n).unwrap_or(0)
+}
+
+/// How many pages of `items` are resident (`mincore`).
+///
+/// Scoped to the buffer, so unlike [`minor_faults`] off Linux nothing else
+/// in the process can move the answer. Counts only pages wholly inside
+/// `items`. Returns 0 where the kernel will not answer, so a caller that
+/// expects every page fails closed rather than passing on an unknown.
+#[must_use]
+pub fn pages_resident<T>(items: &[T]) -> usize {
+    let page = page_size();
+    if page == 0 || items.is_empty() {
+        return 0;
+    }
+    let start = items.as_ptr() as usize;
+    let end = start.saturating_add(std::mem::size_of_val(items));
+    // The first and last pages wholly inside the slice.
+    let lo = start.saturating_add(page - 1) & !(page - 1);
+    let hi = end & !(page - 1);
+    if hi <= lo {
+        return 0;
+    }
+    let n = (hi - lo) / page;
+    let mut vec = vec![0_u8; n];
+    #[cfg(target_os = "linux")]
+    let vec_ptr = vec.as_mut_ptr().cast::<libc::c_uchar>();
+    #[cfg(not(target_os = "linux"))]
+    let vec_ptr = vec.as_mut_ptr().cast::<libc::c_char>();
+    // SAFETY: lo..hi is n whole pages inside the slice's mapped bytes, and
+    // vec holds one byte per page for the kernel to fill.
+    let rc = unsafe { libc::mincore(lo as *mut libc::c_void, n * page, vec_ptr) };
+    if rc != 0 {
+        return 0;
+    }
+    vec.iter().filter(|&&b| b & 1 == 1).count()
+}
+
 /// `clock_gettime(id)` in ns (0 on failure: the rows that read it are
 /// checked for a sane rate first).
 #[inline]
@@ -141,4 +196,49 @@ pub fn kernel() -> String {
         .map(|&c| c.to_ne_bytes()[0])
         .collect();
     String::from_utf8_lossy(&release).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `mincore` counts exactly the pages a slice has resident, so a cold
+    /// page in a sample buffer is visible before a timed pass runs over it.
+    /// The region is a fresh anonymous mapping, which the kernel leaves
+    /// zero-fill-on-demand: a heap buffer would do as well once touched, but
+    /// the allocator may hand back memory that is already resident, so it
+    /// cannot show the cold end of the count.
+    #[test]
+    fn pages_resident_counts_the_pages_actually_touched() {
+        let page = page_size();
+        assert!(page > 0, "no page size");
+        let pages = 64_usize;
+        let len = pages * page;
+        // SAFETY: a fresh anonymous mapping of len bytes, viewed and
+        // unmapped again below.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED, "mmap of {len} bytes failed");
+        // SAFETY: base is our mapping of exactly len bytes.
+        let slice = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), len) };
+        assert_eq!(pages_resident(slice), 0, "a fresh mapping must be cold");
+        for b in &mut slice[..len / 2] {
+            *b = 1;
+        }
+        assert_eq!(pages_resident(slice), pages / 2);
+        for b in &mut slice[len / 2..] {
+            *b = 1;
+        }
+        assert_eq!(pages_resident(slice), pages);
+        // SAFETY: our mapping, its exact length.
+        assert_eq!(unsafe { libc::munmap(base, len) }, 0);
+    }
 }

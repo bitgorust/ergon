@@ -3,8 +3,9 @@
 //! The gate is what makes a published head-to-head number mean anything, so its
 //! own failure modes are pinned here:
 //!
-//! - it reads the estimator Criterion actually displays (regression slope), not
-//!   the raw sample median;
+//! - it reads the estimator Criterion actually displays (regression slope when
+//!   one exists, otherwise the **mean** — `Estimates::typical()`, criterion
+//!   0.8.2 `estimate.rs:116`), never the raw sample median;
 //! - the SBE ceiling is literal — `1.0000` passes, anything above fails, and a
 //!   caller cannot pass a tolerance that waves a regression through;
 //! - a missing pair is a failure, never a silent skip;
@@ -114,7 +115,7 @@ fn write_estimate(
     fs::write(
         dir.join("estimates.json"),
         format!(
-            r#"{{"slope":{{"point_estimate":{slope}}},"median":{{"point_estimate":{median}}}}}"#
+            r#"{{"slope":{{"point_estimate":{slope}}},"mean":{{"point_estimate":{slope}}},"median":{{"point_estimate":{median}}}}}"#
         ),
     )?;
     Ok(())
@@ -232,6 +233,72 @@ fn describe(output: &Output) -> String {
     )
 }
 
+/// Criterion writes `slope` as JSON `null` for flat-sampling benchmarks: it
+/// runs no regression, so the key is present with no value. The gate's reader
+/// used `dict.get('slope', default)`, which returns that null rather than the
+/// default — the pair then reported "missing estimates" and one run failed
+/// thirteen of them at once. Flat sampling is how the suite keeps samples short
+/// enough that the scheduler does not deschedule inside one.
+///
+/// Criterion reports **the mean** when it has no slope, not the median:
+/// `Estimates::typical()` is `self.slope.as_ref().unwrap_or(&self.mean)`
+/// (criterion 0.8.2 `src/estimate.rs:116`), and the console `time:` line is
+/// printed from `typical()` (`src/report.rs:564,576`). Both are written here
+/// so a fixture can make them disagree.
+fn write_estimate_flat(
+    root: &Path,
+    group: &str,
+    function: &str,
+    mean: f64,
+    median: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = estimate_dir(root, group, function);
+    fs::create_dir_all(&dir)?;
+    fs::write(
+        dir.join("estimates.json"),
+        format!(
+            r#"{{"slope":null,"mean":{{"point_estimate":{mean}}},"median":{{"point_estimate":{median}}}}}"#
+        ),
+    )?;
+    Ok(())
+}
+
+/// An estimate carrying a confidence interval. The A/A null band and every
+/// ratio CI are derived from these, so a fixture that has to exercise the
+/// "no established winner" rule must write them.
+fn write_estimate_ci(
+    root: &Path,
+    group: &str,
+    function: &str,
+    slope: f64,
+    ci_lo: f64,
+    ci_hi: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = estimate_dir(root, group, function);
+    fs::create_dir_all(&dir)?;
+    fs::write(
+        dir.join("estimates.json"),
+        format!(
+            r#"{{"slope":{{"point_estimate":{slope},"confidence_interval":{{"lower_bound":{ci_lo},"upper_bound":{ci_hi}}}}},"mean":{{"point_estimate":{slope},"confidence_interval":{{"lower_bound":{ci_lo},"upper_bound":{ci_hi}}}}},"median":{{"point_estimate":{slope}}}}}"#
+        ),
+    )?;
+    Ok(())
+}
+
+/// The SBE suite's harness control: two arms running identical work. Their
+/// ratio is the harness's own noise.
+const SBE_AA_GROUP: &str = "parity_control_aa_encode_throughput";
+
+fn write_sbe_aa_control(
+    root: &Path,
+    arm_a: (f64, f64, f64),
+    arm_b: (f64, f64, f64),
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_estimate_ci(root, SBE_AA_GROUP, "arm_a", arm_a.0, arm_a.1, arm_a.2)?;
+    write_estimate_ci(root, SBE_AA_GROUP, "arm_b", arm_b.0, arm_b.1, arm_b.2)?;
+    Ok(())
+}
+
 // ── Estimator ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -249,6 +316,237 @@ fn bench_gate_uses_criterion_displayed_regression_estimate()
     assert!(
         output.status.success(),
         "gate did not use Criterion's displayed regression estimate:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn bench_gate_falls_back_to_the_mean_when_slope_is_null() -> Result<(), Box<dyn std::error::Error>>
+{
+    let criterion = TempCriterion::new()?;
+    for (group, ergo, reference) in PAIRS {
+        write_estimate_flat(&criterion.0, group, ergo, 90.0, 90.0)?;
+        write_estimate_flat(&criterion.0, group, reference, 100.0, 100.0)?;
+    }
+
+    let output = run_gate(&criterion.0, &[])?;
+    assert!(
+        output.status.success(),
+        "gate failed on flat-sampled estimates (slope: null) instead of falling \
+         back to the mean:\n{}",
+        describe(&output)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("missing estimates"),
+        "gate reported missing estimates for a flat-sampled run that has means:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn bench_gate_fails_a_mean_breach_when_slope_is_null() -> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    for (group, ergo, reference) in PAIRS {
+        write_estimate_flat(&criterion.0, group, ergo, 102.0, 102.0)?;
+        write_estimate_flat(&criterion.0, group, reference, 100.0, 100.0)?;
+    }
+
+    let output = run_gate(&criterion.0, &[])?;
+    assert!(
+        !output.status.success(),
+        "a flat-sampled mean ratio of 1.02 must fail the 1.00 ceiling:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+/// The estimator the gate reads has to be the estimator Criterion displays.
+/// Criterion's `Estimates::typical()` is `slope.unwrap_or(mean)` — never the
+/// median — so a fixture whose means say 2.0 while its medians say 1.0 must
+/// fail. Reading the median would grade the wrong statistic and let a real
+/// regression through: these samples are right-skewed (17% high outliers is
+/// ordinary for this suite), so the mean sits well above the median.
+#[test]
+fn bench_gate_reads_the_mean_not_the_median_when_slope_is_null()
+-> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    for (group, ergo, reference) in PAIRS {
+        // Means say ergo is 2.0x the reference; medians say they are equal.
+        write_estimate_flat(&criterion.0, group, ergo, 200.0, 100.0)?;
+        write_estimate_flat(&criterion.0, group, reference, 100.0, 100.0)?;
+    }
+
+    let output = run_gate(&criterion.0, &[])?;
+    assert!(
+        !output.status.success(),
+        "the gate graded the median (1.0) instead of the mean (2.0) that \
+         Criterion reports, and passed a 2.0x regression:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+/// A calculation that cannot run is not a pass. The caller invokes
+/// `check_ratio ... || failures=$((failures + 1))`, which suppresses `set -e`
+/// around the call, so a Python traceback left `status` empty and fell through
+/// to `return 0` — five ratios at 2.0x printed tracebacks and the run still
+/// exited 0 with PASS. Fail closed instead.
+#[test]
+fn bench_gate_fails_closed_when_the_ratio_calculation_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    for (group, ergo, reference) in PAIRS {
+        write_estimate_flat(&criterion.0, group, ergo, 100.0, 100.0)?;
+        write_estimate_flat(&criterion.0, group, reference, 100.0, 100.0)?;
+    }
+    // Malformed point estimates: `float()` raises, the script prints a
+    // traceback, and no `@STATUS` line is produced.
+    for (group, ergo, reference) in PAIRS {
+        let dir = estimate_dir(&criterion.0, group, ergo);
+        fs::write(
+            dir.join("estimates.json"),
+            r#"{"slope":null,"mean":{"point_estimate":"not-a-number"},"median":{"point_estimate":1.0}}"#,
+        )?;
+        let dir = estimate_dir(&criterion.0, group, reference);
+        fs::write(
+            dir.join("estimates.json"),
+            r#"{"slope":null,"mean":{"point_estimate":100.0},"median":{"point_estimate":100.0}}"#,
+        )?;
+    }
+
+    let output = run_gate(&criterion.0, &[])?;
+    assert!(
+        !output.status.success(),
+        "a failed ratio calculation reported PASS. A gate that cannot compute \
+         a ratio must not certify it:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+// ── A/A null band ──────────────────────────────────────────────────────────
+//
+// The A/A control is two arms running identical work, so its ratio is the
+// harness's own noise. `check-bench-gate.sh` states the contract twice — in
+// `aa_band` and in `report_aa_null`: "a pair inside it has no established
+// winner". These tests hold the reader to that contract. They are not a way
+// to pass a breach: a pair outside a measured band, or a pair with no
+// measured control at all, still fails closed.
+
+#[test]
+fn a_pair_inside_a_measured_aa_null_band_establishes_no_winner()
+-> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    // Identical arms, each ±1 %: the ratio CI the gate derives spans about
+    // 0.98–1.02, which is the harness's resolution for this loop.
+    write_sbe_aa_control(&criterion.0, (100.0, 99.0, 101.0), (100.0, 99.0, 101.0))?;
+    for (group, ergo, reference) in PAIRS {
+        // A 2 % ratio with tight CIs: above the ceiling as a point estimate,
+        // but inside what the harness produces for identical code.
+        write_estimate_ci(&criterion.0, group, ergo, 102.0, 101.5, 102.5)?;
+        write_estimate_ci(&criterion.0, group, reference, 100.0, 99.5, 100.5)?;
+    }
+
+    let output = run_gate(&criterion.0, &[])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a pair inside a measured A/A null band has no established winner and must \
+         not be graded as a breach:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("no winner"),
+        "the gate must say no winner is established, not silently pass:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("A/A null"),
+        "the gate must report the A/A null it graded against:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_breach_outside_the_aa_null_band_still_fails() -> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    // A tight control: the harness resolves these arms to within 0.02 %.
+    write_sbe_aa_control(&criterion.0, (100.0, 99.99, 100.01), (100.0, 99.99, 100.01))?;
+    for (group, ergo, reference) in PAIRS {
+        write_estimate_ci(&criterion.0, group, ergo, 105.0, 104.9, 105.1)?;
+        write_estimate_ci(&criterion.0, group, reference, 100.0, 99.9, 100.1)?;
+    }
+
+    let output = run_gate(&criterion.0, &[])?;
+    assert!(
+        !output.status.success(),
+        "a 5 % breach outside a tight A/A null band must still fail:\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("outside A/A null band"),
+        "the gate must show the breach is outside the null band, so it cannot be \
+         waved away as harness noise:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_breach_without_a_measured_aa_control_still_fails() -> Result<(), Box<dyn std::error::Error>> {
+    // Fail closed: with no control in the run there is no measured noise band,
+    // so nothing may excuse a ratio above its ceiling.
+    let criterion = TempCriterion::new()?;
+    for (group, ergo, reference) in PAIRS {
+        write_estimate_ci(&criterion.0, group, ergo, 102.0, 101.9, 102.1)?;
+        write_estimate_ci(&criterion.0, group, reference, 100.0, 99.9, 100.1)?;
+    }
+
+    let output = run_gate(&criterion.0, &[])?;
+    assert!(
+        !output.status.success(),
+        "a breach with no A/A control measured must fail closed:\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("A/A null not measured"),
+        "the gate must say the null was not measured rather than imply the pair \
+         was inside a band:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_pair_below_its_ceiling_is_not_made_inconclusive_by_a_wide_aa_band()
+-> Result<(), Box<dyn std::error::Error>> {
+    // A wide control must not turn a clean win into a shrug. Only a ratio that
+    // actually exceeds its ceiling can be inconclusive.
+    let criterion = TempCriterion::new()?;
+    write_sbe_aa_control(&criterion.0, (100.0, 95.0, 105.0), (100.0, 95.0, 105.0))?;
+    for (group, ergo, reference) in PAIRS {
+        write_estimate_ci(&criterion.0, group, ergo, 90.0, 89.5, 90.5)?;
+        write_estimate_ci(&criterion.0, group, reference, 100.0, 99.5, 100.5)?;
+    }
+
+    let output = run_gate(&criterion.0, &[])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a ratio of 0.90 is within every ceiling and must pass:\n{}",
+        describe(&output)
+    );
+    assert!(
+        !stdout.contains("no winner established"),
+        "a ratio well below its ceiling is resolved, not inconclusive:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("resolved"),
+        "the gate must report the ratio as resolved:\n{}",
         describe(&output)
     );
     Ok(())

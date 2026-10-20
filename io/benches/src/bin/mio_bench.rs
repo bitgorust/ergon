@@ -221,6 +221,7 @@ fn meta(
     loop_stats: &LoopCounters,
     elapsed_s: i64,
     end_reason: &str,
+    end_real_ns: i64,
 ) -> String {
     let mut m = String::new();
     let _ = writeln!(m, "mode={mode}");
@@ -230,7 +231,7 @@ fn meta(
     let _ = writeln!(m, "duration_s={duration_s}");
     let _ = writeln!(m, "elapsed_s={elapsed_s}");
     let _ = writeln!(m, "end_reason={end_reason}");
-    let _ = writeln!(m, "end_realtime_ns={}", realtime_ns());
+    let _ = writeln!(m, "end_realtime_ns={end_real_ns}");
     let _ = writeln!(
         m,
         "kernel={}",
@@ -315,17 +316,22 @@ fn lab(a: &Args) -> BoxResult<()> {
             if c.closed {
                 // An early peer close fails the run; it is not a short
                 // successful one whose samples sit beside full-duration runs.
-                let reason = end_reason(monotonic_ns(), end)?;
+                let end_mono = monotonic_ns();
+                let end_real = realtime_ns();
+                let reason = end_reason(end_mono, end)?;
                 return finish_lab(
                     &out, duration_s, &records, &stalls, spins, reads, polls, dropped, start,
-                    reason,
+                    end_mono, end_real, reason,
                 );
             }
         }
         stalls.tick(records.len() as u64);
     }
+    let end_mono = monotonic_ns();
+    let end_real = realtime_ns();
     finish_lab(
-        &out, duration_s, &records, &stalls, spins, reads, polls, dropped, start, "deadline",
+        &out, duration_s, &records, &stalls, spins, reads, polls, dropped, start, end_mono,
+        end_real, "deadline",
     )
 }
 
@@ -340,6 +346,8 @@ fn finish_lab(
     polls: u64,
     dropped: u64,
     start_mono_ns: i64,
+    end_mono_ns: i64,
+    end_real_ns: i64,
     end_reason: &str,
 ) -> BoxResult<()> {
     stalls.write(&out.join("stalls-0.txt"))?;
@@ -362,8 +370,9 @@ fn finish_lab(
                 reads,
                 polls,
             },
-            (monotonic_ns() - start_mono_ns).max(0) / 1_000_000_000,
+            (end_mono_ns - start_mono_ns).max(0) / 1_000_000_000,
             end_reason,
+            end_real_ns,
         ),
     )?;
     println!(
@@ -479,6 +488,12 @@ fn pingpong(a: &Args) -> BoxResult<()> {
         }
         stalls.tick(records.len() as u64);
     }
+    // Both endpoints sampled here, before any of the run's own file I/O.
+    // Writing stalls and records first folded the disk time into the
+    // schedule's span and inflated `scheduled` past the slots the loop
+    // actually owed; the reported run length came out long for the same reason.
+    let end_mono = monotonic_ns();
+    let end_real = realtime_ns();
     stalls.write(&out.join("stalls-0.txt"))?;
     write_records(&out.join("records.bin"), &records)?;
     // Beside the percentiles: what the run planned and what became of it.
@@ -488,7 +503,7 @@ fn pingpong(a: &Args) -> BoxResult<()> {
         feed_last.0
     );
     io_bench::stats::Work::paced(
-        realtime_ns(),
+        end_real,
         first_due,
         interval,
         u64::try_from(seq).unwrap_or(0),
@@ -507,8 +522,9 @@ fn pingpong(a: &Args) -> BoxResult<()> {
                 reads,
                 polls,
             },
-            (monotonic_ns() - start).max(0) / 1_000_000_000,
+            (end_mono - start).max(0) / 1_000_000_000,
             reason,
+            end_real,
         ),
     )?;
     println!(
@@ -704,6 +720,8 @@ fn http(a: &Args) -> BoxResult<()> {
             });
         }
     }
+    let end_mono = monotonic_ns();
+    let end_real = realtime_ns();
     stalls.write(&out.join("stalls-0.txt"))?;
     write_records(&out.join("records.bin"), &records)?;
     let extra = format!(
@@ -722,8 +740,9 @@ fn http(a: &Args) -> BoxResult<()> {
                 reads,
                 polls,
             },
-            (monotonic_ns() - start).max(0) / 1_000_000_000,
+            (end_mono - start).max(0) / 1_000_000_000,
             "deadline",
+            end_real,
         ),
     )?;
     println!(

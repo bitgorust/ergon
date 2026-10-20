@@ -177,6 +177,63 @@ fn more_issued_than_scheduled_is_reported() {
     );
 }
 
+/// An absent count is "not yet measured" — a path that never produced it. A
+/// count that is present but not a number is malformed metadata, and must not
+/// collapse into the same gap: `work.scheduled=garbage` read as "not yet
+/// measured" would sit beside the percentiles as an honest hole while the run
+/// had in fact reported something unreadable.
+#[test]
+fn an_unreadable_count_is_malformed_not_missing() {
+    let map: std::collections::HashMap<String, String> = [
+        ("work.scheduled", "garbage"),
+        ("work.issued", "8"),
+        ("work.completed", "6"),
+        ("work.censored", "2"),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+    .collect();
+    let err = Work::from_meta(&map).expect_err("a count that is not a number is malformed");
+    assert!(
+        err.contains("work.scheduled") && err.contains("garbage"),
+        "the report names the key and the value it could not read, got: {err}"
+    );
+
+    // A key that is never written stays "not yet measured".
+    let partial: std::collections::HashMap<String, String> =
+        [("work.completed", "6"), ("work.censored", "2")]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+    let got = Work::from_meta(&partial)
+        .expect("present counts parse")
+        .expect("two counts are present");
+    assert_eq!((got.completed, got.censored), (Some(6), Some(2)));
+    assert_eq!(
+        got.scheduled, None,
+        "an absent key is still not yet measured"
+    );
+}
+
+/// The one loader the report paths share: the map's counts, checked against
+/// the records the run actually wrote, before any warm-up is dropped.
+#[test]
+fn load_reconciles_completions_with_the_records_on_disk() {
+    let mut m = String::new();
+    Work::round_trip(10, 8, 7, 2, 1).write_meta(&mut m);
+    let map: std::collections::HashMap<String, String> = m
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    assert!(Work::load(&map, 7).is_ok(), "7 completions, 7 records");
+    let err = Work::load(&map, 6).expect_err("more completions than records");
+    assert!(
+        err.contains("work.completed") && err.contains("records"),
+        "the reason names both sides, got: {err}"
+    );
+}
+
 #[test]
 fn the_work_row_puts_the_counts_next_to_the_percentiles() {
     let w = Work::round_trip(10, 8, 6, 2, 2);

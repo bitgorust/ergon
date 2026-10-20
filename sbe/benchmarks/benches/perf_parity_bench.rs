@@ -56,8 +56,9 @@ use ergo_sbe_benchmarks::{
 
 // sbe-tool Rust SBE generated code (patched for module inclusion)
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
+use std::time::Duration;
 
 #[path = "_common.rs"]
 mod common;
@@ -351,7 +352,7 @@ fn bench_decode_entry_point(c: &mut Criterion) {
     let (bl_e, ver_e) = ergo_sbe_header_fields();
     assert_baseline_wrap_extent(BASELINE, 0, bl_e, ver_e);
 
-    let mut group = c.benchmark_group("parity/decode/entry_point");
+    let mut group = parity_group(c, "parity/decode/entry_point");
     group.throughput(Throughput::Elements(MICRO_BATCH_SIZE as u64));
 
     // Gated arm, class `none` like the other body-wrap pairs: the extent is
@@ -398,7 +399,7 @@ fn bench_decode_scalar(c: &mut Criterion) {
     let ver = sbe_tool_version();
     let sbe_tool_car = sbe_tool_car_body_decoder(BASELINE, 0, bl, ver);
 
-    let mut group = c.benchmark_group("parity/decode/scalar");
+    let mut group = parity_group(c, "parity/decode/scalar");
     group.throughput(Throughput::Elements(MICRO_BATCH_SIZE as u64));
 
     // Keep the 1024 field loads in the loop. A single `black_box` outside lets
@@ -457,7 +458,7 @@ fn bench_decode_array(c: &mut Criterion) {
     let ver = sbe_tool_version();
     let sbe_tool_car = sbe_tool_car_body_decoder(BASELINE, 0, bl, ver);
 
-    let mut group = c.benchmark_group("parity/decode/array");
+    let mut group = parity_group(c, "parity/decode/array");
     group.throughput(Throughput::Elements(MICRO_BATCH_SIZE as u64));
 
     group.bench_function("ergo-sbe", |b| {
@@ -499,7 +500,7 @@ fn bench_decode_composite(c: &mut Criterion) {
     assert_eq!(ergo_engine.capacity(), tool_engine.capacity());
     assert_eq!(ergo_engine.num_cylinders(), tool_engine.num_cylinders());
 
-    let mut group = c.benchmark_group("parity/decode/composite");
+    let mut group = parity_group(c, "parity/decode/composite");
     group.throughput(Throughput::Elements(MICRO_BATCH_SIZE as u64));
 
     // Traverse a contiguous stream so the gate measures composite decoding,
@@ -575,7 +576,7 @@ fn bench_throughput_batch(c: &mut Criterion) {
     assert_eq!(decoded.ergo_serial, BATCH_SIZE as u64 * decoded.one_serial);
     assert_eq!(decoded.ergo_year, BATCH_SIZE as u64 * decoded.one_year);
 
-    let mut group = c.benchmark_group("parity/throughput/batch_10k");
+    let mut group = parity_group(c, "parity/throughput/batch_10k");
     group.throughput(Throughput::Elements(BATCH_SIZE as u64));
 
     // Equal work: both arms stride absolute offsets into one prebuilt buffer
@@ -621,7 +622,7 @@ fn bench_throughput_batch(c: &mut Criterion) {
 }
 
 fn bench_encode_scalar(c: &mut Criterion) {
-    let mut group = c.benchmark_group("parity/encode/scalar");
+    let mut group = parity_group(c, "parity/encode/scalar");
     group.throughput(Throughput::Elements(MICRO_BATCH_SIZE as u64));
 
     // ── length parity: both codecs must produce identical encoded lengths ──
@@ -875,7 +876,7 @@ fn bench_encode_throughput(c: &mut Criterion) {
     );
     assert_eq!(encoded.year_total, BATCH_SIZE as u64 * encoded.one_year);
 
-    let mut group = c.benchmark_group("parity/encode/throughput_10k");
+    let mut group = parity_group(c, "parity/encode/throughput_10k");
     group.throughput(Throughput::Elements(BATCH_SIZE as u64));
 
     // Equal work: both arms encode header + 2 scalars per message, via the
@@ -935,7 +936,7 @@ fn bench_aa_control_encode_throughput(c: &mut Criterion) {
     assert_eq!(encoded.one_ergo, encoded.one_tool);
     assert_eq!(encoded.batch_ergo, encoded.batch_tool);
 
-    let mut group = c.benchmark_group("parity/control/aa_encode_throughput");
+    let mut group = parity_group(c, "parity/control/aa_encode_throughput");
     group.throughput(Throughput::Elements(BATCH_SIZE as u64));
 
     group.bench_function("arm_a", |b| {
@@ -992,7 +993,7 @@ fn bench_decode_consuming_full(c: &mut Criterion) {
     let ver = sbe_tool_version();
     let (bl_e, ver_e) = ergo_sbe_header_fields();
 
-    let mut group = c.benchmark_group("parity/decode/full_message");
+    let mut group = parity_group(c, "parity/decode/full_message");
     group.throughput(Throughput::Elements(MICRO_BATCH_SIZE as u64));
 
     group.bench_function("ergo-sbe_random", |b| {
@@ -1010,16 +1011,17 @@ fn bench_decode_consuming_full(c: &mut Criterion) {
                     car.extras(),
                 ));
                 let engine = car.engine();
-                let booster = engine.booster();
+                // Observed at the same program point as the sbe-tool arm, which
+                // must read these before `booster_decoder` consumes the engine.
                 black_box((
                     engine.capacity(),
                     engine.num_cylinders(),
                     engine.manufacturer_code(),
                     engine.efficiency(),
                     engine.booster_enabled(),
-                    booster.boost_type(),
-                    booster.horse_power(),
                 ));
+                let booster = engine.booster();
+                black_box((booster.boost_type(), booster.horse_power()));
                 let mut fuel = car.fuel_figures().unwrap();
                 while let Some(Ok(e)) = fuel.next() {
                     black_box((e.speed(), e.mpg()));
@@ -1032,11 +1034,9 @@ fn bench_decode_consuming_full(c: &mut Criterion) {
                         black_box((a.mph(), a.seconds()));
                     }
                 }
-                black_box((
-                    car.manufacturer().unwrap(),
-                    car.model().unwrap(),
-                    car.activation_code().unwrap(),
-                ));
+                black_box(car.manufacturer().unwrap());
+                black_box(car.model().unwrap());
+                black_box(car.activation_code().unwrap());
             }
         });
     });
@@ -1056,16 +1056,17 @@ fn bench_decode_consuming_full(c: &mut Criterion) {
                     car.extras(),
                 ));
                 let engine = car.engine();
-                let booster = engine.booster();
+                // Observed at the same program point as the sbe-tool arm, which
+                // must read these before `booster_decoder` consumes the engine.
                 black_box((
                     engine.capacity(),
                     engine.num_cylinders(),
                     engine.manufacturer_code(),
                     engine.efficiency(),
                     engine.booster_enabled(),
-                    booster.boost_type(),
-                    booster.horse_power(),
                 ));
+                let booster = engine.booster();
+                black_box((booster.boost_type(), booster.horse_power()));
                 let after_perf = car
                     .into_fuel_figures(|e| -> Result<_, sbe_rt::DecodeError> {
                         black_box((e.speed(), e.mpg()));
@@ -1084,9 +1085,11 @@ fn bench_decode_consuming_full(c: &mut Criterion) {
                     })
                     .unwrap();
                 let (mfr, a1) = after_perf.into_manufacturer().unwrap();
+                black_box(mfr);
                 let (model, a2) = a1.into_model().unwrap();
+                black_box(model);
                 let (code, _done) = a2.into_activation_code().unwrap();
-                black_box((mfr, model, code));
+                black_box(code);
             }
         });
     });
@@ -1106,16 +1109,17 @@ fn bench_decode_consuming_full(c: &mut Criterion) {
                     car.extras(),
                 ));
                 let engine = car.engine();
-                let booster = engine.booster();
+                // Observed at the same program point as the sbe-tool arm, which
+                // must read these before `booster_decoder` consumes the engine.
                 black_box((
                     engine.capacity(),
                     engine.num_cylinders(),
                     engine.manufacturer_code(),
                     engine.efficiency(),
                     engine.booster_enabled(),
-                    booster.boost_type(),
-                    booster.horse_power(),
                 ));
+                let booster = engine.booster();
+                black_box((booster.boost_type(), booster.horse_power()));
                 // The ordered lane, not a second copy of the staged one:
                 // same fields, same traversal, one callback per tail.
                 car.ordered()
@@ -1212,7 +1216,7 @@ fn bench_decode_consuming_full(c: &mut Criterion) {
 fn bench_encode_full_stage_transition(c: &mut Criterion) {
     // ergon-only stage-transition diagnostic (no sbe-tool equivalent) — not a
     // parity scenario, so the group is not under parity/.
-    let mut group = c.benchmark_group("encode/full_stage");
+    let mut group = parity_group(c, "encode/full_stage");
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("ergo-sbe", |b| {
@@ -1371,7 +1375,7 @@ fn bench_wire_parity_encode_full_message(c: &mut Criterion) {
     };
 
     assert_full_message_encode_wire_parity();
-    let mut group = c.benchmark_group("parity/wire_parity/encode_full");
+    let mut group = parity_group(c, "parity/wire_parity/encode_full");
     group.throughput(Throughput::Elements(MICRO_BATCH_SIZE as u64));
 
     group.bench_function("ergo-sbe", |b| {
@@ -1465,18 +1469,59 @@ fn bench_wire_parity_encode_full_message(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_decode_entry_point,
-    bench_decode_scalar,
-    bench_decode_array,
-    bench_decode_composite,
-    bench_throughput_batch,
-    bench_encode_scalar,
-    bench_encode_throughput,
-    bench_aa_control_encode_throughput,
-    bench_decode_consuming_full,
-    bench_encode_full_stage_transition,
-    bench_wire_parity_encode_full_message,
-);
+/// Sampling for the parity suite.
+///
+/// Criterion's default `Linear` mode ramps each sample up to tens of
+/// milliseconds of work. On a general-purpose host the scheduler deschedules a
+/// normal-priority process inside a sample that long, and the sample absorbs
+/// the gap. Measured on `parity/control/aa_encode_throughput` — two
+/// textually identical arms — with the default mode: per-sample work ramped to
+/// 10,900 iterations (about 95 ms) and the per-iteration cost drifted from
+/// 8,440 ns to 8,650 ns as the sample lengthened, with spikes to 12,172 and
+/// 18,318 ns where the process was descheduled. One arm took those spikes in
+/// a given run and the other did not, so the same code measured 12.5 % CV
+/// against 1.6 % and the A/A "null band" came out [1.0418, 1.1201] — a noise
+/// band, not a null. Re-running the same binary twice moved the noise to the
+/// other arm, which rules out arm order and arm identity as the cause.
+///
+/// Flat mode with a short measurement budget keeps every sample under a few
+/// milliseconds, where descheduling is rare. Both arms then land on the same
+/// clean cost. Ceilings are unchanged; this only makes the ratio mean what it
+/// claims.
+///
+/// `sampling_mode` lives on `BenchmarkGroup`, not on `Criterion`, so
+/// [`parity_group`] applies it. The budget and sample count are set here and
+/// bound how long any sample can be, which is what keeps the scheduler out.
+fn parity_criterion() -> Criterion {
+    Criterion::default()
+        .measurement_time(Duration::from_millis(500))
+        .sample_size(200)
+}
+
+/// Every group in this suite samples flat. See [`parity_criterion`] for why
+/// the sample length matters more than the total budget.
+fn parity_group<'a>(
+    c: &'a mut Criterion,
+    name: &str,
+) -> criterion::BenchmarkGroup<'a, criterion::measurement::WallTime> {
+    let mut group = c.benchmark_group(name);
+    group.sampling_mode(SamplingMode::Flat);
+    group
+}
+
+criterion_group! {
+    name = benches;
+    config = parity_criterion();
+    targets = bench_decode_entry_point,
+        bench_decode_scalar,
+        bench_decode_array,
+        bench_decode_composite,
+        bench_throughput_batch,
+        bench_encode_scalar,
+        bench_encode_throughput,
+        bench_aa_control_encode_throughput,
+        bench_decode_consuming_full,
+        bench_encode_full_stage_transition,
+        bench_wire_parity_encode_full_message
+}
 criterion_main!(benches);

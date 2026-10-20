@@ -927,3 +927,103 @@ fn optional_enum_nullify_arms_make_the_same_values_opaque() -> Result<(), Box<dy
     );
     Ok(())
 }
+
+/// `fn bench_*` names in a source, in order.
+fn bench_function_names(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = source;
+    while let Some(i) = rest.find("\nfn bench_") {
+        rest = &rest[i + 1..];
+        let end = rest.find('(').unwrap_or(rest.len());
+        if let Some(name) = rest[..end].strip_prefix("fn ") {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// `(label, body)` for every `bench_function("...")` arm in `fn_source`.
+fn bench_arms(fn_source: &str) -> Vec<(String, String)> {
+    let mut arms = Vec::new();
+    let mut rest = fn_source;
+    while let Some(i) = rest.find("bench_function(\"") {
+        rest = &rest[i + "bench_function(\"".len()..];
+        let Some(label_end) = rest.find('"') else {
+            break;
+        };
+        let label = rest[..label_end].to_string();
+        let Some(body) = timed_arm_body(fn_source, &label) else {
+            continue;
+        };
+        arms.push((label, body.to_string()));
+    }
+    arms
+}
+
+/// A `black_box` is an observation barrier: the compiler may not drop a value
+/// that reaches one, and it may not move work across one. Two arms gated with
+/// different barrier placements are gated under different optimization
+/// constraints, so their ratio is not a like-for-like comparison — and packing
+/// two of sbe-tool's barriers into one tuple hands that arm's compiler strictly
+/// more freedom. Every value one arm makes opaque, the other must too, through
+/// the same number of barriers.
+#[test]
+fn parity_arms_use_identical_observation_barriers() -> Result<(), Box<dyn std::error::Error>> {
+    for (file, source) in [
+        ("perf_parity_bench.rs", PERF_PARITY),
+        ("perf_parity_extended_bench.rs", PERF_PARITY_EXTENDED),
+    ] {
+        for name in bench_function_names(source) {
+            let fn_source = get_source(source, &name)?;
+            let arms = bench_arms(fn_source);
+            for (label, body) in &arms {
+                if label != "ergo-sbe" && !label.starts_with("ergo-sbe_") {
+                    continue;
+                }
+                // Pair by suffix so `ergo-sbe_header_only` is not graded against
+                // `sbe-tool_header_and_body`; a bare `sbe-tool` is the partner
+                // of every ergon lane of the same message.
+                let suffix = label.strip_prefix("ergo-sbe").unwrap_or("");
+                let partner = format!("sbe-tool{suffix}");
+                let tool = arms
+                    .iter()
+                    .find(|(l, _)| *l == partner)
+                    .or_else(|| arms.iter().find(|(l, _)| l == "sbe-tool"));
+                let Some(tool) = tool else {
+                    continue;
+                };
+                let tool_n = strip_line_comments(&tool.1).matches("black_box(").count();
+                let n = strip_line_comments(body).matches("black_box(").count();
+                assert_eq!(
+                    n, tool_n,
+                    "{file}: {name}/{label} and {} pay {n} vs {tool_n} black_box calls. \
+                     A merged tuple is one barrier where sbe-tool pays two: not the same \
+                     optimization constraint.",
+                    tool.0
+                );
+            }
+        }
+    }
+
+    // The composite boundary is an observation point in both APIs. The engine's
+    // scalars are read before `booster_decoder` consumes the engine in sbe-tool;
+    // ergon must observe them at the same point, not defer them into a tuple
+    // taken after the booster is already in hand.
+    let source = get_source(PERF_PARITY, "bench_decode_consuming_full")?;
+    for label in ["ergo-sbe_random", "ergo-sbe_consuming", "ergo-sbe_ordered"] {
+        let arm = strip_line_comments(timed_arm_body(source, label).ok_or("missing arm")?);
+        let observed = arm
+            .find("booster_enabled()")
+            .ok_or("arm never reads booster_enabled")?;
+        let fetched = arm
+            .find("booster_decoder()")
+            .or_else(|| arm.find("engine.booster()"))
+            .ok_or("arm never fetches the booster")?;
+        assert!(
+            observed < fetched,
+            "{label} must observe the engine's scalars before the booster is fetched, \
+             as the sbe-tool arm does"
+        );
+    }
+    Ok(())
+}

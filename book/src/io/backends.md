@@ -237,5 +237,5 @@ $B/analyse --warmup-s 2 res/c20-*
   `adaptive-rx off rx-usecs 0 tx-usecs 0`, with the NIC's interrupts on a
   core of their own ([ergon-tune N1](../tune/overview.md)). Otherwise the
   interrupt waits for moderation and `epoll-spin` looks slower than it is.
-- HTTP with a pool: [HTTP with many connections](http-client.md#limits).
+- HTTP with a pool: [HTTP with many connections](http-client.md#many-connections).
 - Everything about the method: [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md).

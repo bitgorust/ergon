@@ -512,6 +512,21 @@ fn kernel<'c, V: Visitor<'c>>(v: &mut V) {
         .monotonic(),
         || sys::clock_ns(libc::CLOCK_MONOTONIC_COARSE),
     );
+    // Aeron's epoch clock source on Linux: `aeron_epoch_clock()` is
+    // `clock_gettime(CLOCK_REALTIME_COARSE)` truncated to milliseconds
+    // (`aeron/aeron-client/src/main/c/util/aeron_clock.c`). The driver calls it
+    // once per millisecond into `aeron_clock_cache_t`, so its cost sits off the
+    // hot path; it is here because it is the one kernel clock Aeron uses and the
+    // table was empty for it. Not monotonic: the wall clock steps.
+    #[cfg(target_os = "linux")]
+    v.read(
+        Spec::new(
+            "clock_gettime_realtime_coarse",
+            Ns,
+            "clock_gettime(CLOCK_REALTIME_COARSE) (a tick's resolution; Aeron's epoch clock)",
+        ),
+        || sys::clock_ns(libc::CLOCK_REALTIME_COARSE),
+    );
     #[cfg(target_os = "macos")]
     v.read(
         Spec::new(

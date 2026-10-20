@@ -95,9 +95,9 @@ repeatable sbe-tool win on a placement-sensitive micro-op; it is not permission
 to add overhead. Record fresh measurements instead of copying old numbers into
 documentation. Documentation-only changes do not require a benchmark run.
 
-Shared GitHub runners execute both profiles and publish Criterion diagnostics,
-but noisy wall-clock ratios are not merge gates there. Run the strict ratio
-gate locally or on a dedicated stable benchmark runner.
+CI compiles both benchmark suites (`cargo bench --no-run`) and runs no
+benchmark: it executes neither profile and publishes no Criterion diagnostics.
+Run the strict ratio gate locally or on a dedicated stable benchmark runner.
 
 `fairness_policy_test` mechanically requires the maintained SBE and Cluster
 parity suites to use `std::hint::black_box`, assert correctness before timing,

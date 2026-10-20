@@ -18,7 +18,7 @@
     unsafe_code
 )]
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use ergo_sbe_benchmarks::parity_group_with_data::{
     MessageHeader, TestMessage1Decoder, TestMessage1Encoder, TestMessage1FixedFields, read_bytes,
     sbe_rt,
@@ -28,6 +28,21 @@ use ergo_sbe_benchmarks::parity_optional_enum_nullify::{
     OptionalEnumNullifyEncoder, OptionalEnumNullifyFixedFields,
 };
 use std::hint::black_box;
+use std::time::Duration;
+
+/// Sampling shared with `perf_parity_bench`. Criterion's default `Linear` mode
+/// ramps a sample to tens of milliseconds of work and the scheduler deschedules
+/// inside it; the sample absorbs the gap and one arm of a pair takes the hit.
+/// Flat mode over a short budget keeps samples under a few milliseconds. The
+/// rationale and the A/A evidence are in [`parity_criterion`] there.
+fn parity_group<'a>(
+    c: &'a mut Criterion,
+    name: &str,
+) -> criterion::BenchmarkGroup<'a, criterion::measurement::WallTime> {
+    let mut group = c.benchmark_group(name);
+    group.sampling_mode(SamplingMode::Flat);
+    group
+}
 
 const AMP: usize = 1024;
 // One running total makes the amplified loop a single dependency chain. On
@@ -45,7 +60,7 @@ const _: () = assert!(AMP % INDEPENDENT_SUMS == 0);
 // swung the LTO ratio from 0.77 to 1.01. `fairness_policy_test` rejects any
 // value made opaque in one arm only.
 fn bench_optional_enum_nullify(c: &mut Criterion) {
-    let mut group = c.benchmark_group("parity_extended/optional_enum_nullify");
+    let mut group = parity_group(c, "parity_extended/optional_enum_nullify");
     group.throughput(Throughput::Elements(AMP as u64));
 
     let mut enc_buf = [0u8; OptionalEnumNullifyEncoder::ENCODED_LENGTH];
@@ -224,7 +239,7 @@ fn assert_group_with_data_value_parity(encoded: &[u8], bl: usize, version: u16) 
 }
 
 fn bench_group_with_data(c: &mut Criterion) {
-    let mut group = c.benchmark_group("parity_extended/group_with_data");
+    let mut group = parity_group(c, "parity_extended/group_with_data");
     group.throughput(Throughput::Elements(AMP as u64));
 
     let len = TestMessage1Encoder::compute_length()
@@ -274,9 +289,11 @@ fn bench_group_with_data(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    parity_extended,
-    bench_optional_enum_nullify,
-    bench_group_with_data
-);
+criterion_group! {
+    name = parity_extended;
+    config = Criterion::default()
+        .measurement_time(Duration::from_millis(500))
+        .sample_size(200);
+    targets = bench_optional_enum_nullify, bench_group_with_data
+}
 criterion_main!(parity_extended);
