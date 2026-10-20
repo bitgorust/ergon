@@ -167,6 +167,27 @@
   measured control still fails closed. Ceilings are unchanged. The gate
   reads Criterion's `typical()` estimator — the mean when `slope` is null,
   never the median.
+- Benchmark gate: a pair is graded on the **envelope of every independent
+  invocation** the runner took, and against a **repeated** A/A control, not
+  on one invocation's confidence interval. Identical code walked 3.5 % across
+  three invocations (`cluster_decode_session_message_header` measured 1.0236,
+  0.9916, 0.9887) while each run's own ratio CI was ±0.5 %, so a single run
+  reported a rotating set of "resolved breach" verdicts on unchanged code.
+  `just bench-cluster` and `run-sbe-bench.sh` now take BENCH_REPEATS
+  invocations (default 5) and snapshot each under `repeats/<k>/`; the gate
+  resolves a pair only where the envelope clears the ceiling and the control's
+  envelope in every invocation, and otherwise establishes no winner. A
+  manifest declaring more invocations than are on disk is refused. Ceilings
+  are unchanged and no exception was added.
+- Benchmark gate: a repeat snapshot keeps only estimates its own invocation
+  produced. The Criterion home is shared with other bench binaries and
+  Criterion leaves `new/` in place for groups a run does not touch, so a
+  snapshot of the whole home folded foreign keys into the envelope and widened
+  it with evidence the run never produced. The runner marks the invocation
+  with `.bench-since`; a snapshot with no marker is refused. The graded line
+  now shows the envelope the verdict is based on — it used to print the last
+  invocation's ratio beside a label decided by the maximum, which read as
+  `0.9941 (max 1.00) above ceiling`.
 - Clock bench: `the_gap_pass_takes_no_page_faults_while_it_times` asserted a
   zero fault count that off Linux is the whole process's
   (`getrusage(RUSAGE_SELF)`; Darwin has no `RUSAGE_THREAD`), so another

@@ -518,6 +518,13 @@ check-bench-reference:
 # absolute workspace paths. package-bench-artifacts expects:
 #   LTO    → <repo>/target/criterion
 #   no-LTO → <repo>/target/bench-no-lto/criterion
+#
+# Each profile is measured BENCH_REPEATS times (default 5), and every
+# invocation is snapshotted under `repeats/<k>/`. One invocation's confidence
+# interval is not the harness's resolution: identical code walked 3.5 % across
+# three invocations on 2026-10-20 while each run's own ratio CI was ±0.5 %.
+# The gate grades the envelope of the invocations, and a pair it cannot
+# separate establishes no winner rather than a breach.
 # Cluster codec benches, ergon vs sbe-tool, both LTO profiles
 bench-cluster:
     #!/usr/bin/env bash
@@ -526,21 +533,39 @@ bench-cluster:
     lto_crit="$root/target/criterion"
     no_lto_crit="$root/target/bench-no-lto/criterion"
     no_lto_target="$root/target/bench-no-lto"
+    repeats="${BENCH_REPEATS:-5}"
     mkdir -p "$lto_crit" "$no_lto_crit"
     commit="$(git -C "$root" rev-parse HEAD)"
     rustc_v="$(rustc --version)"
     target="$(rustc -vV | sed -n 's/^host: //p')"
     run_id="cluster-$(date -u +%Y%m%dT%H%M%SZ)-$(git -C "$root" rev-parse --short HEAD)"
     stamp="$root/scripts/stamp-cluster-bench-manifest.sh"
+    snap="$root/scripts/snapshot-bench-repeat.sh"
+    # A stale snapshot from an earlier run would widen this run's envelope
+    # with foreign evidence; the gate refuses a mixed one, so clear it here.
+    rm -rf "$lto_crit/repeats" "$no_lto_crit/repeats"
     # LTO-on (release profile: lto=true, codegen-units=1)
-    CRITERION_HOME="$lto_crit" cargo bench -p ergo-aeron-cluster
+    for k in $(seq 1 "$repeats"); do
+        echo "=== cluster LTO — invocation $k/$repeats ==="
+        # The Criterion home is shared with ergon-clock-bench, and Criterion
+        # leaves `new/` in place for groups this binary does not touch. The
+        # marker bounds the snapshot to what this invocation is about to write.
+        touch "$lto_crit/.bench-since"
+        CRITERION_HOME="$lto_crit" cargo bench -p ergo-aeron-cluster
+        "$snap" "$lto_crit" "$k"
+    done
     "$stamp" "$lto_crit" lto "$run_id" "$commit" "$rustc_v" "$target"
     # LTO-off — publish both profiles per the benchmark fairness matrix
-    CARGO_TARGET_DIR="$no_lto_target" \
-      CARGO_PROFILE_BENCH_LTO=false \
-      CARGO_PROFILE_BENCH_CODEGEN_UNITS=1 \
-      CRITERION_HOME="$no_lto_crit" \
-      cargo bench -p ergo-aeron-cluster
+    for k in $(seq 1 "$repeats"); do
+        echo "=== cluster no-LTO — invocation $k/$repeats ==="
+        touch "$no_lto_crit/.bench-since"
+        CARGO_TARGET_DIR="$no_lto_target" \
+          CARGO_PROFILE_BENCH_LTO=false \
+          CARGO_PROFILE_BENCH_CODEGEN_UNITS=1 \
+          CRITERION_HOME="$no_lto_crit" \
+          cargo bench -p ergo-aeron-cluster
+        "$snap" "$no_lto_crit" "$k"
+    done
     "$stamp" "$no_lto_crit" no-lto "$run_id" "$commit" "$rustc_v" "$target"
     echo ""
     echo "=== Gate (LTO) ==="

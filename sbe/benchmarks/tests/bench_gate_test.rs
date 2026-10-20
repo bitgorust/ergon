@@ -12,14 +12,21 @@
 //! - with `--run-id`, results that this run did not produce are refused:
 //!   unstamped, mixed-run, stale, or an incomplete manifest all fail closed;
 //! - the producer (`CRITERION_HOME`) and the consumer (the gate's directory
-//!   argument) are the same path by construction.
+//!   argument) are the same path by construction;
+//! - the harness's noise is **repeated**, not read off one control: identical
+//!   code walks between invocations by more than a within-run confidence
+//!   interval, so a pair graded on one invocation claims resolution it does
+//!   not have;
+//! - a repeat snapshot carries only estimates its own invocation produced —
+//!   the Criterion home is shared with other bench binaries, and leftovers
+//!   from one would widen this run's envelope with foreign evidence.
 
 use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::atomic::{AtomicUsize, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const PAIRS: &[(&str, &str, &str)] = &[
@@ -1202,6 +1209,501 @@ fn cluster_decode_ratio_within_the_documented_exception_passes()
     assert!(
         output.status.success(),
         "cluster decode at 1.005 must pass the documented 1.01 noise-floor exception:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+// ── Repeated runs ──────────────────────────────────────────────────────────
+//
+// A within-run confidence interval is not the harness's resolution. On
+// 2026-10-20 three invocations of *unchanged* cluster code produced
+// `cluster_decode_session_message_header` ratios of 1.0236, 0.9916 and 0.9887
+// — a 3.5 % swing where each run's own ratio CI was ±0.5 %. The identity of
+// the "resolved breach" rotated through the pairs on every run. Grading one
+// invocation therefore claims a resolution the harness does not have.
+//
+// The runner repeats the measurement; the gate grades the **envelope** of the
+// repeats and the envelope of a repeated A/A control. A pair separated from
+// its ceiling across every repeat and from the control's envelope across every
+// repeat is resolved. Anything else establishes no winner.
+
+/// One arm's estimate in one independent invocation: `(point, ci_lo, ci_hi)`.
+type Arm = (f64, f64, f64);
+
+/// Where repeat `k` of a key's estimates lives, and where the single-run
+/// layout puts it. Both are read by the gate; the repeat tree wins when it is
+/// present, so a fixture that writes only one of them pins the fallback.
+fn repeat_estimate_dir(root: &Path, repeat: usize, group: &str, function: &str) -> PathBuf {
+    root.join("repeats")
+        .join(repeat.to_string())
+        .join(group)
+        .join(function)
+}
+
+fn write_arm(dir: &Path, arm: Arm) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(dir)?;
+    let (slope, ci_lo, ci_hi) = arm;
+    fs::write(
+        dir.join("estimates.json"),
+        format!(
+            r#"{{"slope":{{"point_estimate":{slope},"confidence_interval":{{"lower_bound":{ci_lo},"upper_bound":{ci_hi}}}}},"mean":{{"point_estimate":{slope},"confidence_interval":{{"lower_bound":{ci_lo},"upper_bound":{ci_hi}}}}},"median":{{"point_estimate":{slope}}}}}"#
+        ),
+    )?;
+    Ok(())
+}
+
+fn write_repeat_arm(
+    root: &Path,
+    repeat: usize,
+    group: &str,
+    function: &str,
+    arm: Arm,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_arm(&repeat_estimate_dir(root, repeat, group, function), arm)
+}
+
+/// A pair across `ergo.len()` independent invocations, plus the single-run
+/// snapshot the un-repeated reader would grade. That snapshot is `at`, an
+/// index into `ergo`: the runner leaves the last invocation in `new/`, and on
+/// this host it was the *last* of three that carried the false breach.
+fn write_pair_repeats(
+    root: &Path,
+    group: &str,
+    ergo_fn: &str,
+    ref_fn: &str,
+    ergo: &[Arm],
+    reference: &[Arm],
+    at: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (k, (e, r)) in ergo.iter().zip(reference.iter()).enumerate() {
+        write_repeat_arm(root, k, group, ergo_fn, *e)?;
+        write_repeat_arm(root, k, group, ref_fn, *r)?;
+    }
+    write_arm(&estimate_dir(root, group, ergo_fn), ergo[at])?;
+    write_arm(&estimate_dir(root, group, ref_fn), reference[at])?;
+    Ok(())
+}
+
+/// The cluster suite's harness controls, repeated. Each is two arms running
+/// identical work, so their ratio is the harness's own noise at that place in
+/// the run; the gate takes the widest envelope over all of them.
+const CLUSTER_AA_GROUPS: &[&str] = &[
+    "cluster_control_aa_encode_keep_alive",
+    "cluster_control_aa_encode_claim_shaped",
+];
+
+fn write_cluster_aa_repeats(root: &Path, arms: &[Arm]) -> Result<(), Box<dyn std::error::Error>> {
+    for group in CLUSTER_AA_GROUPS {
+        for (k, arm) in arms.iter().enumerate() {
+            write_repeat_arm(root, k, group, "arm_a", *arm)?;
+            write_repeat_arm(root, k, group, "arm_b", *arm)?;
+        }
+        write_arm(&estimate_dir(root, group, "arm_a"), arms[arms.len() - 1])?;
+        write_arm(&estimate_dir(root, group, "arm_b"), arms[arms.len() - 1])?;
+    }
+    Ok(())
+}
+
+/// The cluster pairs the fixture is not exercising: held identical in every
+/// invocation, so only the pair under test can move the verdict.
+fn write_cluster_stable_repeats(
+    root: &Path,
+    repeats: usize,
+    skip: &str,
+    ergo: Arm,
+    reference: Arm,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (group, ergo_fn, ref_fn) in CLUSTER_PAIRS {
+        if *group == skip {
+            continue;
+        }
+        for k in 0..repeats {
+            write_repeat_arm(root, k, group, ergo_fn, ergo)?;
+            write_repeat_arm(root, k, group, ref_fn, reference)?;
+        }
+        write_arm(&estimate_dir(root, group, ergo_fn), ergo)?;
+        write_arm(&estimate_dir(root, group, ref_fn), reference)?;
+    }
+    Ok(())
+}
+
+fn manifest_with_repeats(run_id: &str, profile: &str, repeats: usize) -> String {
+    format!(
+        r#"{{"run_id":"{run_id}","profile":"{profile}","commit":"abc","rustc":"rustc 1.0.0","target":"x86_64","repeats":{repeats}}}"#
+    )
+}
+
+/// Identical code walked 3.5 % across three invocations of the same binary on
+/// 2026-10-20, while each invocation's own ratio CI was ±0.5 %. The run that
+/// landed last carried 1.0236 and was graded a "resolved breach"; the two
+/// either side of it measured 0.9916 and 0.9887 for the same instructions.
+/// Grading the envelope of the five reproduces that walk and must establish
+/// no winner — the gate cannot separate the arms at this resolution, and a
+/// pair it cannot separate is not a pair it has beaten.
+#[test]
+fn a_pair_that_walks_between_repeats_establishes_no_winner()
+-> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    // The walk, as measured: under the ceiling four times, over it once.
+    let ergo: Vec<Arm> = [
+        (99.2, 98.9, 99.5),
+        (98.9, 98.6, 99.2),
+        (99.1, 98.8, 99.4),
+        (99.3, 99.0, 99.6),
+        (102.4, 101.6, 103.1),
+    ]
+    .into_iter()
+    .collect();
+    let reference: Vec<Arm> = [
+        (100.0, 99.7, 100.3),
+        (100.0, 99.7, 100.3),
+        (100.0, 99.7, 100.3),
+        (100.0, 99.7, 100.3),
+        (100.0, 99.7, 100.3),
+    ]
+    .into_iter()
+    .collect();
+    write_cluster_aa_repeats(
+        &criterion.0,
+        &[
+            (100.0, 99.7, 100.3),
+            (100.0, 99.7, 100.3),
+            (100.2, 99.9, 100.5),
+            (100.1, 99.8, 100.4),
+            (100.4, 100.1, 100.7),
+        ],
+    )?;
+    write_cluster_stable_repeats(
+        &criterion.0,
+        5,
+        "cluster_decode_session_message_header",
+        (100.0, 99.7, 100.3),
+        (100.0, 99.7, 100.3),
+    )?;
+    write_pair_repeats(
+        &criterion.0,
+        "cluster_decode_session_message_header",
+        "ergo-sbe",
+        "sbe-tool",
+        &ergo,
+        &reference,
+        4,
+    )?;
+
+    let output = run_cluster_gate(&criterion.0, &[])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a pair whose ratio walked 0.989 to 1.024 across five invocations of unchanged \
+         code establishes no winner and must not fail:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("no winner"),
+        "the gate must say no winner is established, not pass silently:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("5 repeats"),
+        "the gate must report how many invocations its uncertainty spans, so a reader \
+         can see the verdict is not one run's confidence interval:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+/// The other half of the contract: repetition must not excuse a real
+/// regression. Five invocations that all agree the arm is 5 % over its ceiling,
+/// against a control that never moves, is a resolved breach and must fail.
+#[test]
+fn a_breach_stable_across_repeats_still_fails() -> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    write_cluster_aa_repeats(&criterion.0, &[(100.0, 99.99, 100.01); 5])?;
+    write_cluster_stable_repeats(
+        &criterion.0,
+        5,
+        "cluster_encode_session_message_header",
+        (100.0, 99.99, 100.01),
+        (100.0, 99.99, 100.01),
+    )?;
+    let ergo = [(105.0, 104.9, 105.1); 5];
+    let reference = [(100.0, 99.99, 100.01); 5];
+    write_pair_repeats(
+        &criterion.0,
+        "cluster_encode_session_message_header",
+        "ergo-sbe",
+        "sbe-tool",
+        &ergo,
+        &reference,
+        4,
+    )?;
+
+    let output = run_cluster_gate(&criterion.0, &[])?;
+    assert!(
+        !output.status.success(),
+        "a 5 % breach repeated in every invocation must still fail:\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("resolved breach"),
+        "the gate must resolve the breach rather than shrug at it:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+/// A repeated control is not decoration. The disposition already records that
+/// one control understates placement sensitivity — the same ergon loop
+/// measured 2.7 % apart in two groups of one run. When the control's own
+/// invocations reach as far as the pair's offset, the harness has shown it
+/// cannot separate the arms, and the pair is inconclusive even though it sits
+/// above its ceiling every time.
+#[test]
+fn a_pair_overlapping_a_repeated_aa_control_establishes_no_winner()
+-> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    // The pair is stably 2 % over; the control reaches past that on its own.
+    write_sbe_aa_control(&criterion.0, (100.0, 99.99, 100.01), (100.0, 99.99, 100.01))?;
+    for repeat in 0..5_usize {
+        let (a, b) = match repeat {
+            0 => ((100.0, 99.7, 100.3), (101.0, 100.7, 101.3)),
+            1 => ((100.0, 99.7, 100.3), (100.2, 99.9, 100.5)),
+            2 => ((100.0, 99.7, 100.3), (98.5, 98.2, 98.8)),
+            3 => ((100.0, 99.7, 100.3), (97.8, 97.5, 98.1)),
+            _ => ((100.0, 99.7, 100.3), (97.2, 96.9, 97.5)),
+        };
+        write_repeat_arm(&criterion.0, repeat, SBE_AA_GROUP, "arm_a", a)?;
+        write_repeat_arm(&criterion.0, repeat, SBE_AA_GROUP, "arm_b", b)?;
+    }
+    for (group, ergo, reference) in PAIRS {
+        for repeat in 0..5_usize {
+            write_repeat_arm(&criterion.0, repeat, group, ergo, (102.0, 101.9, 102.1))?;
+            write_repeat_arm(&criterion.0, repeat, group, reference, (100.0, 99.9, 100.1))?;
+        }
+        write_estimate_ci(&criterion.0, group, ergo, 102.0, 101.9, 102.1)?;
+        write_estimate_ci(&criterion.0, group, reference, 100.0, 99.9, 100.1)?;
+    }
+
+    let output = run_gate(&criterion.0, &[])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a pair whose 2 % offset lies inside what a repeated control shows identical \
+         code does on its own establishes no winner and must not fail:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("no winner"),
+        "the gate must say no winner is established:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("A/A null"),
+        "the gate must report the null it graded against:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+/// The runner declares how many invocations it produced. A manifest claiming
+/// five with two on disk is incomplete evidence, and the gate must refuse it
+/// rather than grade the thinner envelope it happens to find.
+#[test]
+fn fewer_repeats_than_the_manifest_declares_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    write_cluster_aa_repeats(&criterion.0, &[(100.0, 99.7, 100.3); 2])?;
+    write_cluster_stable_repeats(
+        &criterion.0,
+        2,
+        "",
+        (100.0, 99.7, 100.3),
+        (100.0, 99.7, 100.3),
+    )?;
+    write_manifest(&criterion.0, &manifest_with_repeats(RUN_ID, "lto", 5))?;
+    stamp_cluster_run_ids(&criterion.0, RUN_ID)?;
+
+    let output = run_cluster_gate(&criterion.0, &["--run-id", RUN_ID])?;
+    assert!(
+        !output.status.success(),
+        "a manifest declaring 5 invocations with 2 on disk must be refused:\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("repeats"),
+        "the refusal must name the missing repeats, not fail for an unrelated reason:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+/// The verdict a pair is graded on is the envelope of its invocations, so the
+/// figure on the graded line has to be that envelope. The headline used to
+/// print the *last* invocation's ratio while the ok / above-ceiling label was
+/// decided by the maximum across all of them, which on this host produced
+/// `0.9941 (max 1.00) above ceiling` beside `over 5 repeats 0.9941–1.0046`:
+/// a reader sees a passing number marked as a breach.
+#[test]
+fn the_headline_figure_is_the_one_the_verdict_uses() -> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    // Last invocation under the ceiling, earlier ones over it: the two figures
+    // the old line could disagree about.
+    let ergo: Vec<Arm> = [
+        (100.4, 100.3, 100.5),
+        (100.3, 100.2, 100.4),
+        (100.2, 100.1, 100.3),
+        (100.1, 100.0, 100.2),
+        (99.8, 99.7, 99.9),
+    ]
+    .into_iter()
+    .collect();
+    let reference: Vec<Arm> = [(100.0, 99.9, 100.1); 5].into_iter().collect();
+    write_cluster_aa_repeats(&criterion.0, &[(100.0, 99.99, 100.01); 5])?;
+    write_cluster_stable_repeats(
+        &criterion.0,
+        5,
+        "cluster_encode_session_message_header",
+        (100.0, 99.99, 100.01),
+        (100.0, 99.99, 100.01),
+    )?;
+    write_pair_repeats(
+        &criterion.0,
+        "cluster_encode_session_message_header",
+        "ergo-sbe",
+        "sbe-tool",
+        &ergo,
+        &reference,
+        4,
+    )?;
+
+    let output = run_cluster_gate(&criterion.0, &[])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let headline = stdout
+        .lines()
+        .find(|line| line.contains("cluster_encode_session_message_header") && line.contains("max"))
+        .ok_or_else(|| format!("no graded line for the pair:\n{}", describe(&output)))?;
+    assert!(
+        headline.contains("1.0040"),
+        "the graded line must show the figure the verdict uses (the highest invocation) \
+         so a reader can see why it is labelled as it is, not only the last one:\n  {headline}\n{}",
+        describe(&output)
+    );
+    assert!(
+        headline.contains("0.9980"),
+        "the graded line must also show the low end of the span — a single number \
+         hides that the invocations disagree:\n  {headline}\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+fn write_stale_estimate(
+    root: &Path,
+    group: &str,
+    function: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_estimate(root, group, function, 100.0, 100.0)
+}
+
+fn set_mtime(path: &Path, when: SystemTime) -> Result<(), Box<dyn std::error::Error>> {
+    let handle = fs::File::options().write(true).open(path)?;
+    handle.set_times(fs::FileTimes::new().set_accessed(when).set_modified(when))?;
+    Ok(())
+}
+
+fn run_snapshot(dir: &Path, k: usize) -> Result<Output, Box<dyn std::error::Error>> {
+    Ok(
+        Command::new(repository()?.join("scripts/snapshot-bench-repeat.sh"))
+            .arg(dir)
+            .arg(k.to_string())
+            .output()?,
+    )
+}
+
+/// `target/criterion` is shared: `ergon-clock-bench` writes `clock_*` into the
+/// same Criterion home, and Criterion leaves `new/` in place for groups a run
+/// does not touch. A snapshot of "everything under the home" therefore folds
+/// another binary's estimates into this run's envelope and widens it with
+/// evidence the invocation never produced. The runner marks the start of the
+/// invocation; only estimates at or after that mark belong to it.
+#[test]
+fn a_snapshot_keeps_only_estimates_this_invocation_produced()
+-> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    let now = SystemTime::now();
+    write_stale_estimate(&criterion.0, "clock_mono_read", "ergon-clock")?;
+    write_stale_estimate(
+        &criterion.0,
+        "cluster_encode_session_message_header",
+        "ergo-sbe",
+    )?;
+    let marker = criterion.0.join(".bench-since");
+    fs::write(&marker, b"")?;
+    // The foreign key is from an earlier run of a different bench binary; the
+    // cluster key is what this invocation is producing right now.
+    set_mtime(
+        &criterion
+            .0
+            .join("clock_mono_read/ergon-clock/new/estimates.json"),
+        now - Duration::from_secs(600),
+    )?;
+    set_mtime(
+        &criterion
+            .0
+            .join("cluster_encode_session_message_header/ergo-sbe/new/estimates.json"),
+        now + Duration::from_secs(600),
+    )?;
+    set_mtime(&marker, now)?;
+
+    let output = run_snapshot(&criterion.0, 1)?;
+    assert!(
+        output.status.success(),
+        "the snapshot of one invocation must succeed:\n{}",
+        describe(&output)
+    );
+    assert!(
+        criterion
+            .0
+            .join("repeats/1/cluster_encode_session_message_header/ergo-sbe/estimates.json")
+            .is_file(),
+        "the group this invocation produced must be kept:\n{}",
+        describe(&output)
+    );
+    assert!(
+        !criterion.0.join("repeats/1/clock_mono_read").exists(),
+        "a group left behind by a different bench binary must not enter this run's \
+         envelope — it is not evidence this invocation produced:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+/// Without the marker there is no way to tell this invocation's estimates from
+/// another binary's leftovers, so the snapshot is refused rather than taken.
+#[test]
+fn a_snapshot_without_a_producer_marker_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    write_stale_estimate(
+        &criterion.0,
+        "cluster_encode_session_message_header",
+        "ergo-sbe",
+    )?;
+
+    let output = run_snapshot(&criterion.0, 1)?;
+    assert!(
+        !output.status.success(),
+        "a snapshot that cannot prove which estimates this invocation produced \
+         must be refused:\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("marker"),
+        "the refusal must name the missing marker:\n{}",
+        describe(&output)
+    );
+    assert!(
+        !criterion.0.join("repeats").exists(),
+        "a refused snapshot must write nothing:\n{}",
         describe(&output)
     );
     Ok(())

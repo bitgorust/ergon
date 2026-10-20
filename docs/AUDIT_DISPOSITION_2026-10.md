@@ -59,6 +59,34 @@ thread. `mincore` is tested against a fresh anonymous mapping, which is
 guaranteed cold, because a heap buffer may land on recycled resident pages.
 30/30 runs of the crate suite held under ~3.2 TB of allocation churn.
 
+**The cluster gate's "resolved breach" verdicts did not reproduce.** Three
+`just bench-cluster` runs of *identical* code at `bfb4f1d3` on
+`aarch64-apple-darwin` produced three different breach sets. Within-run ratio
+CIs were ±0.5%; the same pair moved 3.5% between invocations
+(`cluster_decode_session_message_header` measured 1.0236, 0.9916, 0.9887) and
+the identity of the "resolved breach" rotated through
+`decode_session_message_header`, `encode_claim_shaped_header_plus_app`, then
+`encode_session_message_header` / `encode_session_keep_alive` /
+`decode_session_event` / `encode_claim_shaped_header_plus_app`. The A/A null
+band moved too — [0.9985, 1.0126] → [0.9918, 1.0078] → [0.9922, 1.0003] — but
+by less than the pairs, so a single invocation's band was narrower than the
+noise it is meant to represent. The gate was claiming a resolution the
+harness does not have on this host.
+
+The cause is aggregation, not ergon: no product code and no ceiling changed
+between the three runs. One invocation's confidence interval is the wrong
+uncertainty for a between-invocation effect. The gate now grades the
+**envelope of every independent invocation** the runner took, against a
+**repeated** A/A control (its own envelope across invocations), and resolves a
+pair only where that envelope clears the ceiling and the control's envelope in
+every invocation. `just bench-cluster` and `run-sbe-bench.sh` take
+`BENCH_REPEATS` invocations (default 5) and snapshot each under
+`repeats/<k>/`; a manifest declaring more invocations than are on disk is
+refused. A pair the harness cannot separate across invocations establishes no
+winner — which is what these three runs showed. Ceilings are unchanged and no
+exception was added; `a_breach_stable_across_repeats_still_fails` holds that a
+regression repeating in every invocation still fails.
+
 **Keep-alive repeatability — the 1.0191 did not repeat.** A second full
 `just bench-cluster` on the same host (run `cluster-20261020T072915Z-e565d087`,
 commit `e565d087`, rustc 1.99.0, `aarch64-apple-darwin`) measures
@@ -302,5 +330,5 @@ l3 price compare, timestamps, DTOs, OUT_DIR, links, categorical claims.
 | `io/benches/BENCHMARK.md:21,52,136,139,243,247` | "Round trips … 1 connection only"; "Graviton: not measured"; "HTTP many connections — estimates only"; "Graviton comparison — not measured" | contradicted-by-artifact | `results/flags-aws-20261019T175248Z/fair.md` holds WebSocket round trips at N = 1/4/16/64 and an HTTP pool of 1 and 20, on Graviton, in the same file | Scoped to x86 and pointed at the fair run; the status table gained a 2026-10-19 row. Fixed 2026-10-20. |
 | `io/benches/BENCHMARK.md` fair-run work sentence | "every point issued and completed 600,000 of 600,001 scheduled" | wrong-aggregation | `tables.md`: scheduled 600,001–600,265, issued/completed 599,994–600,005, late 0–47, censored 0–1 | Quote the ranges and name `tables.md` as the source. Fixed 2026-10-20. |
 | `scripts/check-bench-gate.sh` A/A verdict | "a pair inside it has no established winner" was printed but the pair was still graded FAIL | contradicted-by-code | The A/A band only produced a note; `resolution` came from the ratio CI against the ceiling alone. `cluster_encode_claim_shaped_header_plus_app` printed "resolved breach" and "inside A/A null band" in the same breath | The band now decides: a ratio above its ceiling whose ratio CI overlaps a measured band is inconclusive, not a breach. A pair with no measured control still fails closed. Ceilings unchanged. Fixed 2026-10-20. |
-| A/A control placement (cluster encode) | the null band is not placed like the pair it grades | unsupported-as-a-null | The same ergon keep-alive loop measures 7,061–7,068 ns in `cluster/control/aa_encode_keep_alive` and 7,250 ns in `cluster/encode/session_keep_alive` — 2.7 % between two copies of identical code. Re-run `cluster-20261020T072915Z-e565d087` measures it again under LTO: 7.3092 µs in the control against 7.3760 µs in the pair's ergo arm, 0.9 % on identical code and larger than that pair's own 0.63 % spread. The control's two arms sit next to each other; the pair's two arms sit in different groups | Open. The control understates placement sensitivity, so "inside the band" is weaker evidence than it looks. Fixing it means placing the control arms like the pair (or per-arm processes), not widening a ceiling. |
-| `scripts/check-bench-gate.sh` A/A band, second property | one `arm_a`-then-`arm_b` pairing per control, so the band's centre carries arm-order bias | wrong-aggregation | The no-LTO null band moves from [0.9970, 1.0129] (centre 1.005) to [0.9752, 0.9946] (centre 0.985) between two runs of identical code on one host. With the band sitting entirely below 1.0, a pair at 1.0001 is reported "outside A/A null band" | Open. The work order asks for *repeated* A/A controls. Running each control with the arms in both orders would centre the band on the true null without widening a ceiling. |
+| A/A control placement (cluster encode) | the null band is not placed like the pair it grades | unsupported-as-a-null | The same ergon keep-alive loop measures 7,061–7,068 ns in `cluster/control/aa_encode_keep_alive` and 7,250 ns in `cluster/encode/session_keep_alive` — 2.7 % between two copies of identical code. Re-run `cluster-20261020T072915Z-e565d087` measures it again under LTO: 7.3092 µs in the control against 7.3760 µs in the pair's ergo arm, 0.9 % on identical code and larger than that pair's own 0.63 % spread. The control's two arms sit next to each other; the pair's two arms sit in different groups | Partly closed 2026-10-20. The gate now grades each pair against the envelope of a **repeated** control across independent invocations, which absorbs a between-invocation offset of the kind that produced the rotating breaches. A *systematic* within-run group offset would still bias every invocation the same way, so a pair that is stably separated across every repeat is the case where a per-pair control is still needed. Open for that case only. Fixing it means placing the control arms like the pair (or per-arm processes), not widening a ceiling. |
+| `scripts/check-bench-gate.sh` A/A band, second property | one `arm_a`-then-`arm_b` pairing per control, so the band's centre carries arm-order bias | wrong-aggregation | The no-LTO null band moves from [0.9970, 1.0129] (centre 1.005) to [0.9752, 0.9946] (centre 0.985) between two runs of identical code on one host. With the band sitting entirely below 1.0, a pair at 1.0001 is reported "outside A/A null band" | Closed 2026-10-20 for the between-invocation part: the band is now the envelope of the control over `BENCH_REPEATS` independent invocations (default 5), so its centre is no longer one run's arm order. Within-run arm-order bias is unchanged and still one pairing; running each control with the arms in both orders would centre the band on the true null without widening a ceiling. |

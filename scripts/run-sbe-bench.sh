@@ -69,16 +69,6 @@ stamp_profile() {
 import json, os, sys
 
 directory, run_id, profile, commit, rustc, target = sys.argv[1:7]
-manifest = {
-    "run_id": run_id,
-    "profile": profile,
-    "commit": commit,
-    "rustc": rustc,
-    "target": target,
-}
-with open(os.path.join(directory, "run-manifest.json"), "w", encoding="utf-8") as handle:
-    json.dump(manifest, handle, indent=2, sort_keys=True)
-
 stamped = 0
 for root, dirs, files in os.walk(directory):
     if os.path.basename(root) == "new" and "estimates.json" in files:
@@ -87,7 +77,37 @@ for root, dirs, files in os.walk(directory):
         stamped += 1
 if stamped == 0:
     sys.exit(f"no Criterion estimates were produced under {directory}")
-print(f"stamped {stamped} estimate(s) in {directory} with run id {run_id}")
+# Each independent invocation the runner took is snapshotted under
+# `repeats/<k>/`; stamp those too, and declare how many there are. The gate
+# grades the envelope of those invocations and refuses a manifest claiming
+# more of them than are on disk.
+repeats_dir = os.path.join(directory, "repeats")
+repeats = 0
+if os.path.isdir(repeats_dir):
+    for name in sorted(
+        (n for n in os.listdir(repeats_dir) if os.path.isdir(os.path.join(repeats_dir, n))),
+        key=lambda n: (0, int(n)) if n.isdigit() else (1, n),
+    ):
+        repeat_root = os.path.join(repeats_dir, name)
+        found = 0
+        for root, dirs, files in os.walk(repeat_root):
+            if "estimates.json" in files:
+                with open(os.path.join(root, "run-id.txt"), "w", encoding="utf-8") as handle:
+                    handle.write(run_id)
+                found += 1
+        if found:
+            repeats += 1
+manifest = {
+    "run_id": run_id,
+    "profile": profile,
+    "commit": commit,
+    "rustc": rustc,
+    "target": target,
+    "repeats": repeats if repeats > 1 else 1,
+}
+with open(os.path.join(directory, "run-manifest.json"), "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2, sort_keys=True)
+print(f"stamped {stamped} estimate(s) in {directory} with run id {run_id} repeats={manifest['repeats']}")
 PY
 }
 
@@ -139,8 +159,25 @@ for profile in "${PROFILES[@]}"; do
         exit 2
         ;;
     esac
-    env "${profile_env[@]}" cargo bench -p ergo-sbe-benchmarks --bench perf_parity_bench
-    env "${profile_env[@]}" cargo bench -p ergo-sbe-benchmarks --bench perf_parity_extended_bench
+    # BENCH_REPEATS independent invocations (default 5), each snapshotted under
+    # `repeats/<k>/`. One invocation's confidence interval is not the harness's
+    # resolution: identical code walked 3.5 % across three invocations on
+    # 2026-10-20 while each run's own ratio CI was ±0.5 %. The gate grades the
+    # envelope of the invocations.
+    repeats="${BENCH_REPEATS:-5}"
+    # A stale snapshot from an earlier run would widen this run's envelope with
+    # foreign evidence; the gate refuses a mixed one, so clear it here.
+    rm -rf "$criterion_dir/repeats"
+    for k in $(seq 1 "$repeats"); do
+        echo "=== SBE perf parity — $profile — invocation $k/$repeats ==="
+        # Bounds the snapshot to what this invocation is about to write: the
+        # Criterion home can also hold other benches' groups, and Criterion
+        # leaves `new/` in place for groups a run does not touch.
+        touch "$criterion_dir/.bench-since"
+        env "${profile_env[@]}" cargo bench -p ergo-sbe-benchmarks --bench perf_parity_bench
+        env "${profile_env[@]}" cargo bench -p ergo-sbe-benchmarks --bench perf_parity_extended_bench
+        "$REPO_ROOT/scripts/snapshot-bench-repeat.sh" "$criterion_dir" "$k"
+    done
 
     stamp_profile "$criterion_dir" "$RUN_ID" "$profile"
 
