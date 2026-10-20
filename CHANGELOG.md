@@ -188,6 +188,12 @@
   now shows the envelope the verdict is based on — it used to print the last
   invocation's ratio beside a label decided by the maximum, which read as
   `0.9941 (max 1.00) above ceiling`.
+- Release artifacts: a cluster archive carries only the run's own evidence.
+  The cluster Criterion home is shared with other bench binaries and Criterion
+  leaves `new/` in place for groups a run does not touch, so one run packaged
+  53 "estimates" of which 35 belonged to `ergon-clock-bench` and the historic
+  bench. The archive and its estimate count now come from `repeats/<k>/` — the
+  tree the runner snapshotted and the gate grades.
 - Clock bench: `the_gap_pass_takes_no_page_faults_while_it_times` asserted a
   zero fault count that off Linux is the whole process's
   (`getrusage(RUSAGE_SELF)`; Darwin has no `RUSAGE_THREAD`), so another

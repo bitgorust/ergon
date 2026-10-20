@@ -216,6 +216,56 @@ mkdir -p "$OUT4"
 check "missing cluster fails closed" \
     bash -c "! REQUIRE_CLUSTER=1 '$FAKE_ROOT/scripts/package-bench-artifacts.sh' '$OUT4' 2>/dev/null"
 
+# ── 7. Cluster archive carries only the run's own evidence ──────────────
+# The cluster Criterion home is shared (`target/criterion` also holds
+# ergon-clock-bench's groups) and Criterion leaves `new/` in place for groups
+# a run does not touch. `repeats/<k>/` is what the runner snapshotted for this
+# run and what the gate grades, so the archive and the manifest's estimate
+# count must come from there — not from whatever else lives under the home.
+write_cluster_with_repeats() {
+    local dir="$1" prof="$2"
+    rm -rf "$dir"
+    mkdir -p "$dir/cluster_fake/new" \
+             "$dir/clock_read_ergon_now_ns/ergon-clock/new" \
+             "$dir/repeats/1/cluster_fake"
+    echo '{"mean":{"point_estimate":2.0}}' >"$dir/cluster_fake/new/estimates.json"
+    echo '{"mean":{"point_estimate":9.0}}' >"$dir/clock_read_ergon_now_ns/ergon-clock/new/estimates.json"
+    echo '{"mean":{"point_estimate":2.0}}' >"$dir/repeats/1/cluster_fake/estimates.json"
+    python3 -c "
+import json
+with open('$dir/run-manifest.json', 'w') as f:
+    json.dump({
+        'run_id': 'cluster-fixture-002',
+        'profile': '$prof',
+        'commit': '$COMMIT',
+        'rustc': 'rustc test',
+        'target': 'test-target',
+        'repeats': 1,
+    }, f, indent=2)
+"
+}
+write_cluster_with_repeats "$FAKE_ROOT/target/criterion" "lto"
+write_cluster_with_repeats "$FAKE_ROOT/target/bench-no-lto/criterion" "no-lto"
+
+OUT_CL_REPEATS="$SCRATCH/out-cluster-repeats"
+mkdir -p "$OUT_CL_REPEATS"
+check "packages clusters that carry repeats" \
+    env REQUIRE_CLUSTER=1 "$FAKE_ROOT/scripts/package-bench-artifacts.sh" "$OUT_CL_REPEATS"
+
+check "cluster archive keeps the run's own estimates" \
+    bash -c "tar -tzf '$OUT_CL_REPEATS/bench-cluster-lto.tar.gz' | grep -q 'repeats/1/cluster_fake'"
+check "cluster archive drops another bench's keys" \
+    bash -c "! tar -tzf '$OUT_CL_REPEATS/bench-cluster-lto.tar.gz' | grep -q 'clock_read_'"
+check "cluster archive has the manifest" \
+    bash -c "tar -tzf '$OUT_CL_REPEATS/bench-cluster-lto.tar.gz' | grep -q 'run-manifest.json'"
+
+# The count is the run's own estimates, not everything under the shared home.
+tmpr=$(mktemp -d)
+tar -xzf "$OUT_CL_REPEATS/bench-cluster-lto.tar.gz" -C "$tmpr"
+OWNED=$(python3 -c "import json,glob; print(json.load(open(glob.glob('$tmpr/**/run-manifest.json', recursive=True)[0]))['estimates'])")
+check "cluster estimate count is the run's own" test "$OWNED" = "1"
+rm -rf "$tmpr"
+
 echo ""
 echo "=== package-bench-artifacts dry-run: $pass passed, $fail failed ==="
 [ "$fail" -eq 0 ]
