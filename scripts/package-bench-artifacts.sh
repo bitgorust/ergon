@@ -128,7 +128,35 @@ package_cluster() {
             return 0
         fi
     fi
-    estimate_count=$(find "$dir" -name "estimates.json" -path "*/new/*" 2>/dev/null | wc -l | tr -d ' ')
+    # The run's own evidence is the `repeats/<k>/` tree the runner snapshotted,
+    # which is also what the gate grades. The cluster Criterion home is shared
+    # with other bench binaries (`target/criterion` also holds ergon-clock-bench's
+    # groups) and Criterion leaves `new/` in place for groups a run does not
+    # touch, so counting or shipping `new/` folds foreign keys into the release
+    # artifact — one run packaged 53 "estimates" of which 35 belonged to other
+    # benches. With no repeats on disk there is nothing better to go on, so fall
+    # back to `new/`.
+    local estimate_count evidence
+    estimate_count=0
+    evidence=""
+    if [ -d "$dir/repeats" ]; then
+        # One invocation's set is the estimate count: `repeats` on the manifest
+        # already says how many invocations there were.
+        local k n
+        for k in $(ls -1 "$dir/repeats" 2>/dev/null | sort -n); do
+            [ -d "$dir/repeats/$k" ] || continue
+            n=$(find "$dir/repeats/$k" -name estimates.json 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$n" -gt 0 ]; then
+                estimate_count="$n"
+                evidence=repeats
+                break
+            fi
+        done
+    fi
+    if [ "$estimate_count" -eq 0 ]; then
+        estimate_count=$(find "$dir" -name "estimates.json" -path "*/new/*" 2>/dev/null | wc -l | tr -d ' ')
+        evidence=new
+    fi
     if [ "$estimate_count" -eq 0 ]; then
         if [ "$REQUIRE_CLUSTER" = "1" ]; then
             fail "no cluster estimates for $label under $dir"
@@ -179,24 +207,35 @@ d['estimates'] = $estimate_count
 with open(path, 'w') as f:
     json.dump(d, f, indent=2)
 "
-    # Package criterion tree + manifest. Parent of criterion is the profile root.
+    # Package the run's evidence + manifest. Parent of criterion is the profile
+    # root. Only `repeats/` is shipped when it is the evidence: `new/` in a
+    # shared home carries whatever else wrote there, and this archive is the
+    # release's proof.
     parent="$(cd "$(dirname "$dir")" && pwd)"
     base="$(basename "$dir")"
     ARCHIVE="$OUT_DIR/bench-cluster-$label.tar.gz"
-    tar -czf "$ARCHIVE" -C "$parent" "$base" -C "$dir" run-manifest.json 2>/dev/null \
-        || tar -czf "$ARCHIVE" -C "$parent" "$base"
-    # Ensure manifest is inside archive
-    if ! tar -tzf "$ARCHIVE" | grep -q 'run-manifest.json'; then
-        # re-pack with manifest at archive root
+    if [ "$evidence" = "repeats" ]; then
         tmp=$(mktemp -d)
-        cp -R "$dir"/* "$tmp/" 2>/dev/null || true
+        cp -R "$dir/repeats" "$tmp/repeats"
         cp "$MANIFEST" "$tmp/run-manifest.json"
         tar -czf "$ARCHIVE" -C "$tmp" .
         rm -rf "$tmp"
+    else
+        tar -czf "$ARCHIVE" -C "$parent" "$base" -C "$dir" run-manifest.json 2>/dev/null \
+            || tar -czf "$ARCHIVE" -C "$parent" "$base"
+        # Ensure manifest is inside archive
+        if ! tar -tzf "$ARCHIVE" | grep -q 'run-manifest.json'; then
+            # re-pack with manifest at archive root
+            tmp=$(mktemp -d)
+            cp -R "$dir"/* "$tmp/" 2>/dev/null || true
+            cp "$MANIFEST" "$tmp/run-manifest.json"
+            tar -czf "$ARCHIVE" -C "$tmp" .
+            rm -rf "$tmp"
+        fi
     fi
     tar -tzf "$ARCHIVE" | grep -q 'estimates.json' || fail "$ARCHIVE missing estimates.json"
     tar -tzf "$ARCHIVE" | grep -q 'run-manifest.json' || fail "$ARCHIVE missing run-manifest.json"
-    echo "Cluster $label: $estimate_count estimates → bench-cluster-$label.tar.gz"
+    echo "Cluster $label: $estimate_count estimates ($evidence) → bench-cluster-$label.tar.gz"
 }
 
 package_cluster "lto" "$REPO_ROOT/target/criterion"
