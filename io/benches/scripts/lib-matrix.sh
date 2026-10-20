@@ -856,6 +856,22 @@ fair_point() {
         if (v["batches"] > 0 && v["late_100us"] * 100 > v["batches"])
           printf "%d of %d sends began over 100 µs late, the latest %d µs\n", v["late_100us"], v["batches"], v["late_max_us"] }' "$srvlog" \
       | while read -r l; do log "!!! point $dir: the sender fell behind its schedule ($l): its traffic was not the planned traffic"; done
+    # The same account belongs beside the work counts in the report. `work.late`
+    # counts the paced order slots filled when the next was already due and
+    # cannot say this: a point reports 2 of those and 39 464 late batches at
+    # once, and only the second is the traffic not being the planned traffic.
+    # Folded into the point's meta.txt here, where the receiver still has it,
+    # so the analysis reports it and a table cannot read a slipped sender as a
+    # clean run.
+    local sch
+    sch=$(awk '/^schedule: / { for (i = 2; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+        if (v["batches"] != "")
+          printf "send.sent=%s send.batches=%s send.late_100us=%s send.late_max_us=%s",
+                 v["sent"], v["batches"], v["late_100us"], v["late_max_us"] }' "$srvlog")
+    if [[ -n $sch ]]; then
+      rssh "for kv in $sch; do grep -qxF \"\$kv\" res/$dir/meta.txt 2>/dev/null || echo \"\$kv\" >> res/$dir/meta.txt; done" \
+        || log "point $dir: the sender schedule was not folded into meta.txt"
+    fi
     [[ -z $POINT_FAILED ]] && return 0
     if (( try < FAIR_RETRIES )); then
       log "point $dir: measuring again ($((try + 1)) of $FAIR_RETRIES); the failed attempt is kept as $dir.attempt$((try + 1))"

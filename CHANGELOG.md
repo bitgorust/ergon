@@ -188,6 +188,46 @@
   now shows the envelope the verdict is based on — it used to print the last
   invocation's ratio beside a label decided by the maximum, which read as
   `0.9941 (max 1.00) above ceiling`.
+- Benchmark gate: an over-ceiling pair is non-blocking only when a **measured**
+  A/A null band reaches it. Without a band, or outside it, it is a resolved
+  breach or **unproven**, and unproven blocks. A wide confidence interval is
+  not evidence: a 2× slowdown (200 ns against 100 ns, ratio CI 50–400) with
+  no control used to exit 0. "The measurement could not resolve it" is not
+  "the ceiling was met".
+- Benchmark gate: every estimate is parsed before any is used. A malformed,
+  non-finite or non-positive repetition refuses the whole key and prints
+  nothing; it used to be dropped, so a key with one good repetition and one
+  truncated `estimates.json` graded on the good one and passed. `NaN`, `0`
+  and negative counts are refused, not read as numbers.
+- Benchmark gate: every declared repetition must carry every consumed pair,
+  matched by repetition ID. Removing both arms of one comparison from
+  repetition two used to still report "2 independent invocations" and grade
+  that pair on one. A repetition missing a pair is incomplete evidence.
+- Benchmark gate: a consumed A/A control is provenance-checked against the
+  run manifest like the pairs it grades. A control stamped by another run
+  used to excuse a tightly measured 2× regression as harness noise. A missing
+  control is still reported as "A/A null not measured", not as a provenance
+  failure.
+- Benchmark manifests record the host CPU. `aarch64-apple-darwin` does not
+  distinguish an M1 from an M4, and 0.1.30's local figures are M1 where
+  0.1.29's were M4, so absolute figures are not comparable across the two
+  releases. Ceilings are host-independent ratios and are unchanged.
+- Fair comparison reports carry the sender's schedule beside the work counts,
+  and name the rows whose sender was not the planned traffic. `Work::late`
+  counts paced **order slots**; the sender's `late_100us` counts **batches**
+  across all traffic, and the two were published as one number. Six of 144
+  points in the Graviton fair run `20261019T175248Z` slipped over 1 % of
+  batches; every one is interior on p50 and p99 within its family, and the
+  two published endpoints a slipped row sets are now printed with and without
+  it. A `latest µs` over 100× the median of its column is named beside the
+  table as a stall, not offered as a ranking.
+- The work-counts extractor fails closed on the evidence it reads. A present
+  but partial sender schedule, a minus count or an unreadable value names the
+  key and value and writes nothing; it used to drop the point or copy the
+  figure through (`late_100us=-80` reported `-8.00% … ok`, exit 0). Its
+  parsing is `u64::from_str`, and its completeness rule is the Rust loader's:
+  a sender schedule is all or none. A run that wrote none of it is still an
+  honest hole, not a failure.
 - Release artifacts: a cluster archive carries only the run's own evidence.
   The cluster Criterion home is shared with other bench binaries and Criterion
   leaves `new/` in place for groups a run does not touch, so one run packaged
@@ -256,6 +296,14 @@
 
 ### Removed
 
+- The recommended JVM options drop `-XX:+TrustFinalNonStaticFields`,
+  `-XX:GuaranteedSafepointInterval=300000` and `-XX:+DebugNonSafepoints`,
+  and the two `-XX:+Unlock{Experimental,Diagnostic}VMOptions` that existed
+  only to admit them. All three came from Aeron's scripts and benchmarks;
+  their effect on the recommended JDK was never measured, and two of them
+  are experimental or diagnostic, so the JVM is free to change them.
+  Every option left in `cluster-test-harness/jvm/aeron.jvm` is either
+  required to start or has a measured reason.
 - Moved the runtime, its server, the wire and bridge crates, the log printer
   and the ClickHouse lab to a private repository.
 

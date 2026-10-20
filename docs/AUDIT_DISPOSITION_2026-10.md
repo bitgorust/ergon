@@ -136,28 +136,25 @@ pairing. The work order asks for *repeated* A/A controls; only single-run
 controls exist. The band is not widened to hide this — a pair outside a
 measured band still fails.
 
-**Open, stage 3.** Clock is done (above). TLS: `io/src/tls.rs` already
+**Stage 3, 2026-10-20.** Clock is done (above). Deployment: the io_uring
+grant is scoped to apps that use it (`latency-pods.md`: "Aeron's C media
+driver does not use io_uring"); `k8s/nri-latency-pods` states "no IPC_LOCK,
+no capabilities, no privileged, and no scheduler change"; and the three
+experimental/diagnostic JVM flags are **removed** from
+`cluster-test-harness/jvm/aeron.jvm` along with the two `Unlock*VMOptions`
+that only admitted them. What is left of stage 3 is TLS: `io/src/tls.rs`
 drives `UnbufferedClientConnection` for the handshake, then
 `dangerous_into_kernel_connection` hands the secrets to a custom
 `RecordLayer` that runs ring AEAD in place and owns post-handshake parsing,
-reassembly, KeyUpdate and the confidentiality limit. The work order asks
-for rustls's maintained unbuffered API and the removal of that custom
-record-layer API. Open, and performance-sensitive: the only evidence for
-keeping it is a decrypt-only microbench whose aggregation this audit has
-already rejected (`io/benches/BENCHMARK.md:122`), so the custom layer is
-not currently justified by a repeatable application-level improvement.
-Deployment: `md-dpdk/deploy/aws-eks/media-driver-daemonset.yaml` is
-`privileged: true` for DPDK; `k8s/nri-latency-pods` already states "no
-IPC_LOCK, no capabilities, no privileged, and no scheduler change: RT
-scheduling is not built", and `latency-pods.md` already scopes the io_uring
-grant to apps that use it ("Aeron's C media driver does not use io_uring").
-Still open there: the `SCHED_FIFO` plumbing in `k8s/nri-shared-cpus`
-(`ergon-cpus --fifo`, `sched-fifo.ergon.io`, `ERGON_SCHED_FIFO`), which no
-ergon component consumes, and the three experimental/diagnostic JVM flags
-in `cluster-test-harness/jvm/aeron.jvm` (`TrustFinalNonStaticFields`,
-`GuaranteedSafepointInterval=300000`, `DebugNonSafepoints`) whose effect on
-the recommended JDK `book/src/deploy/java.md:68` already records as not
-measured.
+reassembly, KeyUpdate and the confidentiality limit. That layer is the live
+data path (`stream.rs`, `ws_conn.rs`, `net.rs`), so replacing it with
+rustls's maintained unbuffered API is a refactor of the post-handshake
+path, not a deletion. The only evidence for keeping it is a decrypt-only
+microbench whose aggregation this audit has already rejected
+(`io/benches/BENCHMARK.md:122`), so it is **not justified** — it is
+scheduled for `feat/0.1.31`. The `SCHED_FIFO` knob in `k8s/nri-shared-cpus`
+stays, default-off and measured no gain on an isolated AWS CPU; whether to
+delete it is the same branch's decision.
 
 **Open, stage 4.** The example rows are done (above). What remains is the
 reconciliation sweep: README, rustdoc, the disclosure, the charts and the
@@ -200,8 +197,8 @@ Root: `/Users/mimra/RustroverProjects/project/ergon`. Evidence quotes are artifa
 
 | file:line | claim | verdict | evidence | disposition | exact fix |
 |---|---|---|---|---|---|
-| `book/src/deploy/latency-pods.md:12,145,150` | "`SCHED_FIFO`, any `sched_setscheduler`, a `--fifo` wrapper" under "Deliberately not built"; "The plugin never changes a scheduler policy" | contradicted-by-code | k8s/nri-shared-cpus builds it: `cmd/ergon-cpus/main.go:9,213` `--fifo`/`SetFifo`; `internal/wrap/wrap.go:312-326` `SCHED_FIFO`; `sched-fifo.ergon.io/` in names.go:45, grants.go:80-96; shared-cpus.md:248 documents `schedFifo: off\|thread`. Default-off and measured worse | rewrite | 1. Remove the SCHED_FIFO row from "Deliberately not built" (keep SR-IOV, netns-sysctl, IRQ). L12: "built but default-off (`ergon-cpus --fifo`, `schedFifo: thread`), measured to give no gain on an isolated CPU on AWS". 2. L150: "The NRI plugin only grants `RLIMIT_RTPRIO` and `ERGON_SCHED_FIFO`; the wrapper or the app/prelock takes `SCHED_FIFO` on the hot thread. On the default no-FIFO path PID 1 stays `SCHED_OTHER`; with `--fifo` the exec'd command runs `SCHED_FIFO`." 3. Keep shared-cpus.md:132 consistent. |
-| `book/src/deploy/java.md:68` | `GuaranteedSafepointInterval=300000` "Removes the stop-the-world safepoint that otherwise runs every second" (also overview.md:51) | unsupported | aeron-samples/scripts/java-common:31 sets the flag only. JDK 27 idle 6 s: zero safepoints logged | rewrite | "raises the guaranteed-safepoint interval from the default 1 s to 300 s (Aeron's scripts set it; effect on JDK 25 not measured)". Drop the causal claim. Same at overview.md:51. |
+| `book/src/deploy/latency-pods.md:12,145,150` | "`SCHED_FIFO`, any `sched_setscheduler`, a `--fifo` wrapper" under "Deliberately not built"; "The plugin never changes a scheduler policy" | contradicted-by-code | k8s/nri-shared-cpus builds it: `cmd/ergon-cpus/main.go:9,213` `--fifo`/`SetFifo`; `internal/wrap/wrap.go:312-326` `SCHED_FIFO`; `sched-fifo.ergon.io/` in names.go:45, grants.go:80-96; shared-cpus.md:248 documents `schedFifo: off\|thread`. Default-off and measured worse | rewrite | 1. Remove the SCHED_FIFO row from "Deliberately not built" (keep SR-IOV, netns-sysctl, IRQ). L12: "built but default-off (`ergon-cpus --fifo`, `schedFifo: thread`), measured to give no gain on an isolated CPU on AWS". 2. L150: "The NRI plugin only grants `RLIMIT_RTPRIO` and `ERGON_SCHED_FIFO`; the wrapper or the app/prelock takes `SCHED_FIFO` on the hot thread. On the default no-FIFO path PID 1 stays `SCHED_OTHER`; with `--fifo` the exec'd command runs `SCHED_FIFO`." 3. Keep shared-cpus.md:132 consistent. **Fixed 2026-10-20** (docs). The plumbing itself stays: default-off, measured no gain, a 0.1.31 decision whether to delete the knob. |
+| `book/src/deploy/java.md:68` | `GuaranteedSafepointInterval=300000` "Removes the stop-the-world safepoint that otherwise runs every second" (also overview.md:51) | unsupported | aeron-samples/scripts/java-common:31 sets the flag only. JDK 27 idle 6 s: zero safepoints logged | remove | The flag is gone from `cluster-test-harness/jvm/aeron.jvm`, with `TrustFinalNonStaticFields` and `DebugNonSafepoints` and the two `Unlock*VMOptions` that only admitted them. Every option left is either required to start or has a measured reason. overview.md:51 now defines a safepoint and points at the logging. **Fixed 2026-10-20.** |
 | `book/src/deploy/java.md:91` | "A cluster's durability comes from its quorum, not from fsync" (justifies sync level 0) | overstated | aeron-archive README "Recording Durability": level 0 is page-cache only. aeron-cluster README: quorum is durability for a majority; single-node clusters exist | rewrite | "In a 3- or 5-member cluster the quorum is the durability mechanism, so sync level 0 is the usual choice; a single-node cluster's durability is fsync — raise both sync levels there." |
 | `book/src/deploy/overview.md:50` | "`ParallelGC` … wins" | overstated | java.md:70 "convention, not a measured collector A/B"; :129 "**not measured**" | relabel not-measured | "so `ParallelGC` is what every Aeron script uses (convention, not a measured collector A/B)". |
 
@@ -332,3 +329,26 @@ l3 price compare, timestamps, DTOs, OUT_DIR, links, categorical claims.
 | `scripts/check-bench-gate.sh` A/A verdict | "a pair inside it has no established winner" was printed but the pair was still graded FAIL | contradicted-by-code | The A/A band only produced a note; `resolution` came from the ratio CI against the ceiling alone. `cluster_encode_claim_shaped_header_plus_app` printed "resolved breach" and "inside A/A null band" in the same breath | The band now decides: a ratio above its ceiling whose ratio CI overlaps a measured band is inconclusive, not a breach. A pair with no measured control still fails closed. Ceilings unchanged. Fixed 2026-10-20. |
 | A/A control placement (cluster encode) | the null band is not placed like the pair it grades | unsupported-as-a-null | The same ergon keep-alive loop measures 7,061–7,068 ns in `cluster/control/aa_encode_keep_alive` and 7,250 ns in `cluster/encode/session_keep_alive` — 2.7 % between two copies of identical code. Re-run `cluster-20261020T072915Z-e565d087` measures it again under LTO: 7.3092 µs in the control against 7.3760 µs in the pair's ergo arm, 0.9 % on identical code and larger than that pair's own 0.63 % spread. The control's two arms sit next to each other; the pair's two arms sit in different groups | Partly closed 2026-10-20. The gate now grades each pair against the envelope of a **repeated** control across independent invocations, which absorbs a between-invocation offset of the kind that produced the rotating breaches. A *systematic* within-run group offset would still bias every invocation the same way, so a pair that is stably separated across every repeat is the case where a per-pair control is still needed. Open for that case only. Fixing it means placing the control arms like the pair (or per-arm processes), not widening a ceiling. |
 | `scripts/check-bench-gate.sh` A/A band, second property | one `arm_a`-then-`arm_b` pairing per control, so the band's centre carries arm-order bias | wrong-aggregation | The no-LTO null band moves from [0.9970, 1.0129] (centre 1.005) to [0.9752, 0.9946] (centre 0.985) between two runs of identical code on one host. With the band sitting entirely below 1.0, a pair at 1.0001 is reported "outside A/A null band" | Closed 2026-10-20 for the between-invocation part: the band is now the envelope of the control over `BENCH_REPEATS` independent invocations (default 5), so its centre is no longer one run's arm order. Within-run arm-order bias is unchanged and still one pairing; running each control with the arms in both orders would centre the band on the true null without widening a ceiling. |
+
+## 5. Second review, 2026-10-20 — nine findings
+
+A code review of the stage-2 work. Every finding was judged valid and fixed
+before the release commit, because a release gate that can false-PASS would
+publish exactly what this audit set out to repair.
+
+| # | Finding | Verdict | Fix |
+|---|---|---|---|
+| 1 | "Inconclusive results now pass the strict gate." A 2× slowdown with a wide CI and no A/A control exited 0 | confirmed | An over-ceiling pair is non-blocking only when a **measured** band reaches it. Otherwise "unproven — blocking". Six tests pin it. |
+| 2 | "A malformed later repetition silently disappears." One good repetition graded alone; `NaN` passed | confirmed | The reader parses everything before using any of it, requires finite **positive** values, and refuses the key on any failure. |
+| 3 | "Repeat completeness counts directories rather than complete comparisons." A pair missing from repetition two still passed | confirmed | Every declared repetition must carry every consumed pair, matched by repetition ID. |
+| 4 | "Unverified A/A controls can change the verdict." A `foreign` control turned a 2× regression into PASS | confirmed | Both control arms are provenance-checked against the run manifest. A missing control is still "not measured", not a failure. |
+| 5 | "New comments still assert unproved benchmark causes" (descheduling, arm order, scheduler, branch prediction) | confirmed | The causal claims are removed from the bench sources; observed figures stay as observations. |
+| 6 | "`--fair` hides the newly collected sender-schedule warning." 80 % late batches published clean | confirmed | `fair.rs` emits the send schedule beside the work counts and names the slipped rows. |
+| 7 | "The evidence exporter silently accepts incomplete or invalid accounts." `late_100us=-80` → `-80.00% … ok`, exit 0 | confirmed | `extract_work_counts.py` now matches `SendSchedule::from_meta` and `Work::from_meta`/`check`, and fails closed. The analogous hole on the `work.*` copy path was real too. |
+| 8 | "The new residency test assumes page-aligned allocation." Expected 2 pages, reported 1 | confirmed | Expectations come from `pages_wholly_inside`; the offset-slice case is pinned. |
+| 9 | "Aeron's underlying clock cost is still described as outside the hot path" | confirmed | Now "One underlying read per duty cycle; no workload benefit demonstrated from replacing it." |
+
+Host provenance was added alongside: `aarch64-apple-darwin` does not
+distinguish an M1 from an M4, and 0.1.30's local figures are M1 where
+0.1.29's were M4. Both manifest writers record `host`; the gate requires and
+prints it. Ceilings are host-independent ratios and were not changed.

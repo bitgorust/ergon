@@ -128,27 +128,48 @@ pub fn page_size() -> usize {
     usize::try_from(n).unwrap_or(0)
 }
 
-/// How many pages of `items` are resident (`mincore`).
+/// How many pages lie wholly inside `items`.
 ///
-/// Scoped to the buffer, so unlike [`minor_faults`] off Linux nothing else
-/// in the process can move the answer. Counts only pages wholly inside
-/// `items`. Returns 0 where the kernel will not answer, so a caller that
-/// expects every page fails closed rather than passing on an unknown.
+/// A page counts only where its whole range is a subset of `items`: the
+/// first and last partial pages do not count. This is what
+/// [`pages_resident`] reports when every one of them is resident, so it is
+/// the count a caller should expect after touching the slice — not
+/// `size_of_val(items) / page_size`, which is wrong for a slice that is not
+/// page-aligned at both ends (a `Vec` is only element-aligned).
 #[must_use]
-pub fn pages_resident<T>(items: &[T]) -> usize {
+pub fn pages_wholly_inside<T>(items: &[T]) -> usize {
     let page = page_size();
     if page == 0 || items.is_empty() {
         return 0;
     }
     let start = items.as_ptr() as usize;
     let end = start.saturating_add(std::mem::size_of_val(items));
-    // The first and last pages wholly inside the slice.
+    // The first page starting inside the slice, and the end of the last
+    // page ending inside it.
     let lo = start.saturating_add(page - 1) & !(page - 1);
     let hi = end & !(page - 1);
     if hi <= lo {
         return 0;
     }
-    let n = (hi - lo) / page;
+    (hi - lo) / page
+}
+
+/// How many pages of `items` are resident (`mincore`).
+///
+/// Scoped to the buffer, so unlike [`minor_faults`] off Linux nothing else
+/// in the process can move the answer. Counts only pages wholly inside
+/// `items` (see [`pages_wholly_inside`]: the first and last partial pages
+/// do not count). Returns 0 where the kernel will not answer, so a caller
+/// that expects every page fails closed rather than passing on an unknown.
+#[must_use]
+pub fn pages_resident<T>(items: &[T]) -> usize {
+    let page = page_size();
+    let n = pages_wholly_inside(items);
+    if page == 0 || n == 0 {
+        return 0;
+    }
+    let start = items.as_ptr() as usize;
+    let lo = start.saturating_add(page - 1) & !(page - 1);
     let mut vec = vec![0_u8; n];
     #[cfg(target_os = "linux")]
     let vec_ptr = vec.as_mut_ptr().cast::<libc::c_uchar>();
@@ -238,6 +259,45 @@ mod tests {
             *b = 1;
         }
         assert_eq!(pages_resident(slice), pages);
+        // SAFETY: our mapping, its exact length.
+        assert_eq!(unsafe { libc::munmap(base, len) }, 0);
+    }
+
+    /// A fully-touched slice that is not page-aligned reports the pages
+    /// wholly inside it, not `length / page_size`. A mid-page offset into a
+    /// three-page mapping, two pages long, has one page wholly inside: the
+    /// review's `expected 2, reported 1`.
+    #[test]
+    fn pages_resident_counts_wholly_inside_pages_of_an_offset_slice() {
+        let page = page_size();
+        assert!(page > 0, "no page size");
+        let len = 3 * page;
+        // SAFETY: a fresh anonymous mapping of len bytes, viewed and
+        // unmapped again below.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED, "mmap of {len} bytes failed");
+        // SAFETY: base is our mapping of exactly len bytes.
+        let region = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), len) };
+        let offset = page / 2;
+        let slice = &mut region[offset..offset + 2 * page];
+        for b in slice.iter_mut() {
+            *b = 1;
+        }
+        // Pages wholly inside: the middle page only. The first and last are
+        // half in the slice and do not count.
+        assert_eq!(pages_wholly_inside(slice), 1);
+        assert_eq!(pages_resident(slice), 1);
+        // The naive length count is the wrong expectation for this slice.
+        assert_eq!(slice.len() / page, 2);
         // SAFETY: our mapping, its exact length.
         assert_eq!(unsafe { libc::munmap(base, len) }, 0);
     }

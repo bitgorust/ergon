@@ -10,15 +10,6 @@
 # Archive CRC32 checksums reach into java.util.zip.
 --add-opens java.base/java.util.zip=ALL-UNNAMED
 
-# The JIT treats final instance fields as constants.
--XX:+UnlockExperimentalVMOptions
--XX:+TrustFinalNonStaticFields
-# A safepoint every 300 s at most rather than every second, and profiles that
-# are accurate between safepoints.
--XX:+UnlockDiagnosticVMOptions
--XX:GuaranteedSafepointInterval=300000
--XX:+DebugNonSafepoints
-
 # Archive, Cluster and the driver allocate nothing in steady state: the
 # collector with the cheapest barriers.
 -XX:+UseParallelGC

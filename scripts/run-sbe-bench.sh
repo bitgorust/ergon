@@ -57,18 +57,33 @@ print_plan() {
     done
 }
 
+# The machine the numbers were taken on. `target` alone does not tell one
+# Apple Silicon generation from another, and figures from an M1 are not figures
+# from an M4: a manifest without a host makes a later comparison guess.
+host_cpu() {
+    local brand=""
+    if command -v sysctl >/dev/null 2>&1; then
+        brand=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
+    fi
+    if [ -z "$brand" ] && [ -r /proc/cpuinfo ]; then
+        brand=$(awk -F': ' '/^model name|^Hardware/ {print $2; exit}' /proc/cpuinfo)
+    fi
+    printf '%s' "${brand:-unknown}"
+}
+
 # Stamp a freshly produced profile directory so the gate can prove provenance.
 stamp_profile() {
     local dir="$1" run_id="$2" profile="$3"
-    local commit rustc target
+    local commit rustc target host
     commit=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
     rustc=$(rustc --version)
     target=$(rustc --version --verbose | awk '/^host: /{print $2}')
+    host=$(host_cpu)
 
-    python3 - "$dir" "$run_id" "$profile" "$commit" "$rustc" "$target" <<'PY'
+    python3 - "$dir" "$run_id" "$profile" "$commit" "$rustc" "$target" "$host" <<'PY'
 import json, os, sys
 
-directory, run_id, profile, commit, rustc, target = sys.argv[1:7]
+directory, run_id, profile, commit, rustc, target, host = sys.argv[1:8]
 stamped = 0
 for root, dirs, files in os.walk(directory):
     if os.path.basename(root) == "new" and "estimates.json" in files:
@@ -103,6 +118,7 @@ manifest = {
     "commit": commit,
     "rustc": rustc,
     "target": target,
+    "host": host,
     "repeats": repeats if repeats > 1 else 1,
 }
 with open(os.path.join(directory, "run-manifest.json"), "w", encoding="utf-8") as handle:

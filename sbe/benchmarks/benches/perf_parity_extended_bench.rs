@@ -31,10 +31,10 @@ use std::hint::black_box;
 use std::time::Duration;
 
 /// Sampling shared with `perf_parity_bench`. Criterion's default `Linear` mode
-/// ramps a sample to tens of milliseconds of work and the scheduler deschedules
-/// inside it; the sample absorbs the gap and one arm of a pair takes the hit.
-/// Flat mode over a short budget keeps samples under a few milliseconds. The
-/// rationale and the A/A evidence are in [`parity_criterion`] there.
+/// ramps a sample to tens of milliseconds of work; under that mode one arm of
+/// an A/A pair took long-sample spikes and the other did not. Flat mode over a
+/// short budget keeps samples under a few milliseconds. The rationale and the
+/// A/A evidence are in [`parity_criterion`] there.
 fn parity_group<'a>(
     c: &'a mut Criterion,
     name: &str,

@@ -209,6 +209,51 @@ extracted from the run's generated `tables.md` (gitignored) by
 `scripts/extract_work_counts.py`; every percentile above is over `completed`
 alone, after the warm-up cut, so `n` is smaller still.
 
+`late` there counts paced **order slots**. It is not the sender's schedule, and
+the two must never be read as one number: a point can report `late = 2` and
+39,464 late sender batches at the same time.
+
+**The sender's schedule.** Across all the traffic each sender had to send (the
+order connection and the feeds together, the first message of each due time),
+six of the run's 144 points began more than 1 % of their batches over 100 µs
+late — so the traffic the receiver measured was not the traffic the run
+planned. All six are in the interrupt family; the polling family has none.
+
+| point | batches over 100 µs late |
+|---|---|
+| `f1-irqlocal/rt-uring-spin-n4` | 39,464 (2.49 %) |
+| `f1-irqlocal/rt-uring-spin-n16` | 20,077 (1.27 %) |
+| `f2-irqcore/rt-epoll-spin-n4` | 15,966 (1.01 %) |
+| `f2-irqcore/rt-uring-spin-n4` | 25,728 (1.62 %) |
+| `f2-irqcore/rt-uring-spin-n64` | 19,334 (1.22 %) |
+| `f2-irqlocal/rt-mio-n4` | 21,888 (1.38 %) |
+
+**Effect on the claims above.** Every slipped row sits inside its family's
+unslipped range on p50 and p99, so the ranking and the shape of the curves do
+not move. Two published endpoints are set by a slipped row, so both ranges are
+given:
+
+- irqcore N=4 interrupt max `136–301` — the 136 is `f2-irqcore/rt-uring-spin-n4`
+  at 135.6 µs; the unslipped rows span **150–301**.
+- irqlocal p99 "62.1–86.5 µs at 16 and 64" — the 62.1 is
+  `f1-irqlocal/rt-uring-spin-n16`; the unslipped rows span **63.0–86.5**.
+
+The irqcore N=64 interrupt row (`39.9–40.4 / 51.9–53.9 / 143–425`) is interior
+on every column and is unchanged. Nothing here overturns a claim; the rows are
+named so a reader can drop them and see the same conclusion.
+
+**One sender stall, investigated.** Every `md-mio-c1` point shows a sender
+`late >100 µs` maximum of 36,059–40,180 µs on 0.07 % of batches; the next
+largest anywhere in the run is 197 µs. It is confined to `mio` at one
+connection across every flag combination, so it is a property of that receiver
+path, not of a setting. No latency sample saw it (`md-mio-c1`'s worst
+sender→decoded is 516 µs), so the published `md-mio-c1` latency figures stand.
+The mechanism **consistent with** the evidence — not traced: `mio`'s receiver
+loop is the run's slowest at 5,412–7,129 µs per pass (`epoll-spin` 140–390 µs),
+and a single-connection run has one socket, so a multi-ms read loop can close
+the TCP window on the only sender socket. No sender-side write-block trace was
+recorded, so the link from "mio's multi-ms loop" to "40 ms" is not measured.
+
 - **At 1 connection, NIC polling is about 2–3 µs ahead at the median**
   (36.0–37.0 against 38.8–39.3; every arm-to-arm pairing falls in 1.7–3.3 µs).
 - **At 4 they are equal.**

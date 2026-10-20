@@ -324,7 +324,7 @@ pub(crate) fn generate_message_encoder(
     // The error path is `#[cold] #[inline(never)]` so the hot path is a single
     // `cmp + ja` followed by the same body as the unchecked companion. The
     // compiler keeps the cold `Err` constructor out of the hot icache, and
-    // the branch predictor always predicts not-taken for correctly-sized buffers.
+    // a correctly-sized buffer leaves that branch not-taken on the success path.
     let needed_lit = syn::LitInt::new(&(header_size + block_length).to_string(), span);
     let cold_check = quote::quote! {
         /// Cold error constructor — never inlined into the hot path.

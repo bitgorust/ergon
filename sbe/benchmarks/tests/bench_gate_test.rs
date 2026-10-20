@@ -164,7 +164,7 @@ fn complete_manifest(run_id: &str) -> String {
 
 fn manifest_for(run_id: &str, profile: &str) -> String {
     format!(
-        r#"{{"run_id":"{run_id}","profile":"{profile}","commit":"abc","rustc":"rustc 1.0.0","target":"x86_64"}}"#
+        r#"{{"run_id":"{run_id}","profile":"{profile}","commit":"abc","rustc":"rustc 1.0.0","target":"x86_64","host":"Test CPU"}}"#
     )
 }
 
@@ -244,8 +244,8 @@ fn describe(output: &Output) -> String {
 /// runs no regression, so the key is present with no value. The gate's reader
 /// used `dict.get('slope', default)`, which returns that null rather than the
 /// default — the pair then reported "missing estimates" and one run failed
-/// thirteen of them at once. Flat sampling is how the suite keeps samples short
-/// enough that the scheduler does not deschedule inside one.
+/// thirteen of them at once. Flat sampling is how the suite keeps each sample
+/// to a few milliseconds.
 ///
 /// Criterion reports **the mean** when it has no slope, not the median:
 /// `Estimates::typical()` is `self.slope.as_ref().unwrap_or(&self.mean)`
@@ -270,9 +270,25 @@ fn write_estimate_flat(
     Ok(())
 }
 
-/// An estimate carrying a confidence interval. The A/A null band and every
-/// ratio CI are derived from these, so a fixture that has to exercise the
-/// "no established winner" rule must write them.
+/// An estimate carrying a confidence interval, at an explicit arm directory.
+/// The A/A null band and every ratio CI are derived from these, so a fixture
+/// that has to exercise the "no established winner" rule must write them.
+fn write_estimate_into(
+    dir: &Path,
+    slope: f64,
+    ci_lo: f64,
+    ci_hi: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(dir)?;
+    fs::write(
+        dir.join("estimates.json"),
+        format!(
+            r#"{{"slope":{{"point_estimate":{slope},"confidence_interval":{{"lower_bound":{ci_lo},"upper_bound":{ci_hi}}}}},"mean":{{"point_estimate":{slope},"confidence_interval":{{"lower_bound":{ci_lo},"upper_bound":{ci_hi}}}}},"median":{{"point_estimate":{slope}}}}}"#
+        ),
+    )?;
+    Ok(())
+}
+
 fn write_estimate_ci(
     root: &Path,
     group: &str,
@@ -281,15 +297,70 @@ fn write_estimate_ci(
     ci_lo: f64,
     ci_hi: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = estimate_dir(root, group, function);
-    fs::create_dir_all(&dir)?;
-    fs::write(
-        dir.join("estimates.json"),
-        format!(
-            r#"{{"slope":{{"point_estimate":{slope},"confidence_interval":{{"lower_bound":{ci_lo},"upper_bound":{ci_hi}}}}},"mean":{{"point_estimate":{slope},"confidence_interval":{{"lower_bound":{ci_lo},"upper_bound":{ci_hi}}}}},"median":{{"point_estimate":{slope}}}}}"#
-        ),
-    )?;
+    write_estimate_into(&estimate_dir(root, group, function), slope, ci_lo, ci_hi)
+}
+
+/// A raw `estimates.json` body at an explicit arm directory, for the cases a
+/// well-formed writer cannot produce: truncated JSON, a `NaN` the run never
+/// measured, a negative count.
+fn write_estimate_body(dir: &Path, body: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(dir)?;
+    fs::write(dir.join("estimates.json"), body)?;
     Ok(())
+}
+
+/// `repeats/<k>/<group>/<function>`: one arm of one independent invocation.
+fn repeat_arm(root: &Path, k: usize, group: &str, function: &str) -> PathBuf {
+    root.join("repeats")
+        .join(k.to_string())
+        .join(group)
+        .join(function)
+}
+
+/// `n` independent invocations, every maintained pair in every one of them,
+/// each arm at `slope` with the same confidence half-width `ci`.
+fn write_repeats(
+    root: &Path,
+    n: usize,
+    ergo: f64,
+    reference: f64,
+    ci: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for k in 1..=n {
+        for (group, ergo_fn, ref_fn) in PAIRS {
+            write_estimate_into(
+                &repeat_arm(root, k, group, ergo_fn),
+                ergo,
+                ergo - ci,
+                ergo + ci,
+            )?;
+            write_estimate_into(
+                &repeat_arm(root, k, group, ref_fn),
+                reference,
+                reference - ci,
+                reference + ci,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Stamp every arm directory that holds estimates, control included.
+fn stamp_everything(root: &Path, run_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn stamp_arms(dir: &Path, run_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.join("estimates.json").is_file() {
+                fs::write(path.join("run-id.txt"), run_id)?;
+            }
+            stamp_arms(&path, run_id)?;
+        }
+        Ok(())
+    }
+    stamp_arms(root, run_id)
 }
 
 /// The SBE suite's harness control: two arms running identical work. Their
@@ -556,6 +627,231 @@ fn a_pair_below_its_ceiling_is_not_made_inconclusive_by_a_wide_aa_band()
         "the gate must report the ratio as resolved:\n{}",
         describe(&output)
     );
+    Ok(())
+}
+
+// ── Uncertainty is not a shrug ─────────────────────────────────────────────
+//
+// "Inconclusive" is the harness saying it cannot separate two arms at its own
+// resolution. It is only that when a **measured** A/A null band reaches as far
+// as the pair. An over-ceiling pair the measurement simply cannot resolve —
+// a wide interval, no control, a foreign control — is unproven, and unproven
+// is not a pass.
+
+#[test]
+fn an_over_ceiling_pair_with_a_wide_interval_and_no_control_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    // A 2x ratio whose interval is so wide it straddles the ceiling. With no
+    // control there is no band to excuse it, so nothing establishes the
+    // ceiling was met — and a 2x point estimate is not "no winner".
+    let criterion = TempCriterion::new()?;
+    for (group, ergo, reference) in PAIRS {
+        write_estimate_ci(&criterion.0, group, ergo, 200.0, 50.0, 400.0)?;
+        write_estimate_ci(&criterion.0, group, reference, 100.0, 90.0, 110.0)?;
+    }
+
+    let output = run_gate(&criterion.0, &[])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a 2x ratio with a wide interval and no A/A control must fail — the ceiling \
+         is not demonstrated:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("A/A null not measured"),
+        "the gate must say the null was not measured:\n{}",
+        describe(&output)
+    );
+    assert!(
+        !stdout.contains("inconclusive"),
+        "an unproven pair must not be reported as inconclusive:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn an_over_ceiling_pair_inside_a_measured_band_establishes_no_winner()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The one case that is legitimately inconclusive: the measured harness
+    // noise for this loop really reaches as far as the pair, so identical code
+    // would look the same.
+    let criterion = TempCriterion::new()?;
+    write_sbe_aa_control(&criterion.0, (100.0, 50.0, 200.0), (100.0, 50.0, 200.0))?;
+    for (group, ergo, reference) in PAIRS {
+        write_estimate_ci(&criterion.0, group, ergo, 200.0, 50.0, 400.0)?;
+        write_estimate_ci(&criterion.0, group, reference, 100.0, 90.0, 110.0)?;
+    }
+
+    let output = run_gate(&criterion.0, &[])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a pair the measured A/A null band reaches is inconclusive, not a breach:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("no winner"),
+        "the gate must say no winner is established:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("inside A/A null band"),
+        "the gate must show the pair was graded against a measured band:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_foreign_control_cannot_excuse_a_breach() -> Result<(), Box<dyn std::error::Error>> {
+    // The control is evidence like any other. A band read off estimates this
+    // run did not produce would turn any regression into "harness noise".
+    // The pairs are this run's; only the control is foreign.
+    let criterion = TempCriterion::new()?;
+    write_sbe_aa_control(&criterion.0, (100.0, 50.0, 200.0), (100.0, 50.0, 200.0))?;
+    for (group, ergo, reference) in PAIRS {
+        write_estimate_ci(&criterion.0, group, ergo, 200.0, 50.0, 400.0)?;
+        write_estimate_ci(&criterion.0, group, reference, 100.0, 90.0, 110.0)?;
+    }
+    write_manifest(&criterion.0, &complete_manifest(RUN_ID))?;
+    for (group, ergo_fn, ref_fn) in PAIRS {
+        for function in [ergo_fn, ref_fn] {
+            fs::write(
+                estimate_dir(&criterion.0, group, function).join("run-id.txt"),
+                RUN_ID,
+            )?;
+        }
+    }
+    for function in ["arm_a", "arm_b"] {
+        fs::write(
+            estimate_dir(&criterion.0, SBE_AA_GROUP, function).join("run-id.txt"),
+            "foreign",
+        )?;
+    }
+
+    let output = run_gate(&criterion.0, &["--run-id", RUN_ID])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a control from another run must not excuse a 2x ratio:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("mixed-run") || stdout.contains("run id"),
+        "the gate must name the provenance failure:\n{}",
+        describe(&output)
+    );
+    assert!(
+        !stdout.contains("inconclusive"),
+        "a foreign band must not be reported as inconclusive:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+// ── Repetition completeness ────────────────────────────────────────────────
+//
+// The envelope is only the envelope of the run if every declared invocation is
+// in it. A pair graded on a subset of the invocations claims a resolution the
+// run does not have.
+
+#[test]
+fn a_malformed_repetition_is_refused_not_dropped() -> Result<(), Box<dyn std::error::Error>> {
+    // Valid first and third invocations, truncated JSON in the second of **both**
+    // arms of one pair. Reading only what parses grades that pair on two of the
+    // three invocations the run declared — and two identical arms look like a
+    // clean pass. The gate must refuse the pair and name the invocation.
+    let criterion = TempCriterion::new()?;
+    write_repeats(&criterion.0, 3, 1.0, 1.0, 0.001)?;
+    for function in ["ergo-sbe", "sbe-tool"] {
+        write_estimate_body(
+            &repeat_arm(&criterion.0, 2, "parity_decode_scalar", function),
+            r#"{"slope":{"point_estimate":1.0,"confidence_inter"#,
+        )?;
+    }
+    write_manifest(&criterion.0, &manifest_with_repeats(RUN_ID, "no-lto", 3))?;
+    stamp_everything(&criterion.0, RUN_ID)?;
+
+    let output = run_gate(&criterion.0, &["--run-id", RUN_ID])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a malformed repetition must fail the pair, not vanish:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("malformed")
+            || stdout.contains("unreadable")
+            || stdout.contains("repetition"),
+        "the gate must name the unreadable invocation:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_pair_missing_one_declared_repetition_is_incomplete_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Three invocations declared, both arms of one pair absent from the
+    // second. Every other pair is complete, so the run-level count still
+    // reads 3 — but this pair has 2, and grading it on 2 while the run claims
+    // 3 is exactly the thinner envelope that overstates resolution.
+    let criterion = TempCriterion::new()?;
+    write_repeats(&criterion.0, 3, 1.0, 1.0, 0.001)?;
+    for (group, ergo_fn, ref_fn) in PAIRS {
+        if *group == "parity_decode_scalar" {
+            let _ = fs::remove_dir_all(repeat_arm(&criterion.0, 2, group, ergo_fn));
+            let _ = fs::remove_dir_all(repeat_arm(&criterion.0, 2, group, ref_fn));
+        }
+    }
+    write_manifest(&criterion.0, &manifest_with_repeats(RUN_ID, "no-lto", 3))?;
+    stamp_everything(&criterion.0, RUN_ID)?;
+
+    let output = run_gate(&criterion.0, &["--run-id", RUN_ID])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a pair graded on fewer invocations than the run declared must fail:\n{}",
+        describe(&output)
+    );
+    assert!(
+        stdout.contains("incomplete evidence") || stdout.contains("repetition"),
+        "the gate must name the missing invocation:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_non_finite_or_non_positive_estimate_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    // `NaN` and a negative estimate are not measurements. Python's JSON reader
+    // accepts both, and a reader that trusts them grades a ratio on them.
+    for body in [
+        r#"{"slope":{"point_estimate":NaN},"mean":{"point_estimate":NaN}}"#,
+        r#"{"slope":{"point_estimate":-1.0},"mean":{"point_estimate":-1.0}}"#,
+        r#"{"slope":{"point_estimate":0.0},"mean":{"point_estimate":0.0}}"#,
+    ] {
+        let criterion = TempCriterion::new()?;
+        for (group, ergo, reference) in PAIRS {
+            write_estimate_ci(&criterion.0, group, ergo, 1.0, 1.0, 1.0)?;
+            write_estimate_ci(&criterion.0, group, reference, 1.0, 1.0, 1.0)?;
+        }
+        write_estimate_body(
+            &estimate_dir(&criterion.0, "parity_decode_scalar", "ergo-sbe"),
+            body,
+        )?;
+        write_manifest(&criterion.0, &complete_manifest(RUN_ID))?;
+        stamp_everything(&criterion.0, RUN_ID)?;
+
+        let output = run_gate(&criterion.0, &["--run-id", RUN_ID])?;
+        assert!(
+            !output.status.success(),
+            "an estimate of {body} is not a measurement and must fail:\n{}",
+            describe(&output)
+        );
+    }
     Ok(())
 }
 
@@ -858,6 +1154,57 @@ fn a_missing_pair_fails_rather_than_silently_passing() -> Result<(), Box<dyn std
     assert!(
         !output.status.success(),
         "an absent maintained scenario must fail, never be skipped:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_manifest_without_the_host_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    // `target` is `aarch64-apple-darwin` on an M1 and on an M4. Figures taken
+    // on one are not figures from the other, so a manifest that cannot say
+    // which machine produced them cannot support a comparison.
+    let criterion = TempCriterion::new()?;
+    write_all_pairs(&criterion.0, 100.0, 100.0)?;
+    stamp_run_ids(&criterion.0, RUN_ID)?;
+    write_manifest(
+        &criterion.0,
+        &format!(
+            r#"{{"run_id":"{RUN_ID}","profile":"no-lto","commit":"abc","rustc":"rustc 1.0.0","target":"aarch64-apple-darwin"}}"#
+        ),
+    )?;
+
+    let output = run_gate(&criterion.0, &["--run-id", RUN_ID])?;
+    assert!(
+        !output.status.success(),
+        "a manifest that cannot say which machine produced the numbers must be refused:\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("host"),
+        "the refusal must name the missing host:\n{}",
+        describe(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn the_provenance_line_names_the_host() -> Result<(), Box<dyn std::error::Error>> {
+    let criterion = TempCriterion::new()?;
+    write_all_pairs(&criterion.0, 100.0, 100.0)?;
+    stamp_run_ids(&criterion.0, RUN_ID)?;
+    write_manifest(&criterion.0, &complete_manifest(RUN_ID))?;
+
+    let output = run_gate(&criterion.0, &["--run-id", RUN_ID])?;
+    assert!(
+        output.status.success(),
+        "correctly stamped results must pass:\n{}",
+        describe(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("host Test CPU"),
+        "the gate must print the machine the numbers came from, so a reader can \
+         tell an M1 run from an M4 one:\n{}",
         describe(&output)
     );
     Ok(())
@@ -1330,7 +1677,7 @@ fn write_cluster_stable_repeats(
 
 fn manifest_with_repeats(run_id: &str, profile: &str, repeats: usize) -> String {
     format!(
-        r#"{{"run_id":"{run_id}","profile":"{profile}","commit":"abc","rustc":"rustc 1.0.0","target":"x86_64","repeats":{repeats}}}"#
+        r#"{{"run_id":"{run_id}","profile":"{profile}","commit":"abc","rustc":"rustc 1.0.0","target":"x86_64","host":"Test CPU","repeats":{repeats}}}"#
     )
 }
 

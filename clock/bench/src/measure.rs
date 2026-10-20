@@ -432,7 +432,10 @@ mod tests {
         for v in &mut values {
             *v = read();
         }
-        let whole = values.len() / page_u64s;
+        // Pages wholly inside the buffer: a `Vec` is only element-aligned,
+        // so this is `length / page_size` or one less where the allocation
+        // straddles a page boundary. Not the naive length count.
+        let whole = sys::pages_wholly_inside(&values);
         assert_eq!(
             sys::pages_resident(&values),
             whole,
@@ -446,16 +449,23 @@ mod tests {
         while i < values.len() {
             values[i] = read();
             let tail = &values[i + 1..];
-            let want = tail.len() / page_u64s;
+            let want = sys::pages_wholly_inside(tail);
             if want > 0 && sys::pages_resident(tail) < want {
                 cold += 1;
             }
             i += page_u64s * 256;
         }
         assert_eq!(cold, 0, "{cold} stretches of the pass ran over a cold page");
-        // And what deltas itself records around its timed pass.
+        // And what deltas itself records around its timed pass. Its buffer
+        // is the same length and fully touched by its own warm-up, so both
+        // ends show every page it can see: `whole`, or one fewer where its
+        // allocation is not page-aligned.
         let d = deltas(&read, 1.0, 8 << 20);
-        assert_eq!(d.resident, (whole, whole), "{d:?}");
+        assert_eq!(d.resident.0, d.resident.1, "{d:?}");
+        assert!(
+            d.resident.0 == whole || d.resident.0 + 1 == whole,
+            "{d:?} vs wholly-inside {whole}"
+        );
         // A cross-check where the counter is the calling thread's. Darwin
         // has no RUSAGE_THREAD, so there the delta is the whole process's
         // and asserting it would be asserting something else entirely.

@@ -405,8 +405,7 @@ fn bench_decode_scalar(c: &mut Criterion) {
     // Keep the 1024 field loads in the loop. A single `black_box` outside lets
     // LLVM rewrite the batch as `(serial_number + model_year) << 10`. Opaque
     // the decoder *inside* the batch (decode_array's shape) instead drowns
-    // the getter under 1024 pointer store/reloads — LTO then ties (~1.004)
-    // because sbe-tool's never-taken bounds checks hide in that traffic.
+    // the getter under 1024 pointer store/reloads — LTO then ties (~1.004).
     // Empty asm is a memory clobber without that extra stack round-trip.
     // First arm in a group pays a position penalty (same class as encode/scalar
     // `warmup_body_only`). Throwaway; the gate matches `ergo-sbe` / `sbe-tool`.
@@ -1472,26 +1471,24 @@ fn bench_wire_parity_encode_full_message(c: &mut Criterion) {
 /// Sampling for the parity suite.
 ///
 /// Criterion's default `Linear` mode ramps each sample up to tens of
-/// milliseconds of work. On a general-purpose host the scheduler deschedules a
-/// normal-priority process inside a sample that long, and the sample absorbs
-/// the gap. Measured on `parity/control/aa_encode_throughput` — two
+/// milliseconds of work. Measured on `parity/control/aa_encode_throughput` — two
 /// textually identical arms — with the default mode: per-sample work ramped to
 /// 10,900 iterations (about 95 ms) and the per-iteration cost drifted from
 /// 8,440 ns to 8,650 ns as the sample lengthened, with spikes to 12,172 and
-/// 18,318 ns where the process was descheduled. One arm took those spikes in
-/// a given run and the other did not, so the same code measured 12.5 % CV
-/// against 1.6 % and the A/A "null band" came out [1.0418, 1.1201] — a noise
-/// band, not a null. Re-running the same binary twice moved the noise to the
-/// other arm, which rules out arm order and arm identity as the cause.
+/// 18,318 ns. One arm took those spikes in a given run and the other did not, so
+/// the same code measured 12.5 % CV against 1.6 % and the A/A "null band" came
+/// out [1.0418, 1.1201] — a noise band, not a null. Re-running the same binary
+/// twice moved the spikes to the other arm. The cause of the spikes is not
+/// measured; a sample that absorbs one is not comparable with a clean one.
 ///
 /// Flat mode with a short measurement budget keeps every sample under a few
-/// milliseconds, where descheduling is rare. Both arms then land on the same
-/// clean cost. Ceilings are unchanged; this only makes the ratio mean what it
-/// claims.
+/// milliseconds. Both arms then land on the same clean cost. Ceilings are
+/// unchanged; this only makes the ratio mean what it claims.
 ///
 /// `sampling_mode` lives on `BenchmarkGroup`, not on `Criterion`, so
 /// [`parity_group`] applies it. The budget and sample count are set here and
-/// bound how long any sample can be, which is what keeps the scheduler out.
+/// bound how long any sample can be. That is why the samples are short; a
+/// short sample is still not immune to a stall.
 fn parity_criterion() -> Criterion {
     Criterion::default()
         .measurement_time(Duration::from_millis(500))

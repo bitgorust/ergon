@@ -7,10 +7,21 @@ run_id="${3:?run_id}"
 commit="${4:?commit}"
 rustc_v="${5:?rustc}"
 target="${6:?target}"
-python3 - "$dir" "$run_id" "$profile" "$commit" "$rustc_v" "$target" <<'PY'
+# The machine the numbers were taken on. `target` alone does not tell one Apple
+# Silicon generation from another, and figures from an M1 are not figures from
+# an M4: a manifest without a host makes a later comparison guess.
+host=""
+if command -v sysctl >/dev/null 2>&1; then
+    host=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
+fi
+if [ -z "$host" ] && [ -r /proc/cpuinfo ]; then
+    host=$(awk -F': ' '/^model name|^Hardware/ {print $2; exit}' /proc/cpuinfo)
+fi
+host="${host:-unknown}"
+python3 - "$dir" "$run_id" "$profile" "$commit" "$rustc_v" "$target" "$host" <<'PY'
 import json, os, sys
 
-directory, run_id, profile, commit, rustc, target = sys.argv[1:7]
+directory, run_id, profile, commit, rustc, target, host = sys.argv[1:8]
 stamped = 0
 for root, dirs, files in os.walk(directory):
     if os.path.basename(root) == "new" and "estimates.json" in files:
@@ -45,6 +56,7 @@ manifest = {
     "commit": commit,
     "rustc": rustc,
     "target": target,
+    "host": host,
     "estimates": stamped,
     "repeats": repeats if repeats > 1 else 1,
 }

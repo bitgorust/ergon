@@ -46,11 +46,10 @@ use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_
 mod reference_sbe;
 
 /// Sampling shared with the SBE parity suite. Criterion's default `Linear` mode
-/// ramps a sample to tens of milliseconds of work and the scheduler deschedules
-/// inside it; the sample absorbs the gap and one arm of a pair takes the hit.
-/// Flat mode over a short budget keeps samples under a few milliseconds. The
-/// rationale and the A/A evidence are in `perf_parity_bench`'s
-/// `parity_criterion`.
+/// ramps a sample to tens of milliseconds of work; under that mode one arm of
+/// an A/A pair took long-sample spikes and the other did not. Flat mode over a
+/// short budget keeps samples under a few milliseconds. The rationale and the
+/// A/A evidence are in `perf_parity_bench`'s `parity_criterion`.
 fn parity_group<'a>(
     c: &'a mut Criterion,
     name: &str,
@@ -332,8 +331,8 @@ fn bench_encode_keep_alive_ergo(c: &mut Criterion) {
 /// slice helper, same alignment, same opaque values. The only thing that
 /// differs between them is what differs between a real pair's arms minus the
 /// codec, so their ratio is the harness's own null distribution: any deviation
-/// from 1.0 is placement, branch-predictor or timing sensitivity, not codec
-/// work.
+/// from 1.0 is not codec work. Which harness or host effect produces that
+/// deviation is not measured.
 ///
 /// Read it beside every maintained pair. A real pair whose ratio falls inside
 /// this band has **no established winner** — inconclusive, not an ergon loss
