@@ -96,4 +96,4 @@ and `<name>_as_str(|text| ..)`, which return `DecodeError`.
 
 The generated staged walk advances once through dynamic tails. Random-access
 getters used before that walk, including counts or lengths for later tails,
-can add scans. See [Keeping the walk single-pass](../feature-tour/decode-stages.md#keeping-the-walk-single-pass).
+can add scans. See [Asking before walking](../feature-tour/decode-stages.md#asking-before-walking).

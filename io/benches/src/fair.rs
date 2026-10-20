@@ -18,7 +18,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::matrix::{Run, Tag};
-use crate::stats::{Summary, us};
+use crate::stats::{Summary, WORK_HEADER, us, work_row};
 
 /// The backends in report order: interrupt-driven, then polling.
 pub const BACKENDS: [&str; 6] = [
@@ -134,9 +134,43 @@ fn cells(s: &Summary) -> String {
     )
 }
 
+/// The work behind one comparison, beside it: a backend row's percentiles are
+/// over `completed` alone and drop the warm-up, so `n` is not the run's work.
+/// Every run in the comparison gets a row; one recorded before the counts were
+/// is "not yet measured" in every column, never zeros.
+fn work_beside(out: &mut String, rows: &[(usize, u32, String, &str, &Run)]) {
+    if rows.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "### Work behind the comparison\n\n\
+         Every percentile above is over `completed` alone, and the tables drop the warm-up, so `n` is \
+         smaller still. `censored` is the issued work they leave out. `scheduled − issued` is work the \
+         schedule called for that never went out (early termination, or a schedule that outran the \
+         client). `rejected` is send attempts the transport refused: capacity exhaustion. `not yet \
+         measured` is a count this run did not record, never a zero.\n\n\
+         {WORK_HEADER}"
+    );
+    let unmeasured = "not yet measured | ".repeat(6);
+    for (_, _, _, name, r) in rows {
+        let label = format!("`{name}`");
+        match r.work {
+            Some(w) => {
+                let _ = writeln!(out, "{}", work_row(&label, &w));
+            }
+            None => {
+                let _ = writeln!(out, "| {label} | {unmeasured}");
+            }
+        }
+    }
+    let _ = writeln!(out);
+}
+
 /// Every point of a kind: (condition, connections, rate) → rows of
-/// (backend, round, run).
-type Groups<'a> = BTreeMap<((u8, String), u32, Option<i64>), Vec<(usize, u32, String, &'a Run)>>;
+/// (backend order, round, backend, run name, run).
+type Groups<'a> =
+    BTreeMap<((u8, String), u32, Option<i64>), Vec<(usize, u32, String, &'a str, &'a Run)>>;
 
 fn groups<'a>(tags: &'a [Tag], kind: Kind) -> Groups<'a> {
     let mut g: Groups<'a> = BTreeMap::new();
@@ -156,7 +190,7 @@ fn groups<'a>(tags: &'a [Tag], kind: Kind) -> Groups<'a> {
             let (o, c) = cond_order(cond);
             g.entry(((o, c.to_owned()), p.conns, p.rate))
                 .or_default()
-                .push((order, round, p.backend, run));
+                .push((order, round, p.backend, name.as_str(), run));
         }
     }
     for rows in g.values_mut() {
@@ -298,7 +332,7 @@ fn market_data(out: &mut String, tags: &[Tag]) {
             conns_text(Kind::Md, *n),
             rate_text(*rate)
         );
-        for (_, round, b, run) in rows {
+        for (_, round, b, _, run) in rows {
             let Some(s) = run.one_way.as_ref() else {
                 continue;
             };
@@ -311,6 +345,7 @@ fn market_data(out: &mut String, tags: &[Tag]) {
             );
         }
         let _ = writeln!(out);
+        work_beside(out, rows);
     }
     let _ = writeln!(
         out,
@@ -323,7 +358,7 @@ fn market_data(out: &mut String, tags: &[Tag]) {
         for (((_, cond), n, _), rows) in &g {
             let rows: Vec<_> = rows
                 .iter()
-                .filter(|(_, _, b, r)| family(b) == fam && r.latency.is_some())
+                .filter(|(_, _, b, _, r)| family(b) == fam && r.latency.is_some())
                 .collect();
             if rows.is_empty() {
                 continue;
@@ -333,7 +368,7 @@ fn market_data(out: &mut String, tags: &[Tag]) {
                 "### {fam} backends, {cond}, {}\n\n| backend | round | n | p50 | p99 | p99.9 | max |\n|---|---|---|---|---|---|---|",
                 conns_text(Kind::Md, *n)
             );
-            for (_, round, b, run) in rows {
+            for (_, round, b, _, run) in rows {
                 if let Some(s) = run.latency.as_ref() {
                     let _ = writeln!(out, "| `{b}` | {round} | {} |", cells(s));
                 }
@@ -371,7 +406,7 @@ fn round_trips(out: &mut String, tags: &[Tag], kind: Kind) {
             conns_text(kind, *n),
             rate_text(*rate)
         );
-        for (_, round, b, run) in rows {
+        for (_, round, b, _, run) in rows {
             let Some(s) = run.latency.as_ref() else {
                 continue;
             };
@@ -387,5 +422,6 @@ fn round_trips(out: &mut String, tags: &[Tag], kind: Kind) {
             );
         }
         let _ = writeln!(out);
+        work_beside(out, rows);
     }
 }

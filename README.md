@@ -97,10 +97,12 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p ergo-aeron-cluster --no-deps
 runs the Java Cluster lifecycle/recovery lane and the HA sample. Use
 `just test-all` to add Miri and deterministic fuzz replay.
 
-Pull-request CI also enforces the non-decreasing coverage baseline and executes
-32-bit x86 plus big-endian s390x codec tests. Scheduled lanes run every fuzz
-target for ten minutes, Miri fixtures nightly, and critical-path mutation
-testing weekly. Missing or empty results fail closed.
+Pull-request CI also enforces the non-decreasing coverage baseline and runs the
+LE/BE/nested fixture crate as ordinary tests. A weekly schedule (Sundays) runs
+every fuzz target for ten minutes and the same fixtures under Miri. Mutation
+testing is manual (`just check-mutation`); CI enforces only its configuration.
+Missing or empty results fail closed. 32-bit x86 and big-endian s390x codec
+tests are not run in CI.
 
 See [`samples/README.md`](samples/README.md) for standalone sample commands and
 Java harness requirements. Run `just --list` for the repository's available

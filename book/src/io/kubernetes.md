@@ -89,9 +89,13 @@ warning thread take the other. Nothing to configure.
 {{#include ../../../io/tests/placement_book.rs:x86_two_cpus}}
 ```
 
-What a busy sibling costs: a little at p50 against a CPU of its own, more
-at p99. On a `cpu: 2` x86 pod the sibling was still ahead of the other
-one-core polling backends at 100 connections. Tables:
+What a busy sibling costs against a core of its own (arrival → decoded,
+run `flags-aws-20261015T122127Z`, three rounds, AWS Tokyo `c7i.2xlarge`):
+about **+0.5 µs p50 at 1 connection, +2.3–2.7 µs p50 and +9–12 µs p99 at
+10–100 connections**. At 100 connections it still beat every single-vCPU
+option by about 8 µs at the median. The maxima are not in that summary —
+the full tables with them are in git history at `2517309d`. Deltas only:
+no absolute latency figure is claimed here. Tables:
 [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md#smt-sibling-cost).
 
 - It needs both hyperthreads and nothing else on the sibling.

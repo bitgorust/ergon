@@ -10,17 +10,17 @@ name = "io_bench"
 
 [dependencies]
 ergon-io = { path = "..", features = ["webpki-roots"] }
-rustls = { version = "0.23.45", default-features = false, features = ["std", "ring"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring"] }
 ring = "0.17"
 libc = "0.2"
 rcgen = "0.14"
 httparse = "1.10"
 # Results are compressed on the VM before they are copied back.
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 # mio_bench: the baseline written the usual way (mio + rustls's buffered API).
 mio = { version = "1", features = ["os-poll", "net"] }
 curl = { version = "0.4.51", optional = true, default-features = false, features = ["ssl"] }
-reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls"] }
 tokio = { version = "1", optional = true, features = ["rt", "time", "macros"] }
 aws-lc-rs = { version = "1.18", optional = true }
 openssl = { version = "0.10", optional = true }

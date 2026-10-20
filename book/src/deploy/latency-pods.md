@@ -9,8 +9,10 @@ numbers are in [Benchmarks](benchmarks.md).
 4 KiB page faults, to cgroup wake-ups on its own core, to io_uring being
 blocked by the default seccomp profile, to an exec probe resetting its
 CPU affinity, and to deep C-states. Five small grants remove each of
-those. A sixth thing people ask for — `SCHED_FIFO` — is deliberately not
-built, because it was measured to make things worse.
+those. A sixth thing people ask for — `SCHED_FIFO` — is built in the
+shared-cpus plugin and left off by default, because it was measured to
+give no gain on an isolated CPU on AWS. This page's own admission policy
+never takes a scheduler policy.
 
 Status: experimental and unpublished. The five extensions are covered by
 a kind e2e (one check per extension). Their latency effect is **not yet
@@ -110,10 +112,11 @@ reads every write back; a write that does not stick fails the create.
 
 ### 3. io_uring
 
-`RuntimeDefault` blocks io_uring (containerd issue 9320). Aeron's
-conductor uses it. The grant is a clone of the pod's own seccomp profile
-with the `io_uring_*` calls allowed — never `Unconfined`, which the
-plugin refuses.
+`RuntimeDefault` blocks io_uring (containerd issue 9320). Aeron's C media
+driver does **not** use io_uring; the grant is for applications that do,
+such as ergon-io's `uring-spin` and `uring-sqpoll` backends. It is a clone
+of the pod's own seccomp profile with the `io_uring_*` calls allowed —
+never `Unconfined`, which the plugin refuses.
 
 ### 4. Admission
 
@@ -138,17 +141,32 @@ The NIC's PHC (`/dev/ptp*`) for clock work, and on x86
 from idle; a C1 cap cut the idle **max** hard. Graviton (c8g) has no
 `cpu_dma_latency` node, so that grant is x86 only.
 
+## Real-time scheduling: built, default off
+
+`SCHED_FIFO` is **not** part of the five grants. It is in
+`k8s/nri-shared-cpus`, off unless a node turns it on:
+
+| path | what it does | default |
+|---|---|---|
+| `ergon-cpus --fifo <prio>` | the exec wrapper takes `SCHED_FIFO` on the thread before it execs the command | off (no flag) |
+| `sched-fifo.ergon.io/<container>: "thread"` | the NRI plugin grants `RLIMIT_RTPRIO` and `ERGON_SCHED_FIFO`; the app or `prelock` takes the policy on the hot thread only | `schedFifo: "off"` — the node refuses the annotation |
+
+Why it is off: no gain on an isolated CPU on AWS ([data](../io/overview.md));
+the RT throttle and RT group scheduling bite it. The one A/B that measured
+it is directional only (a sleeping sender inflated it), so the "no gain"
+direction is what `ergon-tune` T7 checks.
+
 ## Deliberately not built
 
 | item | why |
 |---|---|
-| `SCHED_FIFO`, any `sched_setscheduler`, a `--fifo` wrapper | no gain on an isolated CPU on AWS ([data](../io/overview.md)); the RT throttle and RT group scheduling bite it |
 | SR-IOV VF per pod | Nitro guests have one ENA per ENI; there are no in-guest VFs |
 | a netns-sysctl writer pretending the knobs are per-netns | `busy_poll`/`busy_read` are global; `gro_flush_timeout` and `napi_defer_hard_irqs` are per-netdev sysfs; `rmem_max` is not writable in a non-init netns. The node sets them (`node-checks.md`) |
 | an IRQ DaemonSet that pins the latency pod's NIC IRQs to the **shared** CPUs | our Graviton data: IRQs on a busy housekeeping CPU cost the tail and lose frames. The kept-CPU default stays |
 
-`RTPRIO` is granted as a **limit only**. The plugin never changes a
-scheduler policy, and the e2e asserts PID 1 stays `SCHED_OTHER`.
+`RTPRIO` is granted as a **limit only** on the latency-pods path. That
+plugin never changes a scheduler policy, and the e2e asserts PID 1 stays
+`SCHED_OTHER` and `ERGON_SCHED_FIFO` is empty.
 
 ## Node setup
 

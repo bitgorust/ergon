@@ -1,7 +1,9 @@
 # ergon-tune
 
 ergon-tune checks a Linux host's low-latency settings. Each finding says what
-is wrong, what it cost in this repository's measurements, and the exact fix.
+is wrong, what it cost in this repository's measurements where measured
+(unmeasured checks say so and cite Aeron's, the kernel's or the vendor's
+documentation), and the exact fix.
 It changes nothing. ergon-io and the ergon-md-dpdk media driver run the checks
 for you ([where](#where-the-checks-run)).
 
@@ -126,7 +128,7 @@ numbers. T1 with the loop on CPU 2 of 8:
 
 ## Measured effect
 
-One A/B per check, with its max, lives in
+One A/B per measured check, with its max, lives in
 [`md-dpdk/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)
 and
 [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md).
@@ -262,7 +264,7 @@ too.
   moderation back on. Re-pin from a link-event hook.
 - **N1 with busy polling: turn off only adaptive moderation.** Zeroing
   `rx-usecs` as well made it worse
-  ([AWS round 2](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-c7i2xlarge-2026-10-14)).
+  ([AWS round 2](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#recommended-configuration)).
 - **N1 without busy polling:** all moderation off helped plain kernel UDP,
   but give the NIC's interrupts a core of their own: on the housekeeping CPU
   its tail blew up under load.

@@ -259,6 +259,41 @@ fn composite_decode_streams_equal_fields_from_equal_message_offsets()
 }
 
 #[test]
+fn entry_point_wrap_pairs_zero_check_wraps_with_the_extent_proved_untimed()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Equal work, per the keep-alive rule. sbe-tool's `wrap` only stores
+    // buffer/offset/block-length/version; ergon's bare `wrap` proves the
+    // version-aware fixed extent on every call. Timing the validating
+    // constructor against the unvalidating one charges ergon for a bounds
+    // proof its reference never performs, so the timed region must use the
+    // unchecked constructor — with the extent proven once, outside the
+    // measurement.
+    let source = get_source(PERF_PARITY, "bench_decode_entry_point")?;
+    let ergo = timed_arm_body(source, "ergo-sbe_wrap").ok_or("missing Ergo entry-point arm")?;
+    let tool = timed_arm_body(source, "sbe-tool_wrap").ok_or("missing sbe-tool entry-point arm")?;
+
+    assert!(
+        source.contains("assert_baseline_wrap_extent(BASELINE, 0, bl_e, ver_e)"),
+        "entry-point decode must prove the baseline extent in an untimed preflight"
+    );
+    assert!(
+        ergo.contains("CarDecoder::wrap_unchecked(black_box(BASELINE), 0, bl_e, ver_e)"),
+        "Ergo entry-point arm must use the unchecked constructor that matches \
+         sbe-tool's zero-check wrap"
+    );
+    assert!(
+        !strip_line_comments(ergo).contains("CarDecoder::wrap("),
+        "a validating wrap in the timed region would not be equal work"
+    );
+    assert!(
+        tool.contains("sbe_tool_car_body_decoder(black_box(BASELINE), 0, bl, ver)"),
+        "sbe-tool entry-point arm must wrap the same baseline"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn decode_scalar_clobber_is_symmetric_across_arms() -> Result<(), Box<dyn std::error::Error>> {
     // decode_scalar opaques the decoder *inside* the micro-batch loop (a
     // per-iteration memory clobber) rather than once outside it, so the
@@ -624,6 +659,127 @@ fn encode_parity_arms_do_not_mix_header_writes() -> Result<(), Box<dyn std::erro
             "{fn_name}: mixed header work — {ergo_label} header={ergo_hdr}, \
              {tool_label} header={tool_hdr}. Both arms must write the MessageHeader \
              or both must skip it."
+        );
+    }
+    Ok(())
+}
+
+/// Timed encode arms must not re-prove the buffer extent every iteration.
+///
+/// `buf[off..off + slot]` is a safe slice index, so rustc emits a bounds check
+/// on every iteration — and it does not fuse the overflow check identically in
+/// the two arms. On aarch64 (2026-10-20) it compiled the sbe-tool arm's check
+/// as `adds`+`b.hs` and the ergon arm's as `add`+`cmp`+`b.lo`: one extra
+/// instruction per iteration, which measured as a 4.6% wall-clock gap on
+/// `cluster_encode_session_keep_alive` even though the two hot loops are
+/// instruction-identical once the check is excluded. That is harness work, not
+/// codec work, and it must not be asymmetric. The extent is proved by the
+/// allocation (`BATCH_SIZE * slot`) and the parity assert in the gated
+/// function; both arms index through `slot_slice`, which does not check.
+#[test]
+fn encode_arms_index_the_buffer_without_a_per_iteration_bounds_check()
+-> Result<(), Box<dyn std::error::Error>> {
+    // (source, function, ergo_label, tool_label)
+    let pairs: &[(&str, &str, &str, &str)] = &[
+        (
+            CLUSTER_CODEC,
+            "bench_encode_msg_header_ergo",
+            "ergo-sbe",
+            "sbe-tool",
+        ),
+        (
+            CLUSTER_CODEC,
+            "bench_encode_keep_alive_ergo",
+            "ergo-sbe",
+            "sbe-tool",
+        ),
+        (
+            CLUSTER_CODEC,
+            "bench_claim_shaped_write",
+            "ergo-sbe",
+            "sbe-tool",
+        ),
+        (
+            PERF_PARITY,
+            "bench_encode_throughput",
+            "ergo-sbe",
+            "sbe-tool",
+        ),
+    ];
+
+    for (source, fn_name, ergo_label, tool_label) in pairs {
+        let fn_src =
+            function_source(source, fn_name).ok_or_else(|| format!("{fn_name}: not found"))?;
+        for (label, arm_label) in [("ergo", ergo_label), ("sbe-tool", tool_label)] {
+            let arm = timed_arm_body(fn_src, arm_label)
+                .ok_or_else(|| format!("{fn_name}/{arm_label}: timed arm not found"))?;
+            let code = strip_line_comments(arm);
+            for (bad, why) in [
+                (
+                    "buf[off",
+                    "a safe `buf[off..` index re-proves the buffer extent every iteration",
+                ),
+                (
+                    "slot[",
+                    "a safe `slot[..` / `slot[..]` index re-proves the buffer extent every iteration",
+                ),
+            ] {
+                assert!(
+                    !code.contains(bad),
+                    "{fn_name}/{label} {why}. That bounds check is unequal work between \
+                     the arms (rustc does not fuse it the same way twice), so the ratio \
+                     would measure the harness. Index through `slot_slice` instead — the \
+                     extent is proved once, outside the timed region."
+                );
+            }
+            assert!(
+                code.contains("slot_slice("),
+                "{fn_name}/{label} must index the buffer through `slot_slice`, which \
+                 both arms share so the timed loops retire the same instructions"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A/A controls must run identical work in both arms.
+///
+/// An A/A control is the harness's null distribution: two arms running the same
+/// codec so their ratio measures placement and timing sensitivity rather than
+/// codec work. If the arms differ in any way, the control stops being a null
+/// and starts measuring whatever the difference is — which would let a real
+/// ceiling breach be dismissed as "noise". Compare the arms after stripping
+/// comments, whitespace and the arm label itself; nothing else may differ.
+#[test]
+fn aa_control_arms_run_identical_work() -> Result<(), Box<dyn std::error::Error>> {
+    // (source, function)
+    let controls: &[(&str, &str)] = &[
+        (CLUSTER_CODEC, "bench_aa_control_keep_alive"),
+        (CLUSTER_CODEC, "bench_aa_control_claim_shaped"),
+        (PERF_PARITY, "bench_aa_control_encode_throughput"),
+    ];
+
+    for (source, fn_name) in controls {
+        let fn_src =
+            function_source(source, fn_name).ok_or_else(|| format!("{fn_name}: not found"))?;
+        let arm_a = timed_arm_body(fn_src, "arm_a")
+            .ok_or_else(|| format!("{fn_name}/arm_a: timed arm not found"))?;
+        let arm_b = timed_arm_body(fn_src, "arm_b")
+            .ok_or_else(|| format!("{fn_name}/arm_b: timed arm not found"))?;
+
+        let normalise = |src: &str| -> String {
+            let code = strip_line_comments(src)
+                .replace("arm_a", "ARM")
+                .replace("arm_b", "ARM");
+            code.chars().filter(|c| !c.is_whitespace()).collect()
+        };
+        assert_eq!(
+            normalise(arm_a),
+            normalise(arm_b),
+            "{fn_name}: the A/A control's two arms differ. An A/A control is only a \
+             null when both arms run identical work; any difference makes the ratio \
+             measure that difference, and a ceiling breach could then be waved away \
+             as noise. Keep the two bodies identical."
         );
     }
     Ok(())

@@ -49,11 +49,10 @@ untimed preflight (`assert_baseline_wrap_extent`, `assert_stream_wrap_extent`,
 constructor. `fairness_policy_test` enforces this mechanically — a maintained arm
 that calls a validating constructor fails the test.
 
-The checked constructors are still benchmarked, as separately labelled
-diagnostic arms (`ergo-sbe_wrap_checked`, `ergo-sbe_try_from`,
-`ergo-sbe_header_and_body_checked`). The gate does not read them; they exist to
-price the safety ergon offers, not to be compared against an unchecked
-reference.
+The checked constructors are still benchmarked, as the separately labelled
+diagnostic arm `ergo-sbe_try_from` (header read plus schema-id check every
+call). The gate does not read it; it exists to price the safety ergon offers,
+not to be compared against an unchecked reference.
 
 The benchmark gate exists to prove that ergo-sbe is **not slower than**
 sbe-tool — not to claim it is faster. sbe-tool is the reference; the goal is
@@ -201,17 +200,12 @@ Not a ≤1.00 gate. Compares **flyweight vs wire-image value vs
 `#[repr(C, packed)]`** for a single mid-block field on a **256-byte** composite
 (`BigBlock`, field `f15`). Field-only arms; no alloc on the timed path.
 
-| Arm | Median (this host) |
-|-----|--------------------|
-| flyweight_f15 | ~0.415 ns |
-| value_preheld_f15 | ~0.431 ns |
-| packed_preheld_f15 | ~0.426 ns |
-| value_copy_then_f15 (copy 256 B first) | ~25.8 ns |
-
-**Conclusion:** single-field access is one load for flyweight, preheld
-`[u8; N]` wire image, and packed overlay alike. Packing does **not** beat the
-wire-image design. Materialising the whole composite just to read one field is
-the expensive path. See README
+The run was never archived, so no figure is published here. What the arm
+establishes on this shape only: single-field access is one load for flyweight,
+preheld `[u8; N]` wire image and packed overlay alike; packing did not beat
+the wire-image design for a mid-block field on this 256-byte composite;
+materialising the whole composite to read one field is the expensive path. The
+size of that gap is not measured. See README
 [Composite layout & little-endian](https://mimran1980.github.io/ergon/sbe/core-concepts/composite-layout.html).
 
 ```sh

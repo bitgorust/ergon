@@ -14,7 +14,9 @@ and upstream reference trees. Those live on GitHub.
 | `ergon-io` | busy-spin network I/O (WebSocket, HTTP/1.1, TLS 1.3) |
 | `ergon-md-dpdk` | DPDK transport for the media driver, with its native C |
 
-Samples and `ergo-sbe-benchmarks` are `publish = false`. Cluster codecs stay
-crate-private; use `AeronCluster`, not `cluster_codec_types`.
+Samples and `ergo-sbe-benchmarks` are `publish = false`. Cluster codecs are
+`#[doc(hidden)] pub` in `cluster_codec_types`, re-exported for integration
+tests and benches only — not a stable consumer API. Use `AeronCluster` for
+normal usage.
 
 Apache-2.0.

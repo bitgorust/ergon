@@ -1281,20 +1281,26 @@ fn decode_ordered(wire: &[u8]) -> Result<Snapshot<'_>, Box<dyn std::error::Error
 /// generated decoders are flyweights over the wire buffer and allocate
 /// nothing, so this whole walk is allocation-free.
 ///
-/// Prices stay in the wire `Decimal` (mantissa/exponent) rather than
-/// converting to `rust_decimal` per level: the conversion is cheap but not
-/// free, and a top-of-book scan only needs to compare and count.
-fn best_bid_and_depth(wire: &[u8]) -> Result<(i64, u64, usize, &str), sbe_rt::DecodeError> {
-    let mut best_bid = i64::MIN;
+/// A price is compared as a price, not as a raw mantissa: the wire `Decimal`
+/// carries its own exponent, and `1.00` (mantissa 100, exponent −2) is less
+/// than `99` (mantissa 99, exponent 0). The fallible domain conversion is the
+/// one place that knows how to align the two.
+fn best_bid_and_depth(wire: &[u8]) -> Result<(Rd, u64, usize, &str), sbe_rt::DecodeError> {
+    let mut best_bid: Option<Rd> = None;
     let mut total_orders = 0u64;
     let mut levels = 0usize;
 
     let (symbol, _done) = L3BookDecoder::try_decode(wire, 0)?
         .into_bids(|level| -> Result<_, sbe_rt::DecodeError> {
             levels += 1;
-            let px = level.price_value().mantissa();
-            if px > best_bid {
-                best_bid = px;
+            let px = level
+                .price()
+                .map_err(|reason| sbe_rt::DecodeError::DomainConversionFailed {
+                    field: "price",
+                    reason,
+                })?;
+            if best_bid.is_none_or(|b| px > b) {
+                best_bid = Some(px);
             }
             let mut orders = level.into_orders()?;
             // Fixed stride, so the count is exact without walking.
@@ -1305,9 +1311,38 @@ fn best_bid_and_depth(wire: &[u8]) -> Result<(i64, u64, usize, &str), sbe_rt::De
         .skip_asks()?
         .into_symbol_as_str()?;
 
-    Ok((best_bid, total_orders, levels, symbol))
+    Ok((
+        best_bid.ok_or(sbe_rt::DecodeError::DomainConversionFailed {
+            field: "bids",
+            reason: "no bid levels",
+        })?,
+        total_orders,
+        levels,
+        symbol,
+    ))
 }
 // ANCHOR_END: decode_hot_path
+
+/// A price at an explicit scale: `100` at scale 2 is `1.00`, not `100`.
+fn d_exp(mantissa: i128, scale: u32) -> Rd {
+    Rd::from_i128_with_scale(mantissa, scale)
+}
+
+/// A two-level bid book whose prices do not share a scale. `1.00` must not
+/// outrank `99` just because its mantissa is larger.
+fn mixed_scale_book() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let one = d_exp(100, 2); // 1.00
+    let ninety_nine = d_exp(99, 0); // 99
+    let asks: &[l3_book::Level<'_>] = &[];
+    let bids: &[l3_book::Level<'_>] = &[
+        (one, d(1), &[(201u64, d(1))][..]),
+        (ninety_nine, d(2), &[(202u64, d(1)), (203u64, d(1))][..]),
+    ];
+    let mut buf = vec![0u8; 8192];
+    let len = encode_book(&mut buf, bids, asks, "MIX")?;
+    buf.truncate(len);
+    Ok(buf)
+}
 
 #[test]
 fn hot_path_walk_borrows_everything() -> Result<(), Box<dyn std::error::Error>> {
@@ -1319,7 +1354,7 @@ fn hot_path_walk_borrows_everything() -> Result<(), Box<dyn std::error::Error>> 
         total_orders,
         exp_bids.iter().map(|(_, _, o)| o.len() as u64).sum::<u64>()
     );
-    assert_eq!(best_bid, exp_bids[0].0.mantissa() as i64);
+    assert_eq!(best_bid, exp_bids[0].0);
     assert_eq!(symbol, "BTCUSDT");
 
     // The `&str` points into `wire`, not into a copy: same address range.
@@ -1328,6 +1363,22 @@ fn hot_path_walk_borrows_everything() -> Result<(), Box<dyn std::error::Error>> 
     assert!(
         sym >= base && sym < base + wire.len(),
         "symbol must borrow the wire buffer, not a copy"
+    );
+    Ok(())
+}
+
+/// Comparing raw mantissas ranks `1.00` (mantissa 100) above `99` (mantissa
+/// 99). A best bid is a price, so the scales have to be taken into account.
+#[test]
+fn best_bid_compares_prices_across_scales() -> Result<(), Box<dyn std::error::Error>> {
+    let wire = mixed_scale_book()?;
+    let (best_bid, total_orders, levels, _symbol) = best_bid_and_depth(&wire)?;
+    assert_eq!(levels, 2, "both bid levels walk");
+    assert_eq!(total_orders, 3, "both orders under the best bid count");
+    assert_eq!(
+        best_bid,
+        d_exp(99, 0),
+        "99 outranks 1.00 whatever their mantissas are"
     );
     Ok(())
 }

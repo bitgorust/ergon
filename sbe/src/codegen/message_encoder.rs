@@ -283,11 +283,12 @@ pub(crate) fn generate_message_encoder(
             quote::quote! {}
         } else {
             quote::quote! {
-                #[doc = " Upper bound of any encoded form of this message (header + body). \
-                         Prefer exact sizing via `Self::compute_length()` / the staged \
-                         `*EncodedLength` builder when the message has groups or var-data; \
-                         a stack `[0u8; Self::MAX_ENCODED_LENGTH]` is fine only when this \
-                         constant is a true fixed upper bound you intend to use."]
+                #[doc = " Size of one encoding that has exactly one entry per group and each \
+                         var-data field at its schema `maxLength` (0 when the schema declares \
+                         none). An upper bound only when the message has no groups and every \
+                         var-data field declares a `maxLength`. Otherwise size exactly with \
+                         `Self::compute_length()` / the staged `*EncodedLength` builder; a \
+                         stack `[0u8; Self::MAX_ENCODED_LENGTH]` is then too small."]
                 pub const MAX_ENCODED_LENGTH: usize = #max_encoded_capped_lit;
                 const _MAX_ENCODED_LEN: () = assert!(Self::MAX_ENCODED_LENGTH >= Self::BLOCK_LENGTH);
             }

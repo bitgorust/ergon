@@ -34,7 +34,7 @@ tower = "0.5"
 # compiled by protox (pure-Rust, no protoc binary in Docker/CI) and handed to
 # tonic-prost-build as a FileDescriptorSet.
 [build-dependencies]
-protox = "0.9"
+protox = "0.10"
 tonic-prost-build = "0.14"
 
 [lints.rust]

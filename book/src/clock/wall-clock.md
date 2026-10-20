@@ -10,9 +10,11 @@ follows. It can be no closer to UTC than the host's own clock.
   second it samples the wall clock (the tightest of up to 8 brackets — each
   bracket is an ordered read, a `CLOCK_REALTIME` read, an ordered read, and
   its width bounds the error) and re-anchors the clock to follow it.
-- **Run the owner on a thread that never idles.** On c7i the slow updates
-  followed deep idle, but the C-state cause is **not confirmed**; on Graviton
-  the slowest is the start update.
+- **Run the owner on a thread that never idles.** On c7i an update costs
+  more than on Graviton and the cause is **untraced**: the measurement
+  harness busy-waits between updates (`clock/bench/src/discipline.rs`), so
+  no update in those runs ran on a core back from idle. On Graviton the
+  slowest is the start update.
 - **Rate cap:** ±500 ppm, NTP's and Linux's own limit.
 - **Never backwards:** a clock behind the wall clock runs faster until it
   catches up; one ahead runs slower.
@@ -20,8 +22,8 @@ follows. It can be no closer to UTC than the host's own clock.
   is rejected, and the clock keeps its rate.
 - **Followers:** the owner publishes each update through a seqlock (a
   lock-free publish; readers never wait). A follower's read costs what the
-  owner's does, and can go back by about 1 ns at an update; the owner's
-  never does.
+  owner's does and sees one consistent published set at a time. Neither
+  read goes back: the owner only slews.
 - **The fallback** is kept the same way: `CLOCK_MONOTONIC` plus a
   disciplined offset, never the raw `CLOCK_REALTIME`.
 
@@ -46,10 +48,11 @@ touches the segment between reads, never the read itself.
 ### Measured
 
 Residuals track chrony's own frequency changes, not an ergon-clock error.
-Updates cost more on c7i than on Graviton after deep idle. The clock is
-never closer to UTC than the host's own bound from chrony. One copy of
+Updates cost more on c7i than on Graviton and the cause is untraced; the
+harness busy-waits between updates, so this is not an idle-exit effect.
+The clock is never closer to UTC than the host's own bound from chrony. One copy of
 every figure, with maxima:
-[`clock/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md#disciplined-clock-residual).
+[`clock/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md#disciplined-residual-to-clock_realtime-ns).
 
 ## How the host keeps the wall clock
 
@@ -72,8 +75,10 @@ idle-timer callback.
 ## Set up time sync
 
 - **AWS:** chrony on the Amazon Time Sync Service. Not systemd-timesyncd:
-  it keeps no error bound, and its slews after boot reached 533 ppm in the
-  [reference runs](https://github.com/mimran1980/ergon/blob/main/clock/BENCHMARKS.md#time-sync-in-these-runs).
+  it keeps no error bound, and its slews after boot ran 820.252 ppm over a
+  1 s window, falling to 533.462 ppm over 120 s (`CLOCK_MONOTONIC` vs
+  `CLOCK_MONOTONIC_RAW`; run `aws-20261016-084001`, node b,
+  `target/md-dpdk-bench/aws-20261016-084001/b-clockbench-isolated.csv`).
 
   ```text
   server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4

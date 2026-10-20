@@ -2,7 +2,8 @@
 
 # ergon-md-dpdk: kernel UDP against DPDK on Azure and AWS
 
-µs: median of 5 reps, range across reps in brackets. Max is each rep's slowest round trip (one sample). Load figures are open loop, from each message's intended send time. Every percentile keeps its max.
+µs: median of 5 reps, range across reps in brackets. A latency cell's third figure, written `max X (a–b)`, is the **median of the five per-rep maxima** X (each rep's slowest round trip, one sample), with the five's smallest and largest in brackets. The bracket's upper end is therefore the **absolute observed maximum** — the largest single round trip in any rep — and X is never a worst case. A cell that names the aggregation in words ("median of rep maxima", "absolute max") is using those words in the book's sense
+([aggregation table](https://mimran1980.github.io/ergon/deploy/benchmarks.html#how-figures-are-aggregated)). Load figures are open loop, from each message's intended send time. Every percentile keeps its absolute maximum.
 
 ## Conclusions
 
@@ -24,16 +25,16 @@
   - The median lead (7 µs) is no more than placement alone moved c7i.4xlarge between rounds 6 and 7. Not proven.
   - The tail lead is clearer. At 100 k/s the max was lower on all three pairs (74–84 against 117, 109–123). At 1 M/s lower on two of three (G2 98, 95–105; G3 106, 93–114); G1's (107, 92–166) overlaps.
   - Only x86 bare metal matched that tail (288 B at 1 M/s max 82, 77–103), at 12 times the price ($8.568 a pair-hour against $0.696; on-demand list, 2026-10-15).
-  - A c9g.2xlarge pair costs $0.696 an hour on demand ($0.306 spot): the 8 cores of a c7i.4xlarge pair ($1.428) at half the price (on-demand list, 2026-10-15; the [cost table](https://mimran1980.github.io/ergon/deploy/benchmarks.html#cost-per-hour) holds every size).
+  - A c9g.2xlarge pair costs $0.696 an hour on demand ($0.306 spot): the 16 cores of a c7i.4xlarge pair ($1.428) at half the price (on-demand list, 2026-10-15; the [cost table](https://mimran1980.github.io/ergon/deploy/benchmarks.html#cost-per-hour) holds every size).
 - **Settings that matter most:**
-  - Kernel UDP on AWS: ENA's interrupt moderation off. On by default since Linux 6.9; added about 60 µs to the median at 100 k/s on c7i.2xlarge (p50 106 against 47, max 606 against 538; 3 reps).
-  - With moderation off, give the data NICs' interrupts a core of their own. On the housekeeping core they fall behind: c7i.2xlarge p99.9 12 ms at 500 k/s; c9g lost at 1 M/s in 5 of 5 reps (max 10.8 ms). Tested on Graviton only.
-  - Every platform: isolated CPUs with pinned agents (Azure DPDK max 216 → 71 µs), transparent hugepages off (Azure idle max 546 → 106 µs), busy threads only on cores the pre-flight finds quiet.
+  - Kernel UDP on AWS: ENA's interrupt moderation off. On by default since Linux 6.9. The earlier c7i.2xlarge "added about 60 µs at 100 k/s (p50 106 against 47, max 606 against 538)" A/B is withdrawn: no such pair is in any run — 47 and 538 µs are `aws-20261014-160247` at idle, 1 rep, moderation on. The c7i cost of leaving moderation on is not measured. Graviton G1–G3 is the measured support: with it off, no lossy rep to 1 M msgs/s in G1 and G3.
+  - With moderation off, give the data NICs' interrupts a core of their own. G1's A/B of the two other placements both failed: on the housekeeping core 1 M/s of 288 B lost in 5 of 5 reps (median of rep maxima 10.8 ms, 7.6–12.7; absolute max 12.7 ms); on the receiver's own core the path collapsed from 500 k/s (p99.9 12.87 ms, 12.12–13.39). Tested on Graviton only.
+  - Every platform: isolated CPUs with pinned agents (Azure DPDK median of rep maxima 216 (69–663) → 71 (65–447) µs), transparent hugepages off (round 4 idle p99.99 67.01 → 53.15 µs; round 6 idle median of rep maxima 545.79 (82.37–632.32) → 106.50 (98.11–286.21) µs, absolute max 632 → 286), busy threads only on cores the pre-flight finds quiet.
   - Azure DPDK: receiver IO vectors 16. A small receiver window (`rcv-wnd`) only with the conductor's 20 µs park — the window alone is a rate cap: see the 80 KiB result below.
 - **Zero loss comes first.** One lost frame on a sparse stream costs about 100 ms, Aeron's heartbeat (one lost ping cost 134 ms). Send a keep-alive at about 1 kHz on sparse, latency-critical streams.
 - **One AWS flow carries at most 7.8–8.0 Gbit/s,** on x86 and Graviton, kernel or DPDK. A channel is one flow: spread a heavier stream over several channels.
 - **What did not help:**
-  - Graviton: sender and receiver on one thread (1,344 B bursts p50 522 against 234, max 748 against 493), the conductor on its own core, a mempool cache of 512, sender IO vectors 2, jumbo frames (for latency), transmit moderation kept at 64 µs, kernel busy polling (288 B at 1 M/s: p50 4,973 µs, max 9,175 (8,544–102,826), 61,488 NAKs).
+  - Graviton: sender and receiver on one thread (1,344 B bursts p50 522 against 234; median of rep maxima 748 against 493, absolute max 886 against 745), the conductor on its own core, a mempool cache of 512, sender IO vectors 2, jumbo frames (for latency), transmit moderation kept at 64 µs, kernel busy polling (288 B at 1 M/s: p50 4,973 µs, median of rep maxima 9,175 (8,544–102,826), absolute max 102,826, 61,488 NAKs).
   - x86 and Azure: `mlockall`, no NIC statistics reads, C-states capped at C1 on metal, a 1 MiB receive window, an RX burst of 64, re-offering refused transmits, pacing to 7.9 Gbit/s.
 - **CPU isolation is the biggest single win on Azure.** Round 11 (2026-10-18), same binary, same pair, `pinned` against `isolated`: DPDK idle max 91.84 (58.02–102.02) → **57.89 (49.47–64.22)**, p99.99 34.40 → 26.35. Round trips of 200 µs or more: **0** in the whole isolated-DPDK idle run, against 39 in isolated kernel UDP. Of 100–250 µs: 0 in 4 of 5 isolated-DPDK reps, against 10–40 in every kernel-UDP rep. The full table is under [round 11](#azure-round-11-2026-10-18-d8s_v6-pair--idle-round-trip-p50--p90--p99--p999--p9999--max).
 - **Localhost is the cleanest path measured on Azure.** Round 12 (2026-10-19), isolated localhost DPDK: idle p50 9.81 µs, **max 31.60 (29.92–32.80)** — a 3 µs spread across five reps — and 0 of 5 reps lost anything at any size or load point. The same path pinned is max 160.13 (45.09–389.38): isolation is what does it. If both ends fit on one host with a spare core, prefer localhost.
@@ -51,7 +52,7 @@ Each item won an A/B and was reproduced on a second pair, unless the row says ot
 | platform | kernel UDP: best measured | DPDK (lab only) |
 | --- | --- | --- |
 | AWS Graviton5, c9g.2xlarge (G1–G3) | interrupt moderation off, data NIC interrupts on a spare core, no busy polling: idle p50 18.93, max 79 (76–168); 288 B at 1 M/s p50 44.83, max 204 (122–211). No lossy rep in G1 or G3; 1 of 5 in G2 (63 NAKs) | 4,096 RX descriptors: idle p50 13.97, max 75 (73–79); 288 B at 1 M/s p50 19.36, max 106 (93–114). No NAK or retransmit below the flow ceiling in G1–G3 |
-| AWS x86, c7i.4xlarge (rounds 5–7) | busy polling, 4,096-entry ring: idle p50 28.22, max 1,938 (349–4,846); 288 B at 1 M/s p50 43.74, max 599, 1 lossy rep of 5 (round 7). Not converged: moderation off with its interrupts on a core of their own is not measured on x86 | 4,096 RX descriptors, receiver IO vectors 16: idle p50 21.28, max 109 (52–116); 288 B at 1 M/s p50 30.38, max 152 (139–155), no lossy rep (round 7) |
+| AWS x86, c7i.4xlarge (rounds 5–7) | busy polling, 4,096-entry ring: idle p50 28.22, max 1,938 (349–4,846); 288 B at 1 M/s p50 43.74, max 599 (536–6,664), 1 lossy rep of 5 (round 7). Not converged: moderation off with its interrupts on a core of their own is not measured on x86 | 4,096 RX descriptors, receiver IO vectors 16: idle p50 21.28, max 109 (52–116); 288 B at 1 M/s p50 30.38, max 152 (139–155), no lossy rep (round 7) |
 | AWS x86 bare metal, c7i.metal-24xl (round 4) | busy polling: idle p50 33.70, max 67 (55–307); 288 B at 1 M/s p50 42.94, max 592 (114–1,150) | idle p50 28.13, max 71 (48–845); 288 B at 1 M/s p50 34.30, max 82 (77–103) |
 | Azure D16s_v6 + D8ds_v6 (rounds 4–10) | busy polling, 4,096-entry ring: idle p50 25.82, max 167 (100–1,246) (round 8); no NIC drop or NAK in round 5 | receiver IO vectors 16; the conductor's park capped at 20 µs with a ring-sized window: idle p50 23.73, max 63 (59–796) (round 8); 288 B at 1 M/s p50 72.70, max 129 (127–205) (round 5, a farther pair) |
 | Azure D8s_v6 pair, **isolated** (round 11) | busy polling: idle p50 21.15, p99.99 31.79, max 99.52 (73.86–209.41). Plain kernel UDP: idle p50 32.03, max 354.81 (272.13–2,203.65), 39 spikes of 200 µs or more and 10–40 of 100–250 µs a rep — **do not use** | **idle p50 19.90, p99.99 26.35, max 57.89 (49.47–64.22)**, **0 spikes of 200 µs or more in the whole round**, 0 of 100–250 µs in 4 of 5 reps. 32 B at 50% of flat-out: p50 26.51, max 90.50. Loss under load at 288 B is the receiver window regressed to the 2 MiB driver default, 26× the 80 KiB rounds 9–10 proved loss-free: see [round 11: the 288 B loss under load](#round-11-the-288-b-loss-under-load) |
@@ -60,9 +61,9 @@ Each item won an A/B and was reproduced on a second pair, unless the row says ot
 
 | setting | why |
 | --- | --- |
-| CPU isolation (`isolcpus`, `nohz_full`, `rcu_nocbs`, `irqaffinity` to housekeeping), agents pinned (`pin_agents_to_configured_cpus`), EAL threads on housekeeping | Azure DPDK max 216 (69–663) → 71 µs (65–447); the agents never share a core. In k8s: static CPU manager, whole physical cores, no SMT sibling shared |
+| CPU isolation (`isolcpus`, `nohz_full`, `rcu_nocbs`, `irqaffinity` to housekeeping), agents pinned (`pin_agents_to_configured_cpus`), EAL threads on housekeeping | Azure DPDK median of rep maxima 216 (69–663) → 71 (65–447) µs; the agents never share a core. In k8s: static CPU manager, whole physical cores, no SMT sibling shared |
 | busy-spinning threads on cores the pre-flight finds quiet | some vCPUs stop for up to 3.7 ms once a minute. Map the gaps at pod start; pin to quiet cores |
-| transparent hugepages off (`/sys/kernel/mm/transparent_hugepage/enabled` = never) | Azure rounds 4 and 6: idle p99.99 67 → 53 µs, idle max 546 → 106 µs. Node-level setting |
+| transparent hugepages off (`/sys/kernel/mm/transparent_hugepage/enabled` = never) | Two rounds, not one pair of numbers. Round 4 (`aws-20261014-113947`): idle p99.99 67.01 (51.84–87.23) → 53.15 (51.81–82.24) µs; absolute idle max 498 → 1,180 µs. Round 6 (`aws-20261014-220612`): idle median of rep maxima 545.79 (82.37–632.32) → 106.50 (98.11–286.21) µs; absolute idle max 632.32 → 286.21 µs. Node-level setting |
 | Aeron directory and term buffers on 2 MiB hugetlbfs, non-sparse, with a sized mount | no 4 KiB page faults; an unsized hugetlbfs fails Aeron's storage check. Mount into the pod |
 | a keep-alive (about 1 kHz) from the application on sparse latency-critical streams | a frame lost on a quiet stream is noticed only at Aeron's next heartbeat, 100 ms in the C driver: one lost ping cost 134 ms (Azure round 5) |
 | AWS: each channel under about 7.8 Gbit/s; a heavier stream over several channels on different ports | AWS caps one UDP flow on every size and both architectures, and holds the sender back rather than dropping |
@@ -75,9 +76,9 @@ Each item won an A/B and was reproduced on a second pair, unless the row says ot
 | setting | why |
 | --- | --- |
 | kernel: interrupt moderation off on the data NICs (`ethtool -C <if> adaptive-rx off rx-usecs 0 tx-usecs 0`) | G1–G3: no lossy rep to 1 M msgs/s in G1 and G3 (one in G2, 63 NAKs). Transmit moderation kept at 64 µs (`COALESCE=0/64`) is not kept: G2's one lossy rep without it did not recur in G3, and it added its own tails (288 B at 1 M/s max 289, 178–569) |
-| kernel: the data NICs' interrupts on a core of their own | G1, one A/B: on the housekeeping core, 1 M/s lost in 5 of 5 reps (max 10.8 ms); on the receiver's core it collapsed from 500 k/s. Graviton's idle is WFI, so the spare core never sleeps deep |
+| kernel: the data NICs' interrupts on a core of their own | G1, one A/B: on the housekeeping core, 1 M/s lost in 5 of 5 reps (median of rep maxima 10.8 ms, 7.6–12.7; absolute max 12.7 ms); on the receiver's core it collapsed from 500 k/s (p99.9 12.87 ms, 12.12–13.39). Graviton's idle is WFI, so the spare core never sleeps deep |
 | kernel: no busy polling | G1, one A/B: the best kernel idle (p50 16.98, max 94, 76–127), but at 288 B, 1 M/s p50 4,973 µs, max 9,175 (8,544–102,826) and 61,488 NAKs. Threaded NAPI busy polling is not measured: G2's setup was wrong |
-| DPDK: dedicated threading (sender and receiver on cores of their own) | G1, one A/B: SHARED_NETWORK's 1,344 B bursts p50 522 against 234, max 748 (723–886) against 493 (465–745) |
+| DPDK: dedicated threading (sender and receiver on cores of their own) | G1, one A/B: SHARED_NETWORK's 1,344 B bursts p50 522 against 234, median of rep maxima 748.03 (723–886) against 493.06 (465–745); absolute max 886.27 against 744.96 |
 | DPDK: 4,096 RX descriptors (the default: min(4,096, the NIC's limit)) | no measurable effect on c9g (G1: idle max 73, 60–88, against 75, 68–155); kept for c7i (round 6) |
 | Aeron MTU 1,408; jumbo frames a candidate for bulk or bursty channels only, not a default | G2, **one** run (no second run yet): DPDK 1,344 B bursts p50 242 → 210, max 664 (466–954) → 561 (455–1,533), ceiling +2.6%; idle unchanged (max 68, 61–100) |
 
@@ -86,9 +87,9 @@ Each item won an A/B and was reproduced on a second pair, unless the row says ot
 | setting | why |
 | --- | --- |
 | DPDK: receiver IO vectors 16 | round 3: the one loss-free DPDK mode at 1.25 M msgs/s of 288 B, max 165 (126–213) against 179 (155–1,167) with 10 NAKs |
-| DPDK: 4,096 RX descriptors | round 6: first-point NIC misses in 0 of 5 reps against 4 of 5; loss-free 1,344 B rate 400 k → 600 k msgs/s; idle max 107 (88–517) against 125 (94–142) |
+| DPDK: 4,096 RX descriptors | round 6 (`aws-20261015-174836`): first-point NIC misses in 0 of 5 reps against 4 of 5; loss-free 1,344 B rate 400 k → 600 k msgs/s; idle median of rep maxima 107 (88–517) against 125 (94–142), absolute idle max 517 against 142 µs |
 | kernel: busy polling with a 4,096-entry ring | the best kernel mode measured on c7i (rounds 5–7): round 7 idle p50 28.22, max 1,938 (349–4,846) |
-| kernel, interrupt-driven: no ENA adaptive moderation, and no deep C-state on the core that takes the interrupts | moderation added about 60 µs at 100 k/s (c7i.2xlarge, 3 reps); c7i.4xlarge's C6 (190 µs exit) made plain kernel UDP's idle p50 235 µs (round 3) |
+| kernel, interrupt-driven: no ENA adaptive moderation, and no deep C-state on the core that takes the interrupts | the c7i.2xlarge moderation A/B behind an earlier "added about 60 µs at 100 k/s" is withdrawn (untraceable pair; see the conclusions); the c7i cost is not measured. c7i.4xlarge's C6 (190 µs exit) made plain kernel UDP's idle p50 235 µs (round 3) |
 | bare metal (`c7i.metal-24xl`, `iommu=pt`) where the tail matters | round 4: DPDK idle max 71 (48–845) against 675 (118–852) on c7i.4xlarge (round 3) |
 | not Azure's window fix (the conductor's 20 µs park with 256 KiB) | round 7: loss-free, but p99.9 of 1.8–5.2 ms from 500 k/s |
 
@@ -125,7 +126,7 @@ Run at the sustainable rate, below both the loss-free and the keeps-up rate, nev
 | Aeron | rusteron-media-driver 0.2.11 (Aeron 1.53.3), MTU 1408, hugetlbfs 2 MiB, exclusive publications | the same | the same, `-mcpu=native` |
 | Placement | one proximity placement group per round | cluster placement group, us-east-1 | cluster placement group, us-east-1, spot |
 
-Round-trip and load numbers are median of 5 reps with the range across reps in brackets; max is one sample per rep and varies most. Compare modes within one round, never across pairs: placement alone moved DPDK's idle p50 by about 7 µs on c7i.4xlarge (rounds 6 and 7).
+Round-trip and load numbers follow the [legend at the top](#ergon-md-dpdk-kernel-udp-against-dpdk-on-azure-and-aws): median of 5 reps, `max X (a–b)` is the median of the five per-rep maxima with the five in brackets, and the bracket's upper end is the absolute observed maximum. Compare modes within one round, never across pairs: placement alone moved DPDK's idle p50 by about 7 µs on c7i.4xlarge (rounds 6 and 7).
 
 ## Measured latency at each load level
 
@@ -482,7 +483,7 @@ is enough to recommend the setting either way. Leave it at the default (1 Hz)
 unless the counters themselves are unwanted; `0` costs nothing.
 
 
-### AWS c7i.4xlarge, round 7 (p50 / p99.9 / max, median across reps)
+### AWS c7i.4xlarge, round 7 (p50 / p99.9 / median of rep maxima)
 
 | 288 B | 500 k msgs/s | 1 M msgs/s | highest loss-free 288 B / 1,344 B |
 | --- | --- | --- | --- |
@@ -490,9 +491,14 @@ unless the counters themselves are unwanted; `0` costs nothing.
 | kernel UDP, busy polling, 4,096 ring | 35.71 / 172.16 / 427, 0 | 43.74 / 242.18 / 599, 1 lossy (4 NAKs) | 500 k / 100 k |
 | kernel UDP | 84.35 / 179.46 / 492, 0 | 85.89 / 653.31 / 2,574, 2 lossy (5 NAKs) | 500 k / 500 k |
 
+The third number of each cell is the median of five per-rep maxima, not a worst
+case. Absolute maxima (largest single round trip in any rep, µs): DPDK 278 at
+500 k/s and 155 at 1 M/s; kernel busy polling 5,022 and 6,664; kernel UDP
+8,471 and 13,943.
+
 ¹ With ENA's default 1,024 RX descriptors as this round ran; with 4,096 (round 6) the loss-free 1,344 B rate was 600 k msgs/s. 1,344 B at 1 M msgs/s is past one flow's ceiling (0.705 M msgs/s) for every transport.
 
-Round 7 at Aeron's 100 k/s point, 288 B (p50 / p99 / p99.9 / max): DPDK 21.82 / 26.56 / 29.30 / 117 (109–123); kernel busy polling 27.79 / 63.81 / 126.78 / 382 (372–389); kernel UDP 94.02 / 129.60 / 150.53 / 469 (448–578). Aeron's published open-source C driver figure (kernel UDP, different instance and harness): 22 / 43 / 60, no max published. Not a like-for-like comparison.
+Round 7 at Aeron's 100 k/s point, 288 B (p50 / p99 / p99.9 / median of rep maxima): DPDK 21.82 / 26.56 / 29.30 / 117 (109–123); kernel busy polling 27.79 / 63.81 / 126.78 / 382 (372–389); kernel UDP 94.02 / 129.60 / 150.53 / 469 (448–578). Aeron's published open-source C driver figure is external, not like-for-like: kernel UDP 22 / 43 / 60 µs at p50 / p99 / p99.9 with no max published, from the aeron.io / AWS blog of February 2026 on a `c6in.16xlarge` in a cluster placement group, harness [`aeron-io/benchmarks`](https://github.com/aeron-io/benchmarks). Different instance, different harness.
 
 ## Sustained maximum throughput (M msgs/s)
 
@@ -507,12 +513,12 @@ Round 7 at Aeron's 100 k/s point, 288 B (p50 / p99 / p99.9 / max): DPDK 21.82 / 
 | Azure kernel busy polling (round 5) | 13.16 | 2.49 | 0.64 | 1.0 | 0.4 |
 | Azure kernel busy polling, isolated (round 11) | 13.97 | 2.62 | 0.68 | 0.26 | 0.54 |
 | c7i.4xlarge DPDK (round 5) | 15.17 | 3.03 | 0.705 | 3.03 (one flow cap) | 0.4 |
-| c7i.2xlarge kernel UDP (round 2) | 15.17 | 2.94 | — | — | — |
+| c7i.2xlarge kernel UDP (round 2) | 14.19 (13.71–15.17) | 2.65 (2.36–2.94) | — | — | — |
 | c7i.metal DPDK (round 4) | 6.75 | 1.82 | — | — | — |
 | c7i.metal kernel UDP (round 4) | 15.17 | 3.03 | — | — | — |
 | c9g.2xlarge DPDK (G1–G3) | — | — | 0.6855 (flow cap) | 1.0 (288 B) | 0.5 |
 
-`—` is a point not yet measured. `loss-free` is the highest ladder rate below the first point that lost anything in any rep. Flat-out is a ceiling, not a rate to run at. One AWS flow never carried more than 8.0 Gbit/s of frames (15.17 M / 3.03 M / 0.705 M msgs/s at 32 / 288 / 1,344 B): the sender is held back, nothing is dropped. ENA's allowance-exceeded counters stay 0 at the ceiling.
+`—` is a point not yet measured. `loss-free` is the highest ladder rate below the first point that lost anything in any rep. Flat-out is a ceiling, not a rate to run at. A cell is that round's **median of per-rep flat-out maxima**, in M msgs/s; where a bracket is shown it is the smallest and largest of those per-rep maxima, so its upper end is the best single rep (not a sustained rate). One AWS flow never carried more than 8.0 Gbit/s of frames (15.17 M / 3.03 M / 0.705 M msgs/s at 32 / 288 / 1,344 B): the sender is held back, nothing is dropped. ENA's allowance-exceeded counters stay 0 at the ceiling.
 
 **Round 11's `none` is a real result, not a gap.** Isolated DPDK at 288 B lost in
 2 of 5 reps at the *lowest* ladder point (394 k/s, 10% of flat-out, 18 NAKs
@@ -789,7 +795,7 @@ One change per experiment, A/B against the current best, 5 reps; kept only if th
 | 2026-10-14 | (finding) where the agents are preempted | EAL threads and `aeron-md-nra` on the agents' CPUs; khugepaged LRU drains 8–22 µs every 10.24 s; VM b stalled 0.3–0.76 ms at :57 | THP off to round 4 |
 | 2026-10-14 | round 3, stopped after rep 2 (counter bug) | 8 Gbit/s cap: 288 B 4.58 → 3.03 M msgs/s; 128 KiB window collapsed; receiver IO vectors 16: max 250 against 1,260 µs | cap off by default; window and sender IO vectors rejected; receiver IO vectors to round 4 |
 | 2026-10-14 | round 4, receive IO vectors 16 | NAKs 16–27 k → 0 at 1,344 B 600–800 k/s; p99.99/max 885/1,130 → 107/142 µs; bursts' max 2,808 → 1,000 µs | candidate; round 5 must reproduce |
-| 2026-10-14 | round 4, THP off | idle p99.99 67 → 53 µs, max 546 → 106 µs (round 6) | not kept alone; retried on top of IO vectors 16 |
+| 2026-10-14 | round 4, THP off | this round: idle p99.99 67.01 (51.84–87.23) → 53.15 (51.81–82.24) µs; absolute idle max 498 → 1,180 µs. The 545.79 → 106.50 max pair is round 6's (`aws-20261014-220612`), not this round's | not kept alone; retried on top of IO vectors 16 |
 | 2026-10-14 | round 4, hot sockets on the local-I/O epoll | localhost 8.49 against 14.45 M msgs/s | the default (unwatch) kept |
 | 2026-10-14 | (finding) the once-a-minute stall | per VM, at a fixed second, some vCPUs stop for up to 3.7 ms (Azure) or about 400 µs (AWS), nothing in the guest | pre-flight records noisy vCPUs; `spikes.py` labels it |
 | 2026-10-14 | (bug) DPDK on ENA crashed at start | 1,024 TX descriptors exceeded ENA's 512 | fixed: queue sizes checked against the NIC's limits; TX default 512 |
@@ -804,7 +810,7 @@ One change per experiment, A/B against the current best, 5 reps; kept only if th
 | 2026-10-14 | (finding) kernel errors were `ENETUNREACH` | cloud-init NIC hotplug re-ran DHCP and dropped data NIC routes | fixed in `vm.sh` |
 | 2026-10-14 | (method) loss counters around each sustained-maximum run | round 6's collapse left no counters | added |
 | 2026-10-15 | AWS round 3, c7i.4xlarge | IO vectors 16 the only loss-free DPDK mode at 1.25 M/s; NIC statistics reads and `mlockall` no gain | IO vectors 16 kept |
-| 2026-10-15 | round 6, THP off on top of IO vectors 16 | idle max 546 → 106 µs; flat-out collapsed on this pair (1.03 M → 50 k) | THP off kept (reproduced); flat-out not counted |
+| 2026-10-15 | round 6, THP off on top of IO vectors 16 | idle median of rep maxima 545.79 (82.37–632.32) → 106.50 (98.11–286.21) µs (absolute 632.32 → 286.21); flat-out collapsed on this pair (1.03 M → 50 k) | THP off kept (reproduced); flat-out not counted |
 | 2026-10-15 | round 7, new pair on the round 6 baseline | DPDK idle max 94 (80–97), every rep under 100 µs; RX burst 64 lossier; 1 MiB window cut every rate by a third | burst 64 and 1 MiB window rejected |
 | 2026-10-15 | round 8, sends all or nothing and the receive drain | DPDK idle p50 23.7; 32 B 22.9 M msgs/s; 1,344 B flat-out collapsed 4 of 5 | drain kept; collapse to round 9 |
 | 2026-10-15 | (measurement bug, fixed) ENA IRQs on isolated CPUs | the ENA driver re-pins queue IRQs on every interface up | lab re-pins after every hand-back; AWS kernel results rounds 2–5 pessimistic, to be re-run |
@@ -817,7 +823,7 @@ One change per experiment, A/B against the current best, 5 reps; kept only if th
 | 2026-10-15 | (finding, fixed) the DPDK receive poll was capped by Aeron's vlen | the receiver drained 4 frames a duty cycle by default | fixed: up to the burst size a burst whatever the vlen |
 | 2026-10-15 | (finding, fixed) DPDK flat-out throughput below the kernel on AWS | partial vector sends caused duplicates (34–56% of frames) | fixed: sends are all or nothing |
 | 2026-10-15 | AWS round 6–7 | 4,096 RX descriptors: first-point NIC misses 0 of 5 against 4 of 5; Aeron load points: DPDK 21.8/26.6/29.3 at 100 k/s of 288 B | 4,096 RX candidate |
-| 2026-10-15 | (finding) ENA adaptive interrupt moderation is kernel UDP's gap to Aeron's published figure | at 100 k/s of 288 B p50 106 with it, 47 with moderation off (equal to idle); off loses at 500 k/s with every interrupt on the housekeeping CPU | repeat with interrupts on a core of their own |
+| 2026-10-15 | (finding) ENA adaptive interrupt moderation | the "p50 106 with it, 47 with it off at 100 k/s of 288 B" pair is withdrawn: 47 µs (and 538) is `aws-20261014-160247` at **idle**, 1 rep, moderation **on**. No moderation A/B of c7i at 100 k/s exists in any run; that cost is not measured. Moderation off with every interrupt on the housekeeping CPU does lose at 500 k/s | repeat with interrupts on a core of their own |
 | 2026-10-15 | (default) `RUSTERON_DPDK_TX_RATE_MBPS` from 0 to a 25,000 Mbit/s backstop | a high default, 1 MiB bucket, defers rather than spinning | shipped with tests |
 | 2026-10-16 | AWS Graviton G1 | DPDK p50 14.0 / max 82 µs at 100 k/s of 288 B; kernel moderation off + spare core loss-free to 1 M/s | kernel on Graviton: moderation off plus interrupts on their own core |
 | 2026-10-16 | (finding) round A's comparison stopped | x86 tuned over many rounds, Graviton not; tune each platform before comparing | comparisons only after each side converges |
@@ -827,7 +833,7 @@ One change per experiment, A/B against the current best, 5 reps; kept only if th
 | 2026-10-16 | AWS Graviton G3 | a third pair, the same medians; media timestamps no measurable cost (one rep a point max 152–183 µs, 4 of 20 against 0 of 20, p ≈ 0.1) | timestamps: one run only; a repeat is still open before they become a default |
 | 2026-10-16 | (finding) the one lossy rep in G3 | host a's egress: 630,837 short sends, 646,280 refused transmits, 0 NAKs, every message echoed. Same signature in 4 of 50 DPDK 1,344 B burst reps | AWS egress noise, not the mode |
 | 2026-10-17 | (correction) G1's "4,096 RX descriptors removed the lossy rep" | that rep was a stall of host b (max 2,564 µs), not receive loss | no measurable effect on c9g; 4,096 stays the default for c7i |
-| 2026-10-17 | (correction) SHARED_NETWORK on Graviton | G1's write-up missed the burst cost: 1,344 B bursts p50 522 against 234, max 748 (723–886) against 493 (465–745) | not the default |
+| 2026-10-17 | (correction) SHARED_NETWORK on Graviton | G1's write-up missed the burst cost: 1,344 B bursts p50 522 against 234, median of rep maxima 748.03 (723–886) against 493.06 (465–745); absolute max 886.27 against 744.96 | not the default |
 | 2026-10-17 | (finding) the per-flow cap on Graviton | 1,344 B: 685.5 k msgs/s in every rep of G1 and G2, both transports | one cap on bytes per flow, same on both architectures |
 | 2026-10-17 | (lab and analysis faults) found in G3 | ping's 43–44 µs minimum exceeds DPDK's whole round trip on c9g; the spike file keeps only the first spikes (lists 459–482 µs where histograms show 491–1,819); every load max of 100 µs or more unexplained; no diagnostics ran during the 30-minute discipline | drop or replace the ping baseline; take maxima from the histograms; start diagnostics before the discipline |
 | 2026-10-18 | (default) `RUSTERON_DPDK_TX_RATE_MBPS` unset is now no cap, not a 25,000 Mbit/s backstop | the backstop put a refill, a compare and a charge on every send whatever the run was doing, and a send it held back sent nothing rather than waiting. Unset now skips the whole pacer block; a rate the operator set paces and waits up to `RUSTERON_DPDK_TX_PACE_SPIN_US` (`0` refuses instead of waiting, which is the behaviour the backstop had); `RUSTERON_DPDK_TX_LOW_STREAMS` still needs a rate or route the operator set. Cost of the change: **not measured** | kept (the simplification is the point; the live Azure round 1 will show whether the paced-sends counter falls away) |

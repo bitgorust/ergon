@@ -47,6 +47,11 @@ SBE_TOLERANCE=0
 CLUSTER_TOLERANCE=0
 
 failures=0
+# Labels whose ratio exceeded its ceiling but whose ratio CI straddles it.
+# An inconclusive result establishes no winner: it is neither an ergon loss nor
+# an ergon win. It still counts as a failure — the gate does not go green on a
+# result it cannot resolve.
+INCONCLUSIVE=""
 
 # Provenance: a run id makes the gate refuse anything this run did not produce.
 verify_manifest() {
@@ -100,22 +105,76 @@ verify_estimate_run_id() {
 
 check_ratio() {
     local label="$1"
-    local ergo_estimate="$2"
-    local ref_estimate="$3"
+    local ergo_key="$2"
+    local ref_key="$3"
     local ceiling="${4:-1.0}"
     local tolerance="${5:-0}"
-    local ratio
-    ratio=$(python3 -c "print(f'{$ergo_estimate / $ref_estimate:.4f}')")
-    local over
-    over=$(python3 -c "print('true' if $ergo_estimate / $ref_estimate > $ceiling + $tolerance else 'false')")
-    printf "  %-45s %10s / %-10s = %s (max %s)" "$label" "$ergo_estimate" "$ref_estimate" "$ratio" "$ceiling"
-    if [ "$over" = "true" ]; then
-        echo "  FAIL"
+    local aa_band="${6:-}"
+    local ergo_estimate ref_estimate ergo_ci ref_ci out status
+    ergo_estimate=$(get_estimate "$ergo_key")
+    ref_estimate=$(get_estimate "$ref_key")
+    ergo_ci=$(get_estimate_ci "$ergo_key")   # "lo hi" or empty
+    ref_ci=$(get_estimate_ci "$ref_key")     # "lo hi" or empty
+    out=$(python3 - "$label" "$ergo_estimate" "$ref_estimate" "$ergo_ci" "$ref_ci" \
+        "$ceiling" "$tolerance" "$aa_band" <<'PY'
+import sys
+
+label, ergo_s, ref_s, ergo_ci, ref_ci, ceiling_s, tol_s, aa_band = sys.argv[1:9]
+ergo, ref = float(ergo_s), float(ref_s)
+ceiling, tol = float(ceiling_s), float(tol_s)
+ratio = ergo / ref
+
+# Ratio CI from both arms' CIs: the widest ratio the two intervals allow.
+# No CI in the estimates.json means the figure is unmeasured — printed as
+# "not measured", never reconstructed.
+if ergo_ci and ref_ci:
+    e_lo, e_hi = (float(x) for x in ergo_ci.split())
+    r_lo, r_hi = (float(x) for x in ref_ci.split())
+    ratio_ci = (e_lo / r_hi, e_hi / r_lo)
+    ci_text = f"ratio CI [{ratio_ci[0]:.4f}, {ratio_ci[1]:.4f}]"
+else:
+    ratio_ci = None
+    ci_text = "ratio CI not measured"
+
+over = ratio > ceiling + tol
+if ratio_ci is None:
+    resolution, res_key = "uncertainty not measured", "unknown"
+elif not over and ratio_ci[1] <= ceiling:
+    resolution, res_key = "resolved", "resolved"
+elif not over:
+    resolution, res_key = "ceiling met at the point estimate; CI straddles the ceiling", "ok_unresolved"
+elif ratio_ci[0] > ceiling:
+    resolution, res_key = "resolved breach", "resolved"
+else:
+    resolution, res_key = "inconclusive — no winner", "inconclusive"
+
+if aa_band:
+    if ratio_ci is None:
+        band_note = "A/A null not comparable (uncertainty not measured)"
+    else:
+        a_lo, a_hi = (float(x) for x in aa_band.split())
+        overlaps = not (ratio_ci[1] < a_lo or ratio_ci[0] > a_hi)
+        band_note = "inside A/A null band" if overlaps else "outside A/A null band"
+else:
+    band_note = "A/A null not measured"
+
+print(
+    f"  {label:<45} {ergo:.4f} / {ref:.4f} = {ratio:.4f} (max {ceiling:.2f})"
+    f"  {'FAIL' if over else 'ok'}"
+)
+print(f"      {ci_text}  {resolution}  {band_note}")
+print(f"@STATUS {'1' if over else '0'} {res_key}")
+PY
+)
+    status=$(printf '%s\n' "$out" | sed -n 's/^@STATUS //p')
+    printf '%s\n' "$out" | sed '/^@STATUS /d'
+    if [ "${status%% *}" = "1" ]; then
+        if [ "${status#* }" = "inconclusive" ]; then
+            INCONCLUSIVE="$INCONCLUSIVE $label"
+        fi
         return 1
-    else
-        echo "  ok"
-        return 0
     fi
+    return 0
 }
 
 estimate_dir() { printf '%s/%s/new' "$CRITERION_DIR" "$1"; }
@@ -129,6 +188,61 @@ get_estimate() {
     else
         return 1
     fi
+}
+
+# "lo hi" for the same estimator get_estimate uses, or empty when the
+# estimates.json carries no confidence interval (fixture runs, and any
+# estimate written without one). Empty means "not measured".
+get_estimate_ci() {
+    local path
+    path="$(estimate_dir "$1")/estimates.json"
+    [ -f "$path" ] || return 0
+    python3 -c "
+import json, sys
+e = json.load(open(sys.argv[1]))
+est = e.get('slope', e['median'])
+ci = est.get('confidence_interval') or {}
+lo, hi = ci.get('lower_bound'), ci.get('upper_bound')
+print('' if lo is None or hi is None else f'{lo} {hi}')
+" "$path"
+}
+
+# A/A null band: "lo hi" of the ratio CI for the harness control, or empty
+# when the run has no control (or no CIs). The control is two arms running
+# identical work, so its ratio is the harness's own noise; a real pair whose
+# ratio lands inside it has no established winner. Ceilings are unaffected.
+aa_band() {
+    local group="$1" arm_a="$2" arm_b="$3"
+    local a_ci b_ci
+    a_ci=$(get_estimate_ci "$group/$arm_a")
+    b_ci=$(get_estimate_ci "$group/$arm_b")
+    [ -n "$a_ci" ] && [ -n "$b_ci" ] || return 0
+    python3 -c "import sys; a_lo, a_hi = (float(x) for x in sys.argv[1].split()); b_lo, b_hi = (float(x) for x in sys.argv[2].split()); print(f'{a_lo / b_hi} {a_hi / b_lo}')" "$a_ci" "$b_ci"
+}
+
+# Print the A/A null for a suite. The band itself is computed by the caller
+# with `aa_band` and threaded into `check_ratio`.
+report_aa_null() {
+    local group="$1" band="$2"
+    if [ -n "$band" ]; then
+        python3 -c "import sys; lo, hi = (float(x) for x in sys.argv[2].split()); print(f'  A/A null ({sys.argv[1]}): ratio CI [{lo:.4f}, {hi:.4f}] — harness noise band; a pair inside it has no established winner')" "$group" "$band"
+    else
+        echo "  A/A null ($group): not measured (no control in this run, or no confidence intervals)"
+    fi
+}
+
+# Widest of several "lo hi" bands, or empty if none are measured. Taking the
+# widest is deliberate: a pair is only called "inside the null band" when the
+# measured harness noise really reaches that far, never on a narrow control.
+widest_band() {
+    python3 -c "
+import sys
+bands = [b for b in sys.argv[1:] if b.strip()]
+if not bands:
+    raise SystemExit(0)
+los, his = zip(*((float(x) for x in b.split()) for b in bands))
+print(f'{min(los)} {max(his)}')
+" "$@"
 }
 
 # Profile of the results under test, from the run-manifest the provenance check
@@ -147,6 +261,9 @@ if [[ "$SUITE" == "sbe" || "$SUITE" == "all" ]]; then
     if [ -n "$EXPECTED_RUN_ID" ]; then
         verify_manifest "$CRITERION_DIR" "$EXPECTED_RUN_ID" || failures=$((failures + 1))
     fi
+
+    SBE_AA_BAND=$(aa_band "parity_control_aa_encode_throughput" "arm_a" "arm_b")
+    report_aa_null "parity/control/aa_encode_throughput" "$SBE_AA_BAND"
 
     # Maintained SBE parity pairs
     # (label/group_name/ergon_function/reference_function/max_ratio).
@@ -205,7 +322,7 @@ if [[ "$SUITE" == "sbe" || "$SUITE" == "all" ]]; then
             fi
         fi
 
-        check_ratio "$label (ergo-sbe/sbe-tool)" "$ergo_estimate" "$ref_estimate" "$ceiling" "$SBE_TOLERANCE" \
+        check_ratio "$label (ergo-sbe/sbe-tool)" "$ergo_key" "$ref_key" "$ceiling" "$SBE_TOLERANCE" "$SBE_AA_BAND" \
             || failures=$((failures + 1))
     done
 fi
@@ -219,6 +336,11 @@ if [[ "$SUITE" == "cluster" || "$SUITE" == "all" ]]; then
     if [ -n "$EXPECTED_RUN_ID" ]; then
         verify_manifest "$CRITERION_DIR" "$EXPECTED_RUN_ID" || failures=$((failures + 1))
     fi
+
+    CLUSTER_AA_BAND=$(widest_band \
+        "$(aa_band "cluster_control_aa_encode_keep_alive" "arm_a" "arm_b")" \
+        "$(aa_band "cluster_control_aa_encode_claim_shaped" "arm_a" "arm_b")")
+    report_aa_null "cluster/control aa_encode_keep_alive + aa_encode_claim_shaped" "$CLUSTER_AA_BAND"
 
     # (group|ergo_fn|sbe_fn|ceiling). Every maintained pair is literal 1.00
     # except the two documented noise-floor exceptions below.
@@ -289,12 +411,19 @@ if [[ "$SUITE" == "cluster" || "$SUITE" == "all" ]]; then
             fi
         fi
 
-        check_ratio "$group (ergo-sbe/sbe-tool)" "$ergo_estimate" "$sbe_estimate" "$ceiling" "$CLUSTER_TOLERANCE" \
+        check_ratio "$group (ergo-sbe/sbe-tool)" "${group}/${ergo_fn}" "${group}/${sbe_fn}" "$ceiling" "$CLUSTER_TOLERANCE" "$CLUSTER_AA_BAND" \
             || failures=$((failures + 1))
     done
 fi
 
 echo ""
+if [ -n "$INCONCLUSIVE" ]; then
+    echo "inconclusive — no winner established for:$INCONCLUSIVE"
+    echo "  these ratios exceed their ceiling but their ratio CI straddles it, so the"
+    echo "  measurement cannot separate the two codecs at this resolution. They are not"
+    echo "  reported as an ergon loss. Ceilings are unchanged."
+    echo ""
+fi
 if [ "$failures" -gt 0 ]; then
     echo "FAIL: $failures maintained ratio(s) or provenance check(s) failed"
     exit 1

@@ -20,7 +20,7 @@ type R = Result<(), Box<dyn std::error::Error>>;
 /// of the work alone starts at `now_ns_begin`.
 #[test]
 fn a_busy_spin_loop() -> R {
-    let mut clock = calibrate(&Config::default())?; // start-up only: 40-70 ms, plus up to 50 ms for the time-sync probe
+    let mut clock = calibrate(&Config::default())?; // start-up only: 40-70 ms, plus a short time-sync probe (50 ms chronyd answer timeout; duration not measured)
     let mut slowest_ns = 0;
     let mut to_log = Vec::new(); // a logger thread prints these in a real program
     for turn in 0..10_000_u64 {

@@ -66,7 +66,7 @@ re-apply it together with the interrupt pins.
 ## C-states
 
 A C-state is how deeply an idle CPU sleeps: deeper saves power but wakes
-later, up to hundreds of microseconds.
+later. The wake delay is the vendor's C-state exit latency, not measured here.
 
 | host | setting | measured effect |
 |---|---|---|

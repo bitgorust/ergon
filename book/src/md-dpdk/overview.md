@@ -16,11 +16,13 @@
 > In this crate **on localhost it seems slightly slower than the open-source Aeron C
 > driver** over kernel UDP: host-local channels run on ordinary kernel
 > sockets in this driver too, so bypass cannot help there. On x86 the
-> medians were within 0.25 µs and its tail was slightly worse
-> (bare-metal c7i: p99.99 8.18 against 7.39 µs, max 10.73 against 8.86 µs;
-> Azure: p50 6.16 against 5.94 µs, p99.99 10.71 against 9.39 µs). On
-> Graviton5 its median was 0.4 µs lower (3.88 against 4.29 µs) but its max
-> higher (19 against 15 µs) ([the data](#localhost-no-gain),
+> medians were within 0.25 µs and its p99.99 slightly worse
+> (bare-metal c7i: 8.18 against 7.39 µs). Its worst round trip was far
+> worse there (664.6 against 9.5 µs, one unexplained 664.6 µs rep of five)
+> and slightly worse on Azure (56.8 against 56.5 µs; p50 6.16 against
+> 5.94, p99.99 10.71 against 9.39). On Graviton5 its median was 0.4 µs
+> lower (3.88 against 4.29 µs) but its worst higher (35.1 against 20.3 µs)
+> ([the data](#localhost-no-gain),
 > [runs](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)).
 
 ## Glossary
@@ -75,11 +77,11 @@ Terms this chapter uses. Host, Kubernetes and Java terms:
 Figures in this glossary: [md-dpdk/BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md).
 | bare metal                                                           | an instance with no hypervisor                                                                                                          | tighter tails and fewer stalls, not a lower median; 6 times a `c7i.4xlarge`'s price                                                            |
 | round trip (ping-pong)                                               | one message out and its reply back. Every latency here is a round trip                                                                  |                                                                                                                                                |
-| rep                                                                  | one repeat of a run; each cell is the median of 5 reps                                                                                  |                                                                                                                                                |
+| rep                                                                  | one repeat of a run; p50 and p99.99 cells are the median of 5 reps, max cells the largest in any one rep                                   |                                                                                                                                                |
 | NAK, retransmit, drop, short send                                    | the receiver asking for a resend; a frame sent again; a packet the NIC threw away; a send that put out less than asked                  | any one makes the rep lossy                                                                                                                    |
 | lossy rep, loss-free maximum                                         | lossy rep: a rep that lost anything. Loss-free maximum: the highest load with no lossy rep                                              | a rate with a lossy rep is a ceiling, not an operating point                                                                                   |
 | p50, p99, p99.9, p99.99, tail                                        | percentiles: p50 is the median; at p99.99, 1 round trip in 10,000 is slower. The high ones are the tail                                 | the median shows the usual case; the tail shows stalls                                                                                         |
-| max                                                                  | the slowest single round trip                                                                                                           | one stall sets it: it shows what a rare bad moment costs                                                                                       |
+| max                                                                  | the largest single round trip in any rep, not the median of the per-rep maxima                                                           | one stall sets it: it shows what a rare bad moment costs                                                                                       |
 | intended send time                                                   | under load, latency counts from when a message should have been sent                                                                    | a stall then counts against every message behind it                                                                                            |
 | CPU counter                                                          | a register in each core that counts at a fixed rate (the TSC on x86)                                                                    | read inline: no system call ([ergon-clock](../clock/overview.md))                                                                              |
 | chrony                                                               | the daemon that keeps the host's wall clock on a reference: NTP, or a hardware clock such as the NIC's (PTP)                            | NIC timestamps need it to keep the host on the NIC's clock ([time sync](../clock/wall-clock.md))                                               |
@@ -119,7 +121,7 @@ Four kernel settings close part of the gap without bypass
 
 | setting                               | what it does                                                                                                                                                                                                                                                                                       |
 | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| interrupt moderation off              | the NIC interrupts for each packet instead of waiting to batch several. ENA's default wait added about 60 µs to the median at only 100 k msgs/s ([A/B](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-kernel-udp-against-aerons-published-open-source-figure-2026-10-15)) |
+| interrupt moderation off              | the NIC interrupts for each packet instead of waiting to batch several. ENA's default wait added about 60 µs to the median at only 100 k msgs/s ([A/B](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-c7i4xlarge-round-7-p50--p999--max-median-across-reps)) |
 | NIC interrupts on a core of their own | the kernel's receive work runs on a core that is awake and has nothing else to do                                                                                                                                                                                                                  |
 | busy polling                          | a socket read spins on the NIC's queue instead of sleeping until an interrupt. x86 only: on Graviton it collapsed at 1 M msgs/s of 288 B                                                                                                                                                           |
 | 4,096-entry receive ring              | the NIC's receive queue holds a burst while the reader catches up                                                                                                                                                                                                                                  |
@@ -146,7 +148,7 @@ below).
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | both ends on one host                                                | kernel UDP, or Aeron IPC (shared memory, no network); never DPDK                                                                                                   |
 | between hosts, Graviton                                              | kernel UDP, moderation off, the NIC's interrupts on a core of their own: the best kernel path measured (no lossy rep at 1 M msgs/s in rounds G1 and G3, one in G2) |
-| between hosts, x86                                                   | kernel UDP with busy polling and a 4,096-entry ring: the lowest kernel median, but under load its max reached 0.6 ms on `c7i` and 21 ms on Azure                   |
+| between hosts, x86                                                   | kernel UDP with busy polling and a 4,096-entry ring: the lowest kernel median, but under load its worst round trip was 6.7 ms on `c7i` and 33 ms on Azure (median of the five per-rep maxima 0.6 and 21 ms) |
 | between hosts, the kernel's median or tail is not good enough        | kernel bypass with [Aeron Premium](https://aeron.io/)                                                                                                              |
 | learning how a transport binding works, or reproducing these numbers | this crate, in a lab                                                                                                                                               |
 
@@ -154,11 +156,13 @@ below).
 
 **Method.** Aeron 1.53.3 ping-pong between two hosts in one placement
 group, isolated CPUs, 5 reps (repeats). Idle: 32 B, one message in flight,
-300,000 round trips a rep. Under load: 288 B at a fixed rate, each latency
-counted from when the message should have been sent, so a stall counts
-against every message behind it. Each cell is the median of the 5 reps, in
-µs: p50 is the median round trip, p99.99 is slower than all but 1 in
-10,000, max is the slowest one.
+300,000 round trips a rep (1,500,000 a cell). Under load: 288 B at a fixed
+rate, each latency counted from when the message should have been sent, so
+a stall counts against every message behind it. p50 and p99.99 are the
+median across the 5 reps of that rep's percentile. **max is the largest
+single round trip in any rep**, not the median of the per-rep maxima: that
+median hides single stalls. The per-rep spread of each max is under its
+table. In µs.
 
 - **Lossy rep:** a rep that lost anything: a NAK (the receiver asking for a
   resend), a retransmit, a drop or a short send.
@@ -172,41 +176,52 @@ against every message behind it. Each cell is the median of the 5 reps, in
 
 Neoverse V3, 8 cores, no SMT; us-east-1, spot, Debian 13, Linux 7.2.6, DPDK
 24.11.4; round G1, 2026-10-16, run `aws-20261016-072005`
-([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-graviton5-c9g2xlarge-round-g1-2026-10-16)).
+([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#conclusions)).
 
 | transport                                                    | idle: p50 / p99.99 / max | 288 B at 1 M msgs/s: p50 / max (lossy reps) | loss-free maximum: 288 B / 1,344 B |
 | ------------------------------------------------------------ | ------------------------ | ------------------------------------------- | ---------------------------------- |
-| kernel UDP, moderation off, NIC interrupts on their own core | 18.54 / 38.14 / 93       | 44.9 / 122 (0 of 5)                         | 1 M / 500 k                        |
-| kernel UDP, busy polling, 4,096 ring                         | 16.98 / 35.26 / 94       | collapsed, p50 5.0 ms (5 of 5)              | 500 k / 500 k                      |
-| DPDK                                                         | 13.69 / 28.67 / 75       | 19.0 / 107 (0 of 5)                         | 1 M / 500 k¹                       |
+| kernel UDP, moderation off, NIC interrupts on their own core | 18.54 / 38.14 / 155      | 44.9 / 216 (0 of 5)                         | 1 M / 500 k                        |
+| kernel UDP, busy polling, 4,096 ring                         | 16.98 / 35.26 / 127      | collapsed, p50 5.0 ms / max 102,826 (5 of 5) | 500 k / 500 k                      |
+| DPDK                                                         | 13.69 / 28.67 / 155      | 19.0 / 166 (0 of 5)                         | 1 M / 500 k¹                       |
+
+The five per-rep maxima behind each max (smallest–largest): idle
+moderation-off kernel 66–155, idle busy-polling 76–127, idle DPDK 68–155;
+1 M msgs/s moderation-off kernel 111–216, busy-polling 8,544–102,826, DPDK
+92–166. The two 155 µs idle maxima (moderation-off kernel and DPDK) are the
+same rep's host stall.
 
 ¹ With 4,096 receive descriptors, the default now. With 1,024, 100 k: in one
 rep a host stall (max 2.6 ms) paced 308 sends, not receive loss.
 
 Two more pairs matched the medians, DPDK 13.78 and 13.97 µs, kernel 18.83
 and 18.93 µs (round G2, `aws-20261016-135004`,
-[data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-graviton5-c9g2xlarge-round-g2-2026-10-16);
+[data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#conclusions);
 round G3, `aws-20261016-223251`,
-[data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-graviton5-c9g2xlarge-round-g3-2026-10-16)).
+[data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#graviton5-c9g2xlarge-round-g3--best-measured-p50--p9999--max)).
 At 1 M msgs/s the kernel path lost in 1 of 5 reps in G2, none in G3.
 
 ### AWS x86: `c7i.4xlarge`
 
 Sapphire Rapids, 8 cores × 2; us-east-1, Debian 13, Linux 7.2.6, DPDK 24.11.4;
 round 7, 2026-10-15, run `aws-20261015-185813`
-([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-c7i4xlarge-rounds-6-and-7-2026-10-15)).
+([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-c7i4xlarge-round-7-p50--p999--max-median-across-reps)).
 
 | transport                            | idle: p50 / p99.99 / max | 288 B at 1 M msgs/s: p50 / max (lossy reps) | loss-free maximum: 288 B / 1,344 B |
 | ------------------------------------ | ------------------------ | ------------------------------------------- | ---------------------------------- |
-| kernel UDP, ENA defaults             | 38.81 / 105.79 / 4,612   | 85.89 / 2,574 (2 of 5)                      | 500 k / 500 k                      |
-| kernel UDP, busy polling, 4,096 ring | 28.22 / 56.48 / 1,938    | 43.74 / 599 (1 of 5)                        | 500 k / 100 k                      |
-| DPDK                                 | 21.28 / 43.71 / 109      | 30.38 / 152 (0 of 5)                        | 1 M / 100 k²                       |
+| kernel UDP, ENA defaults             | 38.81 / 105.79 / 5,378   | 85.89 / 13,943 (2 of 5)                     | 500 k / 500 k                      |
+| kernel UDP, busy polling, 4,096 ring | 28.22 / 56.48 / 4,846    | 43.74 / 6,664 (1 of 5)                      | 500 k / 100 k                      |
+| DPDK                                 | 21.28 / 43.71 / 116      | 30.38 / 155 (0 of 5)                        | 1 M / 100 k²                       |
+
+The five per-rep maxima behind each max (smallest–largest): idle ENA-defaults
+kernel 381–5,378, idle busy-polling 349–4,846, idle DPDK 52–116; 1 M msgs/s
+ENA-defaults 513–13,943, busy-polling 536–6,664, DPDK 139–155.
 
 ² With ENA's default 1,024 receive descriptors, as this round ran; 600 k
 with 4,096, the default now (round 6).
 
 - Every kernel mode had an idle max of 2–9 ms on this pair and round 6's.
-  **Open, no cause found.** DPDK's never passed 142 µs.
+  **Open, no cause found.** DPDK's idle maxima were an order of magnitude
+  smaller (116 µs on this round).
 - Kernel UDP with moderation off and the interrupts on their own core (the
   Graviton winner) has not been measured on `c7i`.
 
@@ -217,38 +232,49 @@ different run and pair; compare down a column.
 
 | transport                | idle: p50 / p99.99 / max | 288 B at 1 M msgs/s: p50 / max (NAKs) | loss-free and keeping up: 288 B / 1,344 B |
 | ------------------------ | ------------------------ | ------------------------------------- | ----------------------------------------- |
-| kernel UDP               | 35.26 / 115.20 / 289     | not measured                          | not measured                              |
-| kernel UDP, busy polling | 21.57 / 33.92 / 82       | 101.50 / 21,152 (0)                   | 2 M / 400 k                               |
-| DPDK                     | 20.11 / 30.29 / 71       | 73.92 / 125 (0)                       | 2 M / 400 k³                              |
+| kernel UDP               | 35.26 / 115.20 / 2,740   | not measured                          | not measured                              |
+| kernel UDP, busy polling | 21.57 / 33.92 / 449      | 101.50 / 33,325 (0)                   | 2 M / 400 k                               |
+| DPDK                     | 20.11 / 30.29 / 447      | 73.92 / 131 (0)                       | 2 M / 400 k³                              |
+
+The five per-rep maxima behind each max (smallest–largest): idle kernel
+244–2,740, idle busy-polling 75–449, idle DPDK 65–447; 1 M msgs/s
+busy-polling 1,487–33,325, DPDK 121–131.
 
 - Idle: two `Standard_D8s_v6`, 2026-10-13, run `20261013-102659`
-  ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#kernel-udp-against-dpdk-on-an-azure-d8s_v6-pair-2026-10-13)).
+  ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#azure-rounds-410--dpdk-and-kernel-p50--p9999--max)).
 - Under load: `D16s_v6` and `D8ds_v6`, round 5, run `20261014-173745`, a
   farther pair, busy polling with the 4,096 ring
-  ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#round-5-reproducing-round-4-five-reps-2026-10-14)).
+  ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#azure-rounds-410--dpdk-and-kernel-p50--p9999--max)).
 - Loss-free: round 10, run `20261015-160250`
-  ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#round-10-reproducing-round-9s-window-on-a-farther-pair-2026-10-15)).
+  ([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#azure-rounds-410--dpdk-and-kernel-p50--p9999--max)).
 
 ³ 600 k with the conductor's park capped at 20 µs and a 256 KiB receiver
 window ([configuration](configuration.md#aeron-settings)).
 
 ## Localhost: no gain
 
-Both ends on one host, 32 B, one in flight, 300,000 round trips a rep,
-median of 5 reps, µs:
+Both ends on one host, 32 B, one in flight, 300,000 round trips a rep, 5
+reps, µs. p50 and p99.99 are the median across reps; **max is the largest
+single round trip in any rep**, not the median of the per-rep maxima.
 
 | run                                                                      | DPDK driver: p50 / p99.99 / max | kernel UDP: p50 / p99.99 / max |
 | ------------------------------------------------------------------------ | ------------------------------- | ------------------------------ |
-| Azure `Standard_D16s_v6`, round 8, 2026-10-15, `20261015-081024`         | 6.16 / 10.71 / 54               | 5.94 / 9.39 / 49               |
-| AWS `c7i.metal-24xl`, round 4, 2026-10-15, `aws-20261015-012400`         | 5.48 / 8.18 / 10.73             | 5.58 / 7.39 / 8.86             |
-| AWS `c7i.4xlarge`, round 3, 2026-10-15, `aws-20261014-223644`            | 5.89 / 12.53 / 20               | 5.94 / 12.43 / 42              |
-| AWS Graviton5 `c9g.2xlarge`, round G1, 2026-10-16, `aws-20261016-072005` | 3.88 / 9.51 / 19                | 4.29 / 10.54 / 15              |
+| Azure `Standard_D16s_v6`, round 8, 2026-10-15, `20261015-081024`         | 6.16 / 10.71 / 56.8             | 5.94 / 9.39 / 56.5             |
+| AWS `c7i.metal-24xl`, round 4, 2026-10-15, `aws-20261015-012400`         | 5.48 / 8.18 / 664.6             | 5.58 / 7.39 / 9.5              |
+| AWS `c7i.4xlarge`, round 3, 2026-10-15, `aws-20261014-223644`            | 5.89 / 12.53 / 28.7             | 5.94 / 12.43 / 225.7           |
+| AWS Graviton5 `c9g.2xlarge`, round G1, 2026-10-16, `aws-20261016-072005` | 3.88 / 9.51 / 35.1              | 4.29 / 10.54 / 20.3            |
+
+The five per-rep maxima behind each max (smallest–largest): Azure DPDK
+45.6–56.8, Azure kernel 38.0–56.5; metal DPDK 9.97–664.6 (the 664.6 µs rep
+is unexplained; the other four were 9.97–11.2), metal kernel 8.4–9.5;
+c7i.4xlarge DPDK 17.1–28.7, c7i.4xlarge kernel 18.3–225.7; Graviton DPDK
+12.3–35.1, Graviton kernel 12.8–20.3.
 
 Data:
-[Azure round 8](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#round-8-sends-all-or-nothing-and-the-receive-drain-2026-10-15),
-[AWS metal](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-c7imetal-24xl-round-4-no-hypervisor-2026-10-15),
-[AWS c7i.4xlarge](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-c7i4xlarge-round-3-2026-10-15),
-[Graviton G1](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-graviton5-c9g2xlarge-round-g1-2026-10-16).
+[Azure round 8](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#azure-rounds-410--dpdk-and-kernel-p50--p9999--max),
+[AWS metal](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#conclusions),
+[AWS c7i.4xlarge](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#experiment-log),
+[Graviton G1](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#conclusions).
 
 ## Next
 

@@ -13,7 +13,12 @@
 //! Note: sbe-tool uses a different API pattern (mutable self, parent
 //! references, advance()-based group iteration). These benchmarks compare
 //! semantically equivalent operations — same fields, same buffer, same count.
-//! Fair comparison uses `wrap` (sbe-tool's `wrap` does no bounds check).
+//! Keep-alive rule (the `encode/session_keep_alive` fairness fix, BENCHMARKS.md):
+//! sbe-tool's `wrap` does no bounds check, so a matched pair runs ergon's
+//! unchecked constructor — ergon's checked `wrap` proves the extent and then
+//! panics, which is unequal work. Every body-wrap decode pair, gated
+//! `decode/entry_point` included, proves the extent in an untimed preflight and
+//! times `wrap_unchecked` against sbe-tool's zero-check wrap.
 //!
 //! Results are profile-specific. The fairness audit found that sbe-tool
 //! performs well with and without LTO because its generated accessors carry
@@ -44,9 +49,9 @@
 // ergon generated code
 
 use ergo_sbe_benchmarks::{
-    THROUGHPUT_SLOT, assert_stream_wrap_extent, ergo_car::*, sample_decode_throughput,
-    sample_encode_throughput, sbe_tool_car_body_decoder, throughput_decode_ergo,
-    throughput_decode_tool, throughput_encode_ergo, throughput_encode_tool,
+    THROUGHPUT_SLOT, assert_baseline_wrap_extent, assert_stream_wrap_extent, ergo_car::*,
+    sample_decode_throughput, sample_encode_throughput, sbe_tool_car_body_decoder,
+    throughput_decode_ergo, throughput_decode_tool, throughput_encode_ergo, throughput_encode_tool,
 };
 
 // sbe-tool Rust SBE generated code (patched for module inclusion)
@@ -68,6 +73,28 @@ const BATCH_SIZE: usize = 10_000;
 #[inline(always)]
 fn clobber_memory() {
     unsafe { core::arch::asm!("", options(nostack, preserves_flags)) };
+}
+
+/// Per-slot buffer view shared by both arms of every encode pair.
+///
+/// The extent is proved once — by the allocation (`BATCH_SIZE * slot`) and the
+/// parity assert in the gated function — and the timed region must not re-prove
+/// it. A safe `buf[off..off + slot]` index emits a bounds check every
+/// iteration, and rustc does not fuse that check the same way twice: on aarch64
+/// it compiled one arm's as `adds`+`b.hs` and the other's as `add`+`cmp`+`b.lo`,
+/// one extra instruction per iteration, which measured as a several-percent
+/// wall-clock gap while the hot loops were otherwise instruction-identical. That
+/// reads the harness, not the codec. Both arms index through this helper so the
+/// timed loops retire the same instructions. Guarded mechanically by
+/// `fairness_policy_test::encode_arms_index_the_buffer_without_a_per_iteration_bounds_check`.
+///
+/// # Safety
+///
+/// `base.add(off..off + len)` must be in bounds of the allocation the caller
+/// owns, and the returned view must not be aliased by any other live `&mut`.
+#[inline(always)]
+unsafe fn slot_slice<'a>(base: *mut u8, off: usize, len: usize) -> &'a mut [u8] {
+    unsafe { core::slice::from_raw_parts_mut(base.add(off), len) }
 }
 
 const SCALAR_FRAME_SIZE: usize = CarEncoder::HEADER_LENGTH + CarEncoder::BLOCK_LENGTH;
@@ -322,15 +349,22 @@ fn bench_decode_entry_point(c: &mut Criterion) {
     let bl = sbe_tool_block_length();
     let ver = sbe_tool_version();
     let (bl_e, ver_e) = ergo_sbe_header_fields();
+    assert_baseline_wrap_extent(BASELINE, 0, bl_e, ver_e);
 
     let mut group = c.benchmark_group("parity/decode/entry_point");
     group.throughput(Throughput::Elements(MICRO_BATCH_SIZE as u64));
 
-    // Fast path: pre-computed header, lean wrap (4 field assigns).
+    // Gated arm, class `none` like the other body-wrap pairs: the extent is
+    // proved once above, outside the measurement, and the timed region wraps
+    // with the unchecked constructor. Keep-alive rule (BENCHMARKS.md): match
+    // sbe-tool's zero-check `wrap`, which only stores buffer/offset/block-
+    // length/version. A validating wrap in the timer would charge ergon for a
+    // bounds proof its reference never performs.
     group.bench_function("ergo-sbe_wrap", |b| {
         b.iter(|| {
             for _ in 0..MICRO_BATCH_SIZE {
-                let car = CarDecoder::wrap(black_box(BASELINE), 0, bl_e, ver_e);
+                let car =
+                    unsafe { CarDecoder::wrap_unchecked(black_box(BASELINE), 0, bl_e, ver_e) };
                 black_box(car);
             }
         });
@@ -850,10 +884,14 @@ fn bench_encode_throughput(c: &mut Criterion) {
     group.bench_function("ergo-sbe", |b| {
         let mut buf = vec![0u8; BATCH_SIZE * THROUGHPUT_SLOT];
         b.iter(|| {
+            let base = buf.as_mut_ptr();
             for i in 0..BATCH_SIZE {
                 let off = i * THROUGHPUT_SLOT;
+                // SAFETY: `BATCH_SIZE * THROUGHPUT_SLOT` allocation, disjoint
+                // per iteration. The extent is proved by the allocation and the
+                // preflight above, not re-proved every iteration.
                 black_box(throughput_encode_ergo(
-                    &mut buf[off..off + THROUGHPUT_SLOT],
+                    unsafe { slot_slice(base, off, THROUGHPUT_SLOT) },
                     i as u64,
                 ));
             }
@@ -864,10 +902,71 @@ fn bench_encode_throughput(c: &mut Criterion) {
     group.bench_function("sbe-tool", |b| {
         let mut buf = vec![0u8; BATCH_SIZE * THROUGHPUT_SLOT];
         b.iter(|| {
+            let base = buf.as_mut_ptr();
             for i in 0..BATCH_SIZE {
                 let off = i * THROUGHPUT_SLOT;
+                // SAFETY: same extent proof as the ergo arm.
                 black_box(throughput_encode_tool(
-                    &mut buf[off..off + THROUGHPUT_SLOT],
+                    unsafe { slot_slice(base, off, THROUGHPUT_SLOT) },
+                    i as u64,
+                ));
+            }
+            black_box(&buf);
+        });
+    });
+
+    group.finish();
+}
+
+/// A/A control for the SBE encode harness.
+///
+/// Both arms run the identical throughput encode chain — same codec, same
+/// slice helper, same opaque serial. Their ratio is the harness's own null
+/// distribution: any deviation from 1.0 is placement or timing sensitivity,
+/// not codec work. Read it beside every maintained pair. A real pair whose
+/// ratio falls inside this band has **no established winner** — inconclusive,
+/// not an ergon loss and not an ergon win. Ceilings are unchanged; this only
+/// says whether a ceiling breach is resolved.
+///
+/// `fairness_policy_test::aa_control_arms_run_identical_work` keeps the two
+/// bodies textually identical.
+fn bench_aa_control_encode_throughput(c: &mut Criterion) {
+    let encoded = sample_encode_throughput(BATCH_SIZE);
+    assert_eq!(encoded.one_ergo, encoded.one_tool);
+    assert_eq!(encoded.batch_ergo, encoded.batch_tool);
+
+    let mut group = c.benchmark_group("parity/control/aa_encode_throughput");
+    group.throughput(Throughput::Elements(BATCH_SIZE as u64));
+
+    group.bench_function("arm_a", |b| {
+        let mut buf = vec![0u8; BATCH_SIZE * THROUGHPUT_SLOT];
+        b.iter(|| {
+            let base = buf.as_mut_ptr();
+            for i in 0..BATCH_SIZE {
+                let off = i * THROUGHPUT_SLOT;
+                // SAFETY: `BATCH_SIZE * THROUGHPUT_SLOT` allocation, disjoint
+                // per iteration. The extent is proved by the allocation and the
+                // preflight above, not re-proved every iteration.
+                black_box(throughput_encode_ergo(
+                    unsafe { slot_slice(base, off, THROUGHPUT_SLOT) },
+                    i as u64,
+                ));
+            }
+            black_box(&buf);
+        });
+    });
+
+    group.bench_function("arm_b", |b| {
+        let mut buf = vec![0u8; BATCH_SIZE * THROUGHPUT_SLOT];
+        b.iter(|| {
+            let base = buf.as_mut_ptr();
+            for i in 0..BATCH_SIZE {
+                let off = i * THROUGHPUT_SLOT;
+                // SAFETY: `BATCH_SIZE * THROUGHPUT_SLOT` allocation, disjoint
+                // per iteration. The extent is proved by the allocation and the
+                // preflight above, not re-proved every iteration.
+                black_box(throughput_encode_ergo(
+                    unsafe { slot_slice(base, off, THROUGHPUT_SLOT) },
                     i as u64,
                 ));
             }
@@ -1375,6 +1474,7 @@ criterion_group!(
     bench_throughput_batch,
     bench_encode_scalar,
     bench_encode_throughput,
+    bench_aa_control_encode_throughput,
     bench_decode_consuming_full,
     bench_encode_full_stage_transition,
     bench_wire_parity_encode_full_message,

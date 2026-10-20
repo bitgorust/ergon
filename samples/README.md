@@ -9,7 +9,7 @@ implementations — they move with experimental APIs on purpose.
 | Step | Sample | Why |
 |------|--------|-----|
 | **1** | [`sbe-feature-tour/`](sbe-feature-tour/) | **Golden path.** Full feature map: stages, EncodedLength, checked constructors + verify, Display, DTO with `DomainVarData::Strings`, all three conversion styles |
-| **2a** | [`l3-book/`](l3-book/) | Nested/ragged books; **`with_domain_type` only**; **build-dep only** (plain `include!`) |
+| **2a** | [`l3-book/`](l3-book/) | Nested/ragged books; **`with_domain_type` only**; **build-dep only** (`#[path]` into `src/generated/`) |
 | **2b** | [`exchange-example/`](exchange-example/) | Multi-schema; **`with_conversion` only**; IPC + app `TryFromSbe` |
 | **3** | [`sbe-codegen-examples/`](sbe-codegen-examples/) | Generator **as a library** (no `build.rs`) |
 | Later | [`cluster-tutorial/`](cluster-tutorial/) | Connect, offer, poll, keep-alive, close |
@@ -38,9 +38,9 @@ library at runtime.
 
 | Pattern | `build-dependencies` | `dependencies` | Typical use |
 |---------|----------------------|----------------|-------------|
-| **Build only** (**product / samples default**) | `ergo-sbe` | — | `generate_to_dir` → `src/generated/` (gitignored) + `#[path = "generated/….rs"]` |
-| **OUT_DIR only** | `ergo-sbe` | — | `generate_to_out_dir` + `include!(concat!(env!("OUT_DIR"), …))` — fine for apps; **poor IDE go-to-def** |
-| **Build + runtime** | `ergo-sbe` | `ergo-sbe` | Macros such as `sbe_mod!` plus build-time generation |
+| **Build only** (**samples default**) | `ergo-sbe` | — | `generate_to_dir` → `src/generated/` (gitignored, unpublished) + `#[path = "generated/….rs"]` |
+| **OUT_DIR only** | `ergo-sbe` | — | `generate_to_out_dir` + `include!(concat!(env!("OUT_DIR"), …))` — the product shape without macros |
+| **Build + runtime** (**product default**) | `ergo-sbe` | `ergo-sbe` | `generate_to_out_dir` + `sbe_mod!` (expands to that `include!`) — what `cluster/build.rs` and the introduction do |
 | **Runtime only** | — | `ergo-sbe` | Call `parse` / `Generator` as a library (no `build.rs`) |
 
 | Sample | Pattern | Purpose | External requirements |
@@ -56,8 +56,8 @@ library at runtime.
 ### Seeing generated code (without committing it)
 
 `include!(concat!(env!("OUT_DIR"), …))` and `sbe_mod!` put files under a
-hashed path like `target/debug/build/<crate>-<hash>/out/….rs` — hard to find
-and rust-analyzer usually **cannot** jump into them.
+hashed path like `target/debug/build/<crate>-<hash>/out/….rs`, which is
+awkward to open by hand.
 
 Samples instead write to a **stable, local path**:
 

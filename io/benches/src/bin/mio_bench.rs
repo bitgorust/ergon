@@ -207,13 +207,18 @@ fn connect(a: &Args, conns: usize) -> BoxResult<(Poll, Vec<Conn>)> {
     connect_paths(a, &paths)
 }
 
+/// The loop's own counters, written as `loop.0.*`.
+struct LoopCounters {
+    spins: u64,
+    reads: u64,
+    polls: u64,
+}
+
 fn meta(
     mode: &str,
     duration_s: i64,
     extra: &str,
-    spins: u64,
-    reads: u64,
-    polls: u64,
+    loop_stats: &LoopCounters,
     elapsed_s: i64,
     end_reason: &str,
 ) -> String {
@@ -235,10 +240,10 @@ fn meta(
     );
     let _ = writeln!(m, "variants=mio");
     let _ = writeln!(m, "loop.0.variant=mio");
-    let _ = writeln!(m, "loop.0.spins={spins}");
-    let _ = writeln!(m, "loop.0.epoll_wait_calls={polls}");
-    let _ = writeln!(m, "loop.0.recvmsg_calls={reads}");
-    let _ = writeln!(m, "loop.0.syscalls={}", polls + reads);
+    let _ = writeln!(m, "loop.0.spins={}", loop_stats.spins);
+    let _ = writeln!(m, "loop.0.epoll_wait_calls={}", loop_stats.polls);
+    let _ = writeln!(m, "loop.0.recvmsg_calls={}", loop_stats.reads);
+    let _ = writeln!(m, "loop.0.syscalls={}", loop_stats.polls + loop_stats.reads);
     m.push_str(extra);
     m
 }
@@ -352,9 +357,11 @@ fn finish_lab(
             "lab",
             duration_s,
             &extra,
-            spins,
-            reads,
-            polls,
+            &LoopCounters {
+                spins,
+                reads,
+                polls,
+            },
             (monotonic_ns() - start_mono_ns).max(0) / 1_000_000_000,
             end_reason,
         ),
@@ -495,9 +502,11 @@ fn pingpong(a: &Args) -> BoxResult<()> {
             "pingpong",
             duration_s,
             &extra,
-            spins,
-            reads,
-            polls,
+            &LoopCounters {
+                spins,
+                reads,
+                polls,
+            },
             (monotonic_ns() - start).max(0) / 1_000_000_000,
             reason,
         ),
@@ -708,9 +717,11 @@ fn http(a: &Args) -> BoxResult<()> {
             "pingpong",
             duration_s,
             &extra,
-            spins,
-            reads,
-            polls,
+            &LoopCounters {
+                spins,
+                reads,
+                polls,
+            },
             (monotonic_ns() - start).max(0) / 1_000_000_000,
             "deadline",
         ),

@@ -166,7 +166,7 @@ copy of every figure:
 **AWS caps one UDP flow** at a few Gbit/s, x86 and Graviton, whatever the
 transport. An Aeron channel is one flow, so spread a heavier stream over
 several channels on different ports
-([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-one-flow-carries-about-8-gbits)).
+([data](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md#aws-c7i4xlarge-round-7-p50--p999--max-median-across-reps)).
 
 ## Clocks and timestamps
 

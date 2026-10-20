@@ -29,7 +29,7 @@ include = [
 # 0.2.11 is the first release whose `links = "aeron_driver"` key hands this
 # crate's build script the headers of the Aeron it builds (DEP_AERON_DRIVER_*)
 # and whose context exposes `set_udp_channel_transport_bindings`.
-rusteron-media-driver = "0.2.11"
+rusteron-media-driver = "0.2.13"
 ctrlc = { version = "3.5", features = ["termination"] }
 libc = "0.2"
 log = "0.4"
@@ -45,12 +45,12 @@ ergon-clock = { version = "0.1.30", path = "../clock" }
 # The M3 probe socket's buffer sizes and the re-check thread's CPU affinity,
 # without `unsafe` (already in the lock through ergon-tune).
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1.4", default-features = false, features = ["std", "net", "thread"] }
+rustix = { version = "1.1.5", default-features = false, features = ["std", "net", "thread"] }
 
 [dev-dependencies]
 criterion = "0.8"
 minstant = "0.1"
-serial_test = { version = "3", features = ["file_locks"] }
+serial_test = { version = "4", features = ["file_locks"] }
 
 [build-dependencies]
 cc = "1.2"

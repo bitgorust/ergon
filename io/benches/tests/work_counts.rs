@@ -114,7 +114,7 @@ fn meta_round_trips_the_six_counts_and_a_missing_one_stays_missing() {
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect();
-    assert_eq!(Work::from_meta(&map), Some(w));
+    assert_eq!(Work::from_meta(&map), Ok(Some(w)));
 
     // A partial write is a partial count: the rest is "not yet measured".
     let mut partial = String::new();
@@ -124,14 +124,57 @@ fn meta_round_trips_the_six_counts_and_a_missing_one_stays_missing() {
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect();
-    let got = Work::from_meta(&map).expect("two counts are present");
+    let got = Work::from_meta(&map)
+        .expect("meta parses")
+        .expect("two counts are present");
     assert_eq!((got.completed, got.censored), (Some(6), Some(2)));
     assert_eq!(got.issued, None);
 
     // A run recorded before the counts were has no row, and is not reported as
     // six zeros.
     let empty = std::collections::HashMap::new();
-    assert_eq!(Work::from_meta(&empty), None);
+    assert_eq!(Work::from_meta(&empty), Ok(None));
+}
+
+/// The accounting a fresh executable once reported without complaint:
+/// `1 scheduled, 8 issued, 7 completed, 5 censored`. It violates both
+/// identities — `scheduled < issued`, and `issued != completed + censored` —
+/// so it is malformed metadata and must be reported, not accepted.
+#[test]
+fn contradictory_counts_are_reported_not_accepted() {
+    let map: std::collections::HashMap<String, String> = [
+        ("work.scheduled", "1"),
+        ("work.issued", "8"),
+        ("work.completed", "7"),
+        ("work.censored", "5"),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+    .collect();
+    let err = Work::from_meta(&map).expect_err("the counts contradict each other");
+    assert!(
+        err.contains("work.issued 8 is not work.completed 7 + work.censored 5"),
+        "the report names the broken identity, got: {err}"
+    );
+}
+
+/// `scheduled` below `issued` is a contradiction on its own.
+#[test]
+fn more_issued_than_scheduled_is_reported() {
+    let map: std::collections::HashMap<String, String> = [
+        ("work.scheduled", "3"),
+        ("work.issued", "8"),
+        ("work.completed", "8"),
+        ("work.censored", "0"),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+    .collect();
+    let err = Work::from_meta(&map).expect_err("the counts contradict each other");
+    assert!(
+        err.contains("work.scheduled 3 is below work.issued 8"),
+        "the report names the broken identity, got: {err}"
+    );
 }
 
 #[test]
@@ -215,6 +258,67 @@ fn a_sample_short_of_the_runs_work_reports_what_it_leaves_out() -> R {
         report.contains("### Work behind the percentiles"),
         "{report}"
     );
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// A run whose `meta.txt` claims work that cannot have happened: 8 sends out
+/// of 1 scheduled slot, 7 recorded and 5 of them censored. The loader must
+/// name the contradiction instead of reporting the counts.
+#[test]
+fn contradictory_work_counts_are_rejected_not_reported() -> R {
+    let dir = std::env::temp_dir().join(format!("io-bench-badwork-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let run_dir = dir.join("r1-base-0").join("pp-recv-busy-10000");
+    run(
+        &run_dir,
+        "pingpong",
+        200,
+        "work.scheduled=1\nwork.issued=8\nwork.completed=7\nwork.late=0\nwork.rejected=0\nwork.censored=5\n",
+    )?;
+    match matrix::load_run(&run_dir, 10) {
+        Err(why) => {
+            assert!(
+                why.contains("work.issued") && why.contains("work.censored"),
+                "the reason names the counts that disagree: {why}"
+            );
+        }
+        Ok(got) => panic!("a contradictory run loaded as {got:?}"),
+    }
+    // And through `load`, so the report lists it beside the runs that failed.
+    let (tags, skipped) = matrix::load(&dir, 10)?;
+    assert!(tags.is_empty(), "the run is not reported: {tags:?}");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(
+        skipped[0].0.ends_with("pp-recv-busy-10000") && skipped[0].1.contains("work."),
+        "{skipped:?}"
+    );
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// `work.completed` is the sends with a recorded sample before the warm-up is
+/// dropped, so it must equal the records on disk. A run that claims more
+/// completions than it recorded is lying about its own sample.
+#[test]
+fn completed_must_match_the_records_on_disk() -> R {
+    let dir = std::env::temp_dir().join(format!("io-bench-shortrec-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let run_dir = dir.join("r1-base-0").join("pp-recv-busy-10000");
+    run(
+        &run_dir,
+        "pingpong",
+        200,
+        "work.scheduled=10\nwork.issued=9\nwork.completed=9\nwork.late=0\nwork.rejected=0\nwork.censored=0\n",
+    )?;
+    // `run` writes 7 records; the meta claims 9 completions.
+    match matrix::load_run(&run_dir, 10) {
+        Err(why) => assert!(
+            why.contains("work.completed") && why.contains("records"),
+            "the reason names both sides: {why}"
+        ),
+        Ok(got) => panic!("a run claiming more completions than records loaded as {got:?}"),
+    }
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
