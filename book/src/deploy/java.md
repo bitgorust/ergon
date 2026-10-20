@@ -88,10 +88,12 @@ These settings are left at their defaults:
 
 - `aeron.archive.file.sync.level` and `aeron.archive.catalog.file.sync.level`
   stay at `0`: writes go to the OS page cache only. `1` adds fdatasync and `2`
-  adds fsync. Keep the catalog's level at least the archive's. In a 3- or
-  5-member cluster the quorum is the durability mechanism, so sync level 0 is
-  the usual choice. A single-node cluster has no quorum, so its durability is
-  fsync: raise both sync levels together there.
+  adds fsync. Keep the catalog's level at least the archive's. Level `0`
+  survives a process dying and loses whatever is still in the page cache if
+  the machine does. In a 3- or 5-member cluster another member's log covers
+  that loss, so `0` is the usual choice. A single-member cluster's quorum is
+  one: its local log is the only copy, so raise both sync levels together
+  there and pay the fsync.
 - `aeron.archive.file.io.max.length` stays at `1m`.
 - `aeron.archive.control.term.buffer.sparse` stays at `true`.
 - `aeron.spies.simulate.connection` stays `false`. It is a media driver

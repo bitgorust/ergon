@@ -335,6 +335,8 @@ mod imp {
         for r in &results {
             all.extend_from_slice(&r.records);
         }
+        // The run's end, before any of its own file I/O.
+        let end_real = realtime_ns();
         write_records(&out.join("records.bin"), &all)?;
         let mut meta = base_meta(
             if mode == Mode::Binance {
@@ -344,6 +346,7 @@ mod imp {
             },
             duration_s,
             busy_poll_us,
+            end_real,
         );
         let _ = writeln!(meta, "wait_us={wait_us}");
         let _ = writeln!(meta, "conns_per_variant={}", targets.len());
@@ -388,7 +391,7 @@ mod imp {
         Ok(())
     }
 
-    fn base_meta(mode: &str, duration_s: i64, busy_poll_us: u32) -> String {
+    fn base_meta(mode: &str, duration_s: i64, busy_poll_us: u32, end_real_ns: i64) -> String {
         let read = |p: &str| {
             std::fs::read_to_string(p)
                 .map(|s| s.trim().to_owned())
@@ -399,7 +402,7 @@ mod imp {
         let _ = writeln!(m, "mode={mode}");
         let _ = writeln!(m, "duration_s={duration_s}");
         let _ = writeln!(m, "busy_poll_us={busy_poll_us}");
-        let _ = writeln!(m, "end_realtime_ns={}", realtime_ns());
+        let _ = writeln!(m, "end_realtime_ns={end_real_ns}");
         let _ = writeln!(m, "kernel={}", read("/proc/sys/kernel/osrelease"));
         let _ = writeln!(m, "arch={}", std::env::consts::ARCH);
         let _ = writeln!(
@@ -509,10 +512,13 @@ mod imp {
             .with_order(order);
         let mut stalls = stall_log(a)?;
         let (stats, sockets, conn_stats) = run_app(&mut driver, &mut app, duration_s, &mut stalls)?;
-        let work = app.work(realtime_ns());
+        // The run's end, before any of its own file I/O: `Work` and
+        // `end_realtime_ns` must describe the same instant.
+        let end_real = realtime_ns();
+        let work = app.work(end_real);
         stalls.write(&out.join("stalls-0.txt"))?;
         write_records(&out.join("records.bin"), &app.records)?;
-        let mut meta = base_meta("pingpong", duration_s, busy_poll_us);
+        let mut meta = base_meta("pingpong", duration_s, busy_poll_us, end_real);
         let _ = writeln!(meta, "variants={}", variant.name());
         let _ = writeln!(meta, "rate={rate}");
         let _ = writeln!(meta, "payload={payload}");

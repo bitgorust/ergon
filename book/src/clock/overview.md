@@ -100,8 +100,9 @@ Measured, node a, LTO (median, slowest batch in brackets) — full rows in
 | `clock_gettime(CLOCK_REALTIME)` | 30.94 (31.97) | 21.09 (21.65) | vDSO |
 | `SystemTime::now()`, as ns | 39.66 (40.58) | 28.51 (28.92) | vDSO + the `SystemTime` → ns conversion |
 
-Two things fall out of that table. The counter is **2.6–2.9× faster than
-the vDSO**, and the vDSO is not the slow part of `SystemTime`: a bare
+Two things fall out of that table. The counter is **2.54× faster than the
+vDSO on c8g** (30.92 against 12.17) **and 1.90× on c9g** (20.78 against
+10.92), and the vDSO is not the slow part of `SystemTime`: a bare
 `clock_gettime(CLOCK_REALTIME)` costs the same as `CLOCK_MONOTONIC`
 (30.94 against 30.92), so the extra 8.7 ns is Rust's `SystemTime` →
 `Duration` → `as_nanos` surface. `CLOCK_REALTIME` is a vDSO read, not a
@@ -208,6 +209,35 @@ Not speed: on x86 all read at about the same cost. The reasons:
 | UTC stamps kept on UTC, at counter cost | yes | no | no: a fixed offset |
 | on Graviton | the counter | the counter | the wall clock, and it can go back |
 | checks that Linux keeps time with the counter | yes | no: x86 CPU flags only, nothing on Arm | only that `tsc` is listed in `available_clocksource` |
+
+## Aeron's clocks
+
+Aeron has its own clocks and does not need this crate. They are not
+interchangeable with it.
+
+| Aeron API | Linux source | Returns | Resolution |
+|---|---|---|---|
+| `aeron_nano_clock()` | `CLOCK_MONOTONIC` | ns since boot | 1 ns |
+| `aeron_epoch_clock()` | `CLOCK_REALTIME_COARSE` | **ms** since Unix epoch | one kernel tick |
+| `aeron_clock_cache_t` | cached pair, release/acquire | both | as of the last refresh |
+
+The media driver reads the clock once per duty cycle per agent and stores it in
+one of three cache-line-padded caches (conductor, sender, receiver); the epoch
+half is refreshed at most once a millisecond. The hot path reads the cached
+`int64`, one acquire load, so the clock's cost is never on it.
+
+Do not point Aeron at this crate:
+
+| reason | |
+|---|---|
+| nothing to win | the hot path reads a cached `int64`, one acquire load. The kernel read is once per work-loop iteration (`aeron_driver_sender_do_work` and its conductor and receiver counterparts), off the data path; replacing it has shown no workload benefit |
+| units and domains differ | Aeron's epoch clock is milliseconds, its nano clock is monotonic since boot; this crate's default domain is UTC. A swap silently changes timeout arithmetic |
+| vendored upstream C | the media driver is the `aeron` submodule; forking its clock is a standing cost |
+
+Where this crate does replace a transport clock: `ergon-md-dpdk`, which reads
+time on every send and every receive poll. `Aeron::nano_clock()` and
+`Aeron::epoch_clock()` remain the way to read Aeron's own time; rusteron has no
+setter for them.
 
 ## Details
 

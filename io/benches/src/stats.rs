@@ -245,22 +245,35 @@ impl Work {
         }
     }
 
-    /// The counts a `meta.txt` map holds; a missing or unreadable key is
-    /// "not yet measured". `Ok(None)` when the run wrote none of them (a run
-    /// recorded before the counts were).
+    /// The counts a `meta.txt` map holds. `Ok(None)` when the run wrote none
+    /// of them (a run recorded before the counts were).
+    ///
+    /// An absent key is "not yet measured": a path that never produced that
+    /// count. A key that is present but not a number is **malformed metadata**,
+    /// not missing data — the two must not collapse into the same gap, or
+    /// `work.scheduled=garbage` is printed beside the percentiles as an honest
+    /// hole while the run had reported something unreadable.
     ///
     /// Counts that contradict each other are reported, not accepted: a run
     /// that claims `1 scheduled, 8 issued, 7 completed, 5 censored` is
     /// malformed metadata, and its numbers must not sit beside percentiles.
     pub fn from_meta(m: &HashMap<String, String>) -> Result<Option<Self>, String> {
-        let get = |k: &str| m.get(k).and_then(|v| v.parse().ok());
+        let get = |k: &str| -> Result<Option<u64>, String> {
+            match m.get(k) {
+                None => Ok(None),
+                Some(v) => v
+                    .parse()
+                    .map(Some)
+                    .map_err(|_| format!("{k}={v} is not a count")),
+            }
+        };
         let w = Self {
-            scheduled: get(WORK_KEYS[0]),
-            issued: get(WORK_KEYS[1]),
-            completed: get(WORK_KEYS[2]),
-            late: get(WORK_KEYS[3]),
-            rejected: get(WORK_KEYS[4]),
-            censored: get(WORK_KEYS[5]),
+            scheduled: get(WORK_KEYS[0])?,
+            issued: get(WORK_KEYS[1])?,
+            completed: get(WORK_KEYS[2])?,
+            late: get(WORK_KEYS[3])?,
+            rejected: get(WORK_KEYS[4])?,
+            censored: get(WORK_KEYS[5])?,
         };
         if [
             w.scheduled,
@@ -277,6 +290,25 @@ impl Work {
         }
         w.check()?;
         Ok(Some(w))
+    }
+
+    /// The one loader the report paths share: the map's counts, checked
+    /// against the records the run wrote to `records.bin`, **before** any
+    /// warm-up is dropped. `work.completed` is the sends with a recorded
+    /// sample, so it must equal `record_count`; a run that claims more
+    /// completions than it recorded is lying about its own sample, and a
+    /// shorter sample can read as a faster one.
+    pub fn load(m: &HashMap<String, String>, record_count: usize) -> Result<Option<Self>, String> {
+        let w = Self::from_meta(m)?;
+        if let Some(w) = &w
+            && let (Some(c), Ok(n)) = (w.completed, u64::try_from(record_count))
+            && c != n
+        {
+            return Err(format!(
+                "work.completed {c} is not the {n} records in records.bin"
+            ));
+        }
+        Ok(w)
     }
 
     /// The counts as table cells: their values, or "not yet measured".

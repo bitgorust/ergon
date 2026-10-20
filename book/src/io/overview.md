@@ -61,7 +61,7 @@ Terms this chapter uses. Each links to the section that explains it.
 | [Ping / Pong](websocket.md#options) | Control frames that check the other side is alive. | Ping after 10 s with nothing received; nothing back in 5 s: timeout. Any byte received counts as the answer. |
 | [close handshake](websocket.md#close) | Each side sends a Close frame, then TCP closes. | Waits up to 1 s (`close_timeout_ms`). `Driver::close` skips it. |
 | [HTTP/1.1 keep-alive](http-client.md#rules) | One connection reused for many requests. | No handshake per request. One request in flight per connection; a timed-out request closes its connection. |
-| [connection pool](http-client.md#limits) | The warm keep-alive connections an `HttpClient` keeps. | All busy: `Error::Busy`. Each one is one more socket the loop polls. |
+| [connection pool](http-client.md#many-connections) | The warm keep-alive connections an `HttpClient` keeps. | All busy: `Error::Busy`. Each one is one more socket the loop polls. |
 | [libcurl](http-client.md) | The common C HTTP library: `HttpImpl::Curl` (feature `curl`). | Pro: redirects, proxies, HTTP/2, compression. Con: slower than native on the same interrupt path. |
 | [rate limit](rate-limits.md#what-venues-do) | A venue's cap on requests, orders or connects per window: per IP, account, instrument or connection. | Break it: refused (429). Keep going: your IP is banned. |
 | [budget, bucket](rate-limits.md#what-ergon-io-gives-you) | `limit::Budget`: one bucket per venue limit, checked before each request. | Never sleeps or queues: a refusal says when to try again. Sees only this process. |
@@ -164,7 +164,7 @@ Figures: [`io/benches/BENCHMARK.md`](https://github.com/mimran1980/ergon/blob/ma
 | order round trip (WebSocket API) | 1 | `recv-busy` or `uring-sqpoll` |
 | order round trip next to N feed sockets | 1 + N | as for 1 + N sockets (not measured) |
 | HTTP | 1 | `recv-busy` |
-| HTTP | about 20, plus the rest | `per_queue`, or `uring-sqpoll` with a spare CPU (not measured: [HTTP with many connections](http-client.md#limits)) |
+| HTTP | about 20, plus the rest | `per_queue`, or `uring-sqpoll` with a spare CPU (not measured: [HTTP with many connections](http-client.md#many-connections)) |
 
 ## Connecting
 

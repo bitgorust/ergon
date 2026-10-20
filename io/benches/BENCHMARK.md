@@ -18,7 +18,7 @@ Run directories under `io/benches/results/`. The run ids are the surviving recor
 
 ## Read this first
 
-- **Round trips (WebSocket and HTTP) were measured with 1 connection only.** Only the one-way market-data runs measured many connections: 1 to 256, on AWS. Azure: 1 connection only. Graviton: not measured.
+- **Round-trip scope.** On x86 the WebSocket and HTTP round trips were measured with 1 connection only, and only the one-way market-data runs measured many connections (1 to 256, AWS). Azure: 1 connection only. The Graviton [fair run](#interrupt-against-nic-polling-the-fair-run-graviton) is the exception: it measured the WebSocket round trip at 1, 4, 16 and 64 sockets on one loop and an HTTP pool of 1 and 20.
 - **Every AWS backend comparison ran with ENA's adaptive receive moderation on** (the default; `rx-usecs 20` in every run's `env-rcv.txt`), bare metal included. It holds back interrupts to batch packets, so the interrupt-driven backends' numbers (`epoll-spin`, `uring-spin`, mio, and libcurl and reqwest) include that delay and are **not a fair comparison with the polling backends** (`recv-busy`, `per_queue`, `uring-sqpoll`). The NIC's interrupts also went to the shared housekeeping CPUs, with their deep idle states on (C6: 190 µs exit on `c7i`, 290 µs on metal; every `env-rcv.txt`). ergon-tune's advice for an interrupt path is the opposite: moderation fully off (`rx-usecs 0`) and the interrupts on a core of their own. Those runs draw no conclusion between the two families. Measured with moderation off: `recv-busy` (`062428Z`, `070339Z`); `uring-spin` once, in the first matrix run, whose sleeping sender inflated every result (`163114Z`, [lab notes](#lab-notes)); `epoll-spin` and mio never — on x86. On Graviton, run `20261019T175248Z` gave every backend the interrupt path's own setting and does compare them: [the fair run](#interrupt-against-nic-polling-the-fair-run-graviton).
 - **Market data is timed two ways:**
   - *Arrival → decoded*: the receiver's clock only, exact. It starts when the kernel first sees the packet: for `epoll-spin`, `uring-spin` and mio that is after the interrupt, and for `per_queue` after its once-per-pass queue poll (a pass is 2–6 µs). It leaves those waits out, so never use it to compare interrupt-driven against polling backends. (The stamp is software, taken when the kernel takes the packet off the NIC queue; ENA has no hardware stamp. So for every polling backend it also leaves out the wait for that queue's next poll.)
@@ -49,7 +49,7 @@ arrival → decoded and sender → decoded tables with maxima are in git history
 - **mio (and so tokio's I/O) is the epoll path:** per round −16 to +24 µs from `epoll-spin` at the median (most rounds within ±5). Tokio itself was not measured as a spin loop.
 - **On AWS, turn ENA's adaptive receive moderation off**: off, `recv-busy`'s p99.99 falls by 43–47 µs (runs `062428Z`, `070339Z`; the mechanism is not broken down by rate). That is the polling backends' setting (`rx-usecs` stays 20). For `epoll-spin`, `uring-spin` and mio, ergon-tune's interrupt-path setting is moderation fully off (`adaptive-rx off rx-usecs 0 tx-usecs 0`) with the NIC's interrupts on a core of their own — measured with ergon-io on Graviton in the [fair run](#interrupt-against-nic-polling-the-fair-run-graviton), not on x86.
 
-**Round trips, 1 connection only.** WebSocket echo on AWS (`045527Z`, back to back): `recv-busy` 39.5–42.0 / 45.5–49.7 / 130–1,038 and `uring-sqpoll` 40.0–41.0 / 45.5–47.0 / 176–862: equal. `epoll-spin` 47.1–49.0 / 55–98 / 188–369, measured with adaptive moderation on: not a fair comparison with them, so no conclusion. `epoll-spin`'s p99 varied from 53 to 98 µs between baselines, under that setting; the cause was not traced. The max is not lower with polling: about 1 ms on every backend ([worst cases](#worst-cases-on-aws)). More sockets on the loop: not measured.
+**Round trips, x86, 1 connection only.** WebSocket echo on AWS (`045527Z`, back to back): `recv-busy` 39.5–42.0 / 45.5–49.7 / 130–1,038 and `uring-sqpoll` 40.0–41.0 / 45.5–47.0 / 176–862: equal. `epoll-spin` 47.1–49.0 / 55–98 / 188–369, measured with adaptive moderation on: not a fair comparison with them, so no conclusion. `epoll-spin`'s p99 varied from 53 to 98 µs between baselines, under that setting; the cause was not traced. The max is not lower with polling: about 1 ms on every backend ([worst cases](#worst-cases-on-aws)). More sockets on the loop on x86: not measured. On Graviton they are: [the fair run](#interrupt-against-nic-polling-the-fair-run-graviton).
 
 **Without NIC polling, epoll and io_uring have equal latency; io_uring is far cheaper.** `epoll-spin` and `uring-spin` match within the A/A noise (0.1–0.3 µs at the median) in two separate runs. io_uring makes about 800 syscalls/s at 1× replay against 4.1 million and spends 0.2 % of the loop in the kernel against 30 %. Use `uring-spin` where the loop's CPU time in the kernel matters.
 
@@ -133,11 +133,13 @@ One change or comparison per experiment; kept only where the numbers say so. Ful
 | 2026-10-15 | AWS settings matrix, Azure settings matrix | no Azure setting moves the median more than 1–3 µs; the maximum is the hypervisor once-a-minute stall | documented |
 | 2026-10-15 | ENA adaptive RX off for polling backends | `recv-busy` p99.99 falls by 43–47 µs (runs `062428Z`, `070339Z`) | kept for polling backends |
 | 2026-10-15 | many connections (1–256) and combined streams | arrival → decoded and sender → decoded with maxima (see [AWS Tokyo](#aws-tokyo)); pack streams onto few connections | kept |
-| 2026-10-15 | HTTP many connections | estimates only — not measured | open |
+| 2026-10-15 | HTTP many connections | on x86, estimates only — not measured | superseded for Graviton below |
 | 2026-10-15 | bare metal and instance types | same ordering; C6 exit 190 µs on c7i, 290 µs on metal | documented |
 | 2026-10-15 | worst cases | about 1 in 1.8 M round trips ~1 ms; rare 0.16–4 ms VM pauses; 110–126 ms path-wide delays at 100 connections | see [worst cases](#worst-cases-on-aws) |
-| 2026-10-15 | Graviton comparison | not measured; harness differences and commands ready | open |
+| 2026-10-15 | Graviton comparison | not measured; harness differences and commands ready | superseded below |
 | 2026-10-15 | (lab notes) sender must not sleep; aws login lock | a sleeping sender inflated every result in `163114Z` | lab rule |
+| 2026-10-19 | Graviton fair backend comparison (`20261019T175248Z`) | moderation off for every backend; WebSocket round trip at 1/4/16/64 sockets and an HTTP pool of 1/20; polling 2.5–3 µs ahead at 1 connection, level from 4, plain `recv-busy` collapses at 64 | [the fair run](#interrupt-against-nic-polling-the-fair-run-graviton) |
+| 2026-10-19 | Graviton against x86 | not measured — the fair run is Graviton only | open |
 
 ## AWS Tokyo
 
@@ -195,15 +197,20 @@ N−1 feeds).
 | 16 | 39.3–40.1 / 49.8–51.8 / 140–193 | 38.98–49.63 / 50.2–69.2 / 128–179 |
 | 64 | 39.9–40.4 / 51.9–53.9 / 143–425 | 40.0–78.3 / 53.7–119.5 / 110–265 |
 
-**Work behind those percentiles.** Every point issued and completed 600,000
-of 600,001 scheduled round trips, with late counts of 0–47, except
-`recv-busy` at 64: `f1-irqcore` issued 501,710 of 600,002 with 501,709 of
-those late, `f2-irqcore` 501,971 of 600,001 with 501,970 late. That point is
-capacity exhaustion, not latency — the loop could not hold 10,000/s and the
-schedule fell behind by seconds.
+**Work behind those percentiles.** Every point but one issued and completed
+599,994–600,005 round trips against 600,001–600,265 scheduled (the extra
+scheduled slots are `mio`'s longer schedule), with late counts of 0–47 and
+0–1 censored. The exception is `recv-busy` at 64: `f1-irqcore` issued 501,710
+of 600,002 with 501,709 of those late, `f2-irqcore` 501,971 of 600,001 with
+501,970 late. That point is capacity exhaustion, not latency — the loop could
+not hold 10,000/s and the schedule fell behind by seconds. Counts are from
+[`work-counts.md`](results/flags-aws-20261019T175248Z/work-counts.md),
+extracted from the run's generated `tables.md` (gitignored) by
+`scripts/extract_work_counts.py`; every percentile above is over `completed`
+alone, after the warm-up cut, so `n` is smaller still.
 
-- **At 1 connection, NIC polling is about 2.5–3 µs ahead at the median**
-  (36.0–37.0 against 38.8–39.3).
+- **At 1 connection, NIC polling is about 2–3 µs ahead at the median**
+  (36.0–37.0 against 38.8–39.3; every arm-to-arm pairing falls in 1.7–3.3 µs).
 - **At 4 they are equal.**
 - **The interrupt family does not degrade with N**: p50 39–40 µs from 1 to
   64 sockets on every interrupt backend.
@@ -212,6 +219,14 @@ schedule fell behind by seconds.
   `uring-sqpoll` (39–40 µs throughout) hold.
 - **Maxima do not separate the families.** The worst round trip in any
   round was 108–425 µs, in both.
+- **Interrupt placement costs tail, not median.** With the NIC's interrupts
+  on the loop's own CPU (`irqlocal`) instead of a core of their own
+  (`irqcore`), the interrupt family's p50 holds at 38–41 µs but its p99
+  rises from 45.9–47.2 µs at 1 connection to 62.1–86.5 µs at 16 and 64,
+  against 47.0–53.9 µs throughout on `irqcore`. The max does not separate
+  the placements (135–641 µs `irqlocal`, 108–425 µs `irqcore`). Same
+  backends, same settings, two rounds each. Give the interrupts their own
+  core.
 
 **What this settles.** With the interrupt path configured properly —
 moderation off, its interrupts on a core of their own — NIC polling is not
@@ -240,11 +255,11 @@ Azure East Asia (`flags-azure-20261014T144146Z`, `flags-azure-20261015T045348Z`)
 - Two clouds, one instance size each (plus one bare-metal spot check).
 - One-way numbers are relative only (chrony bounds the two clocks).
 - AWS settings-matrix raw records were lost; the tables survived in git history.
-- Round trips: 1 connection only. More sockets on the loop: not measured.
+- Round trips on x86: 1 connection only. More sockets on the loop: the Graviton fair run only.
 - Many connections: AWS only.
 - ENA adaptive moderation was on in every AWS x86 comparison (‡ rows unfair). The Graviton fair run turned it off for every backend.
 - Arrival → decoded leaves out the interrupt delay and, for polling backends, the wait for the next queue poll.
-- HTTP many connections: estimates only, not measured.
+- HTTP many connections: estimates only on x86; pool of 1 and 20 on Graviton.
 - Software receive timestamps only (ENA has no hardware stamp).
 - The fair run's raw records were left on the terminated lab VM; only `fair.md` and `tables.md` are archived.
 - Graviton against x86: not measured.

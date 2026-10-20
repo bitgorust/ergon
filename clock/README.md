@@ -161,6 +161,51 @@ Everything else is in `advanced`: the fixed `Copy` clock, raw ticks,
 `Params` for C, `Trust` and `Policy`, the discipline and seqlock under
 `update` and `Follower`, `WallOffset`, and the time-sync probe.
 
+## Aeron's clocks
+
+Aeron ships its own clocks and does not need ergon-clock. The two are not
+interchangeable.
+
+| Aeron API | Linux source | Returns | Resolution |
+|---|---|---|---|
+| `aeron_nano_clock()` | `CLOCK_MONOTONIC` | ns since boot | 1 ns |
+| `aeron_epoch_clock()` | `CLOCK_REALTIME_COARSE` | **ms** since Unix epoch | one kernel tick |
+| `aeron_clock_cache_t` | cached pair, release/acquire | both | as of the last refresh |
+
+How Aeron uses them: the media driver keeps three cache-line-padded
+`aeron_clock_cache_t` (conductor, sender, receiver). Each agent reads the clock
+once per duty cycle and stores it; the epoch half is refreshed at most once a
+millisecond. Everything on the hot path — publications, images, loss detectors
+— reads the cached `int64`, one acquire load. The clock's own cost is not on
+the hot path.
+
+Cost of the underlying kernel reads, measured on c8g.xlarge
+([BENCHMARKS.md](BENCHMARKS.md), slowest batch in brackets):
+
+| read | ns |
+|---|---|
+| `clock_gettime(CLOCK_MONOTONIC)` — Aeron's nano clock | 30.92 (max not reported in the summary table) |
+| `clock_gettime(CLOCK_REALTIME_COARSE)` — Aeron's epoch clock | not measured (now a `clockbench` row) |
+| ergon-clock `now_ns` | 12.17 (12.47) |
+| ergon-clock `now_ns_ordered` | 21.93 (22.34) |
+
+We do not swap them into Aeron:
+
+| reason | |
+|---|---|
+| nothing to win | the hot path reads a cached `int64`, one acquire load. The kernel read is once per work-loop iteration (`aeron_driver_sender_do_work` and its conductor and receiver counterparts), off the data path; replacing it has shown no workload benefit |
+| units and domains differ | Aeron's epoch clock is milliseconds and its nano clock is monotonic since boot; ergon-clock's default domain is UTC. Swapping one for the other silently changes timeout arithmetic |
+| vendored upstream C | the media driver lives in the `aeron` submodule; forking its clock is a standing maintenance cost |
+
+Where ergon-clock does replace it: the DPDK transport in `ergon-md-dpdk`, which
+reads time on every send and every receive poll and took
+`clock_gettime(CLOCK_MONOTONIC)` at millisecond resolution. That is our code and
+a real hot path.
+
+`Aeron::nano_clock()` and `Aeron::epoch_clock()` expose the two Aeron reads
+through rusteron. rusteron has no way to replace them: the C driver context
+holds both as `aeron_clock_func_t` fields, but no setter is generated.
+
 ## Further reading
 
 - The book: a glossary, ordered reads, measured results, and why not

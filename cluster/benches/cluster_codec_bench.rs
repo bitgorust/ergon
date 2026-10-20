@@ -38,11 +38,27 @@
 #![allow(unused_must_use, unused_imports)]
 
 use std::hint::black_box;
+use std::time::Duration;
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 
 /// sbe-tool 1.39.0 reference runtime — Criterion-private (forbid production imports).
 mod reference_sbe;
+
+/// Sampling shared with the SBE parity suite. Criterion's default `Linear` mode
+/// ramps a sample to tens of milliseconds of work and the scheduler deschedules
+/// inside it; the sample absorbs the gap and one arm of a pair takes the hit.
+/// Flat mode over a short budget keeps samples under a few milliseconds. The
+/// rationale and the A/A evidence are in `perf_parity_bench`'s
+/// `parity_criterion`.
+fn parity_group<'a>(
+    c: &'a mut Criterion,
+    name: &str,
+) -> criterion::BenchmarkGroup<'a, criterion::measurement::WallTime> {
+    let mut group = c.benchmark_group(name);
+    group.sampling_mode(SamplingMode::Flat);
+    group
+}
 
 const BATCH_SIZE: usize = 10_000;
 /// Standard SBE message-header size (same as `message_header_codec::ENCODED_LENGTH`).
@@ -186,7 +202,7 @@ fn assert_session_connect_request_encode_parity(channel: &[u8], credentials: &[u
 /// Encode 10k SessionMessageHeader **bodies** (no MessageHeader write).
 fn bench_encode_msg_header_ergo(c: &mut Criterion) {
     assert_session_message_header_encode_parity();
-    let mut g = c.benchmark_group("cluster/encode/session_message_header");
+    let mut g = parity_group(c, "cluster/encode/session_message_header");
     g.throughput(Throughput::Elements(BATCH_SIZE as u64));
     let slot = HDR + ergo_aeron_cluster::cluster_codec_types::SessionMessageHeaderEncoder::BLOCK_LENGTH;
     g.bench_function("ergo-sbe", |b| {
@@ -252,7 +268,7 @@ fn bench_encode_msg_header_ergo(c: &mut Criterion) {
 /// Encode 10k SessionKeepAlive **bodies** (no MessageHeader write).
 fn bench_encode_keep_alive_ergo(c: &mut Criterion) {
     assert_session_keep_alive_encode_parity();
-    let mut g = c.benchmark_group("cluster/encode/session_keep_alive");
+    let mut g = parity_group(c, "cluster/encode/session_keep_alive");
     g.throughput(Throughput::Elements(BATCH_SIZE as u64));
     let slot = HDR + ergo_aeron_cluster::cluster_codec_types::SessionKeepAliveEncoder::BLOCK_LENGTH;
     g.bench_function("ergo-sbe", |b| {
@@ -328,7 +344,7 @@ fn bench_encode_keep_alive_ergo(c: &mut Criterion) {
 /// bodies textually identical.
 fn bench_aa_control_keep_alive(c: &mut Criterion) {
     assert_session_keep_alive_encode_parity();
-    let mut g = c.benchmark_group("cluster/control/aa_encode_keep_alive");
+    let mut g = parity_group(c, "cluster/control/aa_encode_keep_alive");
     g.throughput(Throughput::Elements(BATCH_SIZE as u64));
     let slot = HDR + ergo_aeron_cluster::cluster_codec_types::SessionKeepAliveEncoder::BLOCK_LENGTH;
     g.bench_function("arm_a", |b| {
@@ -401,7 +417,7 @@ fn bench_aa_control_keep_alive(c: &mut Criterion) {
 /// [`bench_aa_control_keep_alive`] for what the control means and
 /// `fairness_policy_test::aa_control_arms_run_identical_work` for the lock.
 fn bench_aa_control_claim_shaped(c: &mut Criterion) {
-    let mut g = c.benchmark_group("cluster/control/aa_encode_claim_shaped");
+    let mut g = parity_group(c, "cluster/control/aa_encode_claim_shaped");
     let hdr_slot = HDR + ergo_aeron_cluster::cluster_codec_types::SessionMessageHeaderEncoder::BLOCK_LENGTH; // 32
     let total = hdr_slot + CLAIM_APP_PAYLOAD.len();
     g.throughput(Throughput::Elements(BATCH_SIZE as u64));
@@ -474,7 +490,7 @@ fn bench_aa_control_claim_shaped(c: &mut Criterion) {
 fn bench_encode_connect_request_ergo(c: &mut Criterion) {
     use ergo_aeron_cluster::cluster_codec_types::SessionConnectRequestFixedFields;
 
-    let mut g = c.benchmark_group("cluster/encode/session_connect_request");
+    let mut g = parity_group(c, "cluster/encode/session_connect_request");
     let channel = "aeron:udp?endpoint=localhost:9999";
     let creds = b"user:pass";
     let fixed = SessionConnectRequestFixedFields {
@@ -564,7 +580,7 @@ fn bench_decode_msg_header(c: &mut Criterion) {
         assert_eq!(ergo.cluster_session_id(), tool.cluster_session_id());
         assert_eq!(ergo.timestamp(), tool.timestamp());
     }
-    let mut g = c.benchmark_group("cluster/decode/session_message_header");
+    let mut g = parity_group(c, "cluster/decode/session_message_header");
     g.throughput(Throughput::Elements(BATCH_SIZE as u64));
     g.bench_function("ergo-sbe", |b| {
         b.iter(|| {
@@ -641,7 +657,7 @@ fn bench_decode_session_event(c: &mut Criterion) {
         let coords = tool.detail_decoder();
         assert_eq!(ergo_detail, tool.detail_slice(coords));
     }
-    let mut g = c.benchmark_group("cluster/decode/session_event");
+    let mut g = parity_group(c, "cluster/decode/session_event");
     g.throughput(Throughput::Elements(BATCH_SIZE as u64));
     g.bench_function("ergo-sbe", |b| {
         b.iter(|| {
@@ -747,7 +763,7 @@ fn bench_decode_new_leader(c: &mut Criterion) {
         let coordinates = tool.ingress_endpoints_decoder();
         assert_eq!(ergo_endpoints, tool.ingress_endpoints_slice(coordinates));
     }
-    let mut g = c.benchmark_group("cluster/decode/new_leader_event");
+    let mut g = parity_group(c, "cluster/decode/new_leader_event");
     g.throughput(Throughput::Elements(BATCH_SIZE as u64));
     g.bench_function("ergo-sbe", |b| {
         b.iter(|| {
@@ -807,7 +823,7 @@ fn bench_decode_new_leader(c: &mut Criterion) {
 const CLAIM_APP_PAYLOAD: [u8; 32] = [0xABu8; 32];
 
 fn bench_claim_shaped_write(c: &mut Criterion) {
-    let mut g = c.benchmark_group("cluster/encode/claim_shaped_header_plus_app");
+    let mut g = parity_group(c, "cluster/encode/claim_shaped_header_plus_app");
     let hdr_slot = HDR + ergo_aeron_cluster::cluster_codec_types::SessionMessageHeaderEncoder::BLOCK_LENGTH; // 32
     let total = hdr_slot + CLAIM_APP_PAYLOAD.len();
     {
@@ -903,16 +919,19 @@ fn bench_claim_shaped_write(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_encode_msg_header_ergo,
-    bench_encode_keep_alive_ergo,
-    bench_aa_control_keep_alive,
-    bench_aa_control_claim_shaped,
-    bench_encode_connect_request_ergo,
-    bench_decode_msg_header,
-    bench_decode_session_event,
-    bench_decode_new_leader,
-    bench_claim_shaped_write,
-);
+criterion_group! {
+    name = benches;
+    config = Criterion::default()
+        .measurement_time(Duration::from_millis(500))
+        .sample_size(200);
+    targets = bench_encode_msg_header_ergo,
+        bench_encode_keep_alive_ergo,
+        bench_aa_control_keep_alive,
+        bench_aa_control_claim_shaped,
+        bench_encode_connect_request_ergo,
+        bench_decode_msg_header,
+        bench_decode_session_event,
+        bench_decode_new_leader,
+        bench_claim_shaped_write
+}
 criterion_main!(benches);

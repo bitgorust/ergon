@@ -1,18 +1,19 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.30] — 2026-10-20
 
 ### Added
-- `ergon-clock` (not yet on crates.io): a hardware-counter clock for low-latency
+
+- `ergon-clock` (first release): a hardware-counter clock for low-latency
   threads. `calibrate` once at start-up returns a `Clock` (`rdtsc` or
   `CNTVCT_EL0`, else `CLOCK_MONOTONIC` with the reason), a `Follower` for
   other threads, and a `Report` with time-sync findings. `now_ns` is UTC
   nanoseconds by default (`Domain::Monotonic` is since boot).
-- `ergon-tune` (not yet on crates.io): pure-function checks of a host's low-latency
+- `ergon-tune` (first release): pure-function checks of a host's low-latency
   settings (CPU isolation, interrupts off busy CPUs, hugepages, Aeron
   directory, cgroup CPU quota, NIC settings). Each finding names its
   effect and the exact fix. `ThrottleWatch` warns when a cgroup throttles.
-- `ergon-io` (not yet on crates.io) gains a complete WebSocket client
+- `ergon-io` (first release) gains a complete WebSocket client
   (close handshake, pings,
   subprotocols, `Reconnect` with backoff), TCP keepalive on every
   connection, a quick-ACK route check per connection
@@ -20,7 +21,7 @@
   `outcome::Verdict`), connect gates for venue limits
   (`Reconnect::poll_gated`, `defer`) and a send budget
   (`ergon_io::limit::Budget`).
-- `ergon-md-dpdk` (not yet on crates.io): an experimental DPDK ENA kernel-bypass UDP
+- `ergon-md-dpdk` (first release): an experimental DPDK ENA kernel-bypass UDP
   transport for the Aeron media driver (Linux, `libdpdk >= 23.11`,
   `dpdk` feature), selected by `RUSTERON_MEDIA_DRIVER_TRANSPORT=dpdk-ena`
   or `DpdkTransport::install`. It interoperates with kernel peers. A
@@ -42,40 +43,6 @@
 - The book gains parts for `ergon-io`, `ergon-clock`, `ergon-tune` and
   `ergon-md-dpdk`, and a Deployment part (AWS, Azure, Kubernetes).
 
-### Changed
-- The workspace toolchain is Rust 1.99.0.
-- Breaking (generated API): a domain DTO's `encode` reports a refused
-  domain conversion as `EncodeError::Conversion` (field path and the
-  conversion's error) instead of `DomainConversionFailed`, and refuses
-  `Some` of an optional field's null value with `EncodeError::SomeNullValue`.
-- Breaking (WebSocket): a complete data frame inside a fragmented message
-  closes the connection (RFC 6455); it used to be delivered as a message.
-- Breaking (libcurl): methods libcurl may send again (POST, PUT, PATCH)
-  are refused unless `HttpClientConfig::curl_allow_non_idempotent_methods`
-  is set.
-- Aeron Archive and Cluster run on Java 25 (Temurin 25). The cluster
-  harness checks the Java version and starts every Java process with
-  tested JVM options. `ClusterLauncher` is compiled with
-  `javac --release 17`.
-- The release publishes `ergon-clock`, `ergon-tune` and `ergon-io` before
-  `ergon-md-dpdk`; `just release-check` dry-runs them together.
-
-### Fixed
-- ergo-sbe: a domain DTO's `encode` writes `NullVal` for a `None`
-  domain-typed enum field instead of leaving whatever the buffer held.
-- Cluster codec benches: `encode/session_keep_alive` and
-  `encode/claim_shaped_header_plus_app` measured unequal mechanisms. Both
-  arms now carry the controls `encode/session_message_header` already used —
-  `.p2align 6` on both loop headers, `wrap_unchecked` on the ergon arm, field
-  values opaque and slice length visible on both arms. The pre-fix closures
-  are kept as a diagnostic probe pair in `cluster_perf_probe`, which shows
-  what the checked `wrap` costs when the slice length is opaque. All three
-  maintained encode pairs are now instruction-identical on x86-64 (80/80,
-  75/75, 72/72) with byte-identical stores.
-
-## [0.1.30] — 2026-10-13
-
-### Added
 - Generate an opt-in cross-schema `AnySchemaMessage` dispatcher
   (`Generator::generate_schema_dispatch`) with typed errors and borrowed
   frames, including unknown schemas and templates.
@@ -101,6 +68,24 @@
   `sbe_rt::encode_fixed_text` and `sbe_rt::decode_fixed_text`.
 
 ### Changed
+
+- The workspace toolchain is Rust 1.99.0.
+- Breaking (generated API): a domain DTO's `encode` reports a refused
+  domain conversion as `EncodeError::Conversion` (field path and the
+  conversion's error) instead of `DomainConversionFailed`, and refuses
+  `Some` of an optional field's null value with `EncodeError::SomeNullValue`.
+- Breaking (WebSocket): a complete data frame inside a fragmented message
+  closes the connection (RFC 6455); it used to be delivered as a message.
+- Breaking (libcurl): methods libcurl may send again (POST, PUT, PATCH)
+  are refused unless `HttpClientConfig::curl_allow_non_idempotent_methods`
+  is set.
+- Aeron Archive and Cluster run on Java 25 (Temurin 25). The cluster
+  harness checks the Java version and starts every Java process with
+  tested JVM options. `ClusterLauncher` is compiled with
+  `javac --release 17`.
+- The release publishes `ergon-clock`, `ergon-tune` and `ergon-io` before
+  `ergon-md-dpdk`; `just release-check` dry-runs them together.
+
 - Breaking (generated API): drop `try_` from the per-field and closure
   methods.
   - A domain-typed field's getter and setter take the plain field name
@@ -160,6 +145,46 @@
   `EgressEvent::SessionEvent` carries `leader_heartbeat_timeout_ns`.
 
 ### Fixed
+
+- ergo-sbe: a domain DTO's `encode` writes `NullVal` for a `None`
+  domain-typed enum field instead of leaving whatever the buffer held.
+- Benchmark validity: SBE parity arms pay the same validation class and the
+  same observation barriers. Gated body-wrap decode pairs and body-only
+  encode pairs time `wrap_unchecked` against sbe-tool's zero-check wrap, with
+  the extent proved once in an untimed preflight; `ergo-sbe_try_from` is a
+  separate informational arm the gate does not read. Every value one arm
+  makes opaque, its partner makes opaque at the same number of barriers and
+  the same program points. `fairness_policy_test` enforces both.
+- Benchmark accounting: `Work::from_meta` rejects a malformed count instead
+  of treating it as missing, and reconciles `work.completed` against the
+  records on disk before any warm-up is dropped. `analyse` refuses to
+  publish latency rows or exit 0 on a contradictory count. The benchmark
+  binaries sample both endpoint clocks before any of the run's own file I/O,
+  so the schedule's span no longer absorbs disk time.
+- Benchmark gate: a calculation that produced no verdict can no longer
+  certify a ratio. A ratio above its ceiling whose ratio CI overlaps a
+  measured A/A null band is inconclusive, not a breach; a pair with no
+  measured control still fails closed. Ceilings are unchanged. The gate
+  reads Criterion's `typical()` estimator — the mean when `slope` is null,
+  never the median.
+- Clock bench: `the_gap_pass_takes_no_page_faults_while_it_times` asserted a
+  zero fault count that off Linux is the whole process's
+  (`getrusage(RUSAGE_SELF)`; Darwin has no `RUSAGE_THREAD`), so another
+  thread's faults failed the test, and its gap assertion could not see a
+  fault at all because the read under test is a counter. The pass now proves
+  its buffer is resident with `mincore` — scoped to the buffer, and counted
+  as pages are touched — and only asserts the fault count where the kernel
+  scopes it to the thread.
+- Cluster codec benches: `encode/session_keep_alive` and
+  `encode/claim_shaped_header_plus_app` measured unequal mechanisms. Both
+  arms now carry the controls `encode/session_message_header` already used —
+  `.p2align 6` on both loop headers, `wrap_unchecked` on the ergon arm, field
+  values opaque and slice length visible on both arms. The pre-fix closures
+  are kept as a diagnostic probe pair in `cluster_perf_probe`, which shows
+  what the checked `wrap` costs when the slice length is opaque. All three
+  maintained encode pairs are now instruction-identical on x86-64 (80/80,
+  75/75, 72/72) with byte-identical stores.
+
 - Leave constant fields out of a group entry's `blockLength`. Frames ergo-sbe
   encoded for schemas with a constant ending an entry change width to match
   sbe-tool.
@@ -203,6 +228,7 @@
   wrote past a fixed 512- or 256-byte buffer.
 
 ### Removed
+
 - Moved the runtime, its server, the wire and bridge crates, the log printer
   and the ClickHouse lab to a private repository.
 

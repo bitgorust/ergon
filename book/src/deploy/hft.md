@@ -28,12 +28,16 @@ Terms: [deployment glossary](overview.md#glossary).
 | pod | each busy thread | pinned to one CPU of the pod's cpuset | a thread outside the cpuset never starts (`EINVAL`) |
 | pod | Aeron directory | hugetlbfs `hostPath`, `AERON_FILE_PAGE_SIZE=2097152`, `AERON_TERM_BUFFER_SPARSE_FILE=false` | no first-write page faults on the log buffers |
 | pod | SIGTERM | handled | a PID 1 with no handler is SIGKILLed, closing nothing |
-| app | ENA interrupt moderation (busy-polling) | `ethtool -C <if> adaptive-rx off` | Linux 6.9+ default. The c7i cost of leaving it on is not measured (an earlier "about 60 µs at 100 k/s" A/B is withdrawn as untraceable); Graviton G1–G3 supports it off |
+| app | ENA adaptive moderation | `ethtool -C <if> adaptive-rx off rx-usecs 0` | **Polling backends:** `recv-busy` p99.99 falls **43–47 µs** (runs `062428Z`, `070339Z`). **Interrupt backends:** with this and the queue IRQs on a core of their own, the interrupt family is within **1.7–3.3 µs** of NIC polling at 1 connection and level with it from 4 sockets, and unlike plain `recv-busy` it does not collapse at 64 (fair run `20261019T175248Z`). Cost of leaving it on, x86: not measured |
+| app | NIC queue IRQ placement | the queues' IRQs on a spare core, never on the loop's CPU | Graviton WebSocket round trip, p99 / max (fair run `20261019T175248Z`): IRQs on the loop's CPU **45.9–47.2 / 135–161 µs** at 1 connection, **52.3–86.5 / 129–641 µs** at 4–64; IRQs on a spare core **47.0–53.9 / 108–425 µs** throughout. Placement costs tail, not median |
 | app | ENA RX ring | `ethtool -G <if> rx 4096` | Azure: no NIC drop or NAK, where the default ring dropped at 1 M msgs/s of 288 B |
 | app | keep-alive | about 1 kHz on sparse, latency-critical streams | a lost frame is noticed only at Aeron's next heartbeat: one lost ping cost **134 ms** |
 | app | quiet cores only | two-minute spin at pod start; pin to cores that never stalled 300 µs | some Azure vCPUs stop for up to **3.7 ms** once a minute |
 
-Figures in this table: [md-dpdk/BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md) (SMT row: [io/benches/BENCHMARK.md](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md)).
+Figures in this table: [md-dpdk/BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)
+(SMT row: [io/benches/BENCHMARK.md](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md);
+the two `app` network rows: the Graviton fair run
+[`20261019T175248Z`](https://github.com/mimran1980/ergon/blob/main/io/benches/results/flags-aws-20261019T175248Z/fair.md)).
 
 ## Never do this
 

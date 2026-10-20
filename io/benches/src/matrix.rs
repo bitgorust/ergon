@@ -284,19 +284,11 @@ pub fn load_run(dir: &Path, warmup_s: i64) -> Result<Run, String> {
     }
     let records =
         read_records(&dir.join("records.bin")).map_err(|e| format!("records.bin: {e}"))?;
-    // The work counts are the run's own account of what it did. A run that
+    // The work counts are the run's own account of what it did, checked
+    // against the records it wrote before any warm-up is dropped. A run that
     // claims counts that cannot hold, or more completions than it recorded,
     // is named here rather than reported beside the percentiles.
-    let work = Work::from_meta(&m)?;
-    if let Some(w) = &work {
-        if let (Some(c), Ok(n)) = (w.completed, u64::try_from(records.len()))
-            && c != n
-        {
-            return Err(format!(
-                "work.completed {c} is not the {n} records in records.bin"
-            ));
-        }
-    }
+    let work = Work::load(&m, records.len())?;
     let t0 = records.iter().map(|r| r.user_ns).min().unwrap_or(0);
     let mut due = None;
     let mut due_over = [0; 4];
