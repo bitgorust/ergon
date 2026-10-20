@@ -146,6 +146,12 @@
 
 ### Fixed
 
+- Supply chain: `rustls-webpki` 0.103.15 → 0.103.16, closing
+  [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382).
+  0.103.15 accepted certificate paths containing distrusted emSign
+  intermediates whose private keys are public. `ergon-io` depends on `rustls`
+  directly, so this shipped in a published crate. `cargo deny` and
+  `cargo audit` block the release on a live advisory; they are what caught it.
 - ergo-sbe: a domain DTO's `encode` writes `NullVal` for a `None`
   domain-typed enum field instead of leaving whatever the buffer held.
 - Benchmark validity: SBE parity arms pay the same validation class and the
