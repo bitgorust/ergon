@@ -167,7 +167,8 @@ On the Mac the clock must be correct, but its speed is not a target.
 - `std::time::Instant` / `CLOCK_MONOTONIC`: medians 20.78–31.69 ns across the hosts measured (slowest batch at most 33.35) — fine off the hot path.
 - Conversion alone over captured ticks: ergon's `to_ns` and `ticks_to_ns` cost one multiply; quanta's `delta_as_nanos` and `scaled` are in the same class.
 
-Full every-run, gap, cross-core and gate tables are in git history.
+The full every-run, gap, cross-core and gate tables were never committed to
+the repository; the figures above are the record.
 
 ## Why ergon-clock and not quanta (or minstant)
 
@@ -189,4 +190,4 @@ Correctness only, no latency claim: the counter is `CNTVCT_EL0`, the same as c8g
 
 ## The hot path's code
 
-The bare read is one counter instruction plus one multiply. The ordered read is the same plus a barrier (`rdtscp` on x86; `mrs cntvctss_el0` where the CPU has `FEAT_ECV`, else `isb; mrs cntvct_el0`). Assembly listings are in git history (`clock/src/lib.rs`, `clock/src/hot.rs`). Do not change the hot path without re-running the read-cost and ordered-read gates.
+The bare read is one counter instruction plus one multiply. The ordered read is the same plus a barrier (`rdtscp` on x86; `mrs cntvctss_el0` where the CPU has `FEAT_ECV`, else `isb; mrs cntvct_el0`). Assembly listings are in `clock/src/arch.rs`. Do not change the hot path without re-running the read-cost and ordered-read gates.
