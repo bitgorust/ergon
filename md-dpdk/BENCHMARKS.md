@@ -130,7 +130,8 @@ Round-trip and load numbers follow the [legend at the top](#ergon-md-dpdk-kernel
 
 ## Measured latency at each load level
 
-Every figure keeps its max. Full tables are in git history; this is the record.
+Every figure keeps its max. The raw run output was written under `target/`
+and is not retained — the tables below are the record.
 
 ### Graviton5 (c9g.2xlarge), round G3 — best measured (p50 / p99.99 / max)
 
