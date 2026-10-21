@@ -3,7 +3,7 @@
 # ergon-md-dpdk: kernel UDP against DPDK on Azure and AWS
 
 µs: median of 5 reps, range across reps in brackets. A latency cell's third figure, written `max X (a–b)`, is the **median of the five per-rep maxima** X (each rep's slowest round trip, one sample), with the five's smallest and largest in brackets. The bracket's upper end is therefore the **absolute observed maximum** — the largest single round trip in any rep — and X is never a worst case. A cell that names the aggregation in words ("median of rep maxima", "absolute max") is using those words in the book's sense
-([aggregation table](https://mimran1980.github.io/ergon/deploy/benchmarks.html#how-figures-are-aggregated)). Load figures are open loop, from each message's intended send time. Every percentile keeps its absolute maximum.
+([aggregation table](https://mimran1980.github.io/ergon/deploy/benchmarks.html#how-to-read-a-number)). Load figures are open loop, from each message's intended send time. Every percentile keeps its absolute maximum.
 
 ## Conclusions
 

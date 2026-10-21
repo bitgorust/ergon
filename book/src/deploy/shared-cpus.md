@@ -15,18 +15,9 @@ shared CPUs. Never a spinner or SQPOLL there.
 Source: `k8s/nri-shared-cpus/`. The install steps below are the ones the
 `k8s/nri-shared-cpus/test/e2e.sh` kind run executes.
 
-Status: experimental and unpublished. Tested on kind. Not yet on EKS: two
-attempts at an EKS spot lab (eu-north-1 `c8g.xlarge`, us-east-1 `c7g.xlarge`)
-found no spot capacity and tore down cleanly, so these steps come from the
-manifests and the kind e2e, not from a live EKS node. **AKS cannot run it**
-(see [Limits](#limits-and-what-is-not-verified)).
-
-This is not a new idea. CRI-O ships the same behaviour as `shared_cpuset`,
-and `kubernetes-sigs/dra-driver-cpu` has it as an open issue
-([#103](https://github.com/kubernetes-sigs/dra-driver-cpu/issues/103)) and a
-non-mergeable draft. What is here is the containerd path with no DRA feature
-gate. The full comparison is in `k8s/nri-shared-cpus/README.md`, section
-*Prior art*.
+Status: experimental and unpublished. Tested on kind; **not yet on a real EKS
+node** (see [Limits](#limits-and-what-is-not-verified)). AKS cannot run it.
+Prior art: `k8s/nri-shared-cpus/README.md`.
 
 ## What it gives
 
@@ -129,7 +120,8 @@ ptp: "auto"               # default "off". Without it, a pod asking for
                           # ptp.ergon.io/<ctr>: "auto" is refused, and the app
                           # has no NIC hardware clock. Use "auto" for the NIC's
                           # PHC, or a /dev/ptp* path the node has
-schedFifo: "off"          # keep off: measured worse (see Latency Pods)
+schedFifo: "off"          # keep off: no gain measured on an isolated CPU (see
+                          # Latency Pods)
 ```
 
 Rules:
@@ -146,13 +138,9 @@ Rules:
 
 ### 3. Build and load the image
 
-**Not released.** Nothing is on a registry yet. `k8s/nri-shared-cpus/RELEASE.md`
-is the gate. The four code defects are fixed and signed off (2026-10-18, unit
-evidence plus the cgroup kernel lane and a 18-step kind e2e, `fails: 0`). What
-is still open is the EKS lane and the latency benchmarks — both are release
-blockers, because the claim of the plugin is that the exclusive CPUs stay
-quiet. The chart, the Dockerfile and the image workflow are ready, so the
-first push is one workflow run once that gate is clear.
+**Not released.** Nothing is on a registry yet; `k8s/nri-shared-cpus/RELEASE.md`
+is the gate. Open before a first push: the EKS lane and the latency
+benchmarks. The chart, the Dockerfile and the image workflow are ready.
 
 **Do not make this image public.** The plugin is root on the node and
 installs an executable at `/opt/ergon/bin`. A public image is a root shell on
@@ -479,7 +467,12 @@ kubectl exec aeron-driver -- sh -c 'ps -L -o pid,tid,psr,comm | head'
   `ergon-cpus -- <cmd>`.
 - In-place CPU resize leaves the CPU env stale. Use
   `resizePolicy: RestartContainer` for `cpu`.
-- Not verified on a real EKS node: the NRI socket, nodeadm TOML merge,
-  `/opt` writable, `system-node-critical` outside kube-system. Two EKS spot
-  lab attempts reached neither nodes (no spot capacity).
-- Not measured: latency of helpers on shared CPUs.
+- **Not measured / not verified:** the latency cost of helpers on shared
+  CPUs, and a real EKS node (the NRI socket, nodeadm TOML merge, `/opt`
+  writable, `system-node-critical` outside kube-system). Two EKS spot lab
+  attempts found no capacity and tore down cleanly.
+
+**Decision.** Use it on kind or a self-managed node where you can set
+`reservedSystemCPUs` and enable NRI. Do not claim the exclusive cores stay
+quiet until the latency benchmarks are run: that is a design claim, not a
+measurement. Do not use it on AKS or CRI-O.

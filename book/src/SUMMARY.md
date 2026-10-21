@@ -40,7 +40,7 @@
   - [App Types on Composites](./sbe/recipes/app-types-composites.md)
   - [Timestamp Conversions](./sbe/recipes/timestamps.md)
 - [Design Notes](./sbe/design-notes.md)
-  - [Type-state is zero-cost](./sbe/design-notes/type-state.md)
+  - [Type-state and runtime cost](./sbe/design-notes/type-state.md)
   - [API freeze decisions](./sbe/design-notes/api-freeze.md)
   - [Why NullVal Instead of Option](./sbe/design-notes/nullval.md)
   - [Feature Matrix](./sbe/design-notes/feature-matrix.md)

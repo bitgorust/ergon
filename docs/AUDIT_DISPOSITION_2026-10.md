@@ -130,11 +130,14 @@ default"). The three `scripts/book-fence-allowlist.txt` line numbers for
 (`just bench-cluster-instructions`, `./scripts/run-cluster-instruction-probes.sh
 --all-profiles`) needs Linux + Valgrind + `llvm-objdump` and fails closed;
 it has not run, so `cluster_encode_session_keep_alive` has no mechanism
-check. (b) The A/A null band is order-sensitive: its centre drifts by about
-2% between runs because each control is a single `arm_a`-then-`arm_b`
-pairing. The work order asks for *repeated* A/A controls; only single-run
-controls exist. The band is not widened to hide this — a pair outside a
-measured band still fails.
+check. (b) The A/A null band is order-sensitive: each control is a single
+`arm_a`-then-`arm_b` pairing, so within-run arm-order bias sits in the band's
+centre. *Repeated* A/A controls are in place — the gate grades each pair
+against the envelope of the control across independent invocations, which
+absorbs a between-invocation offset — but the repeats are the same pairing
+each time. The band is not widened to hide this: a pair outside a measured
+band still fails. Open for arm order and per-pair placement only; see the
+placement row below.
 
 **Stage 3, 2026-10-20.** Clock is done (above). Deployment: the io_uring
 grant is scoped to apps that use it (`latency-pods.md`: "Aeron's C media
@@ -156,12 +159,18 @@ scheduled for `feat/0.1.31`. The `SCHED_FIFO` knob in `k8s/nri-shared-cpus`
 stays, default-off and measured no gain on an isolated AWS CPU; whether to
 delete it is the same branch's decision.
 
-**Open, stage 4.** The example rows are done (above). What remains is the
-reconciliation sweep: README, rustdoc, the disclosure, the charts and the
-CI descriptions against each other, and a disposition line for every book
-chapter. Nothing in this file certifies every historical experiment, and
-nothing here establishes that any library meets an unspecified HFT latency
-budget.
+**Closed, stage 4, 2026-10-21.** The example rows are done (above). The
+reconciliation sweep is done: README, rustdoc, the disclosure, the charts
+and the CI descriptions were read against each other, and every claim named
+in section 1 is now fixed in the tree — verified by re-reading the cited
+line, not by assuming. Section 6 gives a disposition line for every book
+file (84 of 84). Concision is a separate axis from correctness: the
+Deployment part was trimmed to a scannable form on 2026-10-21 (method moved
+out of `deploy/benchmarks.md` into `md-dpdk/BENCHMARKS.md`, status essays
+cut from `deploy/shared-cpus.md`, the notation preamble cut from
+`deploy/hft.md`). Nothing in this file certifies every historical
+experiment, and nothing here establishes that any library meets an
+unspecified HFT latency budget.
 
 ---
 
@@ -352,3 +361,228 @@ Host provenance was added alongside: `aarch64-apple-darwin` does not
 distinguish an M1 from an M4, and 0.1.30's local figures are M1 where
 0.1.29's were M4. Both manifest writers record `host`; the gate requires and
 prints it. Ceilings are host-independent ratios and were not changed.
+
+## 6. Chapter dispositions — every book file
+
+One line per file, 2026-10-21. A **high-risk claim** is a latency figure, a
+comparative, a "required/always/never/zero-cost", or a setting sold as making
+a difference. **clean** = no high-risk claim, or every one traced. A row that
+says **fixed** names what was wrong and points at section 1.
+
+### Front matter
+
+| file | disposition |
+|---|---|
+| `SUMMARY.md` | clean — structure only |
+| `introduction.md` | clean — `generate_to_out_dir` + `sbe_mod!` is the product pattern; no latency claim |
+
+### ergo-sbe
+
+| file | disposition |
+|---|---|
+| `sbe/getting-started.md` | clean — index |
+| `sbe/getting-started/depend.md` | clean — dependency setup |
+| `sbe/getting-started/generate.md` | clean — build-script recipe, no performance claim |
+| `sbe/getting-started/include.md` | clean — `include!` / `sbe_mod!` mechanics |
+| `sbe/getting-started/encode-decode.md` | clean — encode/decode walkthrough |
+| `sbe/getting-started/method-chaining.md` | clean — type-state wiring |
+| `sbe/getting-started/multi-schema.md` | clean — multi-schema layout |
+| `sbe/getting-started/from-sbe-tool.md` | clean — migration map; differences are stated, not ranked |
+| `sbe/getting-started/error-diagnostics.md` | clean — error reporting |
+| `sbe/feature-tour.md` | clean — index |
+| `sbe/feature-tour/exact-sizing.md` | clean — length APIs |
+| `sbe/feature-tour/bulk-arrays.md` | clean — array accessors |
+| `sbe/feature-tour/decode-stages.md` | clean — decode lanes |
+| `sbe/feature-tour/generated-code.md` | clean — shape of the output |
+| `sbe/feature-tour/trust-boundaries.md` | clean — where validation happens |
+| `sbe/feature-tour/domain-objects.md` | clean — DTOs; the DTO-vs-flyweight latency A/B is written **not measured** |
+| `sbe/feature-tour/multi-template.md` | clean — template dispatch |
+| `sbe/core-concepts.md` | clean — index |
+| `sbe/core-concepts/trust-boundary.md` | clean — the fail-closed rule restated, no figure |
+| `sbe/core-concepts/wire-order-stages.md` | clean — type-state wire order |
+| `sbe/core-concepts/buffer-sizing.md` | clean — generated length APIs |
+| `sbe/core-concepts/flyweight-vs-struct.md` | clean — design trade-off, no figure |
+| `sbe/core-concepts/composite-layout.md` | clean — layout and endianness |
+| `sbe/configuration.md` | clean — index |
+| `sbe/configuration/feature-integrations.md` | clean — feature wiring |
+| `sbe/configuration/conversion-vs-domain.md` | clean — `with_conversion` vs `with_domain_type` |
+| `sbe/configuration/generation-config.md` | clean — option reference |
+| `sbe/configuration/hooks.md` | clean — codegen hooks |
+| `sbe/recipes.md` | clean — index |
+| `sbe/recipes/aeron-try-claim.md` | **fixed** — claim zeroing's latency cost is written **not measured**; no figure invented |
+| `sbe/recipes/display-debug.md` | clean |
+| `sbe/recipes/schema-rustdoc.md` | clean |
+| `sbe/recipes/domain-dtos.md` | **fixed** — DTO-vs-flyweight latency A/B written **not measured** |
+| `sbe/recipes/app-types-composites.md` | clean — type mapping |
+| `sbe/recipes/timestamps.md` | clean — conversions; UTC discipline lives in the clock chapter |
+| `sbe/design-notes.md` | clean — index |
+| `sbe/design-notes/type-state.md` | **fixed** — the title "Type-state is zero-cost" was a categorical claim standing alone in the TOC. Retitled "Type-state and runtime cost"; the body keeps the scoped claim (no runtime tag) and the proof obligation ("whether a revision passes requires a fresh run") |
+| `sbe/design-notes/api-freeze.md` | clean — API decisions |
+| `sbe/design-notes/nullval.md` | clean — null-value representation |
+| `sbe/design-notes/feature-matrix.md` | clean — support matrix |
+| `sbe/benchmarks.md` | **fixed** — diagnostic arms corrected, static text size no longer sold as executed cost, exoneration dropped (section 1, `sbe`) |
+| `sbe/benchmarks/methodology.md` | **fixed** — arm list matches what the gate reads; validation-class rule restated |
+
+### ergo-aeron-cluster
+
+| file | disposition |
+|---|---|
+| `cluster/overview.md` | clean — client scope; not a consensus module |
+| `cluster/session-builder.md` | clean — builder surface |
+| `cluster/egress-listeners.md` | clean — egress wiring |
+| `cluster/chained-decoding.md` | clean — decode chain |
+| `cluster/compatibility.md` | clean — version policy |
+
+### ergon-io
+
+| file | disposition |
+|---|---|
+| `io/overview.md` | **fixed** — TLS stack is the in-place `tls::RecordLayer` (not "stock rustls by default"); comparative claims now carry a max and a run id (section 1 + section 5) |
+| `io/backends.md` | clean — backend comparison is qualitative where unmeasured, and says so |
+| `io/websocket.md` | **fixed** — "more sockets on the loop: not measured"; figures carry max and run |
+| `io/http-client.md` | **fixed** — signing figures labelled "best of 7, max not recorded"; the dead `#4-http-clients` anchor retargeted to `BENCHMARK.md#conclusions`; many-connection written **not measured** |
+| `io/rate-limits.md` | **fixed** — the unarchived `try_charge` table deleted; section says **not measured** and keeps the reproduce recipe; per-call vs per-batch aggregation no longer mixed |
+| `io/kubernetes.md` | **fixed** — pod-placement claims carry max and run id |
+
+### ergon-clock
+
+| file | disposition |
+|---|---|
+| `clock/overview.md` | **fixed** — the 100,000-reads/sec cutoff removed; minstant described as `_rdtsc` on x86 and `SystemTime` on Arm/macOS; the vCPU stall written "unexplained in the guest; the platform's vCPU is suspected" |
+| `clock/wall-clock.md` | **fixed** — dead anchors retargeted; 533.462 ppm kept with its run named |
+
+### ergon-tune
+
+| file | disposition |
+|---|---|
+| `tune/overview.md` | **fixed** — "what it cost in this repository's measurements **where measured**"; "One A/B per **measured** check"; the unmeasured checks (T4, T5, T6, T9, N2, N3) named |
+
+### ergon-md-dpdk
+
+| file | disposition |
+|---|---|
+| `md-dpdk/overview.md` | **fixed** — every "max" column is the absolute worst, or a median of per-rep maxima labelled as such with the worst named (localhost 664.6 µs, Azure 447 µs, c7i 6.7 ms / Azure 33 ms); proof-of-concept status stated once |
+| `md-dpdk/configuration.md` | clean — configuration reference |
+
+### Deployment
+
+| file | disposition |
+|---|---|
+| `deploy/overview.md` | **fixed** — ParallelGC labelled "convention, not a measured collector A/B"; checklist before glossary; trimmed 2026-10-21 |
+| `deploy/hft.md` | **fixed** — notation preamble cut to one line 2026-10-21 so the settings table is first on screen; every row's figure traced to a named run; the two `app` network rows cite fair run `20261019T175248Z` |
+| `deploy/hosts.md` | clean — host settings; the C-state wake delay is the vendor's, written **not measured here** |
+| `deploy/kubernetes.md` | clean — node bootstrap; the two node scripts are a table as of 2026-10-21 |
+| `deploy/shared-cpus.md` | **fixed** — SCHED_FIFO is built and default-off, not "deliberately not built"; status essay and release log cut 2026-10-21; ends on a decision, with the unmeasured/unverified list in one place |
+| `deploy/latency-pods.md` | **fixed** — the SCHED_FIFO row moved out of "Deliberately not built"; the grant wording matches the plugin (section 1, `deploy`) |
+| `deploy/benchmarks.md` | **fixed** — absolute maxima with the per-rep spread; "max" is never defined as the slowest single round trip while printing a median. Method and aggregation moved to one footnote each (2026-10-21); page is tables |
+| `deploy/java.md` | **fixed** — `GuaranteedSafepointInterval` removed (it removed nothing); quorum-vs-fsync scoped to cluster size; ParallelGC labelled convention |
+
+### Samples
+
+| file | disposition |
+|---|---|
+| `samples/overview.md` | **fixed** — `src/generated/` is the **samples** default; OUT_DIR + `sbe_mod!` is the **product** default; L3 build-dep is `#[path]`, not `include!` |
+| `samples/sbe-feature-tour.md` | clean — sample walkthrough |
+| `samples/l3-book.md` | **fixed** — the price assertion compares `Decimal` values (mantissa **and** scale), not mantissas |
+| `samples/exchange-example.md` | clean |
+| `samples/codegen-library.md` | clean |
+| `samples/cluster-tutorial.md` | clean |
+| `samples/cluster-ha-orderbook.md` | clean |
+| `samples/cluster-rfq.md` | clean |
+| `samples/build-patterns.md` | **fixed** — the three build patterns labelled samples-default / product-default correctly |
+| `samples/buffer-sizing.md` | **fixed** — "every buffer must use EncodedLength" softened to the generated length APIs, with `MAX_ENCODED_LENGTH` sanctioned where it is a true fixed bound |
+
+### Project
+
+| file | disposition |
+|---|---|
+| `project/contributing.md` | **fixed** — mutation testing is manual; Miri is weekly (Sundays); 32-bit x86 and s390x codec tests are stated as **not run in CI** |
+| `project/ai-assistance.md` | clean — process disclosure |
+| `project/verification.md` | clean — release gates; names `sbe-bench-gate-no-lto.txt` as the CI artifact |
+| `project/road-to-1.0.md` | **fixed** — semver-checks cite the `baseline_tag` in `api/public-api-baseline.toml` (0.1.26), not a hardcoded 0.1.21 |
+| `project/external-pilot.md` | clean |
+| `project/package-scope.md` | **fixed** — cluster codecs are `#[doc(hidden)] pub`, not crate-private; `AeronCluster` is the consumer API |
+
+84 of 84 named. Count check: 2 front matter + 42 sbe + 5 cluster + 6 io + 2
+clock + 1 tune + 2 md-dpdk + 8 deploy + 10 samples + 6 project = 84.
+
+## 7. Flag and setting latency evidence — 2026-10-21
+
+Release goal B asks whether every recommended flag or setting has a confirmed
+latency effect with evidence. It does not hold as written. Every recommended
+setting was traced to the run artefact that supports it and given one of four
+verdicts. Settings are counted once per claim, so a setting that is required
+for correctness *and* credited with a latency win appears twice.
+
+| verdict | count | meaning |
+|---|---|---|
+| **EVIDENCED** | 18 | a run A/B exists and the docs quote it |
+| **UNMEASURED** | 27 | recommended, often with a mechanism, no latency A/B |
+| **REQUIRED-NOT-PERF** | 28 | correctness, access or observability; makes no latency claim |
+| **CONTRADICTED** | 3 | the cited data disagrees — **all three fixed** |
+
+What can be claimed at release: every setting presented as a latency win
+either has a run behind it or is written "not measured" at the site. No
+setting is presented as a measured win without one. The 28 correctness
+settings are labelled as such in `book/src/deploy/hft.md` ("required for
+whole cores or fail closed"). **Not** claimable: "all flags have confirmed
+to make a difference in latencies" — 27 of them have not been measured, and
+28 do not claim to.
+
+### EVIDENCED — the settings that carry the latency claim
+
+| setting | measured effect | source |
+|---|---|---|
+| `isolcpus` / `nohz_full` / `rcu_nocbs` / `irqaffinity=0` (bundle) | Azure DPDK idle median of rep maxima **216 (69–663) → 71 (65–447)** µs | `md-dpdk/BENCHMARKS.md` |
+| `transparent_hugepage=never` | idle p99.99 **67.01 → 53.15**; idle median of rep maxima **545.79 → 106.50**, absolute max **632 → 286** | `md-dpdk/BENCHMARKS.md` rounds 4, 6 |
+| SMT off (`ThreadsPerCore: 1`, `nosmt`) | a busy sibling costs **+0.5 µs p50** at 1 conn, **+2.3–2.7 µs p50** and **+9–12 µs p99** at 10–100 | `io/benches/BENCHMARK.md` run `122127Z` |
+| `ethtool -C <if> adaptive-rx off` (rx-usecs stays 20) | `recv-busy` p99.99 falls **43–47 µs**, median about **3 µs** | `io/benches/BENCHMARK.md` runs `062428Z`, `070339Z` |
+| NIC queue IRQs on a spare core; `irqbalance` stopped | placement costs the tail: p99/max **45.9–47.2 / 135–161** vs **47.0–53.9 / 108–425**; IRQs on housekeeping lost 1 M/s in 5 of 5 | `io/benches/BENCHMARK.md`; fair run `20261019T175248Z`; `md-dpdk/BENCHMARKS.md` G1 |
+| ENA RX ring `ethtool -G <if> rx 4096` | no NIC drop or NAK where the default ring dropped at 1 M msgs/s of 288 B (loss, not tail) | `md-dpdk/BENCHMARKS.md` round 5 |
+| keep-alive about 1 kHz on sparse streams | one lost ping cost **134 ms** (Aeron's next heartbeat) | `md-dpdk/BENCHMARKS.md` |
+| quiet cores only (two-minute spin at pod start) | some Azure vCPUs stop for up to **3.7 ms** once a minute | `md-dpdk/BENCHMARKS.md` experiment log 2026-10-14 |
+| `net.core.busy_read/busy_poll=50` (Azure) | busy polling p50 **21.15 / max 99.52** vs plain kernel UDP **32.03 / 354.81** | `md-dpdk/BENCHMARKS.md` round 11 |
+| plain kernel UDP, no isolation (counter-arm) | idle median of rep maxima **354.81 (272.13–2,203.65)** vs **57.89** isolated DPDK | `md-dpdk/BENCHMARKS.md` round 11 |
+| `SHARED_NETWORK` (counter-arm) | 1,344 B bursts p50 **522 vs 234**, median of rep maxima **748 vs 493** | `md-dpdk/BENCHMARKS.md`, correction 2026-10-17 |
+| busy polling on Graviton at 288 B, 1 M/s (counter-arm) | collapse: p50 **4,973 µs**, absolute max 102,826, 61,488 NAKs | `md-dpdk/BENCHMARKS.md` G1 |
+| `mlockall`, pacing, RX burst 64, 1 MiB window, C1 on metal (counter-arms) | each lost its A/B; C1 on metal made kernel UDP's p50 **2 µs** worse | `md-dpdk/BENCHMARKS.md` |
+| `rcv-wnd=80k` alone vs window + 20 µs park | flat-out falls **6.5–6.8×**; loss-free ceiling **drops** 157 k → 121 k msgs/s without the park | `md-dpdk/BENCHMARKS.md` rounds 12–13 |
+| `SCHED_FIFO` built, default off | no gain on an isolated CPU (p50 **+0.5/−1.8 µs**, p99.99 **+1/−45 µs**; one A/B, sender inflated, directional only) | `io/benches/BENCHMARK.md` run `163114Z` |
+| `uring-sqpoll` on a sibling, never a second isolated core | sibling costs **+0.5 µs p50 / +9–12 µs p99**, still beats single-vCPU by about 8 µs | `io/benches/BENCHMARK.md` run `122127Z` |
+| x86 VM C-state cap `intel_idle.max_cstate=1` | mixed: helped one round, cost the 288 B loss-free rate in another; worse on metal | `book/src/deploy/hosts.md`; `md-dpdk/BENCHMARKS.md` |
+| ENA interrupt path `adaptive-rx off rx-usecs 0 tx-usecs 0`, IRQs on a core of their own | within **1.7–3.3 µs** of NIC polling at 1 conn, level from 4 (Graviton only) | fair run `20261019T175248Z` |
+
+### UNMEASURED — recommended without a latency A/B
+
+Each of these is recommended for a stated mechanism. None has a run behind
+it. Sites that admit it in place are noted; the rest carry no number.
+
+| area | settings | source of the gap |
+|---|---|---|
+| Memory / hugepages | boot hugepages + `vm.nr_hugepages`; Aeron dir on sized hugetlbfs with `AERON_FILE_PAGE_SIZE`, `AERON_TERM_BUFFER_SPARSE_FILE=false`, pre-touch; latency-pods extension 1 | T4: tmpfs and hugetlbfs never A/B'd (`tune/src/mem.rs`) |
+| Kernel memory policy | KSM off; `numa_balancing=0`; `memory.high` pressure off the pod | T5, K6 |
+| CPU placement | `topologyManagerPolicy: single-numa-node` **latency effect** (the placement itself is required); co-tenancy kept off the node | T6: every lab host had one NUMA node |
+| CPU quota | the 100 ms CFS-quota stall behind "no CPU quota on the busy container" | T9, `tune/src/quota.rs` |
+| CPU power / idle | x86 C-state exit latency; Graviton `nohlt`; `tuned` profiles | admitted at each site |
+| NIC | `napi_defer_hard_irqs=2`, `gro_flush_timeout=200000`; N3's Azure accelerated-networking VF | N2's timer wait and N3 |
+| Shared CPUs | timer slack 1 ns; helpers (dial, TLS, warnings, Aeron conductors) off the loop's core; `hostNetwork: true` | admitted at each site |
+| Java / Aeron JVM | `-XX:+UseParallelGC`; `-Xms=-Xmx` + `AlwaysPreTouch`; metaspace and code-cache sizes; `-Xlog:async`; `-Dagrona.disable.bounds.checks=true`; `aeron.*.idle.strategy=spin/noop`; hot-thread pinning; `-XX:+UseSerialGC`; the four "measure first" options | the Source column is Aeron scripts or external `aeron-io/benchmarks`; no Java latency A/B exists in this repo |
+| Build flags | `-march=native`, `target-cpu=neoverse-*`, `-mcpu=…` | codegen claim only |
+| Latency-pods | extension 2 (`cpuset.cpus.partition=isolated`) and the set's latency effect | two EKS spot labs reached no capacity |
+
+The repo's own summary agrees: `book/src/tune/overview.md` — "Not measured:
+T4, T5, T6, T9, N2's timer wait and N3. T8's effect was weak."
+
+### CONTRADICTED — three claims the cited data disagreed with
+
+| # | claim | what the data says | fix |
+|---|---|---|---|
+| 1 | `latency-pods.md`: "Deep C-states cost every update from idle; a C1 cap cut the idle **max** hard", and `node-checks.md` attributing the **3.5 µs** clock-update cost (max **6.1–18.7**) to "waking from deep idle" | the only C1 A/Bs are mixed on a VM and **worse** on metal (`md-dpdk/BENCHMARKS.md`, `hosts.md`); `clock/BENCHMARKS.md` says the clock-update cost is untraced and "the harness never sleeps, so this is not an idle-exit effect" | the device grant is now stated as access, not a latency win, and points at the C-state table; the false attribution is gone from the book, `node-checks.md` and `eks-nri-userdata.sh`'s comment |
+| 2 | `shared-cpus.md`: `schedFifo: "off"` — "keep off: **measured worse**" | the one A/B measured **no gain** and is flagged directional only (a sleeping sender inflated it); "worse" is the opposite claim | wording corrected; the recommendation (keep off) was already right |
+| 3 | `tune/src/nic/mod.rs` N1: "plain kernel UDP at 100 k msgs/s went from p50 **106 → 71 µs** (max **606 → 560**; 3 of 5 reps)" | that pair is **withdrawn** in `md-dpdk/BENCHMARKS.md`: 106/606 came from an idle, single-rep run with moderation **on**; no c7i moderation A/B at 100 k/s exists in any run | clause deleted from the live finding. A second unsourced number in the same sentence ("round trips over 100 µs went from 73–117 to 15–32 a minute", which appears nowhere else in the tree) went with it. The Graviton G1–G3 support is kept, per architecture. `tune/tests/nic_checks.rs` now asserts the withdrawn figures **stay** out |
+
+A fourth recommendation went with claim 1: `cpu.idle` "off for latency
+pods", in `node-checks.md`, its sample `node.json` and the book's node-setup
+table. Its only justification was claim 1's idle-exit attribution, and
+nothing in the tree reads or writes the setting. If a measured effect turns
+up, it can return with the run that shows it.

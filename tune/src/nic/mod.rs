@@ -402,9 +402,9 @@ fn driver_of(
     }
 }
 
-const N1_EVIDENCE: &str = "io/benches/BENCHMARK.md (Recommendations; Host and NIC settings on AWS); \
-     md-dpdk/BENCHMARKS.md (AWS kernel UDP against Aeron's published open-source figure, 3 of 5 reps; \
-     Experiment log 2026-10-15); AWS Graviton performance runbook";
+const N1_EVIDENCE: &str = "io/benches/BENCHMARK.md (Host and NIC settings on AWS; runs 062428Z, \
+     070339Z); md-dpdk/BENCHMARKS.md (Graviton G1–G3; the withdrawn c7i 100 k/s pair and its \
+     correction, 2026-10-15); AWS Graviton performance runbook";
 
 /// N1: ENA's adaptive RX interrupt moderation is off on `interface`. For
 /// the kernel-socket paths (ergon-io, the media driver's socket transport)
@@ -435,10 +435,11 @@ pub fn n1_adaptive_rx<E: Ethtool>(
             use_adaptive_rx: Some(true),
             ..
         }) => {
-            let graviton = if Platform::detect(host).is_graviton() {
-                " AWS's Graviton performance runbook gives the same advice."
+            let platform = if Platform::detect(host).is_graviton() {
+                " On Graviton, G1–G3 lost nothing to 1 M msgs/s of 288 B with it off; AWS's \
+                 Graviton performance runbook gives the same advice."
             } else {
-                ""
+                " The cost of leaving it on at 100 k msgs/s is not measured."
             };
             Finding::found(
                 id,
@@ -447,12 +448,11 @@ pub fn n1_adaptive_rx<E: Ethtool>(
                 format!(
                     "{interface}: adaptive RX interrupt moderation is on (ENA's default since Linux \
                      6.9): its work item (ena_dim_work) pre-empts a busy-polling loop about 40 times \
-                     a second. Turned off, the round trip's p99.99 fell 43–47 µs and round trips over \
-                     100 µs went from 73–117 to 15–32 a minute (AWS, 8-minute A/B), and plain kernel \
-                     UDP at 100 k msgs/s went from p50 106 → 71 µs (max 606 → 560 µs; 3 of 5 \
-                     reps).{graviton} Fix: `ethtool -C {interface} adaptive-rx off` (leave rx-usecs \
-                     at ENA's 20: moderation fully off made busy polling worse); ENA turns it back on \
-                     at every reset, so apply it again after one (when carrier_changes moves)"
+                     a second. Turned off, the round trip's p99.99 fell 43–47 µs and the median about \
+                     3 µs (runs 062428Z, 070339Z).{platform} Fix: `ethtool -C {interface} adaptive-rx \
+                     off` (leave rx-usecs at ENA's 20: moderation fully off made busy polling \
+                     worse); ENA turns it back on at every reset, so apply it again after one (when \
+                     carrier_changes moves)"
                 ),
             )
         }
