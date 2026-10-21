@@ -68,6 +68,16 @@ with open('$path', 'w') as f:
 "
 }
 
+# The gate's stdout for the no-LTO profile. `package-bench-artifacts.sh` ships
+# this as `sbe-bench-gate-no-lto.txt` and fails closed without it, so every
+# fixture that is meant to package has to keep one.
+write_gate_log() {
+    local run_id="$1"
+    local path="$FAKE_ROOT/target/bench-runs/$run_id/no-lto/gate.txt"
+    mkdir -p "$(dirname "$path")"
+    printf 'PASS: fixture gate for %s\n' "$run_id" >"$path"
+}
+
 # ── 2. Fixture layout packages both SBE profiles ────────────────────────
 RUN_ID="run-fixture-001"
 for profile in lto no-lto; do
@@ -78,6 +88,7 @@ for profile in lto no-lto; do
         "$FAKE_ROOT/target/bench-runs/$RUN_ID/$profile/criterion/run-manifest.json" \
         "$RUN_ID" "$profile" "$COMMIT"
 done
+write_gate_log "$RUN_ID"
 # Cluster fixtures — must carry run_id + HEAD commit (no invent-on-package).
 CL_RUN="cluster-fixture-001"
 for pair in \
@@ -112,6 +123,10 @@ MAN_COMMIT=$(python3 -c "import json; print(json.load(open('$tmpm/criterion/run-
 check "manifest commit matches HEAD" test "$MAN_COMMIT" = "$COMMIT"
 rm -rf "$tmpm"
 
+# `book/src/project/verification.md` names this artifact on the release.
+check "ships the no-LTO gate stdout" \
+    test -s "$OUT2/sbe-bench-gate-no-lto.txt"
+
 # ── 3. Missing profile fails closed ─────────────────────────────────────
 rm -rf "$FAKE_ROOT/target/bench-runs/$RUN_ID/no-lto"
 OUT3="$SCRATCH/out-missing-profile"
@@ -132,6 +147,8 @@ for profile in lto no-lto; do
         "$FAKE_ROOT/target/bench-runs/$STALE_RUN/$profile/criterion/run-manifest.json" \
         "$STALE_RUN" "$profile" "$STALE_COMMIT"
 done
+# Present, so the stale commit is the first failure rather than a missing gate.
+write_gate_log "$STALE_RUN"
 # Cluster fixtures stamped for HEAD so SBE stale is the first failure.
 for pair in \
     "$FAKE_ROOT/target/criterion:lto" \
@@ -185,6 +202,7 @@ for profile in lto no-lto; do
         "$FAKE_ROOT/target/bench-runs/$RUN_ID/$profile/criterion/run-manifest.json" \
         "$RUN_ID" "$profile" "$COMMIT"
 done
+write_gate_log "$RUN_ID"
 rm -rf "$FAKE_ROOT/target/criterion" "$FAKE_ROOT/target/bench-no-lto"
 for dir in "$FAKE_ROOT/target/criterion" "$FAKE_ROOT/target/bench-no-lto/criterion"; do
     mkdir -p "$dir/cluster_fake/new"
@@ -265,6 +283,18 @@ tar -xzf "$OUT_CL_REPEATS/bench-cluster-lto.tar.gz" -C "$tmpr"
 OWNED=$(python3 -c "import json,glob; print(json.load(open(glob.glob('$tmpr/**/run-manifest.json', recursive=True)[0]))['estimates'])")
 check "cluster estimate count is the run's own" test "$OWNED" = "1"
 rm -rf "$tmpr"
+
+# ── 8. Missing gate stdout fails closed ─────────────────────────────────
+# verification.md names `sbe-bench-gate-no-lto.txt` on the GitHub release. A
+# run that did not keep the no-LTO gate output must not package: shipping
+# without it is the failure the requirement exists to prevent.
+rm -f "$FAKE_ROOT/target/bench-runs/$RUN_ID/no-lto/gate.txt"
+OUT5="$SCRATCH/out-missing-gate"
+mkdir -p "$OUT5"
+check "missing no-LTO gate stdout fails" \
+    bash -c "! REQUIRE_CLUSTER=0 '$FAKE_ROOT/scripts/package-bench-artifacts.sh' '$OUT5' 2>/dev/null"
+check "no archives after missing gate reject" \
+    bash -c "! find '$OUT5' -name '*.tar.gz' | grep -q ."
 
 echo ""
 echo "=== package-bench-artifacts dry-run: $pass passed, $fail failed ==="

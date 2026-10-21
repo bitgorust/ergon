@@ -69,6 +69,15 @@ done < <(ls -t "$SBE_RUNS" 2>/dev/null)
 SBE_RUN_DIR="$SBE_RUNS/$SBE_RUN_ID"
 [ -d "$SBE_RUN_DIR" ] || fail "SBE run dir missing: $SBE_RUN_DIR"
 
+# The gate's own stdout for the no-LTO profile. `book/src/project/verification.md`
+# requires this artifact by name on the GitHub release. Checked before any
+# archive is written, so a run that did not keep it leaves no partial output:
+# shipping a release without the gate output is exactly what that requirement
+# exists to prevent.
+GATE_LOG="$SBE_RUN_DIR/no-lto/gate.txt"
+[ -s "$GATE_LOG" ] || fail \
+    "missing $GATE_LOG — the run did not record the no-LTO gate stdout; re-run 'just bench'"
+
 for profile in no-lto lto; do
     CRITERION_DIR="$SBE_RUN_DIR/$profile/criterion"
     [ -d "$CRITERION_DIR" ] || fail "missing $profile profile in SBE run $SBE_RUN_ID"
@@ -114,6 +123,9 @@ sys.exit(0 if d.get('commit') == sys.argv[2] else 1)
     rm -rf "$tmp"
     echo "SBE $profile: $estimate_count estimates → bench-sbe-$profile.tar.gz"
 done
+
+cp "$GATE_LOG" "$OUT_DIR/sbe-bench-gate-no-lto.txt"
+echo "SBE no-LTO gate stdout → sbe-bench-gate-no-lto.txt"
 
 # ── Cluster artifacts (produced by just bench-cluster) ────────────────────
 
