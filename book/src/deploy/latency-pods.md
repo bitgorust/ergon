@@ -5,10 +5,10 @@ They live in `k8s/nri-latency-pods` (node setup and the admission policy) and
 `k8s/nri-shared-cpus` (the NRI plugin). This page is the contract; the
 numbers are in [Benchmarks](benchmarks.md).
 
-**In short:** a busy-spin loop on a dedicated core loses its tail to
+**In short:** a busy-spin loop on a dedicated core can lose its tail to
 4 KiB page faults, to cgroup wake-ups on its own core, to io_uring being
 blocked by the default seccomp profile, to an exec probe resetting its
-CPU affinity, and to deep C-states. Five small grants remove each of
+CPU affinity, and to idle wake-up. Five small grants target each of
 those. A sixth thing people ask for — `SCHED_FIFO` — is built in the
 shared-cpus plugin and left off by default, because it was measured to
 give no gain on an isolated CPU on AWS. This page's own admission policy
@@ -137,8 +137,9 @@ from outside the container.
 ### 5. Devices
 
 The NIC's PHC (`/dev/ptp*`) for clock work, and on x86
-`/dev/cpu_dma_latency` to cap C-states. Deep C-states cost every update
-from idle; a C1 cap cut the idle **max** hard. Graviton (c8g) has no
+`/dev/cpu_dma_latency` so a pod can cap C-states. The cap's measured effect
+is mixed on a VM and worse on metal ([C-states](hosts.md#c-states)), so
+treat the grant as access, not a latency win. Graviton (c8g) has no
 `cpu_dma_latency` node, so that grant is x86 only.
 
 ## Real-time scheduling: built, default off
@@ -177,7 +178,6 @@ The full check list is `k8s/nri-latency-pods/node-checks.md`. The short version:
 | Kubernetes | >= 1.33 (1.36 recommended) |
 | kubelet | `cpuManagerPolicy: static`; `reservedSystemCPUs` = the IRQ CPU(s) plus the shared CPUs; x86 `full-pcpus-only` |
 | `strict-cpu-reservation` | **off** (on, it empties the shared pool) |
-| `cpu.idle` | **off** for latency pods |
 | kernel | >= 6.7, cgroup v2 (`cpuset.cpus.exclusive` is what the partition writes, and it is 6.7; a vendor backport of that file also works — the plugin reads the file, not the version). Also `nohz_full`, `rcu_nocbs`, `isolcpus=managed_irq` on the exclusive CPUs, never the shared ones. 6.2 is enough for the shared CPUs only |
 | `transparent_hugepage` | `never` |
 | `net.core.rmem_max` / `wmem_max` | 4–16 MiB |

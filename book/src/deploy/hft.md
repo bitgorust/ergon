@@ -1,12 +1,8 @@
 # Kubernetes HFT tuning
 
-Every setting that either won an A/B on a real pair or is required for the
-pod to get its own cores, and what it cost when it was wrong. Rows with
-bold µs figures are measured; the rest are required for the pod to get whole
-cores of its own, or fail closed when missing.
-A `X (a–b)` cell is the median of the five per-rep maxima X with the five in
-brackets; the bracket's upper end is the absolute worst round trip in any rep
-([aggregation](benchmarks.md#how-figures-are-aggregated), [full tables](../md-dpdk/overview.md#measured-between-two-hosts)).
+Bold µs rows are measured; the rest are required for whole cores or fail
+closed. `X (a–b)` = median of five per-rep maxima
+([how to read a number](benchmarks.md#how-to-read-a-number)).
 Scan the tables, copy the two blocks, run the three checks.
 
 Terms: [deployment glossary](overview.md#glossary).
@@ -34,13 +30,11 @@ Terms: [deployment glossary](overview.md#glossary).
 | app | keep-alive | about 1 kHz on sparse, latency-critical streams | a lost frame is noticed only at Aeron's next heartbeat: one lost ping cost **134 ms** |
 | app | quiet cores only | two-minute spin at pod start; pin to cores that never stalled 300 µs | some Azure vCPUs stop for up to **3.7 ms** once a minute |
 
-Figures in this table: [md-dpdk/BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)
-(SMT row: [io/benches/BENCHMARK.md](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md);
-the two `app` network rows: the Graviton fair run
+Figures: [md-dpdk/BENCHMARKS.md](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md)
+(SMT: [io/benches/BENCHMARK.md](https://github.com/mimran1980/ergon/blob/main/io/benches/BENCHMARK.md);
+the two `app` rows: fair run
 [`20261019T175248Z`](https://github.com/mimran1980/ergon/blob/main/io/benches/results/flags-aws-20261019T175248Z/fair.md),
-whose [note at the top](https://github.com/mimran1980/ergon/blob/main/io/benches/results/flags-aws-20261019T175248Z/fair.md)
-names the six points whose sender fell behind and what that does and does not
-move).
+whose top note names the six points whose sender fell behind).
 
 ## Never do this
 

@@ -42,8 +42,7 @@
 #     on the node. Kubelet 1.33+ sets no CPU quota on a container with
 #     exclusive CPUs (1.36 is the floor here), so the hot container needs no
 #     exception.
-#   * no strict-cpu-reservation (it would empty the shared pool) and no
-#     cpu.idle (deep C-states cost microseconds out of idle).
+#   * no strict-cpu-reservation (it would empty the shared pool).
 #   * Graviton has no SMT: no full-pcpus-only (it is x86-only anyway).
 set -euo pipefail
 

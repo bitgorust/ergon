@@ -196,7 +196,7 @@ accessors are branch-free. Full detail:
 
 ## Further reading
 
-- [Type-state is zero-cost](../design-notes/type-state.md)
+- [Type-state and runtime cost](../design-notes/type-state.md)
 - [API freeze decisions](../design-notes/api-freeze.md)
 - [Feature matrix](../design-notes/feature-matrix.md)
 - Sample: [sbe-feature-tour](https://github.com/mimran1980/ergon/tree/main/samples/sbe-feature-tour)

@@ -84,27 +84,19 @@ off):
 
 The node scripts (tested against fixtures by `just test-dpdk-bootstrap`):
 
-- **First boot** (`node/provision-node.sh`) sets the kernel command line,
-  then reboots once before kubelet starts: every CPU but the reserved core
-  isolated, interrupts on the reserved core, C-states capped at C1 on a VM,
-  `iommu=pt`, `transparent_hugepage=never`,
-  and 2 MiB hugepages, so kubelet's first start advertises `hugepages-2Mi`.
-  The clocksource is left to the kernel: a forced `clocksource=tsc
-  tsc=reliable` turns the kernel's TSC checks off, so bare metal takes it only
-  with `RUSTERON_FORCE_TSC=1`, after the TSC has been measured as the same
-  across cores against a PTP/PHC reference. A VM never gets it.
-- **Kubelet's reserved CPUs and the kernel's housekeeping CPUs are the same
-  set.** That keeps interrupts and system daemons off the pods' cores.
-- **Every boot** (`node/bootstrap-dpdk-ena.sh`, before kubelet): interrupts on
-  housekeeping with a watcher that re-pins them on each link event,
-  `irqbalance`, KSM and NUMA balancing off, transparent hugepages off,
-  `rmem_max`/`wmem_max` 16 MiB, Aeron's directory on a sized hugetlbfs at
-  `/mnt/huge-aeron`; for DPDK, the two spare ENAs bound to `igb_uio` and
-  listed for the device plugin. If it fails, the node still runs kernel UDP
-  and advertises no DPDK pair.
-- **Dedicated nodes**, labelled `rusteron-dpdk/ena=true` and tainted
-  `rusteron-dpdk:NoSchedule`, so only pods with that `nodeSelector` and
-  toleration land there.
+| script | when | what it does |
+|---|---|---|
+| `node/provision-node.sh` | once, then one reboot before kubelet | kernel command line: every CPU but the reserved core isolated, interrupts on that core, C-states C1 on a VM, `iommu=pt`, `transparent_hugepage=never`, 2 MiB hugepages, so kubelet's first start advertises `hugepages-2Mi` |
+| `node/bootstrap-dpdk-ena.sh` | every boot, before kubelet | interrupts on housekeeping with a watcher that re-pins on each link event; `irqbalance`, KSM, NUMA balancing off; THP off; `rmem_max`/`wmem_max` 16 MiB; Aeron's directory on a sized hugetlbfs at `/mnt/huge-aeron`; for DPDK the two spare ENAs on `igb_uio`. On failure the node still runs kernel UDP and advertises no DPDK pair |
+
+Clocksource is left to the kernel. A forced `clocksource=tsc tsc=reliable`
+turns the kernel's TSC checks off, so bare metal takes it only with
+`RUSTERON_FORCE_TSC=1`, after the TSC has been measured as the same across
+cores against a PTP/PHC reference. A VM never gets it.
+
+Kubelet's reserved CPUs and the kernel's housekeeping CPUs are the same set:
+interrupts and system daemons stay off the pods' cores. Dedicated nodes are
+labelled `rusteron-dpdk/ena=true` and tainted `rusteron-dpdk:NoSchedule`.
 
 ## SMT off
 

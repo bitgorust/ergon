@@ -89,11 +89,13 @@ fn n1_warns_while_ena_adaptive_moderation_is_on() -> R {
         "{}",
         v.message
     );
-    assert!(
-        v.message.contains("106 → 71 µs (max 606 → 560 µs"),
-        "{}",
-        v.message
-    );
+    assert!(v.message.contains("p99.99 fell 43–47 µs"), "{}", v.message);
+    assert!(v.message.contains("is not measured"), "{}", v.message);
+    // The c7i 100 k/s moderation pair (p50 106 → 71 µs) was withdrawn: those
+    // figures came from an idle, single-rep run with moderation on. It must not
+    // come back into a live finding.
+    assert!(!v.message.contains("106 → 71"), "{}", v.message);
+    assert!(!v.message.contains("606 → 560"), "{}", v.message);
     assert!(v.message.contains("every reset"), "{}", v.message);
     assert!(!v.message.contains("Graviton"), "{}", v.message);
     // The same advice on Graviton, with AWS's runbook.
