@@ -414,7 +414,9 @@ ladder and 5 reps, `isolated` only. Three arms, cross-host and localhost:
 | window | `dpdk`, `SUB_PARAMS=rcv-wnd=80k` |
 | window+park | `dpdk`, `SUB_PARAMS=rcv-wnd=80k`, `AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS=100-10-1us-20us` |
 
-Artefact: `target/md-dpdk-bench/20261019-071438/` (`results.csv`, `summary.md`).
+Provenance: round 13, 2026-10-19, five reps per arm on that pair. The raw
+output was written under `target/` and is not retained — the tables below
+are the record, as for the other rounds.
 
 #### Idle round trip (p50 / p99.99 / max, µs, across 5 reps)
 
@@ -461,7 +463,7 @@ create/close.
 
 **Refuted 2026-10-19**, Azure `Standard_D8s_v6` ×2, `LAB_STATES=isolated`,
 `LAB_MODES="dpdk dpdk@RUSTERON_DPDK_NIC_STATS_MS=0"`, 3 reps
-(`target/md-dpdk-bench/20261019-173045`). Stopping the reads entirely leaves
+(run `20261019-173045`). Stopping the reads entirely leaves
 the mark where it was:
 
 | arm | conductor max µs (a idle, b idle, a full, b full) | round trip p50 / p99.99 / max µs | M msgs/s | dropped |
@@ -710,7 +712,7 @@ on its own either way — the window decides how much a stall may cost.
 #### What the gap split says
 
 **Measured 2026-10-19, Azure `Standard_D8s_v6` ×2, `LAB_STATES=isolated`,
-`LAB_MODES="dpdk dpdk@RUSTERON_DPDK_GAP_ATTRIB=1"`, 3 reps** (`target/md-dpdk-bench/20261019-164532`).
+`LAB_MODES="dpdk dpdk@RUSTERON_DPDK_GAP_ATTRIB=1"`, 3 reps** (run `20261019-164532`).
 
 **The receiver's long maxima are descheduling, not work.** Every gap maximum
 above 100 µs has `poll-cycle-gap-desched-max-ns` equal to the undivided

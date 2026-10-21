@@ -586,3 +586,63 @@ pods", in `node-checks.md`, its sample `node.json` and the book's node-setup
 table. Its only justification was claim 1's idle-exit attribution, and
 nothing in the tree reads or writes the setting. If a measured effect turns
 up, it can return with the run that shows it.
+
+## 8. Artefact provenance and one unjudged setting — 2026-10-21
+
+Every figure quoted in section 7 was traced to the run that produced it, and
+then to the artefact that still holds its output. Two things turned up.
+
+### Where each body of numbers actually lives
+
+| body | raw output in the tree? | how to recover a figure |
+|---|---|---|
+| `io/benches`, runs through `142240Z` | env, cpumap and an empty `analyse.err` only | `git show 128747b9^:io/benches/results/<run>/tables.md` — commit `128747b9` ("tables out of the tree") deleted the per-run tables; `io/benches/BENCHMARK.md:17` says so and is accurate |
+| `io/benches`, fair run `20261019T175248Z` | `tables.md`, `fair.md`, `work-counts.md`, frozen | in place. `records.bin` was left on the receiver by `KEEP_RECORDS=0` and is gone with the VM, so the tables cannot be re-derived |
+| `md-dpdk` rounds G1–G3, 4–13, experiment log | **nothing** | prose tables in `md-dpdk/BENCHMARKS.md` are the record. No md-dpdk run output was ever committed; the only hit in git history is a test fixture |
+| local codec benches | Criterion trees + run manifests under `target/bench-runs/` | in place; re-stamped per commit by `just bench` / `just bench-cluster` |
+
+Consequence: section 7's io figures are verifiable to a run, through git
+history. Its md-dpdk figures are not verifiable to any artefact — the
+tables are the record. `md-dpdk/BENCHMARKS.md:417` named
+`target/md-dpdk-bench/20261019-071438/` (`results.csv`, `summary.md`) as
+round 13's artefact; `target/` is gitignored (`.gitignore:2`), the directory
+is gone and was never committed. The dead path is removed and the line now
+states what is retained.
+
+### `mitigations=off` — measured, never judged
+
+Four runs captured a boot ladder on the receiver
+(`env-rcv-{stock,isolcpus,full,full-nomitig}.txt`):
+`flags-aws-20261014T163114Z`, `flags-aws-20261015T045527Z`,
+`flags-azure-20261014T144146Z` and `flags-aws-20261015T051741Z` (that one
+`full`/`full-sqtick`). The difference between `full` and `full-nomitig` is
+`mitigations=off` on the kernel command line — spectre_v2, IBPB, STIBP,
+SSB and the spectre_v1 swapgs barriers, as the env capture records.
+
+Only `163114Z` analysed the ladder. Its tables are in git history at
+`128747b9^`. `045527Z` captured the same env pair and analysed something
+else — **no `nomitig` row in its tables** — so this is one run, not two.
+
+HTTP round trip `http-recv-busy-10000` (n ≈ 1.19 M, µs), `boot-full-nomitig`
+against `boot-full`:
+
+| | p50 | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|
+| `full-nomitig` | 46.10 | 58.65 | 70.45 | **88.99** | **1,045.66** |
+| `full` | 46.31 | 58.80 | 72.65 | 119.69 | 269.07 |
+
+Market-data burst `md-recv-busy` (n ≈ 2.9 M, µs), the same pair:
+
+| | p50 | p99 | p99.9 | p99.99 | max |
+|---|---|---|---|---|---|
+| `full-nomitig` | **2.43** | **6.69** | **11.88** | 30.58 | 46.37 |
+| `full` | 3.28 | 7.16 | 14.09 | **33.42** | **39.73** |
+
+Two other arms in the same tables favour `full-nomitig` on the tail (one
+WebSocket arm's max **245.79** against **1,035.94**; another **166.61**
+against **534.91**). So `mitigations=off` wins the tail on some backends and
+loses it on others, with one arm's absolute max four times worse with it on.
+**Mixed, one run, no repetition: this establishes no winner.** Per the rule
+that an inconclusive result claims nothing, `mitigations=off` is recorded as
+measured and undecided, and is recommended nowhere. If it is ever
+recommended, it needs a second run on the same pair first.

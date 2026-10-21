@@ -81,8 +81,7 @@ idle-timer callback.
 - **AWS:** chrony on the Amazon Time Sync Service. Not systemd-timesyncd:
   it keeps no error bound, and its slews after boot ran 820.252 ppm over a
   1 s window, falling to 533.462 ppm over 120 s (`CLOCK_MONOTONIC` vs
-  `CLOCK_MONOTONIC_RAW`; run `aws-20261016-084001`, node b,
-  `target/md-dpdk-bench/aws-20261016-084001/b-clockbench-isolated.csv`).
+  `CLOCK_MONOTONIC_RAW`; run `aws-20261016-084001`, node b).
 
   ```text
   server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4
