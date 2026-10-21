@@ -143,8 +143,13 @@ jobs:
             --app-version "${{ github.event.inputs.tag }}" \
             --destination /tmp/chart
 
+      # The job token is read from the env on stdin. Do not echo it and do not
+      # run this step under `set -x`: the workflow log is public.
       - name: Push the chart to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
-            --username "${{ github.actor }}" --password-stdin
+          helm registry login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin <<< "$GHCR_TOKEN"
           helm push /tmp/chart/*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts

@@ -54,6 +54,7 @@ rusteron-media-driver = "0.2.13"
 [workspace.lints.rust]
 unsafe_code = "deny"
 missing_docs = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ergon_rlvalidator)"] }
 
 [workspace.lints.clippy]
 all = "deny"
