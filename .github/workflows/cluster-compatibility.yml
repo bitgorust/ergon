@@ -52,7 +52,7 @@ jobs:
       - uses: extractions/setup-just@v2
 
       - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev libbsd-dev
+        run: sudo rm -f /etc/apt/sources.list.d/microsoft-prod.* && sudo apt-get update && sudo apt-get install -y libclang-dev libbsd-dev
 
       - name: Check out Aeron ${{ matrix.aeron-version }}
         run: |
