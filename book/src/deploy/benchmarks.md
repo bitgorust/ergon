@@ -121,8 +121,9 @@ bracket's upper end is the absolute observed maximum. Never read X as a worst
 case.
 
 **Method and provenance.** Aeron ping-pong between two hosts in one cluster
-placement group, us-east-1, Debian 13, isolated CPUs, 5 reps. Each published
-figure cites its run directory under `target/md-dpdk-bench/`, which keeps
-`commit`, `dirty`, `ergon.tar`, `env-*.txt`, the kernel command line and the
-per-mode flag. One copy of the full method:
+placement group, us-east-1, Debian 13, isolated CPUs, 5 reps. The lab writes
+each run to `target/md-dpdk-bench/<stamp>/` carrying `commit`, `dirty`,
+`ergon.tar`, `env-*.txt`, the kernel command line and the per-mode flag;
+`target/` is not kept in the repository, so the run id is the surviving
+record and the tables are the record of the numbers. Method:
 [`md-dpdk/BENCHMARKS.md`](https://github.com/mimran1980/ergon/blob/main/md-dpdk/BENCHMARKS.md).
