@@ -4,10 +4,10 @@
 # the nodes the DaemonSet runs on. It must be inside the kubelet's
 # reservedSystemCPUs, minus the CPU(s) kept for NIC IRQs.
 
-# Published image tag 0.1.0. Empty tag means the chart appVersion.
+# Published image tag 0.1.1. Empty tag means the chart appVersion.
 # image.digest, when set, wins and the pod uses repository@digest.
-# The published image does not implement --kubelet-config. Leave
-# hostContract disabled against tag 0.1.0.
+# Image 0.1.1 accepts --kubelet-config and the other host flags.
+# hostContract stays off in this chart. Image 0.1.0 rejects those flags.
 image:
   repository: ghcr.io/mimran1980/ergon-shared-cpus
   # Empty means appVersion. Ignored when digest is set.
@@ -93,8 +93,8 @@ config:
   # Absolute AERON_DIR, or empty to omit a directory.
   hugepagesAeronDir: ""
   # Named layouts. Leave this unset for the legacy single sharedCpus file.
-  # Image 0.1.0 rejects nodeProfileLabel (unknown field) and exits. These
-  # keys need a binary built from this tree. When profiles is set, the chart
+  # Image 0.1.0 rejects nodeProfileLabel (unknown field) and exits. Image
+  # 0.1.1 accepts these keys. When profiles is set, the chart
   # writes profiles and nodeProfileLabel and omits the flat sharedCpus key.
   # That process reads the node once
   # (NODE_NAME, a get-only Role) and fails if the label is missing or names
@@ -110,9 +110,10 @@ config:
 
 # Read-only host facts for the hot-create contract. Off by default, and
 # never FileOrCreate: a created file would be a kubelet config the plugin
-# would trust. The published image 0.1.0 rejects --kubelet-config,
-# --kubelet-configz, --kubelet-overrides, --host-sys and --host-proc.
-# Leave these off until a binary that has those flags is published.
+# would trust. Image 0.1.1 accepts --kubelet-config, --kubelet-configz,
+# --kubelet-overrides, --host-sys and --host-proc. Leave these off: the
+# chart does not pass them unless a value below is enabled. Image 0.1.0
+# rejects the flags.
 hostContract:
   sys:
     enabled: false

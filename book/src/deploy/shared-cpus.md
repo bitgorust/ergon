@@ -33,27 +33,28 @@ the node, and it does not install the hot-pod admission policy.
 
 ```sh
 helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus \
-  --version 0.1.0 \
+  --version 0.1.1 \
   --namespace ergon-system --create-namespace \
-  --set config.sharedCpus=0 \
+  --set-string config.sharedCpus=0 \
   --set 'config.namespaces={trading}'
 ```
 
 Check the pulled image. This prints the index digest
-`sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`:
+`sha256:69893e0c23ec6c3656053c0d6c4a06c676e33b726d56f362a30ce760908796c0`:
 
 ```sh
-docker buildx imagetools inspect ghcr.io/mimran1980/ergon-shared-cpus:0.1.0
+docker buildx imagetools inspect ghcr.io/mimran1980/ergon-shared-cpus:0.1.1
 ```
 
 The published chart's image helper is `repository:tag`. `image.tag` cannot
-be `@sha256:…` on that package. Chart digest
+be `@sha256:…` on that package. Chart 0.1.1 digest
+`sha256:77a65305a45ea1b376ce80f9b1d5234b9061f4066a8c5baf5efdb892854fc0d8`.
+Chart 0.1.0 digest
 `sha256:7347131d7d87caee5cf6de11b2a11e2b62454da59c41092b3805bc2834795dbd`.
 
-`helm install` of this 0.1.0 package prints "This chart is NOT released".
-That note was packed before the push. The tag is the public chart. The
-note in the repo is corrected for a later tag. This tag is not republished
-to change the note.
+`helm install` of the 0.1.0 package prints "This chart is NOT released".
+That note was packed before the push. The tag is the public chart. It is
+not republished to change the note.
 
 Chart 0.1.0 writes `sharedCpus`, `oversubscription`, `namespaces`,
 `defaultAffinity`, `hookPath`, `annotationOptIn`, `metricsAddress` and
@@ -62,16 +63,18 @@ those keys does nothing on this package. The plugin leaves them off.
 A later edit of the ConfigMap can turn a key on, and the pod still has to
 opt in. Aeron's C media driver does not use io_uring. `SCHED_FIFO` stays off.
 
-Git chart 0.1.1 is not published. It renders every field `config.File`
+Chart 0.1.1 is published. It renders every field `config.File`
 accepts, with `seccomp.ioUring`, `ptp` and `schedFifo` quoted `"off"`.
 `image.digest` renders `repository@digest`; an empty digest keeps
-`repository:tag`, and the default tag stays the published image `0.1.0`.
+`repository:tag`, and the default tag is image `0.1.1`.
 `admission.create` defaults to false and renders a ConfigMap whose
 `data.owner` is `external`. Set it true to install the two named admission
 files (the policy, its binding, and the `ergon-hot` and `ergon-helper`
 PriorityClasses). A ConfigMap edit does not roll the DaemonSet. Drain
-first, then set `layoutRevision`. Do not install 0.1.1 from GHCR: it is
-not there.
+first, then set `layoutRevision`. `helm install` of the pushed 0.1.1
+package prints a NOTES text that still says the chart is not published.
+That text was packed with the push. The tag is not republished to change it.
+Tag 0.1.0 remains, and its install note is stale in the same way.
 
 3. Apply the hot-pod policy. These two files only, from
    `k8s/nri-latency-pods/admission/`:
@@ -200,15 +203,15 @@ The plugin is public. No image pull secret.
 
 | what | address |
 |---|---|
-| image | `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` (and `:latest`) |
-| digest of `0.1.0` and `latest` | `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9` |
-| chart | `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.0` |
+| image | `ghcr.io/mimran1980/ergon-shared-cpus:0.1.1` (and `:latest`) |
+| digest of `0.1.1` and `latest` | `sha256:69893e0c23ec6c3656053c0d6c4a06c676e33b726d56f362a30ce760908796c0` |
+| chart | `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.1` |
 
 ```sh
 helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus \
-  --version 0.1.0 \
+  --version 0.1.1 \
   --namespace ergon-system --create-namespace \
-  --set config.sharedCpus=0 \
+  --set-string config.sharedCpus=0 \
   --set 'config.namespaces={trading}'
 ```
 
@@ -359,7 +362,7 @@ stay as they were at create.
 at that path. The createRuntime hook matches the same path against
 `/proc/<pid>/cgroup`.
 
-Git chart 0.1.1 can also write `profiles` and `nodeProfileLabel` instead of
+Chart 0.1.1 can also write `profiles` and `nodeProfileLabel` instead of
 the flat fields. Image 0.1.0 rejects `nodeProfileLabel` and exits with
 `unknown field "nodeProfileLabel"`. At startup the binary from this tree
 reads its node once and uses the label's value as the profile name. A missing or unknown label stops the

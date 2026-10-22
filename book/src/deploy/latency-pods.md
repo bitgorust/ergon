@@ -12,11 +12,11 @@ built in the shared-cpus plugin and off by default
 ([evidence: mixed](hft.md#sched_fifo)).
 
 Status: the grants ship in the public image
-`ghcr.io/mimran1980/ergon-shared-cpus:0.1.0`. Install it with the chart
-`oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.0`
+`ghcr.io/mimran1980/ergon-shared-cpus:0.1.1`. Install it with the chart
+`oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.1`
 ([Shared CPUs](shared-cpus.md#use-the-public-chart)). This page's admission
-YAML and node units are not an image. Chart 0.1.0 leaves `seccomp.ioUring`
-and `ptp` off, because its ConfigMap template does not write those keys.
+YAML and node units are not an image. Chart 0.1.1 writes `seccomp.ioUring`
+and `ptp` as `"off"`. Chart 0.1.0 does not write those keys.
 `k8s/nri-shared-cpus/examples/try` installs that chart and shows two things
 on kind: the shared-CPU grant, and this page's admission policy denying an
 exec probe. It does not exercise hugepages, the cpuset partition, io_uring

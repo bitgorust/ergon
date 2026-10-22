@@ -1,9 +1,8 @@
-ergon-shared-cpus chart {{ .Chart.Version }} (git; the published OCI chart is still 0.1.0) installed in namespace {{ include "ergon-shared-cpus.namespace" . }}.
+ergon-shared-cpus chart {{ .Chart.Version }} installed in namespace {{ include "ergon-shared-cpus.namespace" . }}.
 
-Image {{ include "ergon-shared-cpus.image" . }}. Anyone can pull tag 0.1.0.
-No image pull secret. This chart is not published. The chart does not set
-the boot line, the kubelet, or containerd. EKS is not verified. Latency
-figures are not measured.
+Image {{ include "ergon-shared-cpus.image" . }}. Anyone can pull it.
+No image pull secret. The chart does not set the boot line, the kubelet,
+or containerd. EKS is not verified. Latency figures are not measured.
 
 {{- if .Values.admission.create }}
 Admission objects from the two named files are included (policy, binding, ergon-hot, ergon-helper).

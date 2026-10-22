@@ -8,11 +8,12 @@ ones. The busy-spin loop keeps its exclusive core; only sleepy helpers
 
 Source: <https://github.com/mimran1980/ergon/tree/main/k8s/nri-shared-cpus>.
 
-**Published, tag 0.1.0.** Anyone can pull
-`ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` (and `:latest`) and the chart
-`oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.0`.
-The EKS lane and the latency benchmarks are still open.
-[`RELEASE.md`](RELEASE.md) names what is not verified. Tested on kind, not yet on EKS.
+**Published, tag 0.1.1.** Anyone can pull
+`ghcr.io/mimran1980/ergon-shared-cpus:0.1.1` (and `:latest`) and the chart
+`oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.1`.
+Tag `0.1.0` remains. The EKS lane and the latency benchmarks are still open.
+[`RELEASE.md`](RELEASE.md) names what is not verified. The kind sample below
+ran on chart `0.1.0`, not on EKS.
 
 **This is not a new idea.** [Prior art](#prior-art) names the projects that
 already do parts of it and the open Kubernetes issue it answers. Read that
@@ -164,15 +165,16 @@ Anyone can pull these. No image pull secret.
 
 | what | address |
 |---|---|
-| image | `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` (and `:latest`) |
-| digest of `0.1.0` and `latest` | `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9` |
-| chart | `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.0` |
+| image | `ghcr.io/mimran1980/ergon-shared-cpus:0.1.1` (and `:latest`) |
+| digest of `0.1.1` and `latest` | `sha256:69893e0c23ec6c3656053c0d6c4a06c676e33b726d56f362a30ce760908796c0` |
+| chart | `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.1` |
+| chart digest | `sha256:77a65305a45ea1b376ce80f9b1d5234b9061f4066a8c5baf5efdb892854fc0d8` |
 
 ```sh
 helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus \
-  --version 0.1.0 \
+  --version 0.1.1 \
   --namespace ergon-system --create-namespace \
-  --set config.sharedCpus=0 \
+  --set-string config.sharedCpus=0 \
   --set 'config.namespaces={trading}'
 ```
 
@@ -200,27 +202,33 @@ prints digest `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c132975
 The published chart image is `repository:tag`. It cannot take `@sha256`.
 Chart digest `sha256:7347131d7d87caee5cf6de11b2a11e2b62454da59c41092b3805bc2834795dbd`.
 
-Git chart 0.1.1 is not published and must not be installed from GHCR.
+Chart 0.1.1 is the package above. `helm template` of that OCI chart with
+`--set-string config.sharedCpus=0` renders image
+`ghcr.io/mimran1980/ergon-shared-cpus:0.1.1` and args `--config` only.
 It renders every `config.File` field (`seccomp.ioUring`, `ptp` and
 `schedFifo` stay quoted `"off"`). `image.digest` renders
-`repository@digest`; empty keeps `repository:tag` and the default tag is
-still image `0.1.0`. `admission.create: false` (the default) renders a
-ConfigMap with `data.owner: external` and does not create the policy or
-the PriorityClasses. `admission.create: true` installs
+`repository@digest`; empty keeps `repository:tag`. `admission.create: false`
+(the default) renders a ConfigMap with `data.owner: external` and does not
+create the policy or the PriorityClasses. `admission.create: true` installs
 `validating-admission-policy.yaml` (policy and binding) and
 `priority-class.yaml` (`ergon-hot` and `ergon-helper`). A ConfigMap edit
 does not roll the DaemonSet. Drain trading workloads, then set
 `layoutRevision`, before changing `sharedCpus`. `cgroupRoot` is not a
-config field. Host-fact mounts stay off: image 0.1.0 has no
-`--kubelet-config` flag, and those mounts are `File` or `Directory`, never
-`FileOrCreate`.
+config field. Host-fact mounts stay off. Image `0.1.1` `--help` on
+linux/amd64 and linux/arm64 lists `--kubelet-config`, `--kubelet-configz`,
+`--kubelet-overrides`, `--host-sys` and `--host-proc`. The chart does not
+pass them. Image `0.1.0` has none of those flags. `helm install` of 0.1.1
+prints a NOTES text that still says the chart is not published and that the
+OCI chart is 0.1.0. That text was packed with the push. The tag is not
+republished to change it. `--version` printed
+`ergon-shared-cpus 0.1.1 515846b0201b5fd70a7a6cf3a88839b6180fa9c1 nri=v0.12.3`.
 
 Image `0.1.0` rejects `nodeProfileLabel` and exits with
 `unknown field "nodeProfileLabel"`. Do not set `config.profiles` or
-`config.nodeProfileLabel` on that image or on chart 0.1.0. A binary built
-from this tree, and the unpublished git chart 0.1.1, can ship one
-DaemonSet that picks a complete named configuration from
-`config.nodeProfileLabel` on the node (`NODE_NAME`, a get-only Node role).
+`config.nodeProfileLabel` on that image or on chart 0.1.0. Chart 0.1.1 can
+write those keys. The default render is the flat `sharedCpus` file. The
+process picks one named configuration from `config.nodeProfileLabel` on the
+node (`NODE_NAME`, a get-only Node role).
 A missing label, an unknown profile, or an empty `NODE_NAME` stops that
 process. It does not watch the node and it does not change labels. Legacy
 `sharedCpus` stays the default. A file that sets both is rejected. Drain
@@ -254,11 +262,12 @@ Kubernetes HFT tuning is that node setup plus this plugin plus the
 admission policy. It is not another image. The book chapter is
 <https://mimran1980.github.io/ergon/deploy/hft.html>. Hugepages, an
 isolated cpuset partition, io_uring seccomp and the NIC PHC are opt-in
-grants in this image. Chart 0.1.0 leaves the matching config keys off.
+grants in this image. Chart 0.1.1 writes `seccomp`, `ptp` and `schedFifo`
+as `"off"`. Chart 0.1.0 does not write those keys.
 EKS is not verified. Latency figures are not measured.
 
 Flux: `HelmRepository` type `oci`, url `oci://ghcr.io/mimran1980/charts`,
-chart `ergon-shared-cpus` version `0.1.0`. Copy the two admission files
+chart `ergon-shared-cpus` version `0.1.1`. Copy the two admission files
 into the repo Flux applies. Do not point a Kustomization at all of
 `admission/`.
 
@@ -309,8 +318,9 @@ The `:dev` DaemonSet needs six host paths: `/var/run/nri`,
 `/var/lib/kubelet/config.yaml` at `/host/kubelet-config`, the last three
 read-only. The kubelet file is a `File` mount, not `FileOrCreate`: the pod
 does not start when that path is missing. The `:dev` image passes it as
-`--kubelet-config`. Chart 0.1.0 and image 0.1.0 do not; leave `hostContract`
-off for that image. The namespace needs Pod Security `privileged`. It is
+`--kubelet-config`. Chart 0.1.1 leaves `hostContract` off, so its
+DaemonSet does not pass that flag. Image 0.1.1 accepts it. Image 0.1.0
+rejects it. The namespace needs Pod Security `privileged`. It is
 root on the node: anything on the NRI socket can change any container.
 
 ## Config

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## [0.1.33] — 2026-10-22
+
+### Changed
+
 - `ergon-md-dpdk` stops its agents and exits non-zero when a NIC asks for a
   device reset, so a DaemonSet can restart it. The transport does not reset
   the device under polling agents. Sender and receiver ENAs that report two
@@ -29,11 +33,12 @@
   receive the whole helper set. A reconnect keeps the recorded helper CPUs.
   `ergon-cpus show` prints `cpu_max`, per-thread allowed masks and the
   affinity rule. Admission of a Pod does not control a later `kubectl exec`.
-  Chart `0.1.0` is not republished. Git chart `0.1.1` is not published
-  either: it renders every config field, `repository@digest` when
-  `image.digest` is set, and the two admission files only when
-  `admission.create` is true. The same unpublished chart can select one
-  named CPU profile from a node label at startup. EKS is not verified.
+  Chart `0.1.0` is not republished. Chart `0.1.1` is on GHCR. It renders
+  every config field, `repository@digest` when `image.digest` is set, and
+  the two admission files only when `admission.create` is true. It can
+  select one named CPU profile from a node label at startup. Its NOTES
+  still say the chart is not published. That text was packed with the
+  push, and the tag is not republished to change it. EKS is not verified.
   Latency figures are not measured.
 - `ergon-shared-cpus` reads the sync resend skip-set only while its lock
   is held, so a delayed re-widen cannot race `StopContainer`. The hot-pod
@@ -66,6 +71,15 @@
   and chart `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version
   `0.1.0`. Anyone can pull them. EKS is not verified. Latency figures are
   not measured.
+- `ergon-shared-cpus` 0.1.1 is on GHCR. Image
+  `ghcr.io/mimran1980/ergon-shared-cpus:0.1.1` and `:latest` (digest
+  `sha256:69893e0c23ec6c3656053c0d6c4a06c676e33b726d56f362a30ce760908796c0`).
+  Chart version `0.1.1` digest
+  `sha256:77a65305a45ea1b376ce80f9b1d5234b9061f4066a8c5baf5efdb892854fc0d8`.
+  `--version` on linux/amd64 and linux/arm64 printed
+  `ergon-shared-cpus 0.1.1 515846b0201b5fd70a7a6cf3a88839b6180fa9c1`.
+  Actions run 39853440732. A kind install of this tag was not run.
+  EKS is not verified. Latency figures are not measured.
 
 ## [0.1.32] — 2026-10-21
 

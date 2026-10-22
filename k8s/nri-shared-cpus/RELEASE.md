@@ -1,10 +1,22 @@
 # Release gate
 
-`ergon-shared-cpus` **0.1.0** was pushed on 2026-10-22. Anyone can pull it.
-The image is `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` (and `:latest`),
-digest `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`.
+`ergon-shared-cpus` **0.1.1** was pushed on 2026-10-22 from `feat/0.1.33`
+at `515846b0`, Actions run
+[39853440732](https://github.com/mimran1980/ergon/actions/runs/39853440732).
+The image is `ghcr.io/mimran1980/ergon-shared-cpus:0.1.1` (and `:latest`),
+digest `sha256:69893e0c23ec6c3656053c0d6c4a06c676e33b726d56f362a30ce760908796c0`.
+`--version` on linux/amd64 and linux/arm64 printed
+`ergon-shared-cpus 0.1.1 515846b0201b5fd70a7a6cf3a88839b6180fa9c1`.
 The chart is `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version
-`0.1.0`. An anonymous GHCR token pull of both manifests returned HTTP 200.
+`0.1.1`, digest `sha256:77a65305a45ea1b376ce80f9b1d5234b9061f4066a8c5baf5efdb892854fc0d8`.
+`helm template` rendered that image. A kind install of 0.1.1 was not run.
+The pushed NOTES still say the chart is not published. That tag is not
+republished to change the note.
+
+Tag **0.1.0** remains. Its image digest is
+`sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`.
+Its chart digest is
+`sha256:7347131d7d87caee5cf6de11b2a11e2b62454da59c41092b3805bc2834795dbd`.
 
 The rows below that are still open were open on that push. The EKS lane is
 not verified. The latency figures are not measured. Do not invent them.

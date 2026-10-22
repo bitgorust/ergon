@@ -9,7 +9,7 @@ Latency-pod extensions for Kubernetes. One directory, three kinds of thing:
 | admission | things a policy should refuse or strip | `admission/` here (ValidatingAdmissionPolicy) |
 
 The grants are in the published `ergon-shared-cpus` image
-(`ghcr.io/mimran1980/ergon-shared-cpus:0.1.0`). This directory is not a
+(`ghcr.io/mimran1980/ergon-shared-cpus:0.1.1`). This directory is not a
 second image. Its admission YAML and node units stay in the repo. Experimental.
 EKS is not verified. Latency figures are not measured.
 
@@ -21,8 +21,9 @@ units. The shared-CPU half is the public chart. Apply only
 `admission/validating-admission-policy.yaml`. The kind sample
 `k8s/nri-shared-cpus/examples/try` installs the chart, accepts one hot pod,
 and shows this policy denying an exec probe. It does not grant hugepages,
-an isolated cpuset partition, io_uring seccomp, or a PHC. Chart 0.1.0 does
-not write `seccomp`, `ptp` or `schedFifo`.
+an isolated cpuset partition, io_uring seccomp, or a PHC. Chart 0.1.1
+writes `seccomp`, `ptp` and `schedFifo` as `"off"`. Chart 0.1.0 does
+not write those keys.
 
 ## Why not AKS
 
@@ -260,14 +261,14 @@ test/e2e.sh
 
    ```sh
    helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus \
-     --version 0.1.0 \
+     --version 0.1.1 \
      --namespace ergon-system --create-namespace \
-     --set config.sharedCpus=0 \
+     --set-string config.sharedCpus=0 \
      --set 'config.namespaces={trading}'
    ```
 
-   Image: `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0`. The chart leaves
-   `seccomp.ioUring` and `ptp` off. A node that grants those writes them
+   Image: `ghcr.io/mimran1980/ergon-shared-cpus:0.1.1`. The chart writes
+   `seccomp.ioUring` and `ptp` as `"off"`. A node that grants those writes them
    into the ConfigMap; the keys are in `k8s/nri-shared-cpus/README.md`.
 3. `kubectl apply -f admission/priority-class.yaml -f admission/validating-admission-policy.yaml`
 4. Label the node `ergon.io/shared-cpus=true`, and give every latency pod the
