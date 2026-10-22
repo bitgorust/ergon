@@ -51,8 +51,8 @@ whether you continue evaluating the crate:
 | What received human review? | Primarily the generated Rust API and source, encoded bytes, test failures, and benchmark results—not an exhaustive line-by-line audit of the `syn`/`quote` generator internals. |
 | What independently constrains the output? | Official `sbe-tool` byte-for-byte comparisons, Java-produced fixtures, upstream schemas, compile-fail proofs, property tests, exact-length checks, allocation tests, and performance gates. |
 | Is it production-proven? | No. It remains experimental 0.x software. Production users should validate their own schemas, versions, message shapes, and traffic. |
-| What did development consume? | Roughly one month of intensive work. The initial `0.1.0` release used approximately **14 billion tokens** (estimated from provider dashboards). The combined ledger on 2026-10-21 is **76.07 billion tokens** (76,074,506,604): the other machine's `ccusage` high-water mark plus this MacBook's local `ccusage`. A run on either machine alone will not match that total (see [cumulative token usage](#cumulative-token-usage-since-2026-06-28)). |
-| What did it cost? | **~$261 actual out-of-pocket** (DeepSeek PAYG $77.39 + GLM plan $114 + subscriptions $70). At work with enterprise API rates, the what-if blend on this page is **~$6,287** (not rescaled to the combined ledger). With my work Claude Enterprise subscription the Claude portion would be covered by the seat licence rather than per-token billing — so the real cost at work would be lower still. The [single-provider what-if comparison](#what-if-all-tokens-through-a-single-provider) shows what this workload costs under each company's comparable model at public API rates. |
+| What did development consume? | Roughly one month of intensive work. The initial `0.1.0` release used approximately **14 billion tokens** (estimated from provider dashboards). The combined ledger on 2026-10-21 is **76.10 billion tokens** (76,095,756,856): the other machine's `ccusage` high-water mark plus this MacBook's local `ccusage`. A run on either machine alone will not match that total (see [cumulative token usage](#cumulative-token-usage-since-2026-06-28)). |
+| What did it cost? | **~$261 actual out-of-pocket** (DeepSeek PAYG $77.39 + GLM plan $114 + subscriptions $70). The combined ledger's own API-rate total is **$19,731.14**. The same measured mix, priced on one Anthropic model at the public card checked on 2026-10-21 with 5-minute cache writes, is **$12,708.01 on Sonnet 5.5** and **$25,416.02 on Opus 5.5**. With my work Claude Enterprise subscription the Claude portion would be covered by the seat licence rather than per-token billing, so the real cost at work would be lower still. The [single-provider what-if](#what-if-all-tokens-through-a-single-provider) shows the input, output, and cache arithmetic. |
 | Which model did most of the work? | DeepSeek: V4 Flash handled much of the early UltraMode/subagent work; the later sequential development stayed primarily on V4 Pro. |
 
 ## Cumulative token usage (since 2026-06-28)
@@ -61,9 +61,11 @@ Per-model figures for Claude Code, Codex, and Grok Build CLI. The other
 machine's per-model high-water mark — every `ccusage` snapshot committed to
 this file (2026-08-03, 2026-08-07, 2026-08-13, 2026-08-15, 2026-08-19,
 2026-08-20, 2026-08-27, 2026-09-07, 2026-09-13 and 2026-09-14, plus the
-2026-10-13 run) — is added to this MacBook's local `ccusage` 20.0.40 read on
-2026-10-21. The two ledgers are summed. A `ccusage` run on either machine
-alone will not match this table.
+2026-10-13 run) — is added to this MacBook's local `ccusage` 20.0.40 reads on
+2026-10-21. A later `npx ccusage@latest --since 2026-06-01 -b` that day raised
+only the Grok row. It did not replace the other machine, and it did not drop
+Codex usage from before 2026-06-01. The two ledgers are summed. A `ccusage`
+run on either machine alone will not match this table.
 
 | Model | Input | Output | Cache Create | Cache Read | Reasoning Output | Total Tokens | Cost (USD) |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -88,7 +90,7 @@ alone will not match this table.
 | gpt-6.1-sol | 18,651,728 | 2,136,766 | — | 522,706,816 | 976,793 | 544,472,103 | $146.59 |
 | grok-4.5-build | 10,030,758 | 881,349 | — | 177,071,360 | — | 187,983,467 | $114.67 |
 | grok-4.6-build | 44,849,892 | 3,100,656 | — | 812,446,592 | — | 860,397,140 | $293.80 |
-| grok-4.7-build | 38,725,658 | 5,342,107 | — | 601,372,928 | — | 645,440,693 | $161.86 |
+| grok-4.7-build | 39,298,841 | 5,592,936 | — | 621,799,168 | — | 666,690,945 | $166.51 |
 | mimo-v2.6-pro | 62,028,500 | 1,093,150 | — | 1,875,607,680 | — | 1,938,729,330 | $34.69 |
 | gpt-5.3-codex | 22,573,884 | 2,873,034 | — | 786,800,512 | 1,263,964 | 813,511,394 | $217.63 |
 | gpt-5-codex | 9,351,684 | 988,119 | — | 204,395,904 | 689,664 | 215,425,371 | $45.08 |
@@ -97,7 +99,7 @@ alone will not match this table.
 | gpt-5 | 701,637 | 79,205 | — | 8,801,920 | 51,776 | 9,634,538 | $2.77 |
 | mimo-v2.6-flash | 359,723 | 15,224 | — | 1,104,448 | — | 1,479,395 | $0.06 |
 | gpt-5.4-mini | 122,102 | 4,288 | — | 434,560 | 2,399 | 563,349 | $0.20 |
-| **Total** | **706,853,257** | **200,239,836** | **711,944,723** | **74,451,670,747** | **6,118,100** | **76,074,506,604** | **$19,726.49** |
+| **Total** | **707,426,440** | **200,490,665** | **711,944,723** | **74,472,096,987** | **6,118,100** | **76,095,756,856** | **$19,731.14** |
 
 **Notes:**
 
@@ -109,7 +111,10 @@ alone will not match this table.
   baseline is the per-model, per-column maximum across all eleven snapshots;
   since the tool can only under-report, that maximum is the best available
   lower bound. This MacBook's 2026-10-21 read is added on top of that baseline.
-  The transcripts are different files, so each published row is the sum.
+  A second read the same day, filtered to `--since 2026-06-01`, is merged the
+  same way: where it was higher, that column replaced this machine's earlier
+  figure; where it was lower, the earlier figure stays. The transcripts are
+  different files, so each published row is the sum.
 - The 2026-10-13 run alone reported **57,084,644,123** tokens. Merging the
   snapshots recovered from this file's git history adds **2,589,115,055**
   tokens the current run can no longer see. A later `ccusage` on one machine
@@ -143,87 +148,139 @@ alone will not match this table.
   2,019,689,986 Codex including 3,537,371 reasoning output + 1,239,781,553
   Grok = 57,084,644,123), and the grand total is monotonic against the
   previously committed 25,853,122,297.
-- 2026-10-21 MacBook check, `ccusage` 20.0.40 with cached offline prices:
-  Claude Code 14,674,098,035 + Codex 1,458,109,013 + Codex reasoning 2,484,098
-  + Grok 266,056,280 = 16,400,747,426. Added to the previous total
-  59,673,759,178 this is **76,074,506,604**. Per-model breakdowns matched each
-  tool's own totals. Claude Code covered 2026-06-26 to 2026-10-21, Codex
+- 2026-10-21 MacBook check, `ccusage` 20.0.40 with cached offline prices.
+  The first read was the full local history: Claude Code 14,674,098,035 +
+  Codex 1,458,109,013 + Codex reasoning 2,484,098 + Grok 266,056,280 =
+  16,400,747,426. Claude Code covered 2026-06-26 to 2026-10-21, Codex
   2025-09-13 to 2026-10-21 (1,154,747,421 of those tokens are before
-  2026-06-28), and Grok 2026-10-14 to 2026-10-21. Unrounded costs are Claude
-  Code $4,737.668, Codex $537.250 and Grok $57.056, together **$5,331.97**. The
-  previous cost total was $14,394.52; combined **$19,726.49**. `deepseek-v4-flash`'s Total Tokens cell
-  remains 2,320,059 below the sum of its own columns, as previously published.
+  2026-06-28), and Grok 2026-10-14 to 2026-10-21. A later read the same day,
+  `npx ccusage@latest --since 2026-06-01 -b`, reported every detected agent:
+  15,583,155,859 tokens and $5,108.42. Antigravity was 290,048,735 tokens and
+  $83.86, the figure already recorded, and stays out of this table. Gemini CLI
+  and OpenCode had no rows in that window. Claude Code's token total was
+  unchanged. Codex token columns for models with usage on or after 2026-06-01
+  matched the first read, including their reasoning. Codex before 2026-06-01
+  is outside that window, so those rows stay at the first read (`gpt-5.3-codex`,
+  `gpt-5-codex`, `gpt-5.1-codex-max`, `gpt-5.4`, `gpt-5`, `gpt-5.4-mini`, and
+  the earlier part of `gpt-5.5`). The unified report also repriced those same
+  Codex tokens; that reprice was not applied, so the published Codex costs
+  remain the daily split from the first read. Grok grew by 573,183 input,
+  250,829 output and 20,426,240 cache read (21,250,252 tokens; unrounded cost
+  from $57.056 to $61.702). The MacBook ledger in this table is therefore
+  Claude Code 14,674,098,035 + Codex 1,458,109,013 + Codex reasoning 2,484,098
+  + Grok 287,306,532 = 16,421,997,678. Added to the other machine's
+  59,673,759,178 this is **76,095,756,856**. Unrounded costs are Claude Code
+  $4,737.668, Codex $537.250 and Grok $61.702, together **$5,336.62**. The
+  previous cost total was $14,394.52; combined **$19,731.14**.
+  `deepseek-v4-flash`'s Total Tokens cell remains 2,320,059 below the sum of
+  its own columns, as previously published.
 
 ## What-if: all tokens through a single provider
 
-The tables below answer: if every token had gone through one provider's models
-at the equivalent intelligence tier, what would the bill have been? Each
-provider's models are assigned to the tier that matches how they were actually
-used:
+This prices the cumulative table's measured buckets on one Anthropic model.
+Rates are the public Claude API card checked on 2026-10-21
+([model pricing](https://platform.claude.com/docs/en/about-claude/pricing)).
+The result is a counterfactual. It is not an invoice, and it is not the
+~$261 out-of-pocket spend.
 
-| Tier | Comparable models | Actual tokens at this tier |
+### Measured mix
+
+The price uses the column sums. Those columns add to **76,098,076,915**
+tokens. The published total cell is **76,095,756,856**, which is 2,320,059
+lower, because `deepseek-v4-flash`'s Total Tokens cell is short of its own
+columns by that amount. Cache writes in this ledger are entirely Claude
+Code rows. Every other provider recorded cache reads and left cache create
+blank.
+
+| Category | Tokens | Share of 76,098,076,915 |
 |---|---:|---:|
-| **Budget** — mechanical edits, test gen, cleanup | GLM-4.7 ≈ Haiku 4.5 ≈ DeepSeek Flash | 276M |
-| **Workhorse** — day-to-day implementation | DeepSeek V4 Flash ≈ Sonnet 5 ≈ GLM-5.2 | 5.7B |
-| **Frontier** — hard design, adversarial review | DeepSeek V4 Pro ≈ Opus 5 ≈ GPT-5.6 Sol | 11.1B |
+| Uncached input | 707,426,440 | 0.93% |
+| Output | 200,490,665 | 0.26% |
+| Reasoning output | 6,118,100 | 0.01% |
+| Cache writes | 711,944,723 | 0.94% |
+| Cache reads | 74,472,096,987 | 97.86% |
+| **Column sum** | **76,098,076,915** | **100%** |
 
-The tier assignment reflects real capability: Flash handled the bulk of
-implementation work at a level comparable to Sonnet, not Haiku. Pro carried the
-hardest sessions at a level comparable to Opus.
+Cache reads plus cache writes are 98.80% of that sum. Output including
+reasoning is 206,608,765 tokens (0.27%).
 
-### What each provider would cost
+### One Anthropic model for every measured token
 
-| Provider | Budget (276M) | Workhorse (5.7B) | Frontier (11.1B) | **Total** | Notes |
-|---:|---:|---:|---:|---:|:---|
-| **DeepSeek** | Flash — $2 | Flash — $34 | V4 Pro — $85 | **$121** | Flash handles budget + workhorse; only frontier needs Pro |
-| **Anthropic (standard)** | Haiku 4.5 — $39 | Sonnet 5 — $2,314 | Opus 5 — $6,302 | **$8,655** | Full 1M context at standard rates; no long-context multiplier |
-| **Anthropic (promo)** | Haiku 4.5 — $39 | Sonnet 5 — $1,543 | Opus 5 — $6,302 | **$7,884** | Promotional Sonnet pricing through 31 Aug 2026 |
-| **GLM** | GLM-4.7 — $41 | GLM-5.2 — $1,668 | GLM-5.2 — $3,021 | **$4,730** | GLM-5.2 covers both workhorse and frontier; 1M context at standard rates |
-| **OpenAI (≤272K)** | GPT-5.5 — $192 | GPT-5.5 — $3,831 | GPT-5.6 Sol — $6,374 | **$10,396** | Short-context rates — unrealistic for this workload |
-| **OpenAI (>272K)** | GPT-5.5 — $238 | GPT-5.5 — $4,590 | GPT-5.6 Sol — $7,060 | **$11,888** | Long-context: 2× input, 1.5× output — the rate you'd actually pay |
-| **Grok (<200K)** | Grok 4.5 — $99 | Grok 4.5 — $1,978 | Grok 4.5 — $3,528 | **$5,605** | Short-context rates — unrealistic for this workload |
-| **Grok (≥200K)** | Grok 4.5 — $198 | Grok 4.5 — $3,956 | Grok 4.5 — $7,055 | **$11,209** | Rates double at ≥200K; 500K max context |
-| **Actual enterprise blend** | — | — | — | **$6,287** | Per-model high-water mark across all 17 models at enterprise/PAYG rates — NOT what I paid (~$261 out-of-pocket) |
+Assumptions, all stated so the arithmetic can be repeated:
 
-The takeaway: at short-context rates, Grok ($5,605) undercuts Anthropic ($7,884
-promo) — the user's intuition is correct. But those rates are fictional for this
-workload: every session exceeded 200K context, so the real Grok bill would be
-$11,209. Anthropic's key advantage is no long-context multiplier — Sonnet 5 at
-$8,655 (standard) is cheaper than both Grok ≥200K ($11,209) and OpenAI >272K
-($11,888) for this kind of sustained agentic work. The actual $6,287 blend is
-cheaper than every single-provider scenario except DeepSeek-only ($121) and
-GLM-only ($4,730), because it used cheap DeepSeek cache reads for the bulk of
-tokens while spending on expensive models only for high-value sessions.
+- uncached input at the model's input price;
+- cache writes at the 5-minute cache-write price (1.25× input), which is the
+  write Claude Code records;
+- cache reads at the model's cache-hit price;
+- output and reasoning output both at the output price;
+- standard global API rates: no fast mode, no batch discount, no US-only
+  1.1× data-residency multiplier;
+- token counts held fixed. Claude 4.7 and later, including Opus 5.5 and
+  Sonnet 5.5, use a tokenizer Anthropic says produces about 30% more tokens
+  for the same text. That uplift is not applied here;
+- Haiku 5.5 bills a higher card when the prompt is over 100,000 tokens,
+  counting input, cache writes, and cache reads toward that length. These
+  sessions are long, so the over-100k line is the matching card. The
+  under-100k line is the short-prompt card only.
 
-> **Scope note (2026-09-14):** the blend figure and model count above track the
-> cumulative table, which is a per-model high-water mark. The **tier token
-> splits** (276M / 5.7B / 11.1B) and every per-provider extrapolation below them
-> were computed against an earlier, smaller snapshot and have **not** been
-> recomputed here. Treat the provider columns as directionally valid and the
-> absolute totals as understated. The 2026-10-21 two-machine sum was not applied here either.
+Sonnet 5's $2 / $10 per million input/output tokens, announced as
+introductory pricing through 31 August 2026, is now the standard price. The
+previously scheduled rise to $3 / $15 on 1 September 2026 did not happen.
+Opus 5.5 and Sonnet 5.5 cache hits are 0.05× input ($0.20 and $0.10 per
+million). Other Claude models on this list use 0.1×.
 
-> **⚠️ Caveats on these estimates:**
+| Model | Input $/MTok | 5m write $/MTok | Cache hit $/MTok | Output $/MTok | **Total** |
+|---|---:|---:|---:|---:|---:|
+| Opus 5.5 | $4 | $5 | $0.20 | $20 | **$25,416.02** |
+| Sonnet 5.5 | $2 | $2.50 | $0.10 | $10 | **$12,708.01** |
+| Opus 5 | $5 | $6.25 | $0.50 | $25 | **$50,388.05** |
+| Sonnet 5 | $2 | $2.50 | $0.20 | $10 | **$20,155.22** |
+| Haiku 4.5 | $1 | $1.25 | $0.10 | $5 | **$10,077.61** |
+| Haiku 5.5, prompts over 100k tokens | $0.50 | $0.625 | $0.05 | $2.50 | **$5,038.81** |
+| Haiku 5.5, prompts up to 100k tokens | $0.10 | $0.125 | $0.01 | $0.50 | **$1,007.76** |
+
+Where each dollar comes from, at the 5-minute write price:
+
+| Model | Uncached input | Cache writes | Cache reads | Output incl. reasoning | **Total** |
+|---|---:|---:|---:|---:|---:|
+| Opus 5.5 | $2,829.71 | $3,559.72 | $14,894.42 | $4,132.18 | **$25,416.02** |
+| Sonnet 5.5 | $1,414.85 | $1,779.86 | $7,447.21 | $2,066.09 | **$12,708.01** |
+| Opus 5 | $3,537.13 | $4,449.65 | $37,236.05 | $5,165.22 | **$50,388.05** |
+| Sonnet 5 | $1,414.85 | $1,779.86 | $14,894.42 | $2,066.09 | **$20,155.22** |
+| Haiku 4.5 | $707.43 | $889.93 | $7,447.21 | $1,033.04 | **$10,077.61** |
+| Haiku 5.5, prompts over 100k tokens | $353.71 | $444.97 | $3,723.60 | $516.52 | **$5,038.81** |
+
+One-hour cache writes are 2× input. Only the write column changes. Opus 5.5
+becomes **$27,551.86** and Sonnet 5.5 becomes **$13,775.93**.
+
+The ledger's own mixed-provider API total is **$19,731.14**. Sonnet 5.5
+comes out lower because 97.86% of the measured tokens are cache reads and
+its cache hit is $0.10 per million. Opus 5.5 cache hits are $0.20 per
+million, so the same reads cost $14,894.42 and the all-Opus bill is
+$25,416.02. Opus 5 cache hits are $0.50 per million, which is why that line
+is $50,388.05. Out of pocket remains about **$261**.
+
+> **Caveats**
 >
-> 1. **Missing cache-create data from non-Claude providers.** DeepSeek and GLM
->    don't report cache writes as a separate billing category (they use a single
->    cache-hit/miss model). Claude and OpenAI DO charge for cache writes. When
->    DeepSeek/GLM sessions are repriced at Anthropic or OpenAI rates, the
->    cache-create cost is missing — the real bill would be higher by an estimated
->    **$400–$500** (based on the ~2.5% cache-create ratio observed in actual
->    Claude sessions). This affects all non-DeepSeek/GLM rows in the table.
+> 1. **Cache writes exist only on the Claude rows.** DeepSeek, GLM, Codex,
+>    and Grok recorded cache reads and no cache-create column. Pricing those
+>    reads as Anthropic hits does not add the write that would have created
+>    the cache entry. A real all-Anthropic run would have paid those writes.
+>    They are not in this ledger, so they are not in the totals above.
 >
-> 2. **The cache-hit ratio is extreme.** 98.8% of this workload's tokens are
->    cache reads from very long agent sessions. A project with shorter sessions or
->    less context reuse would see a very different ranking — Anthropic's $0.30
->    cache-read advantage over GPT-5.5's $0.50 only dominates at high cache-hit
->    ratios. My personal experience with OpenAI feeling cheaper than Anthropic
->    likely reflects sessions with lower cache-hit rates, where input/output
->    pricing matters more than cache-read pricing.
+> 2. **The cache-read share dominates the bill.** 74.47 billion of the 76.10
+>    billion column-sum tokens are cache reads. A project with shorter
+>    sessions would rank these models differently, because input and output
+>    prices would matter more than the cache-hit price.
 >
-> 3. **These are computed costs, not observed.** Every provider's pricing
->    interacts differently with real session behaviour (tokenisation differences,
->    reasoning token policies, cache eviction, rate limiting). The only way to
->    know for certain is to run the same work with each provider.
+> 3. **Token counts are held fixed.** Another model can tokenise the same
+>    transcript differently, emit different output and reasoning, and keep a
+>    different cache-hit ratio. The Claude 4.7+ tokenizer note above is the
+>    documented case of that. These figures isolate the rate card.
+
+The [14-billion-token comparison](#normalised-pay-as-you-go-comparison)
+further down uses a July 2026 sample and the prices checked on 26 July 2026.
+It is not this ledger.
 
 Choose the path that matches why you are here:
 
