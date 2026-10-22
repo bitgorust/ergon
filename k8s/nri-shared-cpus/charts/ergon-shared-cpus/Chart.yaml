@@ -5,12 +5,12 @@ description: >-
   Give a Kubernetes pod its exclusive CPUs and the node's shared housekeeping
   CPUs. Containerd NRI plugin and kubelet device plugin in one daemon.
 type: application
-# Chart version. Tracks the chart, not the image. 0.1.1 is in git only.
-# The published OCI chart is still 0.1.0. Publish is workflow_dispatch; do
-# not treat this version as released.
+# Chart version. The publish workflow packages this file with --version and
+# --app-version set to the dispatch tag. Git appVersion stays 0.1.0 until
+# that tag is on GHCR. EKS is not verified. Latency is not measured.
 version: 0.1.1
-# Default image tag. The published image is 0.1.0. A newer binary is not
-# on the registry.
+# Default image tag for a render from this git tree. The workflow overrides
+# it for the OCI package.
 appVersion: "0.1.0"
 home: https://github.com/mimran1980/ergon/tree/main/k8s/nri-shared-cpus
 sources:
@@ -28,7 +28,6 @@ annotations:
   artifacthub.io/changes: |
     - kind: added
       description: >-
-        Git chart 0.1.1, not published. Renders every config.File field,
-        repository@digest when image.digest is set, and an admission
-        ownership switch. The OCI chart remains 0.1.0. EKS and latency
-        benchmarks are still open.
+        Chart 0.1.1 renders every config.File field, repository@digest
+        when image.digest is set, and an admission ownership switch.
+        EKS is not verified. Latency figures are not measured.
