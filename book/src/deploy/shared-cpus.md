@@ -88,8 +88,31 @@ pods and the plugin's own pod while it is down.
 
 ## Install on Kubernetes
 
-Six steps. The image and the chart are on GHCR, tag `0.1.0`. A kind node
-still builds the image locally and loads it.
+The plugin is public. No image pull secret.
+
+| what | address |
+|---|---|
+| image | `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` (and `:latest`) |
+| digest of `0.1.0` and `latest` | `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9` |
+| chart | `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.0` |
+
+```sh
+helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus \
+  --version 0.1.0 \
+  --namespace ergon-system --create-namespace \
+  --set config.sharedCpus=0 \
+  --set 'config.namespaces={trading}'
+```
+
+`config.sharedCpus` is this node's shared CPU. For the 8-CPU split above
+that is `0`: inside `reservedSystemCPUs`, and not the IRQ CPU. The chart
+creates `ergon-system` with the privileged Pod Security labels and selects
+nodes labelled `ergon.io/shared-cpus=true`. It does not label nodes, and it
+does not set the boot line, the kubelet, or containerd.
+
+Do the node setup above first, then the steps below. A kind node still
+builds a local image. The published chart leaves `seccomp.ioUring` and
+`ptp` off; those keys belong in the ConfigMap when a latency node grants them.
 
 ### 1. Label the nodes that take the plugin
 
@@ -142,54 +165,22 @@ Rules:
   a grant the ConfigMap does not allow does not start: the kubelet shows
   `CreateContainerError` and the text names the field to change.
 
-### 3. Build and load the image
+### 3. Install the public chart
 
-**Published, tag 0.1.0.** Image
-`ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` and `:latest`, digest
-`sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`.
-Chart `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.0`.
-Anyone can pull them. `k8s/nri-shared-cpus/RELEASE.md` still has the EKS
-lane and the latency benchmarks open.
+Use the `helm install` at the top of this section. One Helm release per
+shared-CPU layout: the chart has one ConfigMap.
 
 The plugin is root on the node and installs an executable at
-`/opt/ergon/bin/ergon-cpus`. Pin the digest. Only this repository's publish
-workflow pushes.
+`/opt/ergon/bin/ergon-cpus`. Only this repository's publish workflow pushes.
 
-- **A cluster:** the chart below. No pull secret.
-- **kind:** `docker build -t ergon-shared-cpus:dev .` then
-  `kind load docker-image ergon-shared-cpus:dev`
-  (or `docker save … | ctr -n k8s.io images import -`).
-- **No registry:** `imagePullPolicy: Never` and the image already on the
-  node (AMI or config management).
-
-The DaemonSet ships `image: ergon-shared-cpus:dev` with
-`imagePullPolicy: IfNotPresent`. Change the image field to match.
-
-### 3b. Or install the chart
-
-`k8s/nri-shared-cpus/charts/ergon-shared-cpus` renders the same three
-manifests, with the config in `values.yaml` instead of a hand-edited
-ConfigMap. Use it when more than one cluster or node group has to agree:
-
-```sh
-helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus \
-  --version 0.1.0 \
-  --namespace ergon-system --create-namespace \
-  --set config.sharedCpus=0 \
-  --set 'config.namespaces={trading}'
-```
-
-The chart in the git tree is the same manifests, for a cluster that does
-not pull from GHCR. `sharedCpus=4` in older examples is a placeholder: it
-has to be this node group's shared CPU, inside `reservedSystemCPUs` and not
-the IRQ CPU. For the 8-CPU split above that is `0`.
-
-The chart creates the namespace with the privileged Pod Security labels and
-sets `ergon.io/shared-cpus: "true"` as its node selector. Node settings
-(`reservedSystemCPUs`, `cpuManagerPolicy`, the containerd NRI validator) are
-not chart-managed; they are the node section above.
+Kind, or a node with no registry: `docker build -t ergon-shared-cpus:dev .`
+from `k8s/nri-shared-cpus`, load that image, and apply the three manifests
+in the next step. `deploy/daemonset.yaml` ships
+`image: ergon-shared-cpus:dev` with `imagePullPolicy: IfNotPresent`.
 
 ### 4. Apply the three manifests
+
+Skip this when the Helm release above is installed. It is the kind path.
 
 ```sh
 kubectl apply -f deploy/namespace.yaml \

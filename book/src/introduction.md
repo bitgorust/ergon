@@ -17,7 +17,7 @@ Kubernetes, if you deploy there. Tuning a node and pod for HFT:
 
 | module | what it does | how you use it |
 |---|---|---|
-| `k8s/nri-shared-cpus` | gives a pod its exclusive CPUs **and** the node's shared housekeeping CPUs, and starts every thread on the shared ones so the busy-spin loop keeps its core | deploy its Helm chart on a containerd node with NRI on; ask for `ergon.io/shared-millicpus` ([chapter](deploy/shared-cpus.md)) |
+| `k8s/nri-shared-cpus` | gives a pod its exclusive CPUs **and** the node's shared housekeeping CPUs, and starts every thread on the shared ones so the busy-spin loop keeps its core | `helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus --version 0.1.0`. Image `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0`. Containerd with NRI on. Ask for `ergon.io/shared-millicpus` ([chapter](deploy/shared-cpus.md)) |
 | `k8s/nri-latency-pods` | the latency-pod setup: node tuning, an admission policy that refuses exec probes and always-restart sidecars, and the pod annotations for hugepages, CPU isolation, io_uring and PHC devices | apply the node and admission halves on **EKS AL2023** only. A pod author sets annotations and labels, nothing more. Not a crate — nothing to import ([chapter](deploy/latency-pods.md)) |
 
 Start with `ergo-sbe`. Add another crate only for a need you have:

@@ -239,9 +239,20 @@ test/e2e.sh
    Ship `admission/profiles/ergon-io-uring.json` to
    `/var/lib/kubelet/seccomp/` (and to the plugin config's
    `seccompProfilePath`) if the Localhost fallback is wanted.
-2. `kubectl apply -f ../nri-shared-cpus/deploy/namespace.yaml -f ../nri-shared-cpus/deploy/configmap.yaml -f ../nri-shared-cpus/deploy/daemonset.yaml`
-   The config must set `devRoot` to where the DaemonSet mounts the host's
-   `/dev` (the shipped DaemonSet uses `/host/dev`).
+2. Install the public plugin. No pull secret. `sharedCpus` is this node's
+   housekeeping CPU (inside `reservedSystemCPUs`, not the IRQ CPU).
+
+   ```sh
+   helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus \
+     --version 0.1.0 \
+     --namespace ergon-system --create-namespace \
+     --set config.sharedCpus=0 \
+     --set 'config.namespaces={trading}'
+   ```
+
+   Image: `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0`. The chart leaves
+   `seccomp.ioUring` and `ptp` off. A node that grants those writes them
+   into the ConfigMap; the keys are in `k8s/nri-shared-cpus/README.md`.
 3. `kubectl apply -f admission/priority-class.yaml -f admission/validating-admission-policy.yaml`
 4. Label the node `ergon.io/shared-cpus=true`, and give every latency pod the
    label `ergon.io/latency: "hot"` (that is what the admission policy matches).

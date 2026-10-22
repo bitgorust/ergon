@@ -138,21 +138,40 @@ The e2e builds both images, creates a kind cluster, runs every check and
 deletes every container, cluster, image and volume it created, on success,
 failure and interrupt.
 
-## Deploy
+## Install from GHCR
 
-1. Node: Kubernetes >= 1.33, `cpuManagerPolicy: static`,
-   `reservedSystemCPUs` = the IRQ CPU(s) + the shared CPUs, kernel >= 6.2,
-   cgroup v2, containerd >= 2.2 with the NRI default validator on. Label
-   the node `ergon.io/shared-cpus=true`. A `cpu-partition` opt-in also needs
-   `cpuset.cpus.exclusive`, which is Linux 6.7 or a vendor kernel that
-   backported it: 6.2 is only enough for the shared CPUs. The plugin reads
-   the file rather than the version, so a backport is accepted.
-2. Image: `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0`. Pin the digest
-   `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`.
-   A local build is `docker build -t ergon-shared-cpus:dev .` for kind.
-3. `kubectl apply -f deploy/namespace.yaml -f deploy/configmap.yaml -f deploy/daemonset.yaml`
-4. Edit `deploy/configmap.yaml` first: `sharedCpus` must be inside
-   `reservedSystemCPUs`, and `namespaces` is the allowlist.
+Anyone can pull these. No image pull secret.
+
+| what | address |
+|---|---|
+| image | `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` (and `:latest`) |
+| digest of `0.1.0` and `latest` | `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9` |
+| chart | `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.0` |
+
+```sh
+helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus \
+  --version 0.1.0 \
+  --namespace ergon-system --create-namespace \
+  --set config.sharedCpus=0 \
+  --set 'config.namespaces={trading}'
+```
+
+`config.sharedCpus` must be inside this node's `reservedSystemCPUs`, minus
+the IRQ CPU. Label each node `ergon.io/shared-cpus=true` before the
+DaemonSet can schedule. The chart does not set the boot line, the kubelet,
+or containerd.
+
+Node requirements: Kubernetes >= 1.33, `cpuManagerPolicy: static`,
+`reservedSystemCPUs` = the IRQ CPU(s) + the shared CPUs, kernel >= 6.2,
+cgroup v2, containerd >= 2.2 with the NRI default validator on. A
+`cpu-partition` opt-in also needs `cpuset.cpus.exclusive`, which is Linux
+6.7 or a vendor kernel that backported it. The plugin reads the file rather
+than the version.
+
+The manifests in `deploy/` are the kind path. Their image is
+`ergon-shared-cpus:dev`. Build it with `docker build -t ergon-shared-cpus:dev .`,
+load it onto the node, edit `deploy/configmap.yaml`, then
+`kubectl apply -f deploy/namespace.yaml -f deploy/configmap.yaml -f deploy/daemonset.yaml`.
 
 containerd:
 

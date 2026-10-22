@@ -28,7 +28,7 @@ has the copy-paste blocks.
 | [`io/`](io/) | `ergon-io` | WebSocket and HTTP/1.1 over TLS 1.3 on one busy-spin thread; epoll or `io_uring` |
 | [`tune/`](tune/) | `ergon-tune` | Reads the host's low-latency settings and reports findings; changes nothing |
 | [`md-dpdk/`](md-dpdk/) | `ergon-md-dpdk` | DPDK transport for the Aeron media driver, Linux x86_64 and aarch64. Proof of concept |
-| [`k8s/nri-shared-cpus`](k8s/nri-shared-cpus/) | Helm chart | Gives a pod its exclusive CPUs plus the node's shared CPUs, and starts its threads on the shared ones |
+| [`k8s/nri-shared-cpus`](k8s/nri-shared-cpus/) | Helm chart | Gives a pod its exclusive CPUs plus the node's shared CPUs. Public chart: `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.0`. Image: `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` |
 | [`k8s/nri-latency-pods`](k8s/nri-latency-pods/) | node and admission setup | Node tuning, an admission policy and pod annotations for latency pods (EKS AL2023) |
 
 Unpublished support: `sbe/benchmarks`, `cluster-test-harness`,

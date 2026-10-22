@@ -119,11 +119,10 @@ red because of the 404. The tags are on GHCR.
 3. Rewrite the README status paragraph and the book runbook to name the
    released tag.
 4. Run `.github/workflows/nri-shared-cpus-publish.yml` with the tag you want
-   and `publish: publish`. That one run pushes the multi-arch image and the
-   chart. Its first step refuses to continue unless the input reads exactly
-   `publish`, so a typo fails the run instead of quietly doing nothing. The
-   build and the chart are proven by `.github/workflows/nri-shared-cpus-image.yml`,
-   which pushes nothing; the publish workflow re-runs both before it pushes.
+   and `publish: publish`. That one run builds both platforms, lints the
+   chart, and pushes the image and the chart. Its first step refuses to
+   continue unless the input reads exactly `publish`, so a typo fails the
+   run instead of quietly doing nothing.
 5. Verify the push: pull `ghcr.io/mimran1980/ergon-shared-cpus:<tag>` on
    both amd64 and arm64, run `--version`, and `helm install` the pushed
    chart on a test cluster.
