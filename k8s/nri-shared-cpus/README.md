@@ -6,6 +6,8 @@ the node's shared housekeeping CPUs, and start every thread on the shared
 ones. The busy-spin loop keeps its exclusive core; only sleepy helpers
 (dial, TLS, warnings, Aeron conductors) run on the shared CPUs.
 
+Source: <https://github.com/mimran1980/ergon/tree/main/k8s/nri-shared-cpus>.
+
 **Published, tag 0.1.0.** Anyone can pull
 `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` (and `:latest`) and the chart
 `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.0`.
