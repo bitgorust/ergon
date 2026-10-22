@@ -1,6 +1,6 @@
 [package]
 name = "ergon-io"
-description = "Busy-spin network I/O for low-latency exchange clients: switchable epoll / io_uring backends, in-place TLS 1.3 records and WebSocket"
+description = "Busy-spin network I/O for low-latency network clients: switchable epoll / io_uring backends, in-place TLS 1.3 records and WebSocket"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

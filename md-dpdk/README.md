@@ -31,7 +31,7 @@ guide, with which transport to use when:
 
 > **AI assistance.** Like the rest of ergon, this crate was written **with heavy
 > AI assistance**. See
-> [AI-ASSISTANCE.md](https://github.com/mimran1980/ergon/blob/main/AI-ASSISTANCE.md).
+> [AI assistance disclosure](https://mimran1980.github.io/ergon/project/ai-assistance.html).
 > It is not production-ready.
 
 - Aeron's C media driver sends and receives through a table of function

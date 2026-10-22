@@ -1,9 +1,5 @@
 # ergon-io benchmarks
 
-The longer write-up removed on 2026-10-18 is
-[BENCHMARK-2026-10-18.md](BENCHMARK-2026-10-18.md). Quote this page when the
-two disagree.
-
 Every ergon-io latency figure lives here, once. Each row names the committed file that holds it, under `io/benches/results/<run>/`. Figures are µs, p50 / p99 / max, a range across rounds, unless a column says otherwise. `max` is the absolute maximum of each round.
 
 ## Answers
@@ -238,20 +234,8 @@ Not measured here: `prefer_busy_poll`, `busy_poll_budget`, route `quickack` and 
 
 ## Reproduce
 
-```sh
-cargo test -p ergon-io --all-features -- --test-threads=1
-cargo build --release --manifest-path io/benches/Cargo.toml --bins
-```
-
-Lab runs create and delete their own cloud resources (each script's header lists them):
-
-```sh
-io/benches/scripts/aws-flags.sh                      # AWS settings matrix (MODE=… picks the set)
-MODE=fair RCV_TYPE=c8g.2xlarge SND_TYPE=c8g.xlarge io/benches/scripts/aws-flags.sh   # the fair run
-io/benches/scripts/azure-run.sh                      # Azure paired replay
-io/benches/scripts/azure-http.sh                     # Azure HTTP clients
-io/benches/scripts/azure-confirm.sh                  # Azure confirmation and connect cost
-io/benches/scripts/azure-tls-bench.sh                # TLS record and signing microbenchmarks
-```
-
-Two hosts by hand: [find the crossover on your own host](https://mimran1980.github.io/ergon/io/backends.html#find-the-crossover-on-your-own-host).
+The executable lab harness is maintained in the downstream stack's
+`io/benches` crate. This directory retains the generic transport
+measurements and their recorded evidence. Compare the same workload and
+socket counts on two hosts, repeat in reverse order, and report work
+counts alongside p50, p99 and maxima.
