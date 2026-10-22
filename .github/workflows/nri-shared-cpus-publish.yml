@@ -153,3 +153,56 @@ jobs:
             --username "${{ github.actor }}" \
             --password-stdin <<< "$GHCR_TOKEN"
           helm push /tmp/chart/*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+
+      # A new GHCR container is private. This owner asked for a public pull.
+      # Public cannot be switched back to private. The job token is admin on
+      # a package this workflow just pushed. Read GH_TOKEN from the env; do
+      # not echo it and do not run this step under set -x.
+      - name: Make the image and the chart public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, time, urllib.error, urllib.request
+          token = os.environ["GH_TOKEN"]
+          names = ("ergon-shared-cpus", "charts%2Fergon-shared-cpus")
+
+          def patch(name):
+              req = urllib.request.Request(
+                  f"https://api.github.com/user/packages/container/{name}",
+                  data=b'{"visibility":"public"}',
+                  method="PATCH",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json",
+                      "X-GitHub-Api-Version": "2026-03-10",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      body = json.load(resp)
+                      return resp.status, body.get("visibility", "")
+              except urllib.error.HTTPError as err:
+                  raw = err.read().decode("utf-8", "replace")
+                  message = raw[:200]
+                  try:
+                      message = json.loads(raw).get("message", message)
+                  except json.JSONDecodeError:
+                      pass
+                  return err.code, message
+
+          failed = False
+          for name in names:
+              status, detail = 0, ""
+              for attempt in range(1, 7):
+                  status, detail = patch(name)
+                  print(f"{name} attempt {attempt}: HTTP {status} {detail}", flush=True)
+                  if status == 200 and detail == "public":
+                      break
+                  time.sleep(10)
+              else:
+                  failed = True
+          if failed:
+              raise SystemExit(1)
+          PY
