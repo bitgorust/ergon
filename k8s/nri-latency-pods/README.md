@@ -13,6 +13,17 @@ The grants are in the published `ergon-shared-cpus` image
 second image. Its admission YAML and node units stay in the repo. Experimental.
 EKS is not verified. Latency figures are not measured.
 
+Kubernetes HFT tuning
+([book](https://mimran1980.github.io/ergon/deploy/hft.html)) is the list of
+node and pod settings. This directory is the admission half and the node
+units. The shared-CPU half is the public chart. Apply only
+`admission/priority-class.yaml` and
+`admission/validating-admission-policy.yaml`. The kind sample
+`k8s/nri-shared-cpus/examples/try` installs the chart, accepts one hot pod,
+and shows this policy denying an exec probe. It does not grant hugepages,
+an isolated cpuset partition, io_uring seccomp, or a PHC. Chart 0.1.0 does
+not write `seccomp`, `ptp` or `schedFifo`.
+
 ## Why not AKS
 
 **AKS cannot do this.** It has no supported way to change containerd (so an

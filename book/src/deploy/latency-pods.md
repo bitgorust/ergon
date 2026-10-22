@@ -14,9 +14,14 @@ built in the shared-cpus plugin and off by default
 Status: the grants ship in the public image
 `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0`. Install it with the chart
 `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.0`
-([Shared CPUs](shared-cpus.md#install-on-kubernetes)). This page's admission
-YAML and node units are not an image. A kind e2e covers the five (one check
-per extension). Not verified on EKS. No latency figure is measured.
+([Shared CPUs](shared-cpus.md#use-the-public-chart)). This page's admission
+YAML and node units are not an image. Chart 0.1.0 leaves `seccomp.ioUring`
+and `ptp` off, because its ConfigMap template does not write those keys.
+`k8s/nri-shared-cpus/examples/try` installs that chart and shows two things
+on kind: the shared-CPU grant, and this page's admission policy denying an
+exec probe. It does not exercise hugepages, the cpuset partition, io_uring
+seccomp, or the PHC. The five-grant kind e2e (`test/e2e.sh`) builds the
+plugin from source. Not verified on EKS. No latency figure is measured.
 
 ## The five
 

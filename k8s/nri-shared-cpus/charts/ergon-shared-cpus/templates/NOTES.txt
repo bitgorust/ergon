@@ -1,8 +1,8 @@
 ergon-shared-cpus {{ .Chart.Version }} installed in namespace {{ include "ergon-shared-cpus.namespace" . }}.
 
-This chart is NOT released. The image {{ include "ergon-shared-cpus.image" . }}
-is not on any registry yet; see RELEASE.md in the module for what must be
-true before the first push.
+Image {{ include "ergon-shared-cpus.image" . }}. Anyone can pull it. No image
+pull secret. The chart does not set the boot line, the kubelet, or
+containerd. EKS is not verified. Latency figures are not measured.
 
 1. Wait for the plugin to be ready:
 

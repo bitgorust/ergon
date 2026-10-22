@@ -170,10 +170,78 @@ cgroup v2, containerd >= 2.2 with the NRI default validator on. A
 6.7 or a vendor kernel that backported it. The plugin reads the file rather
 than the version.
 
-The manifests in `deploy/` are the kind path. Their image is
+Chart 0.1.0 writes `sharedCpus`, `oversubscription`, `namespaces`,
+`defaultAffinity`, `hookPath`, `annotationOptIn`, `metricsAddress` and
+`devRoot`. It does not write `seccomp`, `ptp` or `schedFifo`, so `--set`
+of those keys does nothing on this package and the plugin leaves them off.
+`helm install` of this package prints "This chart is NOT released". That
+note was packed before the push. The tag is the public chart.
+
+`docker buildx imagetools inspect ghcr.io/mimran1980/ergon-shared-cpus:0.1.0`
+prints digest `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`.
+The chart image is `repository:tag`. It cannot take `@sha256`.
+Chart digest `sha256:7347131d7d87caee5cf6de11b2a11e2b62454da59c41092b3805bc2834795dbd`.
+
+### Steps on a cluster you run
+
+1. Prepare the node (the chart does not): Kubernetes >= 1.33, cgroup v2,
+   kernel >= 6.2, containerd >= 2.2 with the NRI block below,
+   `cpuManagerPolicy: static`, `reservedSystemCPUs` = the IRQ CPU(s) plus
+   the shared CPUs, boot line isolating the exclusive CPUs only, label
+   `ergon.io/shared-cpus=true`.
+2. `helm install` as above. `config.sharedCpus` must be inside
+   `reservedSystemCPUs` and must not be an IRQ CPU.
+3. Apply `k8s/nri-latency-pods/admission/priority-class.yaml` and
+   `validating-admission-policy.yaml`. Skip `admission/examples/` and the
+   mutating policy. That policy is the HFT admission check: a pod labelled
+   `ergon.io/latency: hot` is denied for an exec probe, an always-restart
+   sidecar, a missing shared-millicpu request, a missing
+   `required-plugins` annotation, or a missing priority class.
+4. Run a Guaranteed pod in an allowlisted namespace (`deploy/example-pod.yaml`
+   is the shape). Check `ERGON_ISOLATED_CPUS`, `ERGON_SHARED_CPUS`, and
+   PID 1 `Cpus_allowed_list` (shared CPUs only).
+
+Kubernetes HFT tuning is that node setup plus this plugin plus the
+admission policy. It is not another image. The book chapter is
+<https://mimran1980.github.io/ergon/deploy/hft.html>. Hugepages, an
+isolated cpuset partition, io_uring seccomp and the NIC PHC are opt-in
+grants in this image. Chart 0.1.0 leaves the matching config keys off.
+EKS is not verified. Latency figures are not measured.
+
+Flux: `HelmRepository` type `oci`, url `oci://ghcr.io/mimran1980/charts`,
+chart `ergon-shared-cpus` version `0.1.0`. Copy the two admission files
+into the repo Flux applies. Do not point a Kustomization at all of
+`admission/`.
+
+### Sample
+
+[examples/try](examples/try) is a throwaway kind cluster that pulls this
+chart and runs the hot pod and the admission denial:
+
+```sh
+k8s/nri-shared-cpus/examples/try/run.sh
+```
+
+Needs Docker (at least 6 CPUs), helm, kubectl and kind v0.33.0. It writes
+its kubeconfig under `/tmp` and deletes the cluster on exit. The pod log
+must show `ERGON_SHARED_CPUS=0`, a non-empty `ERGON_ISOLATED_CPUS`, PID 1
+`Cpus_allowed_list` of `0`, and `nproc=1`. The exec-probe pod must be
+denied. The sample does not measure latency and does not ask for
+hugepages, PTP, or an isolated cpuset partition.
+
+On 2026-10-22 that script passed on chart `0.1.0` and
+`kindest/node:v1.33.0` (Docker Desktop, linux aarch64, 10 CPUs):
+`ERGON_ISOLATED_CPUS=2,3`, `ERGON_SHARED_CPUS=0`,
+`cpuset.cpus.effective=0,2-3`, `nproc=1`, allocatable
+`ergon.io/shared-millicpus=1k`, and `ValidatingAdmissionPolicy`
+`ergon-latency-pods` denied the exec probe. The lines are in
+[examples/try/README.md](examples/try/README.md).
+
+The manifests in `deploy/` are the local build path. Their image is
 `ergon-shared-cpus:dev`. Build it with `docker build -t ergon-shared-cpus:dev .`,
 load it onto the node, edit `deploy/configmap.yaml`, then
 `kubectl apply -f deploy/namespace.yaml -f deploy/configmap.yaml -f deploy/daemonset.yaml`.
+`test/e2e.sh` uses that image. It does not pull the public chart.
 
 containerd:
 

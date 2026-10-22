@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A hot pod the validating policy must refuse: livenessProbe of type exec.
+# Every other hot-pod rule is satisfied, so the refusal names the probe.
+# run.sh applies this and expects a deny. It must not stay on the cluster.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: trader-bad-probe
+  namespace: trading
+  labels:
+    ergon.io/latency: "hot"
+  annotations:
+    required-plugins.noderesource.dev: '["ergon-shared-cpus"]'
+spec:
+  priorityClassName: ergon-hot
+  restartPolicy: Never
+  nodeSelector:
+    ergon.io/shared-cpus: "true"
+  containers:
+    - name: app
+      image: registry.k8s.io/e2e-test-images/busybox:1.36.1-1
+      command: ["sleep", "3600"]
+      resources:
+        requests:
+          cpu: "2"
+          memory: 64Mi
+          ergon.io/shared-millicpus: "250"
+        limits:
+          cpu: "2"
+          memory: 64Mi
+          ergon.io/shared-millicpus: "250"
+      livenessProbe:
+        exec:
+          command: ["true"]
+        periodSeconds: 10

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `k8s/nri-shared-cpus/examples/try` installs the public chart on a
+  throwaway kind cluster and checks the shared-CPU grant and the hot-pod
+  admission denial. A run on 2026-10-22 (chart `0.1.0`,
+  `kindest/node:v1.33.0`) printed `ERGON_ISOLATED_CPUS=2,3`,
+  `ERGON_SHARED_CPUS=0`, `cpuset.cpus.effective=0,2-3`, `nproc=1`, and the
+  admission policy denied the exec probe. Chart 0.1.0 still prints a stale
+  "not released" note and does not emit `seccomp`, `ptp` or `schedFifo`.
 - `ergon-shared-cpus` 0.1.0 is on GHCR. Image
   `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` (digest
   `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`)

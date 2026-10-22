@@ -12,14 +12,111 @@ housekeeping CPUs as well, and start every thread there.
 The busy-spin loop keeps its exclusive core. Only sleepy helpers go to the
 shared CPUs. Never a spinner or SQPOLL there.
 
-Source: `k8s/nri-shared-cpus/`. The install steps below are the ones the
-`k8s/nri-shared-cpus/test/e2e.sh` kind run executes.
+Source: `k8s/nri-shared-cpus/`.
 
 Status: published as tag `0.1.0`. Anyone can pull the image and the chart.
 Tested on kind; **not yet on a real EKS node** (see
 [Limits](#limits-and-what-is-not-verified)). The latency numbers are not
 measured. AKS cannot run it.
 Prior art: `k8s/nri-shared-cpus/README.md`.
+
+## Use the public chart
+
+Do these in order. The chart installs the DaemonSet. It does not prepare
+the node, and it does not install the hot-pod admission policy.
+
+1. Prepare the node. [Node setup](#node-setup) below. Label it
+   `ergon.io/shared-cpus=true`.
+2. Install. `config.sharedCpus` is the housekeeping CPU, inside
+   `reservedSystemCPUs`, and not the IRQ CPU. For the 8-CPU split in that
+   section the value is `0`. One Helm release per shared-CPU layout.
+
+```sh
+helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus \
+  --version 0.1.0 \
+  --namespace ergon-system --create-namespace \
+  --set config.sharedCpus=0 \
+  --set 'config.namespaces={trading}'
+```
+
+Check the pulled image. This prints the index digest
+`sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`:
+
+```sh
+docker buildx imagetools inspect ghcr.io/mimran1980/ergon-shared-cpus:0.1.0
+```
+
+The chart's image helper is `repository:tag`. `image.tag` cannot be
+`@sha256:…`. Chart digest
+`sha256:7347131d7d87caee5cf6de11b2a11e2b62454da59c41092b3805bc2834795dbd`.
+
+`helm install` of this 0.1.0 package prints "This chart is NOT released".
+That note was packed before the push. The tag is the public chart. The
+note in the repo is corrected for a later tag. This tag is not republished
+to change the note.
+
+Chart 0.1.0 writes `sharedCpus`, `oversubscription`, `namespaces`,
+`defaultAffinity`, `hookPath`, `annotationOptIn`, `metricsAddress` and
+`devRoot`. It does not write `seccomp`, `ptp` or `schedFifo`. `--set` of
+those keys does nothing on this package. The plugin leaves them off.
+A later edit of the ConfigMap can turn a key on, and the pod still has to
+opt in. Aeron's C media driver does not use io_uring. `SCHED_FIFO` stays off.
+
+3. Apply the hot-pod policy. These two files only, from
+   `k8s/nri-latency-pods/admission/`:
+
+```sh
+kubectl apply -f priority-class.yaml -f validating-admission-policy.yaml
+```
+
+Leave `examples/` and `mutating-admission-policy.yaml` unapplied.
+A pod labelled `ergon.io/latency: hot` is refused when it has an exec
+probe, a container with `restartPolicy: Always`, no
+`ergon.io/shared-millicpus` request, no
+`required-plugins.noderesource.dev` annotation naming `ergon-shared-cpus`,
+or no `priorityClassName`.
+
+4. Run a Guaranteed pod in an allowlisted namespace. Whole-number `cpu`,
+   requests equal limits, `ergon.io/shared-millicpus`. The pod spec is
+   under [Pod](#pod). Inside it, `ERGON_SHARED_CPUS` is the housekeeping
+   list, `ERGON_ISOLATED_CPUS` is the exclusive list, PID 1
+   `Cpus_allowed_list` is the shared CPUs only, and
+   `cpuset.cpus.effective` is the union.
+
+Flux: a `HelmRepository` of type `oci` at
+`oci://ghcr.io/mimran1980/charts`, chart `ergon-shared-cpus` version
+`0.1.0`, `targetNamespace: ergon-system`, and the same `config` values.
+Copy the two admission files into the Git repo Flux already applies.
+Do not point Flux at the whole `admission/` directory: that directory
+also holds pods the policy is meant to refuse.
+
+### See it on kind
+
+`k8s/nri-shared-cpus/examples/try/run.sh` creates a throwaway kind cluster
+(`kindest/node:v1.33.0`, static CPU manager, `reservedSystemCPUs: "0,1"`),
+installs this public chart with `sharedCpus: "0"`, applies the two
+admission files, and runs one hot pod. The pod's log must show
+`ERGON_SHARED_CPUS=0`, a non-empty `ERGON_ISOLATED_CPUS`, PID 1
+`Cpus_allowed_list` of `0`, and `nproc=1`. A second pod with an exec
+liveness probe must be denied. The script deletes the cluster on the way
+out and uses a kubeconfig under `/tmp`.
+
+That run shows the shared-CPU grant and the HFT admission check. It does
+not measure latency. Kind on Docker Desktop has no hugepage pool, no NIC
+PHC and no `cpuset.cpus.exclusive` partition to demonstrate, and this
+sample does not ask for those grants.
+
+One run of that script on 2026-10-22, chart `0.1.0`,
+`kindest/node:v1.33.0`, Docker Desktop linux aarch64 with 10 CPUs, printed
+`ERGON_ISOLATED_CPUS=2,3`, `ERGON_SHARED_CPUS=0`,
+`cpuset.cpus.effective=0,2-3`, PID 1 `Cpus_allowed_list` `0`, `nproc=1`.
+Node allocatable `ergon.io/shared-millicpus` was `1k`. The exec-probe pod
+was denied by `ValidatingAdmissionPolicy` `ergon-latency-pods`. The
+cluster was deleted afterwards. The log lines are in
+`k8s/nri-shared-cpus/examples/try/README.md`.
+
+The 18-step `test/e2e.sh` is a different run. It builds
+`ergon-shared-cpus:dev` from this tree. It does not pull the public chart.
 
 ## What it gives
 
@@ -110,9 +207,11 @@ creates `ergon-system` with the privileged Pod Security labels and selects
 nodes labelled `ergon.io/shared-cpus=true`. It does not label nodes, and it
 does not set the boot line, the kubelet, or containerd.
 
-Do the node setup above first, then the steps below. A kind node still
-builds a local image. The published chart leaves `seccomp.ioUring` and
-`ptp` off; those keys belong in the ConfigMap when a latency node grants them.
+Do the node setup above first, then the steps below. The public install is
+[Use the public chart](#use-the-public-chart). Chart 0.1.0 does not emit
+`seccomp`, `ptp` or `schedFifo`. Step 4 below is the local image
+`ergon-shared-cpus:dev`. The kind sample that pulls the public chart is
+[See it on kind](#see-it-on-kind).
 
 ### 1. Label the nodes that take the plugin
 
