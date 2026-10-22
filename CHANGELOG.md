@@ -2,13 +2,58 @@
 
 ## Unreleased
 
+- Pin `simple-binary-encoding` to sbe-tool 1.41.0
+  (`5f4d6e2152a007918d638d4736106e2978012200`). A set choice with
+  `sinceVersion` greater than 0 reads false from a message or group field
+  when the acting version is lower, matching the Java and C++ codecs
+  (sbe-tool issue 1035). The buffer is left as it arrived. A group
+  `raw_<field>()` accessor still returns that wire word. A set member of a
+  composite is not gated. The official Rust generator is unchanged in
+  1.41.0, so the checked-in reference codecs were left in place. The
+  comparator provenance record names 1.41.0.
+- `ergon-shared-cpus` checks the mounted kubelet config, NIC IRQ affinity
+  and isolated exclusive CPUs before a hot create. A failure refuses that
+  create and leaves the plugin connected. Node bootstrap takes a separate
+  IRQ destination (`RUSTERON_IRQ_CPUS`), which must be inside the
+  housekeeping set. A hot container cannot turn the start-affinity hook
+  off. The validating policy denies startup, readiness and liveness exec
+  probes, lifecycle exec handlers, a shared-millicpu request missing from
+  any application container, and a `required-plugins` value that is not the
+  exact plugin token. Request `M = 1000 × |S|` with oversubscription 1 to
+  receive the whole helper set. A reconnect keeps the recorded helper CPUs.
+  `ergon-cpus show` prints `cpu_max`, per-thread allowed masks and the
+  affinity rule. Admission of a Pod does not control a later `kubectl exec`.
+  Chart `0.1.0` is not republished. Git chart `0.1.1` is not published
+  either: it renders every config field, `repository@digest` when
+  `image.digest` is set, and the two admission files only when
+  `admission.create` is true. The same unpublished chart can select one
+  named CPU profile from a node label at startup. EKS is not verified.
+  Latency figures are not measured.
+- `ergon-shared-cpus` reads the sync resend skip-set only while its lock
+  is held, so a delayed re-widen cannot race `StopContainer`. The hot-pod
+  admission rule converts resource strings with `quantity(...)` before
+  calling quantity methods. Kubernetes 1.33 rejects
+  `isInteger(string)` (`no such overload`). The try sample uses pod
+  `restartPolicy: OnFailure` with container `resizePolicy: RestartContainer`,
+  and deletes its kind cluster only after that run's `kind create` succeeds.
+  If containerd on that kind node crash-loops with
+  `failed to get metadata for stored sandbox`, the sample wipes that node's
+  containerd state once and keeps waiting. It does not wipe a node whose
+  containerd is up.
+  The `:dev` DaemonSet mounts `/var/lib/kubelet/config.yaml` and passes
+  `--kubelet-config`. Image `0.1.0` still rejects `nodeProfileLabel` and
+  `--kubelet-config`. Chart `0.1.0` is not republished. EKS is not
+  verified. Latency figures are not measured.
 - `k8s/nri-shared-cpus/examples/try` installs the public chart on a
   throwaway kind cluster and checks the shared-CPU grant and the hot-pod
   admission denial. A run on 2026-10-22 (chart `0.1.0`,
   `kindest/node:v1.33.0`) printed `ERGON_ISOLATED_CPUS=2,3`,
   `ERGON_SHARED_CPUS=0`, `cpuset.cpus.effective=0,2-3`, `nproc=1`, and the
-  admission policy denied the exec probe. Chart 0.1.0 still prints a stale
-  "not released" note and does not emit `seccomp`, `ptp` or `schedFifo`.
+  admission policy denied the exec probe. A later run the same day, with
+  the containerd recovery in the script, printed the same grant and the
+  same denial. Containerd stayed up, so the wipe did not run. Chart 0.1.0
+  still prints a stale "not released" note and does not emit `seccomp`,
+  `ptp` or `schedFifo`.
 - `ergon-shared-cpus` 0.1.0 is on GHCR. Image
   `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` (digest
   `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`)

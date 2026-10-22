@@ -77,10 +77,28 @@ See [examples/pin.c](examples/pin.c) (C) and
 Rules:
 
 - never run a spinner or SQPOLL on a shared CPU;
-- create helpers from a thread that is still on the shared set (a new
-  thread copies its creator's mask);
+- the createRuntime hook pins the threads that exist at create onto the
+  shared CPUs. A thread created later inherits its creator's mask. A helper
+  created by a pinned hot thread inherits the hot mask. The application can
+  change affinity with `sched_setaffinity`. That inheritance was observed for
+  a C `pthread_create` (`test/e2e/pin-test.c` mode `masks`) on the Docker
+  Desktop linuxkit kernel, which has no `isolcpus`. A Go 1.27 OS thread
+  started from the hot-pinned thread kept the shared CPU `PinProcess` had set;
+  it did not inherit the hot mask. JVM and Aeron were not run;
+- create helpers from a thread that is still on the shared set;
 - each sleepy helper checks `sched_getcpu()` when it wakes and alarms if it
   is not on `ERGON_SHARED_CPUS`.
+
+The configured pool is fixed. A container does not receive all of it unless
+it asks for it: the allocator grants `ceil(M/1000)` CPUs, preferring the
+assignment it recorded for that pod and otherwise the least-loaded CPUs.
+For one trading process, request `M = 1000 × |S|` with `oversubscription: 1`.
+That uses the existing interface and grants the whole helper set. A smaller
+`M` still grants `ceil(M/1000)` CPUs, which is scheduler accounting, not a
+fraction of a core. A reconnect rebuilds the table from the environment
+recorded at create. It does not choose replacement helper CPUs for a
+container that is already running. Drain trading before changing the
+reservation, the profile or the shared list.
 
 ## ergon-cpus
 
@@ -179,8 +197,36 @@ note was packed before the push. The tag is the public chart.
 
 `docker buildx imagetools inspect ghcr.io/mimran1980/ergon-shared-cpus:0.1.0`
 prints digest `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`.
-The chart image is `repository:tag`. It cannot take `@sha256`.
+The published chart image is `repository:tag`. It cannot take `@sha256`.
 Chart digest `sha256:7347131d7d87caee5cf6de11b2a11e2b62454da59c41092b3805bc2834795dbd`.
+
+Git chart 0.1.1 is not published and must not be installed from GHCR.
+It renders every `config.File` field (`seccomp.ioUring`, `ptp` and
+`schedFifo` stay quoted `"off"`). `image.digest` renders
+`repository@digest`; empty keeps `repository:tag` and the default tag is
+still image `0.1.0`. `admission.create: false` (the default) renders a
+ConfigMap with `data.owner: external` and does not create the policy or
+the PriorityClasses. `admission.create: true` installs
+`validating-admission-policy.yaml` (policy and binding) and
+`priority-class.yaml` (`ergon-hot` and `ergon-helper`). A ConfigMap edit
+does not roll the DaemonSet. Drain trading workloads, then set
+`layoutRevision`, before changing `sharedCpus`. `cgroupRoot` is not a
+config field. Host-fact mounts stay off: image 0.1.0 has no
+`--kubelet-config` flag, and those mounts are `File` or `Directory`, never
+`FileOrCreate`.
+
+Image `0.1.0` rejects `nodeProfileLabel` and exits with
+`unknown field "nodeProfileLabel"`. Do not set `config.profiles` or
+`config.nodeProfileLabel` on that image or on chart 0.1.0. A binary built
+from this tree, and the unpublished git chart 0.1.1, can ship one
+DaemonSet that picks a complete named configuration from
+`config.nodeProfileLabel` on the node (`NODE_NAME`, a get-only Node role).
+A missing label, an unknown profile, or an empty `NODE_NAME` stops that
+process. It does not watch the node and it does not change labels. Legacy
+`sharedCpus` stays the default. A file that sets both is rejected. Drain
+before changing a label or a profile. Running grants stay until those
+containers are recreated. A multi-node cluster was not started for this
+selection.
 
 ### Steps on a cluster you run
 
@@ -194,9 +240,12 @@ Chart digest `sha256:7347131d7d87caee5cf6de11b2a11e2b62454da59c41092b3805bc28347
 3. Apply `k8s/nri-latency-pods/admission/priority-class.yaml` and
    `validating-admission-policy.yaml`. Skip `admission/examples/` and the
    mutating policy. That policy is the HFT admission check: a pod labelled
-   `ergon.io/latency: hot` is denied for an exec probe, an always-restart
-   sidecar, a missing shared-millicpu request, a missing
-   `required-plugins` annotation, or a missing priority class.
+   `ergon.io/latency: hot` is denied for an exec startup, readiness or
+   liveness probe, a lifecycle exec handler, an always-restart sidecar, a
+   shared-millicpu request missing from any application container, a
+   `required-plugins` annotation that is not the exact plugin token, a
+   fractional CPU, a missing `resizePolicy: RestartContainer` for `cpu`, or
+   a missing priority class. Admission does not control a later `kubectl exec`.
 4. Run a Guaranteed pod in an allowlisted namespace (`deploy/example-pod.yaml`
    is the shape). Check `ERGON_ISOLATED_CPUS`, `ERGON_SHARED_CPUS`, and
    PID 1 `Cpus_allowed_list` (shared CPUs only).
@@ -223,7 +272,9 @@ k8s/nri-shared-cpus/examples/try/run.sh
 ```
 
 Needs Docker (at least 6 CPUs), helm, kubectl and kind v0.33.0. It writes
-its kubeconfig under `/tmp` and deletes the cluster on exit. The pod log
+its kubeconfig under `/tmp` and deletes the cluster after this run creates
+it. A preflight refusal, including a cluster that already has that name,
+does not delete it. The pod log
 must show `ERGON_SHARED_CPUS=0`, a non-empty `ERGON_ISOLATED_CPUS`, PID 1
 `Cpus_allowed_list` of `0`, and `nproc=1`. The exec-probe pod must be
 denied. The sample does not measure latency and does not ask for
@@ -252,11 +303,15 @@ containerd:
   # kube-system pods and this plugin's own pod while it is down
 ```
 
-The DaemonSet needs five host paths: `/var/run/nri`,
+The `:dev` DaemonSet needs six host paths: `/var/run/nri`,
 `/var/lib/kubelet/device-plugins` and `/opt/ergon/bin` read-write, plus
-`/dev` at `/host/dev` and the host cgroup v2 tree at `/sys/fs/cgroup`, both
-read-only. The namespace needs Pod Security `privileged`. It is root on the
-node: anything on the NRI socket can change any container.
+`/dev` at `/host/dev`, the host cgroup v2 tree at `/sys/fs/cgroup`, and
+`/var/lib/kubelet/config.yaml` at `/host/kubelet-config`, the last three
+read-only. The kubelet file is a `File` mount, not `FileOrCreate`: the pod
+does not start when that path is missing. The `:dev` image passes it as
+`--kubelet-config`. Chart 0.1.0 and image 0.1.0 do not; leave `hostContract`
+off for that image. The namespace needs Pod Security `privileged`. It is
+root on the node: anything on the NRI socket can change any container.
 
 ## Config
 
@@ -304,9 +359,10 @@ means the layout is doing its job. Run it with and without the plugin.
 
 | event | effect |
 |---|---|
-| plugin down at create | `required-plugins` makes the create fail (containerd >= 2.2); the wrapper refuses without `ERGON_SHARED_CPUS`; the device plugin is down too, so the resource does not allocate |
-| kubelet restart, plugin up | the re-write goes through `UpdateContainer` and keeps the union |
-| kubelet restart, plugin down | cpuset shrinks to the exclusive CPUs; helpers fall onto them; `Synchronize` re-widens on return |
+| plugin down at create | `required-plugins` makes the create fail (containerd >= 2.2); the wrapper refuses without `ERGON_SHARED_CPUS`; the device plugin is down too, so the resource does not allocate. This does not protect a pod that is already running |
+| kubelet restart, plugin up | the re-write goes through `UpdateContainer` and keeps the union. The plugin does not clear a CPU quota |
+| kubelet restart, plugin down | cpuset shrinks to the exclusive CPUs; helpers fall onto them. `test/e2e.sh` step 9 demonstrates that outage. It is not a passing isolation claim. `Synchronize` re-widens on return and does not prove the contract held while the plugin was down |
+| host drift (reserved set, quota, NIC affinity, isolation) | a new hot create is refused. The plugin stays connected: `/healthz` stays up, and this is not a liveness restart |
 | kernel < 6.2 or cgroup v1 | the plugin exits with one clear line |
 | kernel has no `cpuset.cpus.exclusive` | shared-only pods work; every `cpu-partition` opt-in is refused and the pod stays out of the partition (6.7 or a vendor backport of that file) |
 | one physical core is split between the exclusive and the shared CPUs | the container is refused, naming the core: on SMT the hot thread and the helpers would share one core, which is the noise this removes |
@@ -323,8 +379,9 @@ means the layout is doing its job. Run it with and without the plugin.
   a host path is not verified (read-only root, SELinux). Use
   `defaultAffinity: all` and the wrapper until checked.
 - `kubectl exec` and exec probes start on any CPU of the cpuset, exclusive
-  ones included. No exec probes on hot containers; run debug commands as
-  `ergon-cpus -- <cmd>`.
+  ones included. No exec probes or lifecycle exec handlers on hot containers.
+  Admission of the Pod does not control a later exec session. Run debug
+  commands as `ergon-cpus -- <cmd>`.
 - Apps that read their CPUs from their own affinity (`nproc`,
   `sched_getaffinity`) now see only the shared CPUs. Read
   `ERGON_ISOLATED_CPUS` or `cpuset.cpus.effective` instead.

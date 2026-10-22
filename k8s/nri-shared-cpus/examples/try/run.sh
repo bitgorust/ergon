@@ -7,7 +7,9 @@
 #
 # Needs: docker (at least 6 CPUs), helm, kubectl, kind.
 # Uses KUBECONFIG under /tmp. Does not read or write ~/.kube/config.
-# Deletes the cluster it created, on success, failure and interrupt. No cloud.
+# Deletes the cluster only after this run's kind create succeeds, including
+# on a later failure or interrupt. A preflight refusal does not delete a
+# cluster that already exists. No cloud.
 #
 #   examples/try/run.sh
 #
@@ -22,16 +24,99 @@ KUBECONFIG=${KUBECONFIG:-/tmp/ergon-shared-cpus-try.kubeconfig}
 export KUBECONFIG
 KIND=${KIND:-kind}
 LOG=/tmp/ergon-shared-cpus-try.log
-: >"$LOG"
 
 say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+
+# Docker Desktop can restart containerd in this kind node and then fail every
+# start with "failed to get metadata for stored sandbox ... not found".
+# ctr can answer for a moment before that loop begins. Wipe the node's
+# containerd state only when it is down and the journal shows that fatal,
+# and only once: wiping a healthy node causes the same fatal. Images on the
+# node are pulled again. No other cluster is touched.
+containerd_recovered=0
+containerd_up() {
+  # grep runs in the node. A host pipeline under pipefail treats SIGPIPE
+  # from grep -q as "containerd is down", and a leftover journal fatal
+  # would then wipe a healthy node.
+  docker exec "${CLUSTER}-control-plane" sh -c 'ctr version 2>/dev/null | grep -q "Server:"'
+}
+containerd_sandbox_fatal() {
+  docker exec "${CLUSTER}-control-plane" sh -c 'journalctl -u containerd --no-pager 2>/dev/null | grep -q "failed to get metadata for stored sandbox"'
+}
+recover_containerd() {
+  [[ "$containerd_recovered" -eq 1 ]] && return 0
+  if containerd_up; then
+    return 0
+  fi
+  containerd_sandbox_fatal || return 0
+  containerd_recovered=1
+  say "containerd is crash-looping on stale sandbox metadata; wiping its state"
+  # killall by exact name. A pkill -f pattern that appears in this script
+  # would kill the shell that runs it.
+  docker exec "${CLUSTER}-control-plane" sh -c '
+    systemctl stop kubelet >/dev/null 2>&1
+    systemctl stop containerd >/dev/null 2>&1
+    sleep 1
+    killall -9 containerd-shim-runc-v2 containerd 2>/dev/null || true
+    rm -rf /var/lib/containerd /run/containerd 2>/dev/null || true
+    mkdir -p /run/containerd
+    systemctl start containerd
+    sleep 1
+    systemctl start kubelet
+  ' >>"$LOG" 2>&1 || true
+}
+wait_containerd() {
+  local i stable=0
+  local need=${CONTAINERD_STABLE_NEED:-5}
+  local limit=${CONTAINERD_WAIT_LIMIT:-45}
+  for i in $(seq 1 "$limit"); do
+    if containerd_up; then
+      stable=$((stable + 1))
+      if [[ "$stable" -ge "$need" ]]; then
+        return 0
+      fi
+    else
+      stable=0
+      recover_containerd
+    fi
+    sleep 1
+  done
+  return 1
+}
+wait_plugin() {
+  local i ready limit=${PLUGIN_WAIT_LIMIT:-150}
+  for i in $(seq 1 "$limit"); do
+    if ! containerd_up; then
+      recover_containerd
+      sleep 2
+      continue
+    fi
+    ready=$(kubectl -n ergon-system get ds ergon-shared-cpus -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+    if [[ "$ready" == "1" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# TRY_LIB_ONLY=1 sources the helpers and stops before any cluster.
+if [[ "${TRY_LIB_ONLY:-}" == 1 ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+: >"$LOG"
 
 if [[ "${KUBECONFIG}" != /tmp/ergon-shared-cpus-try.kubeconfig ]]; then
   say "refusing: KUBECONFIG must stay /tmp/ergon-shared-cpus-try.kubeconfig"
   exit 1
 fi
 
+created=0
 cleanup() {
+  if [[ "$created" -ne 1 ]]; then
+    return
+  fi
   say "deleting kind cluster ${CLUSTER}"
   "$KIND" delete cluster --name "$CLUSTER" >>"$LOG" 2>&1 || true
   rm -f "$KUBECONFIG"
@@ -74,20 +159,32 @@ say "creating ${CLUSTER} (kindest/node:v1.33.0)"
   --name "$CLUSTER" \
   --config "$TRY/kind.yaml" \
   --kubeconfig "$KUBECONFIG" \
-  --wait 300s >>"$LOG" 2>&1 || fail "kind create failed; see $LOG"
+  --wait 300s >>"$LOG" 2>&1 || fail "kind create failed; see $LOG. This script did not delete a cluster."
+created=1
 
 kubectl get nodes -o wide >>"$LOG" || fail "kubectl cannot reach the cluster"
 node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
 kubectl label node "$node" ergon.io/shared-cpus=true --overwrite >>"$LOG" || fail "node label failed"
 say "node: $node"
+wait_containerd || fail "containerd did not stay up on ${node}; see $LOG"
+
+install_chart() {
+  helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus \
+    --version 0.1.0 \
+    --namespace ergon-system --create-namespace \
+    --set config.sharedCpus=0 \
+    --set 'config.namespaces={trading}' \
+    >>"$LOG" 2>&1
+}
 
 say "helm install oci://ghcr.io/mimran1980/charts/ergon-shared-cpus --version 0.1.0"
-helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus \
-  --version 0.1.0 \
-  --namespace ergon-system --create-namespace \
-  --set config.sharedCpus=0 \
-  --set 'config.namespaces={trading}' \
-  --wait --timeout 300s >>"$LOG" 2>&1 || fail "helm install failed; see $LOG"
+if ! install_chart; then
+  say "helm install failed; checking containerd and retrying once"
+  wait_containerd || fail "containerd did not stay up on ${node}; see $LOG"
+  helm uninstall ergon-shared-cpus -n ergon-system >>"$LOG" 2>&1 || true
+  install_chart || fail "helm install failed; see $LOG"
+fi
+wait_plugin || fail "the ergon-shared-cpus DaemonSet did not become ready; see $LOG"
 say "chart 0.1.0 notes still say it is not released. That sentence is stale. This install is the public chart."
 
 say "waiting for ergon.io/shared-millicpus"
@@ -123,9 +220,12 @@ printf '%s\n' "$grant" | grep -q '^Cpus_allowed_list:[[:space:]]*0$' || fail "PI
 printf '%s\n' "$grant" | grep -q '^nproc=1$' || fail "nproc is not 1; PID 1 can see more than the shared CPU"
 
 say "applying the exec-probe pod (expect deny)"
-deny=$(kubectl apply -f "$TRY/bad-probe.yaml" 2>&1 || true)
+deny_status=0
+deny=$(kubectl apply -f "$TRY/bad-probe.yaml" 2>&1) || deny_status=$?
 printf '%s\n' "$deny" | tee -a "$LOG"
-printf '%s\n' "$deny" | grep -q 'livenessProbe must not be exec' || fail "the exec probe was not denied"
+[[ "$deny_status" -ne 0 ]] || fail "the exec probe was admitted (kubectl exited 0)"
+printf '%s\n' "$deny" | grep -Eqi 'denied|forbidden' || fail "the exec probe was not an admission denial"
+printf '%s\n' "$deny" | grep -q 'livenessProbe must not be exec' || fail "the exec probe was not denied for the probe rule"
 if kubectl -n trading get pod trader-bad-probe >/dev/null 2>&1; then
   fail "trader-bad-probe exists; the policy did not deny it"
 fi

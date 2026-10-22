@@ -11,8 +11,15 @@ k8s/nri-shared-cpus/examples/try/run.sh
 Needs Docker with at least 6 CPUs, helm, kubectl, and kind v0.33.0.
 `KIND=/path/to/kind` if `kind` is not on `PATH`. The script writes
 `KUBECONFIG` to `/tmp/ergon-shared-cpus-try.kubeconfig` and refuses any
-other value. It deletes cluster `ergon-shared-cpus-try` on success, failure
-and interrupt. It does not read `~/.kube/config`. No cloud.
+other value. It deletes cluster `ergon-shared-cpus-try` only after this
+run's `kind create` succeeds, including on a later failure or interrupt.
+If that cluster already exists, the script stops and leaves it alone. It
+does not read `~/.kube/config`. No cloud.
+
+Docker Desktop can crash-loop containerd in this kind node with
+`failed to get metadata for stored sandbox`. The script wipes that node's
+containerd state once and keeps waiting. It does not wipe a node whose
+containerd is answering, and it does not touch any other cluster.
 
 The kind node is `kindest/node:v1.33.0` with the static CPU manager,
 `reservedSystemCPUs: "0,1"`, NRI on, and the label

@@ -34,7 +34,7 @@ The [NRI plugin README](k8s/nri-shared-cpus/README.md) covers installation and c
 | [`k8s/nri-latency-pods`](k8s/nri-latency-pods/) | node and admission setup | Node tuning, an admission policy and pod annotations for latency pods (EKS AL2023) |
 
 Unpublished support: `sbe/benchmarks`, `cluster-test-harness`,
-`md-dpdk/harness`, `md-dpdk/device-plugin` and seven sample
+`io/benches`, `md-dpdk/harness`, `md-dpdk/device-plugin` and seven sample
 crates in [`samples/`](samples/README.md).
 
 Start with `ergo-sbe`. Add another crate only for a need you have. Which one

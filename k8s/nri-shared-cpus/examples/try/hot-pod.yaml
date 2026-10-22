@@ -16,7 +16,10 @@ metadata:
     required-plugins.noderesource.dev: '["ergon-shared-cpus"]'
 spec:
   priorityClassName: ergon-hot
-  restartPolicy: Never
+  # OnFailure, not Never. A pod with restartPolicy Never cannot set
+  # resizePolicy RestartContainer; the API server rejects that pair before
+  # admission. The container sleeps, so a successful exit is not the path.
+  restartPolicy: OnFailure
   nodeSelector:
     ergon.io/shared-cpus: "true"
   containers:
@@ -49,3 +52,6 @@ spec:
           cpu: "2"
           memory: 64Mi
           ergon.io/shared-millicpus: "250"
+      resizePolicy:
+        - resourceName: cpu
+          restartPolicy: RestartContainer

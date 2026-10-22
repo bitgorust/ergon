@@ -1,5 +1,7 @@
 # ergon-io benchmarks
 
+Earlier measurement details are retained in the [2026-10-18 snapshot](BENCHMARK-2026-10-18.md). This page takes precedence where conclusions differ.
+
 Every ergon-io latency figure lives here, once. Each row names the committed file that holds it, under `io/benches/results/<run>/`. Figures are µs, p50 / p99 / max, a range across rounds, unless a column says otherwise. `max` is the absolute maximum of each round.
 
 ## Answers
@@ -234,8 +236,20 @@ Not measured here: `prefer_busy_poll`, `busy_poll_budget`, route `quickack` and 
 
 ## Reproduce
 
-The executable lab harness is maintained in the downstream stack's
-`io/benches` crate. This directory retains the generic transport
-measurements and their recorded evidence. Compare the same workload and
-socket counts on two hosts, repeat in reverse order, and report work
-counts alongside p50, p99 and maxima.
+The generic rate-limit and TLS record tools are in this checkout:
+
+```sh
+cargo test --manifest-path io/benches/Cargo.toml
+cargo build --release --manifest-path io/benches/Cargo.toml --bins
+io/benches/target/release/limit_bench --samples 200000 --batch 64
+io/benches/target/release/tls_bench --sizes 200,1000,4000,16000 --mib 64 --reps 5
+```
+
+TLS implementation comparisons optionally enable `aws-lc` and `openssl`.
+These tools measure CPU cost and allocations; the TLS benchmark decrypts
+ciphertext already in memory. They do not establish whole-network latency.
+
+The two-host replay and live-feed harness lives in the downstream stack's
+`io/benches` crate. Transport measurements and their recorded evidence stay
+here. Compare the same workload and socket counts on two hosts, repeat in
+reverse order, and report work counts alongside p50, p99 and maxima.

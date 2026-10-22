@@ -1,0 +1,29 @@
+[package]
+name = "ergon-io-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Generic rate-limit and TLS record benchmarks for ergon-io"
+
+[lib]
+name = "io_bench"
+
+[dependencies]
+ergon-io = { path = ".." }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring"] }
+libc = "0.2"
+rcgen = "0.14"
+aws-lc-rs = { version = "1.18", optional = true }
+openssl = { version = "0.10", optional = true }
+
+[features]
+aws-lc = ["dep:aws-lc-rs", "rustls/aws_lc_rs"]
+openssl = ["dep:openssl"]
+
+[profile.release]
+debug = 1
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+
+[workspace]

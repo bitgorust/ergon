@@ -14,7 +14,9 @@ metadata:
     required-plugins.noderesource.dev: '["ergon-shared-cpus"]'
 spec:
   priorityClassName: ergon-hot
-  restartPolicy: Never
+  # OnFailure, not Never. Never plus resizePolicy RestartContainer is
+  # rejected by the API server, so the admission rule would never be reached.
+  restartPolicy: OnFailure
   nodeSelector:
     ergon.io/shared-cpus: "true"
   containers:
@@ -30,6 +32,9 @@ spec:
           cpu: "2"
           memory: 64Mi
           ergon.io/shared-millicpus: "250"
+      resizePolicy:
+        - resourceName: cpu
+          restartPolicy: RestartContainer
       livenessProbe:
         exec:
           command: ["true"]

@@ -118,13 +118,18 @@ containerd 2.x `RuntimeDefault` blocks `io_uring_*` (containerd PR #9320).
 For pods labelled `ergon.io/latency: "hot"` (a **pod** label, not a namespace
 label):
 
-- no `livenessProbe`/`readinessProbe` of type `exec`/`command` (an exec probe
-  starts a process on any CPU of the container's cpuset, the loop's
-  included; `httpGet`/`tcpSocket`/`grpc` run from outside and are fine);
+- no `livenessProbe`, `readinessProbe` or `startupProbe` of type `exec`/`command`,
+  and no lifecycle `postStart`/`preStop` exec handler (an exec starts a process
+  on any CPU of the container's cpuset, the loop's included;
+  `httpGet`/`tcpSocket`/`grpc` run from outside and are fine). Admission of
+  the Pod does not control a later `kubectl exec` session;
 - no container and no init container with `restartPolicy: Always` (an injected
   sidecar shares the pod's CPU budget and wakes on the hot core);
-- `ergon.io/shared-millicpus` requested, and
-  `required-plugins.noderesource.dev: '["ergon-shared-cpus"]'` present;
+- `ergon.io/shared-millicpus` requested on every application container, and
+  `required-plugins.noderesource.dev` listing the exact token
+  `"ergon-shared-cpus"` (a substring does not count);
+- a whole-number `cpu` request equal to its limit, and `resizePolicy:
+  RestartContainer` for `cpu`;
 - a `priorityClassName` set (`admission/priority-class.yaml` has `ergon-hot`
   and `ergon-helper` with `preemptionPolicy: Never`).
 

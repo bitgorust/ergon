@@ -65,3 +65,17 @@ The budget reads no clock, performs no I/O and allocates nothing after
 construction on the charge path. Supply one monotonic clock for all calls.
 Adding buckets allocates and belongs outside the send path. The charge
 path's latency has not been established by a committed benchmark run.
+
+## Measure the generic budget
+
+`io/benches` includes `limit_bench`, with rolling and draining buckets,
+multiple simultaneous charges, refusals and idle catch-up. It reports
+batch means, the slowest batch and allocations; a batch percentile is not
+a percentile of individual calls.
+
+```sh
+cargo run --release --manifest-path io/benches/Cargo.toml --bin limit_bench -- --samples 200000 --batch 64
+```
+
+Pin to an isolated Linux CPU with `--cpu` for timing conclusions. A macOS
+run is a functional smoke check.
