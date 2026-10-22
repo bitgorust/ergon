@@ -6,6 +6,8 @@
 
 ### Changed
 
+- `tokio` 1.54.1. 1.54.0 is yanked (`RUSTSEC-2026-0384`, a race in
+  `Interval` on the multi-thread runtime).
 - `ergon-md-dpdk` stops its agents and exits non-zero when a NIC asks for a
   device reset, so a DaemonSet can restart it. The transport does not reset
   the device under polling agents. Sender and receiver ENAs that report two
