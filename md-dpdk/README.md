@@ -263,7 +263,9 @@ periodic runs on them.
 - **NIC health.** Housekeeping runs DPDK's timer service once a second, which
   drives the ENA PMD's keep-alive and transmit-completion watchdog. A failed
   check is counted (`nic-reset-requested`, type 79) and logged at error
-  level; the transport never resets the device: restart the media driver.
+  level. The transport does not reset the device under the polling agents.
+  The `media_driver` process stops them and exits non-zero, so a DaemonSet
+  restarts it.
   Under `uio_pci_generic` the keep-alive needs ENA's
   `control_path_poll_interval` devarg (DPDK 24.11+), or the watchdog fires.
 - **Receive drain.** A poll takes up to `RUSTERON_DPDK_BURST_SIZE` frames a

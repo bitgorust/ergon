@@ -87,9 +87,11 @@ window. `SCHED_FIFO`, io_uring seccomp and PTP stay off unless you opt in
 on a binary that has those grants. The published chart 0.1.0 does not
 write those keys.
 
-The repository states a single-NUMA premise for the EKS notes. This sample
-does not read a machine. The book's measurements include an SMT-on
-receiver. That does not change the SMT-off setting this pod assumes.
+The repository states a single-NUMA premise for the EKS notes. The driver
+refuses two ENAs that report different NUMA nodes, and the device plugin
+does not advertise that pair. This sample does not read a machine. The
+book's measurements include an SMT-on receiver. That does not change the
+SMT-off setting this pod assumes.
 
 Hot creates are refused when the mounted kubelet config, the NIC IRQ
 masks, or the isolated set do not match. The plugin stays connected.

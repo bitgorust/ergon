@@ -86,6 +86,9 @@ The Memory Manager stays at `None`: every
 c7i size below `metal-48xl` has one NUMA node, so `Static` would pin nothing,
 and kubelet refuses to start under `Static` unless `reservedMemory` exactly
 equals kubeReserved, systemReserved and the hard eviction threshold together.
+The driver refuses to start when the two ENAs report different NUMA nodes,
+and the device plugin does not advertise that pair. Queues and mbuf pools
+use the node the PMD reports, not a hardcoded node 0.
 `userdata.sh` fails if its gzipped output exceeds EC2's 16384-byte user-data
 limit.
 

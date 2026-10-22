@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `ergon-md-dpdk` stops its agents and exits non-zero when a NIC asks for a
+  device reset, so a DaemonSet can restart it. The transport does not reset
+  the device under polling agents. Sender and receiver ENAs that report two
+  different NUMA nodes are refused before the second pool is created, and
+  the device plugin does not advertise that pair. An unknown socket does not
+  fail the pair. `RUSTERON_MEDIA_DRIVER_MLOCKALL` stays unset on EKS.
 - Pin `simple-binary-encoding` to sbe-tool 1.41.0
   (`5f4d6e2152a007918d638d4736106e2978012200`). A set choice with
   `sinceVersion` greater than 0 reads false from a message or group field
