@@ -4,8 +4,7 @@
 # the nodes the DaemonSet runs on. It must be inside the kubelet's
 # reservedSystemCPUs, minus the CPU(s) kept for NIC IRQs.
 
-# The image is not published yet. Set repository/tag to a local build to try
-# the chart before RELEASE.md is signed off.
+# Published. Tag 0.1.0 and latest. Empty tag means the chart appVersion.
 image:
   repository: ghcr.io/mimran1980/ergon-shared-cpus
   # Empty means appVersion.

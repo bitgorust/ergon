@@ -25,4 +25,4 @@ annotations:
   artifacthub.io/license: Apache-2.0
   artifacthub.io/changes: |
     - kind: added
-      description: First chart. Not published; see RELEASE.md.
+      description: Published as 0.1.0. EKS and latency benchmarks are still open; see RELEASE.md.

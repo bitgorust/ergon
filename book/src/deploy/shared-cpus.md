@@ -15,8 +15,10 @@ shared CPUs. Never a spinner or SQPOLL there.
 Source: `k8s/nri-shared-cpus/`. The install steps below are the ones the
 `k8s/nri-shared-cpus/test/e2e.sh` kind run executes.
 
-Status: experimental and unpublished. Tested on kind; **not yet on a real EKS
-node** (see [Limits](#limits-and-what-is-not-verified)). AKS cannot run it.
+Status: published as tag `0.1.0`. Anyone can pull the image and the chart.
+Tested on kind; **not yet on a real EKS node** (see
+[Limits](#limits-and-what-is-not-verified)). The latency numbers are not
+measured. AKS cannot run it.
 Prior art: `k8s/nri-shared-cpus/README.md`.
 
 ## What it gives
@@ -86,8 +88,8 @@ pods and the plugin's own pod while it is down.
 
 ## Install on Kubernetes
 
-Six steps, from the `k8s/nri-shared-cpus` directory. Nothing is pushed to a
-registry: build the image and load it onto each node.
+Six steps. The image and the chart are on GHCR, tag `0.1.0`. A kind node
+still builds the image locally and loads it.
 
 ### 1. Label the nodes that take the plugin
 
@@ -142,22 +144,21 @@ Rules:
 
 ### 3. Build and load the image
 
-**Not released.** Nothing is on a registry yet; `k8s/nri-shared-cpus/RELEASE.md`
-is the gate. Open before a first push: the EKS lane and the latency
-benchmarks. The chart, the Dockerfile and the image workflow are ready.
+**Published, tag 0.1.0.** Image
+`ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` and `:latest`, digest
+`sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`.
+Chart `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.0`.
+Anyone can pull them. `k8s/nri-shared-cpus/RELEASE.md` still has the EKS
+lane and the latency benchmarks open.
 
-**Do not make this image public.** The plugin is root on the node and
-installs an executable at `/opt/ergon/bin`. A public image is a root shell on
-every node that pulls it, for whoever can push.
+The plugin is root on the node and installs an executable at
+`/opt/ergon/bin/ergon-cpus`. Pin the digest. Only this repository's publish
+workflow pushes.
 
-- **kind or one node:** `docker build -t ergon-shared-cpus:dev .` then
+- **A cluster:** the chart below. No pull secret.
+- **kind:** `docker build -t ergon-shared-cpus:dev .` then
   `kind load docker-image ergon-shared-cpus:dev`
   (or `docker save … | ctr -n k8s.io images import -`).
-- **A real cluster:** push to a private registry your nodes can read, pin
-  the DaemonSet image to the digest (`@sha256:…`), `imagePullPolicy:
-  IfNotPresent`, and give `ergon-system` an `imagePullSecret`. When it is
-  released the image is `ghcr.io/mimran1980/ergon-shared-cpus`; keep the
-  package private and pin the digest.
 - **No registry:** `imagePullPolicy: Never` and the image already on the
   node (AMI or config management).
 
@@ -171,11 +172,17 @@ manifests, with the config in `values.yaml` instead of a hand-edited
 ConfigMap. Use it when more than one cluster or node group has to agree:
 
 ```sh
-helm install ergon-shared-cpus k8s/nri-shared-cpus/charts/ergon-shared-cpus \
+helm install ergon-shared-cpus oci://ghcr.io/mimran1980/charts/ergon-shared-cpus \
+  --version 0.1.0 \
   --namespace ergon-system --create-namespace \
-  --set config.sharedCpus=4 \
+  --set config.sharedCpus=0 \
   --set 'config.namespaces={trading}'
 ```
+
+The chart in the git tree is the same manifests, for a cluster that does
+not pull from GHCR. `sharedCpus=4` in older examples is a placeholder: it
+has to be this node group's shared CPU, inside `reservedSystemCPUs` and not
+the IRQ CPU. For the 8-CPU split above that is `0`.
 
 The chart creates the namespace with the privileged Pod Security labels and
 sets `ergon.io/shared-cpus: "true"` as its node selector. Node settings

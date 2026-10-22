@@ -11,8 +11,10 @@ Each is a mechanism; none has a measured latency effect. `SCHED_FIFO` is
 built in the shared-cpus plugin and off by default
 ([evidence: mixed](hft.md#sched_fifo)).
 
-Status: experimental and unpublished. A kind e2e covers the five (one check
-per extension).
+Status: the grants ship in `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0`.
+This page's admission YAML and node units are not an image. A kind e2e
+covers the five (one check per extension). Not verified on EKS. No latency
+figure is measured.
 
 ## The five
 

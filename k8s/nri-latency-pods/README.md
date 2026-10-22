@@ -8,7 +8,10 @@ Latency-pod extensions for Kubernetes. One directory, three kinds of thing:
 | plugin | things an NRI plugin can grant on opt-in | `k8s/nri-shared-cpus` |
 | admission | things a policy should refuse or strip | `admission/` here (ValidatingAdmissionPolicy) |
 
-Experimental and unpublished. Nothing is pushed to a registry.
+The grants are in the published `ergon-shared-cpus` image
+(`ghcr.io/mimran1980/ergon-shared-cpus:0.1.0`). This directory is not a
+second image. Its admission YAML and node units stay in the repo. Experimental.
+EKS is not verified. Latency figures are not measured.
 
 ## Why not AKS
 

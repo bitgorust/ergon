@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `ergon-shared-cpus` 0.1.0 is on GHCR. Image
+  `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` (digest
+  `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`)
+  and chart `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version
+  `0.1.0`. Anyone can pull them. EKS is not verified. Latency figures are
+  not measured.
+
 ## [0.1.32] — 2026-10-21
 
 ### Changed

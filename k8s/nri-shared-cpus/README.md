@@ -6,11 +6,11 @@ the node's shared housekeeping CPUs, and start every thread on the shared
 ones. The busy-spin loop keeps its exclusive core; only sleepy helpers
 (dial, TLS, warnings, Aeron conductors) run on the shared CPUs.
 
-**Not released.** Nothing is on a registry. The Dockerfile, the Helm chart in
-[`charts/ergon-shared-cpus`](charts/ergon-shared-cpus) and the image workflow
-are ready to publish, but the EKS lane and the latency benchmarks are still
-open. [`RELEASE.md`](RELEASE.md) is the gate: it names every blocker and the
-exact publish step once they are clear. Tested on kind, not yet on EKS.
+**Published, tag 0.1.0.** Anyone can pull
+`ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` (and `:latest`) and the chart
+`oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version `0.1.0`.
+The EKS lane and the latency benchmarks are still open.
+[`RELEASE.md`](RELEASE.md) names what is not verified. Tested on kind, not yet on EKS.
 
 **This is not a new idea.** [Prior art](#prior-art) names the projects that
 already do parts of it and the open Kubernetes issue it answers. Read that
@@ -147,7 +147,9 @@ failure and interrupt.
    `cpuset.cpus.exclusive`, which is Linux 6.7 or a vendor kernel that
    backported it: 6.2 is only enough for the shared CPUs. The plugin reads
    the file rather than the version, so a backport is accepted.
-2. Image: `docker build -t ergon-shared-cpus:dev .` and load it on the node.
+2. Image: `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0`. Pin the digest
+   `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`.
+   A local build is `docker build -t ergon-shared-cpus:dev .` for kind.
 3. `kubectl apply -f deploy/namespace.yaml -f deploy/configmap.yaml -f deploy/daemonset.yaml`
 4. Edit `deploy/configmap.yaml` first: `sharedCpus` must be inside
    `reservedSystemCPUs`, and `namespaces` is the allowlist.

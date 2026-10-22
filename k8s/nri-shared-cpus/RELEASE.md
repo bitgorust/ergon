@@ -1,12 +1,13 @@
 # Release gate
 
-`ergon-shared-cpus` is **not released**. Nothing is on a registry. The chart,
-the Dockerfile and the workflow in this tree are ready to publish; the items
-below are not.
+`ergon-shared-cpus` **0.1.0** was pushed on 2026-10-22. Anyone can pull it.
+The image is `ghcr.io/mimran1980/ergon-shared-cpus:0.1.0` (and `:latest`),
+digest `sha256:d28fea2f95ebce3e53d33f8770f3ba69be75c76ec7437ea2b92c1329759e07e9`.
+The chart is `oci://ghcr.io/mimran1980/charts/ergon-shared-cpus` version
+`0.1.0`. An anonymous GHCR token pull of both manifests returned HTTP 200.
 
-The first push to `ghcr.io/mimran1980/ergon-shared-cpus` happens only when
-every row is signed off. Until then the workflow builds and uploads an image
-tarball as an artifact and writes nothing to a registry.
+The rows below that are still open were open on that push. The EKS lane is
+not verified. The latency figures are not measured. Do not invent them.
 
 ## 1. Code defects
 
@@ -76,7 +77,7 @@ namespace allowlist. Each has a test or a documented refusal.
 
 | item | state |
 |---|---|
-| README status says "not released" and names this gate | done; must be rewritten the day of the first push |
+| README status names tag 0.1.0 and this gate | done 2026-10-22 |
 | README `## Prior art` names CRI-O, `mixed-cpu-node-plugin`, `dra-driver-cpu` #103/#149/#305, `nri-plugins` and `nri-cpuset-partition`, and does not claim novelty | done |
 | README `## Verify` includes the IRQ-leak check (probe and socket on one exclusive CPU) | done |
 | book install runbook (`book/src/deploy/shared-cpus.md`) | present; must name the released image tag |
@@ -98,9 +99,18 @@ Do not claim SBE wire compatibility, latency numbers or "loss-free" in this
 tree without a measured `BENCHMARKS.md` beside this file. Unmeasured is
 written "not measured", never invented.
 
-## 6. How to publish, once the gate is clear
+## 6. How to publish
 
-Nothing below has been run.
+The first push ran on 2026-10-22 from `feat/0.1.33` at `e1e97ef6`,
+Actions run
+[39729861655](https://github.com/mimran1980/ergon/actions/runs/39729861655).
+The image push and the chart push succeeded. A later step called
+`PATCH /user/packages/container/{name}` to set visibility and got HTTP 404.
+That step is not how these packages became pullable: an anonymous token
+from `ghcr.io/token` then fetched both manifests with HTTP 200. The job is
+red because of the 404. The tags are on GHCR.
+
+0.1.0 did not wait for the open EKS row or the benchmark rows. Order for a later tag:
 
 1. Fix the four defects and the test lanes in sections 1 and 2.
 2. Run the benchmarks in section 3 and put the numbers in a
