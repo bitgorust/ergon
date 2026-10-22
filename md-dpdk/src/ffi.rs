@@ -132,7 +132,9 @@ impl DpdkTransport {
     ///
     /// Always false without the `dpdk` feature, and until a PMD raises
     /// `RTE_ETH_EVENT_INTR_RESET`. The native side does not reset the device.
+    // Not const: the dpdk build loads an atomic in the native runtime.
     #[must_use]
+    #[cfg_attr(not(feature = "dpdk"), allow(clippy::missing_const_for_fn))]
     pub fn nic_reset_exit(&self) -> bool {
         #[cfg(feature = "dpdk")]
         {

@@ -937,14 +937,12 @@ fn t10_warns_when_smt_is_on_and_names_every_way_to_turn_it_off() -> R {
     f.file("/sys/devices/system/cpu/smt/active", "1\n")?;
     let v = t10_smt_on(&f.host());
     assert!(v.is_warning(), "{v:#?}");
-    let refused = HostCheckPolicy::Require.refusal(std::slice::from_ref(&v));
+    let refused = HostCheckPolicy::Require
+        .refusal(std::slice::from_ref(&v))
+        .ok_or("T10 under require refuses every SMT-on x86 host")?;
     assert!(
-        refused.is_some(),
-        "T10 under require refuses every SMT-on x86 host: {v:#?}"
-    );
-    assert!(
-        refused.unwrap().to_string().contains("T10"),
-        "require refusal must name T10"
+        refused.to_string().contains("T10"),
+        "require refusal must name T10: {refused}"
     );
     let m = &v.message;
     // What it means in Kubernetes, with the measured numbers.
