@@ -329,17 +329,30 @@ impl ConnectAttempt {
     }
 
     fn offer_connect(&mut self, ingress: &AeronExclusivePublication) -> Result<bool, ClusterError> {
+        self.offer_connect_at(Instant::now(), |bytes| offer_handshake(ingress, bytes, "connect"))
+    }
+
+    /// The re-offer interval paces only accepted requests. A retryable refusal
+    /// is offered again on the next call, as Java's `AsyncConnect` does.
+    fn offer_connect_at(
+        &mut self,
+        now: Instant,
+        offer: impl FnOnce(&[u8]) -> Result<bool, ClusterError>,
+    ) -> Result<bool, ClusterError> {
         if self.challenged {
             return Ok(false);
         }
         let Some(bytes) = self.connect_bytes.as_deref() else {
             return Ok(false);
         };
-        if self.last_offer.elapsed() < self.reoffer {
+        if now.saturating_duration_since(self.last_offer) < self.reoffer {
             return Ok(false);
         }
-        self.last_offer = Instant::now();
-        offer_handshake(ingress, bytes, "connect")
+        let offered = offer(bytes)?;
+        if offered {
+            self.last_offer = now;
+        }
+        Ok(offered)
     }
 
     fn offer_challenge(&mut self, ingress: &AeronExclusivePublication) -> Result<bool, ClusterError> {
@@ -2251,6 +2264,30 @@ mod tests {
         assert!(
             !offer_body.contains("vec!["),
             "offer must not allocate on the heap for fragmented messages"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_refused_connect_offer_is_retried_on_next_call() -> Result<(), Box<dyn std::error::Error>> {
+        let mut attempt = ConnectAttempt::new(&crate::SessionBuilder::default());
+        attempt.connect_bytes = Some(Vec::new());
+        let start = Instant::now();
+        assert!(
+            !attempt.offer_connect_at(start, |_| Ok(false))?,
+            "first offer back-pressured"
+        );
+        assert!(
+            attempt.offer_connect_at(start, |_| Ok(true))?,
+            "a refused connect request must be offered again without waiting for the re-offer interval"
+        );
+        assert!(
+            !attempt.offer_connect_at(start + attempt.reoffer / 2, |_| Ok(true))?,
+            "an accepted connect request waits for the re-offer interval"
+        );
+        assert!(
+            attempt.offer_connect_at(start + attempt.reoffer, |_| Ok(true))?,
+            "an accepted connect request is offered again once the re-offer interval has passed"
         );
         Ok(())
     }

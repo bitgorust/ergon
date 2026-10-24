@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- `ergo-aeron-cluster`: a connect request refused with a retryable code
+  (`BACK_PRESSURED`, `NOT_CONNECTED`, `ADMIN_ACTION`) is offered again on the
+  next connect step. The re-offer interval (`message_timeout / 4`, clamped to
+  [50 ms, 1 s]) now paces only accepted requests. Before, a refused first
+  offer delayed the connect by the whole interval, 1 s with the default 5 s
+  message timeout. Java's `AeronCluster.AsyncConnect.sendMessage` likewise
+  offers a back-pressured request again on its next step.
+
 ## [0.1.33] — 2026-10-23
 
 ### Changed
